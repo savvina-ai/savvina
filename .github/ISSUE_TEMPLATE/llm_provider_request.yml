@@ -1,0 +1,38 @@
+name: LLM Provider Request
+description: Request support for a new LLM provider
+labels: ["llm-provider", "needs-triage"]
+body:
+  - type: input
+    id: provider
+    attributes:
+      label: Provider name
+      placeholder: "e.g. Cohere"
+    validations:
+      required: true
+  - type: input
+    id: api
+    attributes:
+      label: API base URL
+      placeholder: "e.g. https://api.cohere.ai/v1"
+    validations:
+      required: true
+  - type: dropdown
+    id: compatible
+    attributes:
+      label: Is it OpenAI API compatible?
+      options:
+        - "Yes — the existing OpenAI-compatible provider may already work"
+        - "No — needs a new adapter"
+        - "Unsure"
+    validations:
+      required: true
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Would you contribute the adapter?
+      options:
+        - "Yes"
+        - "No"
+        - "Maybe, with guidance"
+    validations:
+      required: true

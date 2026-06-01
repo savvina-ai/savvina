@@ -1,0 +1,33 @@
+name: Data Source Request
+description: Request support for a new database or storage source
+labels: ["data-source", "needs-triage"]
+body:
+  - type: input
+    id: source
+    attributes:
+      label: Data source name
+      placeholder: "e.g. CockroachDB"
+    validations:
+      required: true
+  - type: dropdown
+    id: auth
+    attributes:
+      label: Authentication method
+      options:
+        - Username / Password
+        - API Key / Token
+        - IAM / Service Account
+        - Connection string
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Would you contribute the adapter?
+      options:
+        - "Yes"
+        - "No"
+        - "Maybe, with guidance"
+    validations:
+      required: true

@@ -1,0 +1,69 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.Python
+
+# Test & lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+
+# === Node / Frontend ===
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+frontend/.eslintcache
+*.tsbuildinfo
+
+# === Environment & Secrets ===
+.env
+.env.local
+.env.*.local
+# Keep .env.example tracked
+
+# === Docker volumes & generated data ===
+volumes/
+
+# === Alembic ===
+# Keep migrations tracked; ignore only local state
+backend/alembic/versions/__pycache__/
+
+# === SSL / TLS certs ===
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+
+# === IDEs ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === OS ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Logs ===
+*.log
+logs/

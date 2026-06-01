@@ -1,0 +1,20 @@
+# Node artefacts
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Test / lint caches
+.eslintcache
+.ruff_cache/
+
+# Environment / secrets
+.env
+.env.*
+
+# Editor and OS
+.git/
+.gitignore
+.DS_Store
+*.swp
+*.swo

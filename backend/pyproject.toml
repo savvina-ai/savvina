@@ -1,0 +1,38 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes (unused imports, undefined names)
+    "I",     # isort (import order)
+    "N",     # pep8-naming
+    "UP",    # pyupgrade (str | None not Optional[str], etc.)
+    "ASYNC", # flake8-async (catch sync I/O in async functions)
+    "S",     # bandit (security checks)
+    "B",     # flake8-bugbear
+    "SIM",   # flake8-simplify
+    "TCH",   # flake8-type-checking (move type-only imports to TYPE_CHECKING)
+    "RUF",   # Ruff-specific rules
+]
+ignore = [
+    "B008",   # FastAPI Depends() in default function args — intentional pattern
+    "S101",   # assert — acceptable in application code
+    "S311",   # random — not used for cryptographic purposes here
+    # TC001/TC003: moving imports behind TYPE_CHECKING breaks Pydantic model validation and
+    # FastAPI dependency injection, which both inspect annotations at runtime.  This applies
+    # to routers, models, schemas, and any module defining Pydantic-validated types.
+    # Removing these entries globally would require hundreds of per-import # noqa annotations.
+    "TC001",
+    "TC003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106", "S107"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+force-sort-within-sections = true
+

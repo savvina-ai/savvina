@@ -1,0 +1,191 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: savvina-app-db
+    profiles:
+      - local-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: savvina_app
+      POSTGRES_USER: savvina
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD must be set in .env}
+    ports:
+      - "0.0.0.0:5434:5432"
+    volumes:
+      # Backup:  docker exec savvina-app-db pg_dump -U savvina savvina_app | gzip > backup_$(date +%F).sql.gz
+      # Restore: zcat backup_YYYY-MM-DD.sql.gz | docker exec -i savvina-app-db psql -U savvina savvina_app
+      - ./volumes/app-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U savvina -d savvina_app"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    networks:
+      - savvina
+
+  sample-postgres:
+    image: postgres:16-alpine
+    container_name: sample-postgres
+    profiles: [test-dbs]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: savvina_test
+      POSTGRES_USER: savvina
+      POSTGRES_PASSWORD: ${SAMPLE_POSTGRES_PASSWORD:?SAMPLE_POSTGRES_PASSWORD must be set in .env}
+    ports:
+      - "0.0.0.0:5435:5432"
+    volumes:
+      - ./volumes/sample-postgres:/var/lib/postgresql/data
+      - ./test_dbs/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U savvina -d savvina_test"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+    command: >
+      postgres
+        -c shared_buffers=256MB
+        -c work_mem=16MB
+        -c maintenance_work_mem=128MB
+        -c effective_cache_size=512MB
+        -c log_min_duration_statement=1000
+        -c log_statement=none
+        -c max_connections=100
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    networks:
+      - savvina
+
+  sample-mysql:
+    image: mysql:8.0
+    profiles: [test-dbs]
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${SAMPLE_MYSQL_ROOT_PASSWORD:?SAMPLE_MYSQL_ROOT_PASSWORD must be set in .env}
+      MYSQL_DATABASE: sample_delivery
+      MYSQL_USER: savvina
+      MYSQL_PASSWORD: ${SAMPLE_MYSQL_PASSWORD:?SAMPLE_MYSQL_PASSWORD must be set in .env}
+    volumes:
+      - ./test_dbs/mysql:/docker-entrypoint-initdb.d:ro
+      - ./volumes/sample-mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin -u savvina -p${SAMPLE_MYSQL_PASSWORD} ping -h 127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    networks:
+      - savvina
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    # Override the Dockerfile's appuser with the host developer's UID/GID so
+    # bind-mounted volumes (./volumes/backend-data) are writable without root.
+    # Intentional UID mismatch: the process runs as the host UID, not appuser.
+    # Set LOCAL_UID / LOCAL_GID in your shell (e.g. export LOCAL_UID=$(id -u)).
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "0.0.0.0:8000:8000"
+    env_file:
+      - ./.env
+    volumes:
+      - ./volumes/backend-data:/app/data
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')\"",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 300s
+    depends_on:
+      db:
+        condition: service_healthy
+        required: false
+    networks:
+      - savvina
+
+  frontend:
+    build: ./frontend
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    restart: unless-stopped
+    ports:
+      # Bound to localhost for local dev. Remove the 127.0.0.1: prefix for external access in production.
+      - "0.0.0.0:${APP_PORT:-3000}:8443"
+    volumes:
+      - ./volumes/certs:/etc/nginx/certs:ro
+      - ./volumes/frontend-run:/run/nginx
+      - ./volumes/frontend-tmp:/var/lib/nginx
+      - ./volumes/frontend-logs:/var/log/nginx
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    networks:
+      - savvina
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    profiles:
+      - local-llm
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:11434/ >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 16g
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    networks:
+      - savvina
+
+volumes:
+  ollama_models:
+
+networks:
+  savvina:
+    driver: bridge

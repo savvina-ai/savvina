@@ -1,0 +1,52 @@
+name: Bug Report
+description: Something is broken
+labels: ["bug", "needs-triage"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Savvina AI version
+      placeholder: "e.g. 1.2.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: datasource
+    attributes:
+      label: Data source type
+      options:
+        - PostgreSQL
+        - MySQL
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: llm
+    attributes:
+      label: LLM provider
+      options:
+        - Claude
+        - OpenAI
+        - Groq
+        - Gemini
+        - Ollama
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+    validations:
+      required: true

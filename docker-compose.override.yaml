@@ -1,0 +1,66 @@
+services:
+  # One-off: run `docker compose run --rm frontend-lockfile` to generate
+  # package-lock.json in ./frontend (no local Node/npm required).
+  frontend-lockfile:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    command: npm install
+    profiles:
+      - lockfile
+
+  # One-off: run frontend tests in a Node container.
+  frontend-test:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    command: sh -lc "npm ci && npm test"
+    profiles:
+      - test
+
+  # Init service to create/chown bind-mounted data directories before app startup.
+  init-permissions:
+    image: alpine:3.20
+    user: root
+    volumes:
+      - ./volumes:/volumes
+    command: >
+      sh -c "
+      echo 'Preparing writable volume directories...' &&
+      mkdir -p /volumes/backend-data /volumes/sample-mysql /volumes/sample-postgres &&
+      mkdir -p /volumes/frontend-run /volumes/frontend-tmp/tmp/client_body /volumes/frontend-tmp/logs /volumes/frontend-logs &&
+      chown -R ${LOCAL_UID:-1000}:${LOCAL_GID:-1000} /volumes/backend-data /volumes/frontend-run /volumes/frontend-tmp /volumes/frontend-logs &&
+      chown -R ${PG_UID:-70}:${PG_GID:-70} /volumes/sample-postgres &&
+      chown -R ${MYSQL_UID:-999}:${MYSQL_GID:-999} /volumes/sample-mysql &&
+      chmod -R 775 /volumes/backend-data /volumes/sample-mysql /volumes/sample-postgres &&
+      chmod -R 755 /volumes/frontend-run /volumes/frontend-tmp /volumes/frontend-logs &&
+      echo 'Permissions configured successfully.'
+      "
+
+  sample-mysql:
+    depends_on:
+      init-permissions:
+        condition: service_completed_successfully
+
+  sample-postgres:
+    depends_on:
+      init-permissions:
+        condition: service_completed_successfully
+
+  frontend:
+    depends_on:
+      init-permissions:
+        condition: service_completed_successfully
+
+  backend:
+    # Bind-mount source so code changes are picked up without rebuilding.
+    # RELOAD=1 activates uvicorn --reload in entrypoint.sh.
+    volumes:
+      - ./backend/app:/app/app
+    environment:
+      RELOAD: "1"
+    depends_on:
+      init-permissions:
+        condition: service_completed_successfully

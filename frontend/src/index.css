@@ -1,0 +1,46 @@
+@import './styles/theme.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  .bg-brand-gradient {
+    background: var(--brand-gradient);
+  }
+
+  /* Gradient button depth — bottom-edge navy shadow + inner top highlight */
+  .shadow-gradient-btn {
+    box-shadow: 0 1px 0 0 hsl(215 65% 17% / 0.3), inset 0 1px 0 0 hsl(0 0% 100% / 0.12);
+  }
+
+  /* Gradient clip text — used on "savvina ai" brand name in headings */
+  .savvina-grad-text {
+    background: var(--brand-gradient);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* Eyebrow — mono uppercase metadata labels (section headers, status chips) */
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem; /* 11px */
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: hsl(var(--fg-muted));
+  }
+
+  /* Techy dot/grid background utilities */
+  .bg-dots {
+    background-image: radial-gradient(hsl(var(--border-strong)) 1px, transparent 1px);
+    background-size: 16px 16px;
+  }
+  .bg-grid {
+    background-image:
+      linear-gradient(hsl(var(--border) / 0.6) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(var(--border) / 0.6) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
+}
