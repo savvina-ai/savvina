@@ -21,4 +21,4 @@ jobs:
           path-to-signatures: signatures/cla.json
           path-to-document: https://github.com/savvina-ai/savvina/blob/main/CLA.md
           branch: cla-signatures
-          allowlist: bot*
+          allowlist: bot*,saltsift-delivery-bot
