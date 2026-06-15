@@ -37,6 +37,8 @@ def create_access_token(
         "iat": now,
         "exp": expire,
     }
+    if settings.jwt_secret_key is None:  # pragma: no cover
+        raise RuntimeError("jwt_secret_key must be set by resolve_jwt_secret")
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
 
@@ -54,6 +56,8 @@ def decode_access_token(token: str) -> dict:
     Raises HTTPException(401) on any validation failure.
     """
     settings = get_settings()
+    if settings.jwt_secret_key is None:  # pragma: no cover
+        raise RuntimeError("jwt_secret_key must be set by resolve_jwt_secret")
     try:
         payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
     except PyJWTError as exc:

@@ -3,10 +3,13 @@
 
 from functools import lru_cache
 import logging
+import secrets
 
 from cryptography.fernet import Fernet
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -84,7 +87,9 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:3000"]
 
     # JWT
-    jwt_secret_key: str  # required — JWT_SECRET_KEY env var
+    # Auto-generated independently by entrypoint.sh and persisted to secrets.env.
+    # Optional here so local dev / tests work without running the entrypoint.
+    jwt_secret_key: str | None = None
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 30
@@ -162,12 +167,28 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def reject_insecure_defaults(self) -> "Settings":
-        if self.jwt_secret_key.lower() in self._WEAK_DEFAULTS or len(self.jwt_secret_key) < 32:
-            raise ValueError(
-                "JWT_SECRET_KEY must be at least 32 characters and not a known weak default. "
-                'Generate one with: python -c "import secrets; print(secrets.token_hex(32))"'
+    def resolve_jwt_secret(self) -> "Settings":
+        if self.jwt_secret_key is None:
+            if not self.debug:
+                raise ValueError(
+                    "JWT_SECRET_KEY must be set in production. "
+                    "In Docker, ensure entrypoint.sh runs before uvicorn starts. "
+                    "For bare-metal deployments, add JWT_SECRET_KEY to .env."
+                )
+            # Debug / local dev only: generate a random in-memory key so the app
+            # starts without configuration. Sessions won't survive restarts.
+            logger.warning(
+                "JWT_SECRET_KEY not set — using a random in-memory key. "
+                "Sessions will not survive restarts. In production, ensure "
+                "entrypoint.sh runs so a persistent key is written to secrets.env."
             )
+            object.__setattr__(self, "jwt_secret_key", secrets.token_hex(32))
+        else:
+            if self.jwt_secret_key.lower() in self._WEAK_DEFAULTS or len(self.jwt_secret_key) < 32:
+                raise ValueError(
+                    "JWT_SECRET_KEY must be at least 32 characters and not a known weak default. "
+                    'Generate one with: python -c "import secrets; print(secrets.token_hex(32))"'
+                )
         return self
 
     def env_api_key(self, provider_name: str) -> str | None:

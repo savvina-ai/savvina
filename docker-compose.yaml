@@ -95,6 +95,8 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      args:
+        HF_TOKEN: ${HF_TOKEN:-}
     # Override the Dockerfile's appuser with the host developer's UID/GID so
     # bind-mounted volumes (./volumes/backend-data) are writable without root.
     # Intentional UID mismatch: the process runs as the host UID, not appuser.
@@ -146,7 +148,7 @@ services:
       backend:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://127.0.0.1:8443/ >/dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -14,8 +14,8 @@ These must be set before the backend will start.
 
 | Variable | Description |
 |---|---|
-| `ENCRYPTION_KEY` | Fernet symmetric key used to encrypt database credentials and API keys at rest. Generate with: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
-| `JWT_SECRET_KEY` | Secret used to sign and verify access tokens. Must be at least 32 characters. Generate with: `python -c "import secrets; print(secrets.token_hex(32))"` |
+| `ENCRYPTION_KEY` | Fernet symmetric key used to encrypt database credentials and API keys at rest. **Docker**: auto-generated on first boot and persisted to `/app/data/secrets.env` — no manual step needed. **Bare-metal / non-Docker**: generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` and add to `.env`. Back up this key — losing it makes all stored credentials permanently unreadable. |
+| `JWT_SECRET_KEY` | Secret used to sign and verify user access tokens. Must be at least 32 characters. **Docker**: auto-generated on first boot alongside `ENCRYPTION_KEY` — sessions survive container restarts. **Bare-metal / non-Docker**: generate with `python -c "import secrets; print(secrets.token_hex(32))"` and add to `.env`. |
 | `DATABASE_URL` | asyncpg connection string for the application PostgreSQL database. Required in all modes — see [Database Mode](#database-mode) below. |
 | `APP_DB_PASSWORD` | Password for the bundled `db` container. Only required when using the `local-db` profile. |
 
@@ -160,6 +160,7 @@ python -c "import secrets; print(secrets.token_urlsafe(24))"
 | `COMPOSE_PROFILES` | *(unset)* | Comma-separated list of active Docker Compose profiles. `local-db` starts the bundled PostgreSQL app container. `test-dbs` starts the sample PostgreSQL and MySQL containers pre-seeded with demo data. `local-llm` starts Ollama. Combine as needed: `local-db,test-dbs`. Leave unset when using an external managed database. |
 | `LOCAL_UID` | `1000` | Backend container runs as this user ID. Set to your host UID on Linux/WSL to avoid volume permission issues: `echo "LOCAL_UID=$(id -u)" >> .env` |
 | `LOCAL_GID` | `1000` | Backend container group ID. Set with: `echo "LOCAL_GID=$(id -g)" >> .env` |
+| `HF_TOKEN` | *(unset)* | Hugging Face access token passed as a **build-time** argument to `docker compose build`. Avoids anonymous rate-limiting when the `model-cache` stage downloads the fastembed ONNX model (`BAAI/bge-small-en-v1.5`) from HuggingFace. Not used at runtime. A free read-only token is sufficient — get one at huggingface.co → Settings → Access Tokens. |
 
 ---
 
@@ -206,6 +207,11 @@ SAMPLE_MYSQL_PASSWORD=<strong-password>
 # ── Host UID/GID (Linux/WSL only) ─────────────────────────────────────────
 LOCAL_UID=1000
 LOCAL_GID=1000
+
+# ── Build optimisation (optional) ─────────────────────────────────────────
+# Avoids HuggingFace anonymous rate-limiting during `docker compose build`.
+# Free read-only token: huggingface.co → Settings → Access Tokens
+HF_TOKEN=
 ```
 
 ---

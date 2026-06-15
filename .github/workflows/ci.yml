@@ -124,7 +124,7 @@ jobs:
           cache-dependency-path: backend/requirements.txt
 
       - name: Python dependency audit
-        run: pip install pip-audit==2.10.0 && pip-audit -r backend/requirements.txt --ignore-vuln PYSEC-2025-183
+        run: pip install pip-audit==2.10.0 && pip-audit -r backend/requirements.txt
 
   audit-frontend:
     name: Frontend dependency audit

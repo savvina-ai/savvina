@@ -34,31 +34,34 @@ cp .env.example .env
 
 ## Step 3 — Generate Required Secrets
 
-Savvina AI requires two cryptographic secrets and several database passwords. All of them are **required** — the backend will refuse to start without them.
+### ENCRYPTION_KEY and JWT_SECRET_KEY (Docker — auto-generated)
 
-### Fernet encryption key
+When running via Docker Compose, **both keys are generated automatically on first boot** and persisted to `/app/data/secrets.env` inside the container's data volume. You do not need to set them manually — the container logs confirm generation:
 
-Encrypts all database credentials and API keys stored in the app database. Losing this key means stored secrets can no longer be decrypted — back it up to a password vault.
+```
+[entrypoint] Generated new ENCRYPTION_KEY → /app/data/secrets.env
+[entrypoint] Generated new JWT_SECRET_KEY → /app/data/secrets.env
+```
+
+> **Important:** Back up `ENCRYPTION_KEY` from the volume after the first boot. Losing it makes all stored database credentials and API keys permanently unreadable.
+
+If you already have an `ENCRYPTION_KEY` or `JWT_SECRET_KEY` in `.env` from a previous install, the entrypoint migrates them to `secrets.env` automatically on the next start — then you can safely remove them from `.env`.
+
+### ENCRYPTION_KEY and JWT_SECRET_KEY (bare-metal / non-Docker)
+
+If running the backend outside of Docker, generate the keys manually and add them to `.env`:
 
 ```bash
+# Fernet encryption key
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-```
 
-Add to `.env`:
-```
-ENCRYPTION_KEY=your-fernet-key-here
-```
-
-### JWT secret key
-
-Signs and verifies user access tokens. Must be at least 32 characters.
-
-```bash
+# JWT secret key (at least 32 characters)
 python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-Add to `.env`:
+Add both to `.env`:
 ```
+ENCRYPTION_KEY=your-fernet-key-here
 JWT_SECRET_KEY=your-jwt-secret-here
 ```
 
@@ -204,6 +207,12 @@ docker compose up --build
 ```
 
 The first build downloads Docker base images and installs Python/Node packages — expect 3–5 minutes. Subsequent starts take about 10–20 seconds.
+
+> **Speed tip:** The build downloads the fastembed ONNX embedding model from HuggingFace. Anonymous downloads are rate-limited and can slow or fail the build. Setting a free HuggingFace token in `.env` avoids the limit:
+> ```
+> HF_TOKEN=hf_...   # huggingface.co → Settings → Access Tokens (read-only token)
+> ```
+> The token is only used at build time and is never included in the final image.
 
 Wait until you see all services healthy:
 

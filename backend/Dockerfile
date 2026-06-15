@@ -1,6 +1,8 @@
 # ── model stage — cached independently of Python deps ─────────────────────────
 # Isolated so that changes to requirements.txt never bust this layer.
 FROM python:3.12-slim AS model-cache
+ARG HF_TOKEN
+ENV HF_TOKEN=${HF_TOKEN}
 RUN pip install --no-cache-dir fastembed
 ENV FASTEMBED_CACHE_PATH=/app/fastembed_cache
 RUN for i in 1 2 3; do \

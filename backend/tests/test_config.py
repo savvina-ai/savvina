@@ -82,3 +82,78 @@ class TestLogLevelValidator:
     def test_rejects_arbitrary_string(self):
         with pytest.raises(ValidationError, match="Invalid log level"):
             Settings(**self._REQUIRED, log_level="VERBOSE")
+
+
+class TestResolveJwtSecret:
+    _BASE: ClassVar[dict] = {
+        "database_url": "postgresql+asyncpg://u:p@localhost/db",
+        "encryption_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        # debug=True so the random-key fallback path is reachable in tests.
+        "debug": True,
+    }
+
+    def _settings_without_jwt_env(self, **extra):
+        """Build Settings with JWT_SECRET_KEY removed from env so the None branch fires."""
+        import os
+
+        saved = os.environ.pop("JWT_SECRET_KEY", None)
+        try:
+            return Settings(**self._BASE, **extra)
+        finally:
+            if saved is not None:
+                os.environ["JWT_SECRET_KEY"] = saved
+
+    def test_none_generates_random_key(self):
+        s = self._settings_without_jwt_env()
+        assert s.jwt_secret_key is not None
+        assert len(s.jwt_secret_key) >= 32
+
+    def test_none_logs_warning(self):
+        import logging
+
+        import app.config as cfg
+
+        records: list[str] = []
+
+        class Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record.getMessage())
+
+        handler = Capture(level=logging.WARNING)
+        cfg.logger.addHandler(handler)
+        cfg.logger.setLevel(logging.WARNING)
+        try:
+            self._settings_without_jwt_env()
+        finally:
+            cfg.logger.removeHandler(handler)
+            cfg.logger.setLevel(logging.NOTSET)
+
+        assert any("JWT_SECRET_KEY not set" in m for m in records)
+
+    def test_raises_in_production_without_jwt_key(self):
+        import os
+
+        saved = os.environ.pop("JWT_SECRET_KEY", None)
+        try:
+            with pytest.raises(ValidationError, match="JWT_SECRET_KEY must be set in production"):
+                Settings(
+                    database_url="postgresql+asyncpg://u:p@localhost/db",
+                    encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                    debug=False,
+                )
+        finally:
+            if saved is not None:
+                os.environ["JWT_SECRET_KEY"] = saved
+
+    def test_rejects_weak_default(self):
+        with pytest.raises(ValidationError, match="JWT_SECRET_KEY"):
+            Settings(**self._BASE, jwt_secret_key="secret")
+
+    def test_rejects_short_key(self):
+        with pytest.raises(ValidationError, match="JWT_SECRET_KEY"):
+            Settings(**self._BASE, jwt_secret_key="short")
+
+    def test_accepts_valid_key(self):
+        key = "a" * 32
+        s = Settings(**self._BASE, jwt_secret_key=key)
+        assert s.jwt_secret_key == key
