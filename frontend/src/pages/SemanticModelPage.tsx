@@ -10,6 +10,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import axios from 'axios';
 import { AlertTriangle, Check, ChevronRight, Pencil, Plus, X } from 'lucide-react';
 
 import { semanticApi } from '../api/semantic';
@@ -397,10 +398,41 @@ export default function SemanticModelPageV2() {
 
       setGenProgress({ tables_done: 0, tables_total: tablesTotal, batch_size: batchSize });
 
-      for (let i = 0; i < batchCount; i++) {
-        await semanticApi.generateBatch(connectionId!, i, providerParam);
-        setGenProgress((p) => (p ? { ...p, tables_done: i + 1 } : null));
-      }
+      const CONCURRENCY = 2;
+      const MAX_RETRIES = 4;
+      const queue = Array.from({ length: batchCount }, (_, i) => i);
+      let cancelled = false;
+
+      const runBatchWithRetry = async (i: number) => {
+        for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+          if (cancelled) throw new Error('cancelled');
+          try {
+            return await semanticApi.generateBatch(connectionId!, i, providerParam);
+          } catch (err: unknown) {
+            const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+            const isNetworkError = axios.isAxiosError(err) && !err.response;
+            const isRetryable = status === 429 || isNetworkError;
+            if (!isRetryable || attempt === MAX_RETRIES - 1) {
+              cancelled = true;
+              throw err;
+            }
+            await new Promise((r) => setTimeout(r, 2000 * 2 ** attempt));
+          }
+        }
+        return undefined;
+      };
+
+      const runWorker = async () => {
+        while (queue.length > 0 && !cancelled) {
+          const i = queue.shift()!;
+          const updated = await runBatchWithRetry(i);
+          const done = updated?.generation_progress?.tables_done;
+          if (done !== undefined) {
+            setGenProgress((p) => (p ? { ...p, tables_done: Math.max(p.tables_done, done) } : null));
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(CONCURRENCY, batchCount) }, runWorker));
 
       return semanticApi.generateGlobals(connectionId!, providerParam);
     },

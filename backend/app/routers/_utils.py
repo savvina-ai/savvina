@@ -37,6 +37,27 @@ async def get_connection_or_404(
     return conn
 
 
+async def lock_and_reread_connection(conn_id: str, db: AsyncSession) -> Connection:
+    """Re-fetch *conn_id* under ``FOR UPDATE``, bypassing the identity-map cache.
+
+    Call immediately before composing a write to ``Connection.semantic_model``
+    in any handler that read the connection earlier in the same request, so
+    the write merges into the latest committed state rather than a stale
+    snapshot from a concurrent request.
+    """
+    stmt = (
+        select(Connection)
+        .where(Connection.id == conn_id, Connection.is_active.is_(True))
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    result = await db.execute(stmt)
+    conn = result.scalar_one_or_none()
+    if conn is None:
+        raise HTTPException(status_code=404, detail=f"Connection '{conn_id}' not found")
+    return conn
+
+
 async def _invalidate_connection_caches(connection_id: str, db: AsyncSession) -> None:
     """Delete QueryCacheEntry, UserSchemaCache, and TableEmbeddingCache rows for
     *connection_id*.
