@@ -40,12 +40,26 @@ from ..services.schema_utils import (
     _schema_from_dict,
     get_or_refresh_schema,
 )
-from ._utils import _invalidate_connection_caches, cached_json_response, get_connection_or_404
+from ._utils import (
+    _invalidate_connection_caches,
+    cached_json_response,
+    get_connection_or_404,
+    lock_and_reread_connection,
+)
 
 _GENERATION_TIMEOUT_SECONDS = 180
 
 router = APIRouter(prefix="/connections", tags=["semantic"])
 logger = logging.getLogger(__name__)
+
+
+def _advance_progress(
+    progress: GenerationProgress | None, tables_done: int
+) -> GenerationProgress | None:
+    """Return *progress* with ``tables_done`` updated, or ``None`` if absent."""
+    if progress is None:
+        return None
+    return progress.model_copy(update={"tables_done": tables_done})
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -83,7 +97,7 @@ async def update_semantic_model(
     per-column, preserving v2 metadata (``semantic_type``, ``cardinality`` …)
     that the frontend doesn't always echo back.
     """
-    conn = await get_connection_or_404(connection_id, db)
+    conn = await lock_and_reread_connection(connection_id, db)
     existing_dict: dict = dict(conn.semantic_model) if conn.semantic_model else {}
     existing_model = (
         SemanticModel.model_validate(existing_dict) if existing_dict else SemanticModel()
@@ -264,7 +278,7 @@ async def apply_suggestion(
 ) -> SemanticModel:
     """Apply a specific semantic suggestion to the stored model.
 
-    OVERHEAD: app-only — reads/writes PostgreSQL app DB only. No DB re-query.
+    OVERHEAD: app-only — reads/writes PostgreSQL app DB only.
     """
     conn = await get_connection_or_404(connection_id, db)
 
@@ -278,6 +292,9 @@ async def apply_suggestion(
     if suggestion is None:
         raise HTTPException(status_code=404, detail="Suggestion not found")
 
+    # Re-read under a row lock right before merging so this doesn't clobber a
+    # concurrent write (e.g. a batch-generation call) made since the read above.
+    conn = await lock_and_reread_connection(connection_id, db)
     if not conn.semantic_model:
         raise HTTPException(status_code=404, detail="No semantic model to update")
 
@@ -428,6 +445,9 @@ async def generate_semantic_init(
 
 
 @router.post("/{connection_id}/semantic/generate/batch", response_model=SemanticModel)
+# CONCURRENCY=2 in the frontend worker pool roughly doubles request density
+# against this limit; retry/backoff in runBatchWithRetry absorbs occasional
+# 429s. Revisit if logs show frequent 429s on large schemas.
 @limiter.limit("20/minute")
 async def generate_semantic_batch(
     request: Request,
@@ -503,11 +523,35 @@ async def generate_semantic_batch(
         detail = str(exc) if str(exc) else f"Batch {batch_idx} generation failed"
         raise HTTPException(status_code=500, detail=detail) from exc
 
-    merged_tables = {**partial_model.tables, **batch_tables}
-    new_progress = (
-        progress.model_copy(update={"tables_done": batch_idx + 1}) if progress is not None else None
+    # Re-read with a row lock so concurrent batch writes merge into the latest
+    # DB state, not the stale snapshot loaded at request start 40 s ago.
+    # populate_existing=True forces SQLAlchemy to bypass the identity-map cache.
+    locked = await db.execute(
+        select(Connection)
+        .where(Connection.id == connection_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
-    new_partial = partial_model.model_copy(
+    conn_locked = locked.scalar_one()
+    current_model = SemanticModel.model_validate(conn_locked.semantic_model)
+
+    if current_model.generation_status != GenerationStatus.TABLES_PARTIAL:
+        # Another request (e.g. a fresh /generate/init, or /generate/globals
+        # finalizing the model) changed status while this batch call was
+        # awaiting the LLM. Discard this batch's results rather than corrupt
+        # a model that has moved on.
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Semantic generation state changed during batch processing "
+                f"(status is now '{current_model.generation_status}')"
+            ),
+        )
+
+    merged_tables = {**current_model.tables, **batch_tables}
+    new_progress = _advance_progress(current_model.generation_progress, len(merged_tables))
+    new_partial = current_model.model_copy(
         update={"tables": merged_tables, "generation_progress": new_progress}
     )
 
@@ -593,6 +637,23 @@ async def generate_semantic_globals(
         detail = str(exc) if str(exc) else "Globals generation failed"
         raise HTTPException(status_code=500, detail=detail) from exc
 
+    # Re-read under a row lock so this doesn't clobber a concurrent batch
+    # write that landed while the (slow) globals LLM call was in flight.
+    conn_locked = await lock_and_reread_connection(connection_id, db)
+    current_model = SemanticModel.model_validate(conn_locked.semantic_model)
+    if current_model.generation_status not in (
+        GenerationStatus.TABLES_PARTIAL,
+        GenerationStatus.COMPLETE,
+    ):
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Semantic generation state changed during globals generation "
+                f"(status is now '{current_model.generation_status}')"
+            ),
+        )
+
     # Prune relationship edges to generated tables only
     generated_tables = set(all_tables.keys())
     pruned_relationships = [
@@ -602,7 +663,7 @@ async def generate_semantic_globals(
     ]
 
     dialect = conn.source_type
-    final = partial_model.model_copy(
+    final = current_model.model_copy(
         update={
             "business_metrics": metrics,
             "common_joins": joins,

@@ -333,6 +333,7 @@ function AddProviderInlineForm({
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
             placeholder={displayNameHint}
+            autoComplete="off"
             className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           />
         </div>
@@ -353,6 +354,7 @@ function AddProviderInlineForm({
               value={model}
               onChange={(e) => setModel(e.target.value)}
               placeholder="e.g. llama3"
+              autoComplete="off"
               className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
             />
           )}
@@ -629,6 +631,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
           <input
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
+            autoComplete="off"
             className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           />
         </div>
@@ -656,6 +659,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
             <input
               value={model}
               onChange={(e) => setModel(e.target.value)}
+              autoComplete="off"
               className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
             />
           )}

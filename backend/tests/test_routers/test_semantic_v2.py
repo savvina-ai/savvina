@@ -238,8 +238,9 @@ class TestApplySuggestion:
         )
 
         db = _mock_db(
-            MockResult(single=conn),  # _get_or_404
+            MockResult(single=conn),  # get_connection_or_404
             MockResult(single=sug),  # select suggestion by id
+            MockResult(single=conn),  # lock_and_reread_connection
             MockResult(),  # update Connection
             MockResult(),  # update SemanticSuggestion
             MockResult(),  # delete QueryCacheEntry
@@ -296,8 +297,9 @@ class TestApplySuggestion:
             value={"filter": "status != 'deleted'"},
         )
         db = _mock_db(
-            MockResult(single=conn),  # _get_or_404
+            MockResult(single=conn),  # get_connection_or_404
             MockResult(single=sug),  # select suggestion
+            MockResult(single=conn),  # lock_and_reread_connection
             MockResult(),  # update Connection
             MockResult(),  # update SemanticSuggestion
             MockResult(),  # delete QueryCacheEntry
@@ -320,8 +322,9 @@ class TestApplySuggestion:
             value={"target": "table", "description": "Updated description"},
         )
         db = _mock_db(
-            MockResult(single=conn),  # _get_or_404
+            MockResult(single=conn),  # get_connection_or_404
             MockResult(single=sug),  # select suggestion
+            MockResult(single=conn),  # lock_and_reread_connection
             MockResult(),  # update Connection
             MockResult(),  # update SemanticSuggestion
             MockResult(),  # delete QueryCacheEntry
@@ -340,8 +343,9 @@ class TestApplySuggestion:
         conn = _make_conn(semantic_model=_POPULATED_MODEL)
         sug = _make_suggestion(connection_id="conn-123")
         db = _mock_db(
-            MockResult(single=conn),  # _get_or_404
+            MockResult(single=conn),  # get_connection_or_404
             MockResult(single=sug),  # select suggestion
+            MockResult(single=conn),  # lock_and_reread_connection
             MockResult(),  # update Connection
             MockResult(),  # update SemanticSuggestion
             MockResult(),  # delete QueryCacheEntry
@@ -359,6 +363,7 @@ class TestApplySuggestion:
         db = _mock_db(
             MockResult(single=conn),  # get_connection_or_404
             MockResult(single=sug),  # select suggestion
+            MockResult(single=conn),  # lock_and_reread_connection
             MockResult(),  # update Connection
             MockResult(),  # update SemanticSuggestion
             MockResult(),  # delete QueryCacheEntry
@@ -367,5 +372,6 @@ class TestApplySuggestion:
         )
         app.dependency_overrides[get_db] = lambda: db
         await http_client.post("/api/v1/connections/conn-123/semantic/suggestions/sug-001/apply")
-        # 1 select (get_or_404) + 1 select (suggestion) + 2 updates + 3 deletes = 7
-        assert db.execute.await_count == 7
+        # 1 select (get_or_404) + 1 select (suggestion) + 1 select (lock_and_reread)
+        # + 2 updates + 3 deletes = 8
+        assert db.execute.await_count == 8
