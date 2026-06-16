@@ -2,6 +2,24 @@
 
 <!-- version list -->
 
+## v1.0.2 (2026-06-16)
+
+### Bug Fixes
+
+- Close concurrent-batch-generation races, patch form-data, js-yaml, ws vulnerabilities, patch
+  starlette, cryptography, python-multipart vulnerabilities
+  ([`c26e99d`](https://github.com/savvina-ai/savvina/commit/c26e99d7da8b07745dfda403d199947d21f97a08))
+
+- **deps**: Patch form-data, js-yaml, ws vulnerabilities
+  ([`c26e99d`](https://github.com/savvina-ai/savvina/commit/c26e99d7da8b07745dfda403d199947d21f97a08))
+
+- **deps**: Patch starlette, cryptography, python-multipart vulnerabilities
+  ([`c26e99d`](https://github.com/savvina-ai/savvina/commit/c26e99d7da8b07745dfda403d199947d21f97a08))
+
+- **semantic**: Close concurrent-batch-generation races
+  ([`c26e99d`](https://github.com/savvina-ai/savvina/commit/c26e99d7da8b07745dfda403d199947d21f97a08))
+
+
 ## v1.0.1 (2026-06-15)
 
 ### Bug Fixes
