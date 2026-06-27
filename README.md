@@ -1,16 +1,17 @@
 # Savvina AI
 
-> ⚠️ **License:** Savvina AI Community Edition is free for development,
-> testing, and non-commercial use under the
-> [Business Source License 1.1](LICENSE). Production or commercial use
-> requires a [commercial license](COMMERCIAL.md). On 2030-06-01 this
-> project converts to Apache 2.0.
+🤖 **Text-to-SQL for self-hosters** — ask your database anything in plain English, get SQL and results instantly.
+
+[![GitHub Stars](https://img.shields.io/github/stars/savvina-ai/savvina?style=social)](https://github.com/savvina-ai/savvina)
+[![License](https://img.shields.io/badge/license-BSL%201.1-blue)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org/)
+[![Latest Release](https://img.shields.io/github/v/release/savvina-ai/savvina)](https://github.com/savvina-ai/savvina/releases)
+
+![Savvina AI demo](docs/assets/demo.gif)
 
 **Self-hosted conversational analytics — query your database with plain English.**
 
 Savvina AI lets you connect to a database, ask questions in natural language, and receive generated SQL queries along with formatted results. It auto-generates a business-language semantic model from your schema, caches frequent queries for speed, and gives you full control over what data reaches the LLM and how queries are executed.
-
-![Savvina AI demo](docs/assets/demo.gif)
 
 ---
 
@@ -284,4 +285,4 @@ cd frontend && npm run lint && npx tsc --noEmit
 
 ## License
 
-Savvina AI Community Edition is licensed under the [Business Source License 1.1](LICENSE). It converts to Apache 2.0 on 2030-06-01. See [COMMERCIAL.md](COMMERCIAL.md) for commercial licensing.
+> **Community Edition** is free for development, testing, and non-commercial use under the [Business Source License 1.1](LICENSE). Production or commercial use requires a [commercial license](COMMERCIAL.md). Converts to Apache 2.0 on 2030-06-01.
