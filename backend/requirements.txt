@@ -21,7 +21,7 @@ slowapi==0.1.9
 numpy==2.2.1
 fastembed==0.8.0
 pgvector==0.3.6
-json-repair==0.30.0
+json-repair==0.60.1
 aiofiles==24.1.0
 alembic==1.15.2
 psycopg2-binary==2.9.10
