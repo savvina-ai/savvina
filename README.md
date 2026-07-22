@@ -51,33 +51,23 @@ Savvina AI lets you connect to a database, ask questions in natural language, an
 git clone https://github.com/savvina-ai/savvina
 cd savvina
 cp .env.example .env
+
+# WSL / Linux: run containers as you, so mounted volumes stay writable
+echo "LOCAL_UID=$(id -u)" >> .env
+echo "LOCAL_GID=$(id -g)" >> .env
 ```
 
-### 2. Generate required secrets
+Open `.env` and set one value — a password for the bundled app database:
 
 ```bash
-# Fernet key — encrypts credentials at rest
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-
-# JWT secret — signs access tokens (use a different value)
-python -c "import secrets; print(secrets.token_hex(32))"
-
-# Database passwords — one for each service
-python -c "import secrets; print(secrets.token_urlsafe(24))"
+APP_DB_PASSWORD=<strong-password>     # python -c "import secrets; print(secrets.token_urlsafe(24))"
 ```
 
-Open `.env` and fill in:
+That's the whole database setup: `.env.example` already ships `COMPOSE_PROFILES=local-db` to start the bundled PostgreSQL container, and Compose derives the connection URL from your password. To use an external or managed database instead, comment out `COMPOSE_PROFILES` and `APP_DB_PASSWORD` and set `DATABASE_URL` to your provider's connection string.
 
-```bash
-ENCRYPTION_KEY=<fernet-key>
-JWT_SECRET_KEY=<jwt-secret>
-APP_DB_PASSWORD=<strong-password>
-SAMPLE_POSTGRES_PASSWORD=<strong-password>
-SAMPLE_MYSQL_ROOT_PASSWORD=<strong-password>
-SAMPLE_MYSQL_PASSWORD=<strong-password>
-```
+> **Encryption and JWT keys are generated for you.** On first boot the backend creates `ENCRYPTION_KEY` and `JWT_SECRET_KEY` and persists them to `/app/data/secrets.env` in the data volume — do not add them to `.env`. Back up `ENCRYPTION_KEY` after the first start; losing it makes all stored credentials and API keys permanently unreadable. See [Quickstart](docs/getting-started/01_quickstart.md#encryption_key-and-jwt_secret_key-docker--auto-generated) for bare-metal setups.
 
-### 3. Get a free LLM API key
+### 2. Get a free LLM API key
 
 **Option A — Groq (recommended, 14,400 requests/day free):**
 1. Sign up at https://console.groq.com
@@ -89,13 +79,7 @@ SAMPLE_MYSQL_PASSWORD=<strong-password>
 2. Create an API key
 3. Add to `.env`: `GEMINI_API_KEY=AIza...`
 
-### 4. Set volume permissions (first run only)
-
-```bash
-docker compose run --rm init-permissions
-```
-
-### 5. Generate TLS certificates (required)
+### 3. Generate TLS certificates
 
 Nginx serves over HTTPS and will not start without a certificate. Use [mkcert](https://github.com/FiloSottile/mkcert) to generate locally-trusted certs:
 
@@ -107,15 +91,15 @@ cd volumes/certs && mkcert localhost 127.0.0.1 && cd ../..
 
 See [HTTPS Setup](docs/infrastructure/docker.md#https-setup) for installation instructions, WSL notes, and custom hostname support.
 
-### 6. Start the stack
+### 4. Start the stack
 
 ```bash
 docker compose up --build
 ```
 
-Wait for all services to show as healthy (about 60–120 seconds on first build).
+Wait for all services to show as healthy (about 60–120 seconds on first build). Volume permissions are prepared automatically by the `init-permissions` service.
 
-### 7. Open the UI
+### 5. Open the UI
 
 Navigate to **https://localhost:3000**
 
@@ -146,19 +130,23 @@ See [docs/user-guide/06_llm-providers.md](docs/user-guide/06_llm-providers.md) f
 
 ## Using Sample Databases (No Real Database Required)
 
-The `test-dbs` profile starts two pre-seeded demo databases — PostgreSQL and MySQL — so you can try Savvina AI without connecting to a real data source:
+The `test-dbs` profile starts two pre-seeded demo databases — PostgreSQL and MySQL — so you can try Savvina AI without connecting to a real data source. Add it to `COMPOSE_PROFILES` in `.env` alongside your database mode:
 
 ```bash
-docker compose --profile test-dbs up --build
+COMPOSE_PROFILES=local-db,test-dbs
 ```
 
-Or combine with the bundled app database:
+These are throwaway demo containers bound to localhost, so they fall back to built-in passwords (`savvina_demo`) if you leave `SAMPLE_POSTGRES_PASSWORD`, `SAMPLE_MYSQL_PASSWORD`, and `SAMPLE_MYSQL_ROOT_PASSWORD` unset. Set them in `.env` to override.
+
+Then start the stack as usual:
 
 ```bash
-docker compose --profile local-db --profile test-dbs up --build
+docker compose up --build
 ```
 
-The sample databases are available on ports **5435** (PostgreSQL) and **3307** (MySQL). Configure them in the UI under **Settings → Add Connection** using the credentials from your `.env` file (`SAMPLE_POSTGRES_PASSWORD`, `SAMPLE_MYSQL_PASSWORD`).
+> Prefer editing `COMPOSE_PROFILES` over passing `--profile` on the command line: the CLI flag **replaces** the value from `.env` rather than adding to it, so `docker compose --profile test-dbs up` would silently stop the `local-db` container from starting.
+
+The sample databases are available on ports **5435** (PostgreSQL) and **3307** (MySQL). Configure them in the UI under **Settings → Add Connection** using user `savvina` and whichever password applies — your `.env` override or the `savvina_demo` default.
 
 See [docs/infrastructure/docker.md](docs/infrastructure/docker.md) for full details.
 
@@ -166,10 +154,16 @@ See [docs/infrastructure/docker.md](docs/infrastructure/docker.md) for full deta
 
 ## Using Ollama (Local LLM)
 
-Start with the `local-llm` profile to include the Ollama service:
+Add the `local-llm` profile to `COMPOSE_PROFILES` in `.env` to include the Ollama service:
 
 ```bash
-docker compose --profile local-llm up --build
+COMPOSE_PROFILES=local-db,local-llm
+```
+
+Then start the stack:
+
+```bash
+docker compose up --build
 ```
 
 Then pull a model (in a separate terminal while the stack is running):
@@ -187,6 +181,16 @@ In the Savvina AI UI, go to **Settings → Add Provider → Ollama (Local)** and
 ## Configuration
 
 All settings live in `.env`. See [docs/getting-started/02_configuration.md](docs/getting-started/02_configuration.md) for the full reference.
+
+Commonly adjusted beyond the Quick Start:
+
+| Variable | Purpose |
+|---|---|
+| `COMPOSE_PROFILES` | Which optional containers start — `local-db`, `test-dbs`, `local-llm`, comma-separated |
+| `DATABASE_URL` | Set only when using an external database; otherwise derived from `APP_DB_PASSWORD` |
+| `APP_PORT` | Port the UI is served on (default `3000`) |
+| `HF_TOKEN` | Avoids anonymous rate-limiting when the build downloads the embedding model |
+| `LOG_LEVEL` / `LOG_FORMAT` | `text` is easier to read during local development |
 
 ---
 

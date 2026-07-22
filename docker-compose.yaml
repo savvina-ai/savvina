@@ -8,7 +8,12 @@ services:
     environment:
       POSTGRES_DB: savvina_app
       POSTGRES_USER: savvina
-      POSTGRES_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD must be set in .env}
+      # No :? guard here — Compose evaluates interpolation across every service
+      # before filtering by profile, so a required-var guard would also abort
+      # startup for users on an external database who never set this. The guard
+      # lives on backend.DATABASE_URL, where it is only reached when the
+      # bundled-database default is actually used.
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD}
     ports:
       - "0.0.0.0:5434:5432"
     volumes:
@@ -36,7 +41,11 @@ services:
     environment:
       POSTGRES_DB: savvina_test
       POSTGRES_USER: savvina
-      POSTGRES_PASSWORD: ${SAMPLE_POSTGRES_PASSWORD:?SAMPLE_POSTGRES_PASSWORD must be set in .env}
+      # Throwaway demo container seeded with public sample data, reachable only
+      # from localhost. Falls back to a default so an unset value cannot block
+      # startup for users who never enable the test-dbs profile (Compose
+      # interpolates inactive services too). Override in .env to change it.
+      POSTGRES_PASSWORD: ${SAMPLE_POSTGRES_PASSWORD:-savvina_demo}
     ports:
       - "0.0.0.0:5435:5432"
     volumes:
@@ -71,15 +80,16 @@ services:
     ports:
       - "0.0.0.0:3307:3306"
     environment:
-      MYSQL_ROOT_PASSWORD: ${SAMPLE_MYSQL_ROOT_PASSWORD:?SAMPLE_MYSQL_ROOT_PASSWORD must be set in .env}
+      # Throwaway demo container — see the note on sample-postgres above.
+      MYSQL_ROOT_PASSWORD: ${SAMPLE_MYSQL_ROOT_PASSWORD:-savvina_demo_root}
       MYSQL_DATABASE: sample_delivery
       MYSQL_USER: savvina
-      MYSQL_PASSWORD: ${SAMPLE_MYSQL_PASSWORD:?SAMPLE_MYSQL_PASSWORD must be set in .env}
+      MYSQL_PASSWORD: ${SAMPLE_MYSQL_PASSWORD:-savvina_demo}
     volumes:
       - ./test_dbs/mysql:/docker-entrypoint-initdb.d:ro
       - ./volumes/sample-mysql:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin -u savvina -p${SAMPLE_MYSQL_PASSWORD} ping -h 127.0.0.1"]
+      test: ["CMD-SHELL", "mysqladmin -u savvina -p${SAMPLE_MYSQL_PASSWORD:-savvina_demo} ping -h 127.0.0.1"]
       interval: 10s
       timeout: 5s
       retries: 15
@@ -109,6 +119,12 @@ services:
       - "0.0.0.0:8000:8000"
     env_file:
       - ./.env
+    environment:
+      # Derived from APP_DB_PASSWORD for the bundled `db` container so the
+      # password only has to be written once. Setting DATABASE_URL in .env
+      # overrides this entirely — that's the path for an external/managed
+      # database, and APP_DB_PASSWORD is then not required.
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://savvina:${APP_DB_PASSWORD:?APP_DB_PASSWORD must be set in .env (or set DATABASE_URL to use an external database)}@db:5432/savvina_app}
     volumes:
       - ./volumes/backend-data:/app/data
     deploy:
