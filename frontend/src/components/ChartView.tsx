@@ -140,7 +140,7 @@ const trendLineProps = {
 interface Props {
   results: QueryResults;
   chart: UserChart;
-  containerRef: RefObject<HTMLDivElement | null>;
+  containerRef?: RefObject<HTMLDivElement | null>;
   animate?: boolean;
 }
 
@@ -172,7 +172,7 @@ export default function ChartView({ results, chart, containerRef, animate = true
     const trendDir = delta !== null ? (delta > 0 ? 'up' : delta < 0 ? 'down' : 'flat') : null;
 
     return (
-      <div ref={containerRef} className="flex flex-col items-center justify-center gap-3 py-12 px-4">
+      <div ref={containerRef ?? null} className="flex flex-col items-center justify-center gap-3 py-12 px-4">
         {chart.title && (
           <p className="text-sm font-medium text-muted-foreground">{chart.title}</p>
         )}
@@ -240,7 +240,7 @@ export default function ChartView({ results, chart, containerRef, animate = true
       : formatNumberValue(value, chart.numberFormat ?? 'decimal', chart.currencySymbol ?? '$');
 
     return (
-      <div ref={containerRef} className="w-full px-4 py-4">
+      <div ref={containerRef ?? null} className="w-full px-4 py-4">
         {chart.title && (
           <p className="mb-2 text-center text-sm font-medium text-foreground">{chart.title}</p>
         )}
@@ -326,7 +326,7 @@ export default function ChartView({ results, chart, containerRef, animate = true
   ) : null;
 
   return (
-    <div ref={containerRef} className="w-full px-4 py-4">
+    <div ref={containerRef ?? null} className="w-full px-4 py-4">
       {chart.title && (
         <p className="mb-2 text-center text-sm font-medium text-foreground">{chart.title}</p>
       )}

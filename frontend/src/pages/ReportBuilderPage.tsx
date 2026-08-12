@@ -433,9 +433,6 @@ export default function ReportBuilderPage() {
       (m) => m.role === 'assistant' && m.results_json && m.status !== 'error',
     );
 
-  // Null ref object used where ChartView requires containerRef but we don't need it
-  const nullRef: React.RefObject<HTMLDivElement | null> = { current: null };
-
   return (
     <div className="flex-1 overflow-auto">
       {/* Off-screen chart capture at fixed width for consistent PDF output */}
@@ -449,7 +446,7 @@ export default function ReportBuilderPage() {
             >
               {/* Strip title from PNG — backend renders it as proper PDF text.
                  Disable animation so labels are present immediately when toPng captures. */}
-              <ChartView results={sec.results} chart={{ ...sec.chart, title: '' }} containerRef={nullRef} animate={false} />
+              <ChartView results={sec.results} chart={{ ...sec.chart, title: '' }} animate={false} />
             </div>
           ) : null,
         )}
@@ -694,7 +691,6 @@ export default function ReportBuilderPage() {
                             <ChartView
                               results={sec.results}
                               chart={sec.chart}
-                              containerRef={nullRef}
                             />
                           </ChartErrorBoundary>
                         ) : (
