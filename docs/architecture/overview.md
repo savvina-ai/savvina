@@ -8,7 +8,7 @@ Savvina AI is built around two core design principles: **adapter pattern everywh
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                       Browser (React 18 + TypeScript)                │
+│                       Browser (React 19 + TypeScript)                │
 │                                                                      │
 │  ┌──────────┐  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐ │
 │  │ ChatPage │  │ConnectionPage│  │ SettingsPage │  │SemanticPage │ │
@@ -71,7 +71,7 @@ Savvina AI is built around two core design principles: **adapter pattern everywh
 
 ## Frontend
 
-**Stack:** React 18, TypeScript, Tailwind CSS, Zustand, TanStack Query v5, Axios, shadcn/ui, lucide-react
+**Stack:** React 19, TypeScript, Vite 8, Tailwind CSS, Zustand, TanStack Query v5, Axios, shadcn/ui, lucide-react
 
 ### State Management
 
@@ -109,13 +109,28 @@ TanStack Query wraps these for caching, background refetching, and loading state
 
 ### Routing
 
-React Router v6 routes:
-- `/` → redirects based on active connection
+React Router v8 routes. The package is `react-router`, not `react-router-dom` — the two were merged in v7, and all router imports come from `react-router` directly.
+
+First-boot setup:
+- `/setup` → SetupPage (public — the only way in before an admin account exists)
+- `/setup/wizard` → SetupWizardPage (`ProtectedRoute`)
+
+Public:
+- `/login` → LoginPage
+- `/forgot-password` → ForgotPasswordPage
+- `/change-password` → ChangePasswordPage (`ProtectedRoute`)
+- `/share/:token` → SharePage (token *is* the credential — no login required)
+- `/share/session/:token` → SharedSessionPage (same)
+
+Inside the `/` layout route, which is wrapped in `ProtectedRoute` so every child below requires an authenticated session:
+- `/` → redirects based on active connection (`/chat` if one is selected, else `/connect`)
 - `/connect` → ConnectionPage
 - `/chat` → ChatPage
 - `/settings` → SettingsPage
 - `/history` → HistoryPage
+- `/reports` → ReportBuilderPage
 - `/semantic/:connectionId` → SemanticModelPage
+- `/profile` → ProfilePage
 
 ---
 

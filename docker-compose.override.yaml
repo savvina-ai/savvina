@@ -2,7 +2,7 @@ services:
   # One-off: run `docker compose run --rm frontend-lockfile` to generate
   # package-lock.json in ./frontend (no local Node/npm required).
   frontend-lockfile:
-    image: node:20-alpine
+    image: node:22-alpine
     working_dir: /app
     volumes:
       - ./frontend:/app
@@ -12,7 +12,7 @@ services:
 
   # One-off: run frontend tests in a Node container.
   frontend-test:
-    image: node:20-alpine
+    image: node:22-alpine
     working_dir: /app
     volumes:
       - ./frontend:/app
