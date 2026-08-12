@@ -1,6 +1,6 @@
 # Testing
 
-Savvina AI's backend has a comprehensive pytest test suite. This guide covers how to run tests, how the test infrastructure is set up, and how to write new tests.
+Savvina AI has two independent suites: a pytest suite for the backend and a Vitest suite for the frontend. Most of this guide covers the backend; [Frontend Tests](#frontend-tests) at the end covers the React side.
 
 ---
 
@@ -374,3 +374,74 @@ The test suite covers:
 **`app.dependency_overrides` bleeds between tests** — always ensure the `clear_overrides` autouse fixture is in scope (it's in `test_routers/conftest.py`). For tests outside `test_routers/`, clean up overrides manually in a `finally` block or with a fixture.
 
 **Mock the right target** — always patch at the import location, not the definition location. If `connections.py` does `from ..utils.encryption import decrypt_value`, patch `app.routers.connections.decrypt_value`, not `app.utils.encryption.decrypt_value`.
+
+---
+
+# Frontend Tests
+
+Vitest + jsdom, with [MSW](https://mswjs.io/) intercepting HTTP and `@testing-library/react` driving components.
+
+## Running
+
+```bash
+cd frontend
+npm test             # single pass — what CI runs
+npm run test:watch   # re-run on change
+npm run test:ui      # browser UI
+npm test -- src/hooks/__tests__/useChat.test.ts   # one file
+```
+
+**Without a local Node install**, use the container — it pins the same Node 22 as CI and the production image:
+
+```bash
+docker compose --profile test run --rm frontend-test    # npm ci && npm test
+```
+
+Node 22.22 or newer is required (`engines` in `frontend/package.json`); react-router 8 refuses to install below it. Running the container as root creates root-owned files under `frontend/node_modules`, which then breaks local `npm` — if that happens, `sudo rm -rf frontend/node_modules && cd frontend && npm ci`.
+
+## Layout
+
+| Path | Purpose |
+|---|---|
+| `src/**/__tests__/*.test.ts(x)` | The tests, colocated with the code they cover |
+| `src/test/setup.ts` | Global setup — MSW lifecycle and Testing Library config |
+| `src/test/server.ts` | MSW server plus the default handler set |
+| `src/test/factories.ts` | Typed builders: `makeConnection`, `makeChatMessage`, `makeChatResponse`, `makeChatSession`, `makeQueryResults`, `makeProviderStatus` |
+
+`globals: true` is set, so `describe`/`it`/`expect` need no import. jsdom runs with the page URL set to `http://localhost:8000`, which is why MSW handlers are registered against absolute `http://localhost:8000/...` URLs.
+
+## Mock HTTP with MSW, never axios
+
+`src/test/server.ts` defines a default handler for every endpoint the app calls, returning empty-but-valid shapes. Tests that need a specific response override per test with `server.use(...)`:
+
+```typescript
+import { http, HttpResponse } from 'msw'
+import { server } from '../../test/server'
+import { makeConnection } from '../../test/factories'
+
+server.use(
+  http.get('http://localhost:8000/api/v1/connections', () =>
+    HttpResponse.json({ items: [makeConnection()], total: 1, limit: 50, offset: 0 }),
+  ),
+)
+```
+
+`setup.ts` calls `server.resetHandlers()` after every test, so an override never leaks into the next one. Do not mock the axios module directly — that bypasses the interceptors in `src/api/client.ts`, so auth-header injection and token refresh go untested.
+
+## Timeouts
+
+`setup.ts` sets `asyncUtilTimeout: 5000` and `vitest.config.ts` sets `testTimeout: 15000`. Both are deliberate: several routes are lazy-loaded with `React.lazy`, so a `findBy*` query waits on a dynamic import rather than a re-render, and Testing Library's 1-second default loses that race on a loaded machine — failing correct tests. `testTimeout` is kept above `asyncUtilTimeout` so a query that never resolves fails as "unable to find element", with a DOM dump, instead of an opaque test timeout.
+
+If you need a longer wait in one test, pass it explicitly (`findByText('x', {}, { timeout: 10000 })`) rather than raising the global.
+
+## Common pitfalls
+
+**Give TanStack Query a fresh client per test** and disable retries, or a failed query silently retries into the next assertion:
+
+```typescript
+new QueryClient({ defaultOptions: { queries: { retry: 0 }, mutations: { retry: 0 } } })
+```
+
+**Zustand stores persist across tests in the same file** — `appStore` and `authStore` are module singletons. Reset the relevant slice in `beforeEach` with `useAppStore.setState({ ... })`.
+
+**`noUnusedLocals` is on** — an unused import fails `npm run build`, not just lint.

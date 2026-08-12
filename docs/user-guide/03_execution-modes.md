@@ -119,4 +119,4 @@ Edits are recorded in the message history — the stored query is updated to ref
 
 Regardless of execution mode, all queries — whether LLM-generated or user-edited — pass through the validator before execution. The validator rejects anything that is not a `SELECT` or `WITH` (CTE) statement, blocks dangerous keywords and dialect-specific functions, rejects multi-statement inputs, and adds a `LIMIT` clause if none is present. A query that fails validation is rejected with an error response — it is never sent to the database.
 
-For the complete blocked keyword list and dialect-specific patterns (PostgreSQL, MySQL), see [Guardrails — SQL Query Validation](../architecture/guardrails.md#4-sql-query-validation).
+For the complete blocked keyword list and dialect-specific patterns (PostgreSQL, MySQL), see [Guardrails — SQL Query Validation](../architecture/guardrails.md#4-sql-query-validation-datasourcesvalidators).

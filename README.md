@@ -274,7 +274,7 @@ python3 -m venv .venv
 # Frontend dev server (hot reload)
 cd frontend
 npm install
-npm run dev   # http://localhost:5173 — proxies /api to localhost:8000
+npm run dev   # http://localhost:3000 — proxies /api to localhost:8000
 
 # Frontend tests
 npm test

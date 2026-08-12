@@ -35,13 +35,19 @@ Appends OWASP-recommended response headers on every reply:
 
 ## 2. Rate Limiting (SlowAPI)
 
-Per-endpoint limits enforced by SlowAPI keyed on user ID + connection ID where applicable:
+Per-endpoint limits enforced by SlowAPI. Every limit is keyed on **client IP**, with one exception: `POST /api/v1/chat` is keyed on the authenticated user ID taken from the Bearer token, falling back to IP if the token is missing or expired. Connection ID is not part of any rate-limit key.
 
-| Endpoint | Limit |
-|---|---|
-| `POST /api/v1/chat` | 20 requests / minute |
-| `POST /api/v1/connections/test` | 5 requests / minute |
-| Auth endpoints (login, register, refresh, password reset) | Configurable via `AUTH_RATE_LIMIT` setting |
+| Endpoint | Limit | Keyed on |
+|---|---|---|
+| `POST /api/v1/chat` | 20 / minute | User ID (IP fallback) |
+| `POST /api/v1/connections/test` | 5 / minute | IP |
+| `POST /api/v1/chat/sort/{message_id}` | 30 / minute | IP |
+| `GET /api/v1/export/messages/{id}/csv` and `/xlsx` | 30 / minute | IP |
+| `POST /api/v1/export/report` | 10 / minute | IP |
+| `GET /api/v1/public/share/*` | 60 / minute | IP |
+| Auth endpoints (login, register, refresh, password reset, `PUT /auth/me`) | `AUTH_RATE_LIMIT`, default 10 / minute | IP |
+
+Because the default key is the client IP, **which IP that resolves to depends on `TRUSTED_PROXIES`** — see [Rate Limiting and Proxy Trust](../getting-started/02_configuration.md#rate-limiting-and-proxy-trust). Behind a proxy that is not in a trusted range, every caller shares one bucket.
 
 Exceeded limits return `429 Too Many Requests`.
 

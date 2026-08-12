@@ -27,7 +27,9 @@ cd savvina
 cp .env.example .env
 ```
 
-Follow [Quick Start steps 2 and 3](../../README.md#2-generate-required-secrets) to generate all required secrets (`ENCRYPTION_KEY`, `JWT_SECRET_KEY`, `APP_DB_PASSWORD`, and the sample database passwords) and to add at least one LLM API key.
+Follow [Quick Start steps 1–3](../../README.md#1-clone-and-configure) to set `APP_DB_PASSWORD` (plus the sample database passwords, if you enable the `test-dbs` profile), add at least one LLM API key, and generate TLS certificates.
+
+`ENCRYPTION_KEY` and `JWT_SECRET_KEY` are **not** set by hand: the backend generates them on first boot and persists them to `/app/data/secrets.env` inside the data volume. Back up `ENCRYPTION_KEY` immediately after that first start — losing it makes every stored credential and API key permanently unreadable.
 
 > **Production note — `ENCRYPTION_KEY`:** Generate it once and **never change it**. Rotating the key requires re-encrypting every stored credential. Use a unique key per environment; never reuse a development key in production.
 

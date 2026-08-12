@@ -136,7 +136,7 @@ Inside the `/` layout route, which is wrapped in `ProtectedRoute` so every child
 
 ## Backend
 
-**Stack:** Python 3.12, FastAPI 0.131.0, SQLAlchemy 2.0 (async), asyncpg, fastembed (ONNX Runtime), Fernet encryption
+**Stack:** Python 3.12, FastAPI 0.136.1, SQLAlchemy 2.0 (async), asyncpg, fastembed (ONNX Runtime), Fernet encryption
 
 ### FastAPI Application (`app/main.py`)
 

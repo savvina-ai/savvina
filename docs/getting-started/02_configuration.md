@@ -135,6 +135,50 @@ The query cache stores question → SQL pairs and uses sentence-transformer embe
 
 ---
 
+## Rate Limiting and Proxy Trust
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `AUTH_RATE_LIMIT` | string | `10/minute` | Rate limit applied to authentication endpoints (login, register, refresh, password reset, profile update). Uses `slowapi` syntax, e.g. `20/minute`, `100/hour`. |
+| `TRUSTED_PROXIES` | JSON array | `["127.0.0.1","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"]` | CIDR ranges whose `X-Real-IP` header is believed when determining the client IP. |
+
+**`TRUSTED_PROXIES` decides which IP gets rate limited.** If the request's *direct* peer address falls inside one of these ranges, the client IP is taken from the `X-Real-IP` header; otherwise the direct peer address is used and the header is ignored. Note it is `X-Real-IP` specifically — `X-Forwarded-For` is not consulted, so a proxy that only sets the latter will leave every request attributed to the proxy itself. That same resolved IP is what login attempts are logged against.
+
+The default trusts loopback plus all three RFC1918 private ranges, which is right for the standard deployment — the frontend Nginx container proxying to the backend over the Docker network. Two cases need attention:
+
+- **A reverse proxy outside those ranges** (a cloud load balancer on a public address, say) will not be trusted, so every request appears to come from the proxy and all clients share one rate-limit bucket. Add the proxy's range, and make sure it sets `X-Real-IP`.
+- **The backend reachable directly from untrusted networks** — do not widen this. Any client that can connect from a trusted range could then spoof `X-Real-IP` and evade rate limiting entirely by rotating the header.
+
+Set it as a JSON array string, like `CORS_ORIGINS`:
+```bash
+TRUSTED_PROXIES=["127.0.0.1","10.0.0.0/8","203.0.113.5/32"]
+```
+
+---
+
+## Runtime Settings (managed in the UI)
+
+These are stored in the `app_settings` table and edited from the **Settings** page, not the environment. The values in `config.py` are only the initial defaults used before a row exists — setting them as environment variables on a running install has no effect, because the database value wins.
+
+Changes are read from the database on each request, so every worker picks them up immediately without a restart. The two connection-pool settings are the exception: they are applied when the engine is created, so they take effect on the **next process restart**.
+
+| Setting | Default | Description |
+|---|---|---|
+| `default_query_timeout` | `30` | Seconds a generated query may run before cancellation. |
+| `default_row_limit` | `1000` | Maximum rows returned per query. Also caps rows served by public share links. |
+| `cache_enabled` | `true` | Whether the query cache is consulted and written. |
+| `cache_max_age_days` | `30` | Entries not accessed within this window are excluded from semantic lookup. `0` disables the TTL. |
+| `semantic_similarity_threshold` | `0.87` | Cosine similarity a cached question must reach to count as a hit. Raising it makes the cache stricter. |
+| `schema_pruning_enabled` | `true` | Embed table names and send only the most relevant tables for each question, instead of the whole schema. |
+| `schema_pruning_top_k` | `15` | Maximum tables kept after pruning. A `fallback_min` guard keeps small schemas intact. |
+| `db_pool_size` | `10` | SQLAlchemy connection pool size. **Restart required.** |
+| `db_max_overflow` | `20` | Connections allowed beyond the pool size under load. **Restart required.** |
+| `bcrypt_rounds` | `12` | Password hashing cost factor. Raising it slows every login and registration. |
+
+Read them with `GET /api/v1/settings` and change them with `PUT /api/v1/settings`.
+
+---
+
 ## Backing Service Credentials
 
 These configure the bundled Docker containers. Each password is only required when its associated profile is active.
@@ -224,7 +268,7 @@ Configuration changes require a backend restart:
 docker compose restart backend
 ```
 
-If you changed `ENCRYPTION_KEY` (which requires re-encrypting all stored secrets — see [Key Rotation](../administration/deployment.md#key-rotation)):
+If you changed `ENCRYPTION_KEY` (which requires re-encrypting all stored secrets — see [Encryption Key Rotation](../administration/maintenance.md#encryption-key-rotation)):
 
 ```bash
 docker compose down

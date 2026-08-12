@@ -98,6 +98,62 @@ Set a new password for the authenticated user without requiring the current pass
 
 ---
 
+### `GET /api/v1/auth/me`
+
+Return the authenticated user's own profile.
+
+**Response `200`:** `UserResponse`
+
+---
+
+### `PUT /api/v1/auth/me`
+
+Update the current user's display name and/or password. Rate limited by the `AUTH_RATE_LIMIT` setting.
+
+Changing a password requires `current_password` as well as `new_password`; `display_name` can be changed on its own. Unlike `reset-password`, this proves possession of the existing password.
+
+**Request body (all fields optional):**
+```json
+{
+  "display_name": "Ada Lovelace",
+  "current_password": "OldP@ssw0rd!",
+  "new_password": "NewP@ssw0rd!"
+}
+```
+
+**Response `200`:** `UserResponse`
+**Response `400`:** Password too weak, or `current_password` incorrect
+
+---
+
+### `GET /api/v1/auth/sessions`
+
+List the caller's active login sessions — refresh tokens that are neither expired nor revoked. This is how a user sees where they are signed in.
+
+**Query parameters:** `limit` (max 200, default 50), `offset` (default 0).
+
+**Response `200`:** `PaginatedResponse[SessionResponse]`
+
+---
+
+### `DELETE /api/v1/auth/sessions/{session_id}`
+
+Revoke one session — signing out a single device without disturbing the others. Use `POST /api/v1/auth/logout-all` to revoke every session at once.
+
+**Response `204`:** No content
+
+---
+
+### `DELETE /api/v1/auth/me`
+
+Delete the caller's own account.
+
+**This anonymises rather than hard-deletes.** The email is replaced with a random `deleted_<random>@anonymized.local` address, the password hash is overwritten with a throwaway value, and every refresh token is revoked. The whole sequence runs inside a savepoint, so a failure part-way through rolls back rather than leaving a half-anonymised account.
+
+**Response `204`:** No content
+
+---
+
 ## Data Sources
 
 ### `GET /api/v1/datasources`
@@ -279,6 +335,30 @@ Change the execution mode for a connection.
 
 ---
 
+### `GET /api/v1/connections/{id}/config`
+
+Return the stored connection config so the UI can pre-fill its edit form.
+
+**Credential fields are masked**, never returned in clear text: any key matching `password`, `passwd`, `pass`, `secret`, `key`, `api_key` or `token` comes back as the literal string `**redacted**`.
+
+**Response `200`:** `ConnectionConfigResponse` — `{"name": ..., "source_type": ..., "config": {...}}`
+**Response `404`:** Connection not found
+
+---
+
+### `PUT /api/v1/connections/{id}/config`
+
+Update a connection's name and/or config.
+
+Send `**redacted**` back for any credential field you do not want to change and the stored value is kept — so the UI can round-trip the masked response from `GET` without making the user retype secrets. Sending a real value replaces it.
+
+Changing the config clears that connection's cached schema and its query cache, since both may no longer describe the database being pointed at.
+
+**Response `200`:** `ConnectionResponse`
+**Response `404`:** Connection not found
+
+---
+
 ## Semantic Model
 
 ### `GET /api/v1/connections/{id}/semantic`
@@ -380,6 +460,36 @@ Partially update the semantic model. Only the fields you provide are updated —
 Remove the semantic model from a connection. Future queries will not have business context.
 
 **Response `204`:** No content
+
+---
+
+### `GET /api/v1/connections/{id}/semantic/drift`
+
+Report schema drift since the semantic model was generated — tables or columns that have since been added, removed, or changed type, and which the stored model therefore describes incorrectly.
+
+Cheap to call: it diffs the stored model against the *cached* schema and runs no introspection or statistical queries against the source database. Refresh the schema first (`POST /api/v1/connections/{id}/schema/refresh`) if you need drift measured against the live database.
+
+**Response `200`:** `DriftReport` — `{"connection_id": ..., "warnings": [...], "warning_count": N, "checked_at": "..."}`
+**Response `404`:** No semantic model — generate one first
+
+---
+
+### `GET /api/v1/connections/{id}/semantic/suggestions`
+
+List pending semantic-model suggestions raised from user feedback on generated queries — the improvement loop that lets the model be corrected without regenerating it wholesale.
+
+**Query parameters:** `limit` (max 200, default 50), `offset` (default 0).
+
+**Response `200`:** `PaginatedResponse[SemanticSuggestionResponse]`
+
+---
+
+### `POST /api/v1/connections/{id}/semantic/suggestions/{suggestion_id}/apply`
+
+Apply one suggestion to the stored semantic model and return the updated model.
+
+**Response `200`:** `SemanticModelResponse`
+**Response `404`:** Connection or suggestion not found
 
 ---
 
@@ -585,11 +695,182 @@ Manually add a verified question → query pair to the example library.
 
 ---
 
+### `PUT /api/v1/chat/examples/{example_id}`
+
+Update the question and/or query of an existing verified example. The example's embedding is recomputed, so an edited question is matched correctly on the next lookup.
+
+**Request body:**
+```json
+{
+  "question": "Show customers active in the last 30 days",
+  "query": "SELECT * FROM customers WHERE status = 'active' AND last_seen > now() - interval '30 days'"
+}
+```
+
+**Response `200`:** `ExampleResponse`
+**Response `404`:** Example not found
+
+---
+
 ### `DELETE /api/v1/chat/examples/{example_id}`
 
 Delete a verified example by its ID.
 
 **Response `204`:** No content
+
+---
+
+### `POST /api/v1/chat/sort/{message_id}`
+
+Re-execute the message's original query with an `ORDER BY` injected, so sorting happens in the source database rather than on the truncated result set the client already holds. Rate limited to 30/minute.
+
+**Request body:** `SortRequest` — the column to sort on and the direction.
+
+**Response `200`:** `QueryResultsResponse`
+
+---
+
+### `GET /api/v1/chat/cache/{connection_id}/entries`
+
+List cached query entries for a connection, newest first.
+
+**Query parameters:** `limit` (1–100, default 20), `offset` (default 0), `search` (optional substring match).
+
+**Response `200`:** `PaginatedResponse[CacheEntryResponse]`
+
+---
+
+### `DELETE /api/v1/chat/cache/entries/{entry_id}`
+
+Delete a single cache entry. Use this to evict one stale answer without flushing the whole cache for the connection.
+
+**Response `204`:** No content
+
+---
+
+## Sharing
+
+Sharing is two halves: an authenticated endpoint that mints a token, and the unauthenticated `/public` endpoints below that redeem it. **The token is the only credential** — anyone holding the URL can read the shared results without logging in, so treat a share link as public.
+
+### `POST /api/v1/chat/messages/{message_id}/share`
+
+Generate — or return the existing — share token for one executed message. Calling it twice returns the same token rather than rotating it.
+
+Only messages with status `executed` or `cached` can be shared; anything else is a `400`.
+
+**Request body (optional):**
+```json
+{
+  "expires_in_days": 30
+}
+```
+
+`expires_in_days` is clamped to 1–365. Omit the body entirely for a link that never expires.
+
+**Response `200`:** `ShareResponse` — `{"share_token": "...", "share_expires_at": "..."}`
+**Response `400`:** Only executed results can be shared
+**Response `404`:** Message not found
+
+---
+
+### `POST /api/v1/chat/sessions/{session_id}/share`
+
+Same as above, but shares an entire conversation thread. Any message in the session becomes readable, so check the whole thread before sharing it.
+
+**Response `200`:** `ShareResponse`
+**Response `404`:** Session not found
+
+---
+
+## Public (unauthenticated)
+
+These endpoints take **no `Authorization` header**. They are the redemption side of the share tokens above, rate limited to 60/minute per IP, and they are the only routes in the API that serve data to an anonymous caller.
+
+Every one of them returns `410 Gone` once `share_expires_at` has passed, and `404` for an unknown token — the two are distinguished deliberately, so a recipient can tell "this link expired" from "this link was never valid".
+
+### `GET /api/v1/public/share/{token}`
+
+Return the results behind a shared message link. Rows are truncated to the `DEFAULT_ROW_LIMIT` setting.
+
+**Response `200`:** `PublicShareResult` — the result set plus the generated SQL
+**Response `404`:** Shared result not found
+**Response `410`:** Share link has expired
+
+---
+
+### `GET /api/v1/public/share/{token}/csv`
+
+Download the shared message's results as CSV. Not row-limited — this serves the full stored result set.
+
+**Response `200`:** `text/csv` attachment, `shared-results.csv`
+
+---
+
+### `GET /api/v1/public/share/{token}/xlsx`
+
+Download the shared message's results as XLSX.
+
+**Response `200`:** `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` attachment, `shared-results.xlsx`
+
+---
+
+### `GET /api/v1/public/share/session/{token}`
+
+Return a shared conversation. Capped at the first 200 messages, and each message's result set is truncated to 10 rows — this is a preview of the thread, not a bulk export.
+
+**Response `200`:** `PublicSessionResult` — session title plus `PublicMessageSummary[]`
+**Response `404`:** Shared session not found
+**Response `410`:** Share link has expired
+
+---
+
+## Export
+
+All export endpoints require authentication and only ever reach messages belonging to the caller's own sessions.
+
+### `GET /api/v1/export/messages/{message_id}/csv`
+
+Download one message's query results as CSV. Rate limited to 30/minute.
+
+**Response `200`:** `text/csv` attachment, `query-<first 8 chars of id>.csv`
+**Response `400`:** Message has no query results
+**Response `404`:** Message not found
+
+---
+
+### `GET /api/v1/export/messages/{message_id}/xlsx`
+
+Same, as a formatted XLSX workbook. Rate limited to 30/minute.
+
+**Response `200`:** XLSX attachment, `query-<first 8 chars of id>.xlsx`
+
+---
+
+### `POST /api/v1/export/report`
+
+Generate a PDF combining several query results into one document. Rate limited to 10/minute.
+
+`chart_image` is a base64 data-URL PNG captured client-side from the rendered chart — the backend does not render charts itself. `heading` defaults to the first 80 characters of the message content when omitted.
+
+**Request body:**
+```json
+{
+  "title": "Q3 Revenue Review",
+  "sections": [
+    {
+      "message_id": "5f2c...",
+      "heading": "Revenue by region",
+      "chart_image": "data:image/png;base64,iVBORw0KGgo...",
+      "chart_title": "Q3 revenue, by region"
+    }
+  ]
+}
+```
+
+`title` is 1–255 characters; `sections` holds 1–50 entries.
+
+**Response `200`:** `application/pdf` attachment, named from a sanitised `title`
+**Response `404`:** A referenced message was not found
 
 ---
 
