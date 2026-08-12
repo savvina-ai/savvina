@@ -362,7 +362,7 @@ frontend:
       condition: service_healthy
 ```
 
-The frontend Dockerfile in `frontend/` builds the React app with `npm run build` and copies the output into an `nginx:alpine` image. Nginx serves the static files over HTTPS and proxies `/api/` requests to the backend.
+The frontend Dockerfile in `frontend/` is a two-stage build. The build stage (`node:22-alpine`) runs `npm ci` and `npm run build`; the runtime stage starts from a bare `alpine:3.21`, installs nginx with `apk add --no-cache nginx`, and copies `dist/` into `/usr/share/nginx/html`. It is deliberately not `nginx:alpine` — starting from bare Alpine and running `apk upgrade` in the same layer means the image ships current Alpine packages rather than whatever was current when the upstream nginx image was last published. Nginx serves the static files over HTTPS and proxies `/api/` requests to the backend.
 
 **Port:** Host `${APP_PORT:-3000}` → container `8443` (Nginx HTTPS). Port 80 inside the container issues a permanent redirect to HTTPS.
 
@@ -552,31 +552,39 @@ Named volumes (managed by Docker) vs. bind-mounts (host paths):
 
 ## Development Overrides
 
-Create `docker-compose.override.yaml` (automatically picked up by Docker Compose) for development-specific settings. This file should not be committed to git.
+`docker-compose.override.yaml` is committed to the repository and picked up automatically by every `docker compose` command — you do not create it, and there is nothing to opt into. It provides:
 
-Example for hot-reload development:
+**Backend hot-reload.** It bind-mounts `./backend/app` into the container and sets `RELOAD: "1"`, which `backend/entrypoint.sh` reads to start uvicorn with `--reload`. Editing backend source therefore takes effect without a rebuild. Note that the mechanism is the environment variable, not a `command:` override — `entrypoint.sh` still needs to run `alembic upgrade head` before uvicorn starts.
 
-```yaml
-# docker-compose.override.yaml
-services:
-  backend:
-    volumes:
-      - ./backend/app:/app/app        # mount source code
-      - ./volumes/backend-data:/app/data
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    environment:
-      LOG_LEVEL: DEBUG
+**Volume permissions.** An `init-permissions` service (running as root) creates and chowns the bind-mounted directories under `./volumes/` before anything else starts. The `backend`, `frontend`, `sample-mysql` and `sample-postgres` services all declare `depends_on: init-permissions` with `condition: service_completed_successfully`, so this always runs first.
 
-  frontend:
-    build:
-      context: ./frontend
-      target: dev                     # use multi-stage dev target
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./frontend/src:/app/src       # mount source for HMR
-    command: npm run dev
+**Two one-off helper services**, each behind a profile so it never starts with a normal `docker compose up`:
+
+```bash
+# Regenerate frontend/package-lock.json without a local Node install
+docker compose run --rm frontend-lockfile
+
+# Run the frontend test suite in a container (npm ci && npm test)
+docker compose --profile test run --rm frontend-test
 ```
+
+Both use `node:22-alpine`, matching `frontend/Dockerfile` and CI. Keep them in step: `frontend/package.json` declares `engines.node >= 22.22.0` (react-router 8's floor), so an older image fails with `EBADENGINE`.
+
+There is no `dev` stage in `frontend/Dockerfile` and no Vite dev server in the compose stack — the frontend container always serves the production build through nginx. For frontend hot-reload, run Vite directly on the host instead:
+
+```bash
+cd frontend && npm run dev     # http://localhost:3000, proxies /api to localhost:8000
+```
+
+### Personal settings
+
+Because the override file is committed, the automatic override slot is already taken. Keep machine-specific settings in a separate file and pass it explicitly:
+
+```bash
+docker compose -f docker-compose.yaml -f docker-compose.override.yaml -f docker-compose.local.yaml up
+```
+
+Add `docker-compose.local.yaml` to `.gitignore` if you use this. Most per-machine settings — ports, passwords, `LOG_LEVEL`, `COMPOSE_PROFILES` — belong in `.env` instead, which is already ignored.
 
 ---
 
