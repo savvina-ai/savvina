@@ -19,5 +19,10 @@ export default defineConfig({
     },
     setupFiles: ['./src/test/setup.ts'],
     css: false,
+    // Must stay above the asyncUtilTimeout set in src/test/setup.ts, so a query
+    // that never resolves surfaces as "unable to find element" rather than an
+    // opaque test timeout with no DOM dump.
+    testTimeout: 15000,
+    hookTimeout: 15000,
   },
 });

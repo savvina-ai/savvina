@@ -46,6 +46,7 @@ from .config import get_settings
 from .core.logging_config import configure_logging as _configure_logging
 from .core.request_context import request_id_var
 from .database import async_session_maker
+from .version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -387,7 +388,7 @@ from .auth.limiter import limiter as _limiter
 app = FastAPI(
     title="Savvina AI API",
     description="Conversational analytics — query your data with natural language.",
-    version="0.1.0",
+    version=__version__,
     lifespan=lifespan,
 )
 

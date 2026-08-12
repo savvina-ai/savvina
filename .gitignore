@@ -67,3 +67,7 @@ desktop.ini
 # === Logs ===
 *.log
 logs/
+
+# === Local tool state ===
+# Per-developer editor and assistant config. Never belongs in the repository.
+.claude/

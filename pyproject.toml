@@ -1,7 +1,12 @@
 [tool.semantic_release]
-# No version files to update — we only want a git tag + GitHub release
+# Keep the version the running app reports in step with the released tag.
+# Without this, `GET /api/version` and the OpenAPI page report a stale hardcoded
+# number — the one endpoint whose whole job is answering "what version is this?".
 version_toml    = []
-version_variables = []
+version_variables = [
+    "backend/app/version.py:__version__",
+    "frontend/package.json:version",
+]
 commit_message  = "chore(release): {version} [skip ci]"
 tag_format      = "v{version}"
 
