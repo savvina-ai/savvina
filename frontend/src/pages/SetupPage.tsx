@@ -2,7 +2,7 @@
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 import { useState } from 'react'
-import { Navigate, useNavigate } from 'react-router-dom'
+import { Navigate, useNavigate } from 'react-router'
 import { Eye, EyeOff } from 'lucide-react'
 import { useAuthStore } from '../store/authStore'
 import { Button } from '../components/ui/button'

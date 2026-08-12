@@ -4,7 +4,7 @@
 /**Public shared session page — renders a full conversation thread without authentication. */
 
 import { useEffect, useState } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams } from 'react-router';
 import { Zap } from 'lucide-react';
 
 import type { PublicMessageSummary, PublicSessionResult } from '../api/share';

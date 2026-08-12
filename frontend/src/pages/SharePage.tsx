@@ -4,7 +4,7 @@
 /**Public share page — renders a shared result (table + chart) without authentication. */
 
 import { useEffect, useRef, useState } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams } from 'react-router';
 import { toPng } from 'html-to-image';
 import { Download, FileDown, FileSpreadsheet } from 'lucide-react';
 

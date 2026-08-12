@@ -2,7 +2,7 @@
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 import { useState, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import { Check, CheckCircle, Database, RefreshCw, XCircle, Zap } from 'lucide-react'
 import { cn } from '@/lib/utils'

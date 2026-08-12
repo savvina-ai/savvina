@@ -140,7 +140,7 @@ const trendLineProps = {
 interface Props {
   results: QueryResults;
   chart: UserChart;
-  containerRef: RefObject<HTMLDivElement>;
+  containerRef: RefObject<HTMLDivElement | null>;
   animate?: boolean;
 }
 

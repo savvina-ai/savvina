@@ -2,7 +2,7 @@
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { Plus, Share2, Check, PanelRight } from 'lucide-react';
 import WorkspacePanel from '../components/WorkspacePanel';
 import logoImg from '@/assets/logo.png';

@@ -1,7 +1,7 @@
 // Copyright (c) 2025 Savvina AI Ltd
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-import { Navigate } from 'react-router-dom'
+import { Navigate } from 'react-router'
 import { useAuthStore } from '../store/authStore'
 
 interface Props {

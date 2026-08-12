@@ -434,7 +434,7 @@ export default function ReportBuilderPage() {
     );
 
   // Null ref object used where ChartView requires containerRef but we don't need it
-  const nullRef = { current: null } as React.RefObject<HTMLDivElement>;
+  const nullRef: React.RefObject<HTMLDivElement | null> = { current: null };
 
   return (
     <div className="flex-1 overflow-auto">

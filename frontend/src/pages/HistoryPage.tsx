@@ -2,7 +2,7 @@
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { useAppStore } from '../store/appStore';
 import { useSessions, useDeleteSession } from '../hooks/useChat';
 import { Button } from '../components/ui/button';
