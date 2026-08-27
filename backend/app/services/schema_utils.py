@@ -8,10 +8,12 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import UTC, datetime
 import json
+import logging
 import re
 from typing import TYPE_CHECKING
 
 import sqlparse
+from sqlparse.exceptions import SQLParseError
 import sqlparse.sql
 import sqlparse.tokens
 
@@ -29,6 +31,8 @@ from ..models.user_schema_cache import UserSchemaCache
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 LARGE_TABLE_ROW_THRESHOLD = 1_000_000
 
@@ -96,7 +100,15 @@ async def get_or_refresh_schema(
 def _extract_tables_from_sql(sql: str) -> list[str]:
     """Extract referenced table names from a SQL string using sqlparse."""
     tables: list[str] = []
-    parsed = sqlparse.parse(sql)
+    try:
+        parsed = sqlparse.parse(sql)
+    except SQLParseError as e:
+        # sqlparse >= 0.5.5 raises when its DoS guards trip. Both callers are advisory
+        # (audit `tables_accessed`, the large-table full-scan check) and run on a query
+        # `validate_query()` already accepted, so degrade to "no tables known" rather
+        # than failing the turn.
+        logger.warning("Table extraction skipped, SQL could not be parsed: %s", e)
+        return []
     for statement in parsed:
         _collect_tables(statement, tables)
     seen: set[str] = set()
