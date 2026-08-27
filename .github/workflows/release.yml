@@ -37,4 +37,4 @@ jobs:
       - name: Run semantic-release
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-        run: semantic-release version
+        run: python scripts/run_semantic_release.py version
