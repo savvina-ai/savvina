@@ -11,6 +11,7 @@ import type {
   ChatSession,
   PaginatedResponse,
   QueryResults,
+  SemanticCorrectionPayload,
   VerifiedExample,
 } from '../types';
 
@@ -37,11 +38,16 @@ export const chatApi = {
       })
       .then(r => r.data),
 
-  submitFeedback: (messageId: string, feedback: 'positive' | 'negative') =>
+  submitFeedback: (
+    messageId: string,
+    feedback: 'positive' | 'negative',
+    semanticCorrection?: SemanticCorrectionPayload,
+  ) =>
     apiClient
       .post(`/api/v1/chat/feedback/${messageId}`, {
         message_id: messageId,
         feedback: feedback === 'positive' ? 'thumbs_up' : 'thumbs_down',
+        ...(semanticCorrection ? { semantic_correction: semanticCorrection } : {}),
       })
       .then(r => r.data),
 

@@ -194,15 +194,17 @@ describe('ChatMessage — feedback submission', () => {
     const msg = makeChatMessage({ id: 'msg-42', status: 'executed', query_generated: 'SELECT 1' });
     render(<ChatMessageBubble message={msg} />);
     await user.click(screen.getByTitle('Good answer'));
-    expect(mockSubmitFeedback).toHaveBeenCalledWith('msg-42', 'positive');
+    expect(mockSubmitFeedback).toHaveBeenCalledWith('msg-42', 'positive', undefined);
   });
 
-  it('clicking 👎 calls chatApi.submitFeedback with "negative"', async () => {
+  // With no active connection in the store there is nothing to correct against, so
+  // thumbs-down skips the correction form and records a bare negative.
+  it('clicking 👎 with no active connection submits "negative" with no correction', async () => {
     const user = userEvent.setup();
     const msg = makeChatMessage({ id: 'msg-42', status: 'executed', query_generated: 'SELECT 1' });
     render(<ChatMessageBubble message={msg} />);
     await user.click(screen.getByTitle('Bad answer'));
-    expect(mockSubmitFeedback).toHaveBeenCalledWith('msg-42', 'negative');
+    expect(mockSubmitFeedback).toHaveBeenCalledWith('msg-42', 'negative', undefined);
   });
 
   it('buttons are disabled after first click to prevent double-submit', async () => {

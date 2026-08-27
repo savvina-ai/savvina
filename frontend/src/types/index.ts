@@ -160,6 +160,22 @@ export interface RelationshipEdge {
   join_sql: string;
   is_required: boolean;
   description: string | null;
+  /** PRIMARY = PK/dimension side, FOREIGN = FK/fact side. */
+  entity_type?: string | null;
+}
+
+/** A named reusable filter expression, applicable to one or more tables. */
+export interface Segment {
+  name: string;
+  sql_expression: string;
+  description: string;
+  applicable_tables: string[];
+}
+
+/** An ordered drill-down path within a table. Generator-only — read-only in the UI. */
+export interface Hierarchy {
+  name: string;
+  levels: string[];
 }
 
 export interface DerivedColumn {
@@ -186,6 +202,10 @@ export interface SemanticModel {
   schema_hash: string | null;
   source_dialect: string;
   generation_warnings: string[];
+  // Optional: the backend always sends these, but older cached payloads and
+  // test fixtures may omit them.
+  segments?: Segment[];
+  notes?: string[];
   generation_status?: 'idle' | 'tables_partial' | 'complete';
   generation_progress?: {
     tables_done: number;
@@ -199,6 +219,16 @@ export interface TableSemantic {
   description: string | null;
   default_filters: string[];
   columns: Record<string, ColumnSemantic>;
+  primary_timestamp_column?: string | null;
+  primary_date_column?: string | null;
+  grain?: string | null;
+  domain?: string | null;
+  // Generator-only — `TableSemanticUpdate` does not accept these, so the editor
+  // shows them read-only.
+  hierarchies?: Hierarchy[];
+  partition_columns?: string[];
+  cluster_columns?: string[];
+  base_sql?: string | null;
 }
 
 export interface ColumnSemantic {
@@ -206,6 +236,13 @@ export interface ColumnSemantic {
   description: string | null;
   value_mappings: ValueMapping[];
   is_sensitive: boolean;
+  semantic_type?: string;
+  cardinality?: string;
+  currency?: string | null;
+  unit?: string | null;
+  default_aggregation?: AggregationType | null;
+  is_non_additive?: boolean;
+  time_granularity?: TimeGranularity | null;
 }
 
 export interface ValueMapping {
@@ -214,19 +251,93 @@ export interface ValueMapping {
   description: string | null;
 }
 
+export type MetricType = 'simple' | 'ratio' | 'derived' | 'cumulative' | 'conversion';
+
+export type AggregationType =
+  | 'sum'
+  | 'count'
+  | 'count_distinct'
+  | 'count_distinct_approx'
+  | 'average'
+  | 'max'
+  | 'min'
+  | 'median';
+
+/** Coarsest meaningful time grain for a DATE/TIMESTAMP column. */
+export type TimeGranularity =
+  | 'second'
+  | 'minute'
+  | 'hour'
+  | 'day'
+  | 'week'
+  | 'month'
+  | 'quarter'
+  | 'year';
+
+/**
+ * Mirrors the backend `BusinessMetric` discriminated union (models.py), flattened:
+ * `metric_type` is the discriminator and is required by the API — variant-specific
+ * fields are optional here and validated server-side.
+ */
 export interface BusinessMetric {
+  metric_type: MetricType;
   name: string;
-  definition: string;
+  // Optional: `conversion` metrics carry no `definition` on the backend.
+  definition?: string;
   description: string;
   filters: string[];
   related_tables: string[];
   format_hint?: string | null;
+  is_non_additive?: boolean;
+  non_additive_dimension?: string | null;
+  // simple | cumulative
+  aggregation?: AggregationType;
+  measure_filters?: string[];
+  // cumulative | conversion
+  window?: string | null;
+  // ratio
+  numerator_expr?: string;
+  denominator_expr?: string;
+  // conversion
+  base_measure?: string;
+  conversion_measure?: string;
+  entity?: string | null;
+  calculation?: 'conversion_rate' | 'conversions';
 }
 
 export interface CommonJoin {
   description: string;
   tables: string[];
   join_pattern: string;
+}
+
+/** Mirrors `SemanticCorrection` in backend/app/schemas/chat.py — sent with thumbs-down. */
+export interface SemanticCorrectionPayload {
+  table_key: string;
+  field: string;
+  correction_type: 'add_value_mapping' | 'update_filter' | 'update_description';
+  value: Record<string, unknown>;
+}
+
+/** Mirrors `SemanticSuggestionResponse` in backend/app/schemas/semantic.py. */
+export interface SemanticSuggestionResponse {
+  id: string;
+  connection_id: string;
+  table_key: string;
+  field: string;
+  correction_type: string;
+  value: Record<string, unknown>;
+  is_applied: boolean;
+  source_message_id: string | null;
+  created_at: string;
+}
+
+/** Mirrors `DriftReport` in backend/app/schemas/semantic.py. */
+export interface DriftReport {
+  connection_id: string;
+  warnings: string[];
+  warning_count: number;
+  checked_at: string;
 }
 
 // ── Schema ──

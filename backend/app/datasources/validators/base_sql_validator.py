@@ -5,6 +5,7 @@ import re
 from typing import ClassVar
 
 import sqlparse
+from sqlparse.exceptions import SQLParseError
 
 from ..models import ValidationResult
 
@@ -58,7 +59,17 @@ class BaseSQLValidator:
         # Counting parsed statements to reject "multiple statements" is unreliable:
         # sqlparse misclassifies subqueries inside JOIN (...) as separate statements.
         # Multi-statement injection is caught accurately by the `;\s*\w` pattern below.
-        parsed = sqlparse.parse(query)
+        # sqlparse >= 0.5.5 raises SQLParseError instead of silently returning an
+        # ungrouped tree when its DoS guards trip (grouping depth > 100, > 10 000
+        # tokens). Fail closed: a statement we cannot parse is a statement whose
+        # type we cannot verify, and this is the gate that keeps non-SELECT SQL out.
+        try:
+            parsed = sqlparse.parse(query)
+        except SQLParseError as e:
+            return ValidationResult(
+                is_valid=False,
+                error_message=f"Query is too complex to validate safely: {e}",
+            )
         non_empty = [s for s in parsed if str(s).strip()]
 
         if not non_empty:

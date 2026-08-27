@@ -14,22 +14,23 @@ import axios from 'axios';
 import { AlertTriangle, Check, ChevronRight, Pencil, Plus, X } from 'lucide-react';
 
 import { semanticApi } from '../api/semantic';
-import apiClient from '../api/client';
+import { connectionsApi } from '../api/connections';
+import { metricValidationError } from '../lib/semanticUtils';
 import SemanticModelEditor from '../components/SemanticModelEditor';
 import BusinessMetricEditor from '../components/BusinessMetricEditor';
 import { useProviders } from '../hooks/useProviders';
 import { useConnections } from '../hooks/useConnections';
 import { useAuthStore } from '../store/authStore';
 import { cn } from '@/lib/utils';
-import type { SemanticModel, RelationshipEdge, DerivedColumn } from '../types';
-
-interface DriftReport {
-  connection_id: string;
-  warnings: string[];
-  warning_count: number;
-  checked_at: string;
-}
-
+import type {
+  DerivedColumn,
+  DriftReport,
+  RelationshipEdge,
+  SchemaTable,
+  Segment,
+  SemanticModel,
+  SemanticSuggestionResponse,
+} from '../types';
 
 // ── Semantic type badge ────────────────────────────────────────────────────
 
@@ -199,6 +200,21 @@ function apiErrorMessage(err: unknown): string {
   return String(err);
 }
 
+// ── Suggestions ───────────────────────────────────────────────────────────
+
+function correctionLabel(s: SemanticSuggestionResponse): string {
+  switch (s.correction_type) {
+    case 'add_value_mapping':
+      return `Add value mapping to ${s.table_key}.${s.field}`;
+    case 'update_filter':
+      return `Add default filter to ${s.table_key}`;
+    case 'update_description':
+      return `Update description on ${s.table_key}${s.field ? `.${s.field}` : ''}`;
+    default:
+      return `${s.correction_type} on ${s.table_key}`;
+  }
+}
+
 // ── Derived column inline form ────────────────────────────────────────────
 
 interface DerivedFormState {
@@ -300,7 +316,17 @@ export function DerivedColumnForm({ form, onChange, onConfirm, onCancel }: Deriv
 
 // ── Tab type ──────────────────────────────────────────────────────────────
 
-type Tab = 'tables' | 'intelligence' | 'metrics' | 'joins' | 'relationships' | 'derived' | 'time';
+type Tab =
+  | 'tables'
+  | 'intelligence'
+  | 'metrics'
+  | 'joins'
+  | 'relationships'
+  | 'derived'
+  | 'segments'
+  | 'notes'
+  | 'time'
+  | 'suggestions';
 
 // ── Main component ────────────────────────────────────────────────────────
 
@@ -317,6 +343,9 @@ export default function SemanticModelPageV2() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [draft, setDraft] = useState<SemanticModel | null>(null);
   const [showConfirm, setShowConfirm] = useState(false);
+  // Dismissals are intentionally session-local: the backend has no "rejected" state
+  // for a suggestion, only is_applied.
+  const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
   const [genProgress, setGenProgress] = useState<{
     tables_done: number;
     tables_total: number;
@@ -362,11 +391,25 @@ export default function SemanticModelPageV2() {
     isFetching: driftChecking,
   } = useQuery<DriftReport>({
     queryKey: ['semantic-drift', connectionId],
-    queryFn: () =>
-      apiClient
-        .get<DriftReport>(`/api/v1/connections/${connectionId}/semantic/drift`)
-        .then((r) => r.data),
+    queryFn: () => semanticApi.getDrift(connectionId!),
     enabled: false,
+  });
+
+  // Schema — the authoritative column list behind the table editor's column dropdowns.
+  // `table.columns` only holds columns the generator annotated, a subset on a partial model.
+  const { data: schemaData } = useQuery({
+    queryKey: ['schema', connectionId],
+    queryFn: () => connectionsApi.getSchema(connectionId!),
+    enabled: !!connectionId,
+    retry: false,
+  });
+  const schemaTables = (schemaData as { tables?: SchemaTable[] } | undefined)?.tables;
+
+  // Suggestions — corrections captured from thumbs-down feedback in chat.
+  const { data: suggestions } = useQuery<SemanticSuggestionResponse[]>({
+    queryKey: ['semantic-suggestions', connectionId],
+    queryFn: () => semanticApi.getSuggestions(connectionId!),
+    enabled: !!connectionId && !!model,
   });
 
 
@@ -459,11 +502,30 @@ export default function SemanticModelPageV2() {
     onError: () => setSaveError('Failed to save — please try again'),
   });
 
+  const applySuggestion = useMutation({
+    mutationFn: (suggestionId: string) =>
+      semanticApi.applySuggestion(connectionId!, suggestionId),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(['semantic', connectionId], updated);
+      setDraft(updated);
+      queryClient.invalidateQueries({ queryKey: ['semantic-suggestions', connectionId] });
+    },
+  });
 
   const connMatch = connections?.find((c) => c.id === connectionId);
   const connName = connMatch?.name ?? (connections === undefined ? 'Loading…' : connectionId);
   const displayModel = draft ?? model;
   const hasModel = !!displayModel;
+
+  // A metric missing a field its type requires would save (empty strings pass the
+  // backend's `str` validation) and then render as broken SQL in every prompt.
+  const invalidMetricCount = (displayModel?.business_metrics ?? []).filter(
+    (m) => metricValidationError(m) !== null,
+  ).length;
+
+  const pendingSuggestions = (suggestions ?? []).filter(
+    (s) => !s.is_applied && !dismissedIds.has(s.id),
+  );
 
 
   const tabs: { id: Tab; label: string; count?: number }[] = [
@@ -481,7 +543,10 @@ export default function SemanticModelPageV2() {
       label: 'Derived',
       count: displayModel?.derived_columns?.length ?? 0,
     },
+    { id: 'segments', label: 'Segments', count: displayModel?.segments?.length ?? 0 },
+    { id: 'notes', label: 'Notes', count: displayModel?.notes?.length ?? 0 },
     { id: 'time', label: 'Time Expressions' },
+    { id: 'suggestions', label: 'Suggestions', count: pendingSuggestions.length },
   ];
 
   if (isLoading) {
@@ -771,6 +836,22 @@ export default function SemanticModelPageV2() {
           {/* Model content */}
           {displayModel && (
             <>
+              {/* Pending suggestions nudge — corrections are invisible on other tabs */}
+              {pendingSuggestions.length > 0 && activeTab !== 'suggestions' && (
+                <div className="flex items-center gap-3 rounded-xl border border-primary/50 bg-primary/10 px-4 py-3">
+                  <p className="flex-1 text-sm text-foreground">
+                    {pendingSuggestions.length} pending correction
+                    {pendingSuggestions.length !== 1 ? 's' : ''} from chat feedback.
+                  </p>
+                  <button
+                    onClick={() => setActiveTab('suggestions')}
+                    className="shrink-0 text-sm font-medium text-primary hover:underline"
+                  >
+                    Review
+                  </button>
+                </div>
+              )}
+
               {/* Tab bar */}
               <div role="tablist" aria-label="Semantic model sections" className="flex flex-wrap gap-1 border-b border-border">
                 {tabs.map((tab) => (
@@ -808,6 +889,7 @@ export default function SemanticModelPageV2() {
               {activeTab === 'tables' && (
                 <SemanticModelEditor
                   model={displayModel as SemanticModel}
+                  schemaTables={schemaTables}
                   onChange={(m) => setDraft((d) => (d ? { ...d, ...m } : (m as SemanticModel)))}
                 />
               )}
@@ -819,12 +901,24 @@ export default function SemanticModelPageV2() {
 
               {/* Business metrics */}
               {activeTab === 'metrics' && (
+                <>
+                {invalidMetricCount > 0 && (
+                  <div className="mb-3 flex items-start gap-3 rounded-xl border border-warning/50 bg-warning/15 px-4 py-3">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+                    <p className="text-sm text-warning-foreground">
+                      {invalidMetricCount} metric{invalidMetricCount !== 1 ? 's are' : ' is'}{' '}
+                      missing a required field. Empty values save but produce broken SQL in
+                      every prompt.
+                    </p>
+                  </div>
+                )}
                 <BusinessMetricEditor
                   metrics={displayModel.business_metrics ?? []}
                   onChange={(metrics) =>
                     setDraft((d) => (d ? { ...d, business_metrics: metrics } : d))
                   }
                 />
+                </>
               )}
 
               {/* Common joins */}
@@ -1241,6 +1335,184 @@ export default function SemanticModelPageV2() {
                 </div>
               )}
 
+              {/* Segments — named reusable filter expressions */}
+              {activeTab === 'segments' && (
+                <div className="space-y-3">
+                  {(displayModel.segments ?? []).map((seg, i) => {
+                    const updateSeg = (patch: Partial<Segment>) =>
+                      setDraft((d) =>
+                        d
+                          ? {
+                              ...d,
+                              segments: (d.segments ?? []).map((s, idx) =>
+                                idx === i ? { ...s, ...patch } : s,
+                              ),
+                            }
+                          : d,
+                      );
+                    return (
+                      <div
+                        key={i}
+                        className="space-y-2 rounded-xl border border-border bg-card p-4"
+                      >
+                        <div className="flex items-center gap-2">
+                          <input
+                            aria-label={`Segment name ${i + 1}`}
+                            value={seg.name}
+                            onChange={(e) => updateSeg({ name: e.target.value })}
+                            placeholder="active_customers"
+                            className="flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                          />
+                          <button
+                            onClick={() =>
+                              setDraft((d) =>
+                                d
+                                  ? {
+                                      ...d,
+                                      segments: (d.segments ?? []).filter((_, idx) => idx !== i),
+                                    }
+                                  : d,
+                              )
+                            }
+                            className="text-sm text-destructive hover:text-destructive/80"
+                          >
+                            Delete
+                          </button>
+                        </div>
+                        <div>
+                          <label className="text-xs text-muted-foreground">SQL expression</label>
+                          <input
+                            aria-label={`Segment SQL expression ${i + 1}`}
+                            value={seg.sql_expression}
+                            onChange={(e) => updateSeg({ sql_expression: e.target.value })}
+                            placeholder="status = 'active' AND deleted_at IS NULL"
+                            className="mt-1 w-full rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-xs text-muted-foreground">Description</label>
+                          <input
+                            aria-label={`Segment description ${i + 1}`}
+                            value={seg.description}
+                            onChange={(e) => updateSeg({ description: e.target.value })}
+                            className="mt-1 w-full rounded border border-border bg-background px-2 py-1 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-xs text-muted-foreground">
+                            Applicable tables (comma-separated)
+                          </label>
+                          <input
+                            aria-label={`Segment applicable tables ${i + 1}`}
+                            value={seg.applicable_tables.join(', ')}
+                            onChange={(e) =>
+                              updateSeg({
+                                applicable_tables: e.target.value
+                                  .split(',')
+                                  .map((s) => s.trim())
+                                  .filter(Boolean),
+                              })
+                            }
+                            placeholder="store.customers"
+                            className="mt-1 w-full rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {(displayModel.segments ?? []).length === 0 && (
+                    <p className="py-4 text-center text-sm text-muted-foreground">
+                      No segments defined. Segments are named filters the model can reuse —
+                      regenerate to auto-populate, or add one below.
+                    </p>
+                  )}
+                  <button
+                    onClick={() =>
+                      setDraft((d) =>
+                        d
+                          ? {
+                              ...d,
+                              segments: [
+                                ...(d.segments ?? []),
+                                {
+                                  name: '',
+                                  sql_expression: '',
+                                  description: '',
+                                  applicable_tables: [],
+                                },
+                              ],
+                            }
+                          : d,
+                      )
+                    }
+                    className="flex w-full items-center justify-center gap-1.5 rounded-lg border-2 border-dashed border-border py-2 text-sm text-muted-foreground transition-colors hover:border-ring hover:text-foreground"
+                  >
+                    <Plus className="h-4 w-4" />
+                    Add Segment
+                  </button>
+                </div>
+              )}
+
+              {/* Notes — free-form domain context injected at the top of every prompt */}
+              {activeTab === 'notes' && (
+                <div className="space-y-3">
+                  <p className="text-xs text-muted-foreground">
+                    Cross-table facts that don't fit table or column metadata. Each note is
+                    injected verbatim at the top of every prompt.
+                  </p>
+                  {(displayModel.notes ?? []).map((note, i) => (
+                    <div key={i} className="flex items-start gap-2">
+                      <textarea
+                        aria-label={`Note ${i + 1}`}
+                        value={note}
+                        onChange={(e) =>
+                          setDraft((d) =>
+                            d
+                              ? {
+                                  ...d,
+                                  notes: (d.notes ?? []).map((n, idx) =>
+                                    idx === i ? e.target.value : n,
+                                  ),
+                                }
+                              : d,
+                          )
+                        }
+                        rows={2}
+                        placeholder="finance.budgets is quarterly; for monthly revenue use finance.transactions"
+                        className="flex-1 rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                      />
+                      <button
+                        onClick={() =>
+                          setDraft((d) =>
+                            d
+                              ? { ...d, notes: (d.notes ?? []).filter((_, idx) => idx !== i) }
+                              : d,
+                          )
+                        }
+                        title={`Delete note ${i + 1}`}
+                        className="mt-1 rounded-md p-1.5 text-destructive hover:bg-muted"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ))}
+                  {(displayModel.notes ?? []).length === 0 && (
+                    <p className="py-4 text-center text-sm text-muted-foreground">
+                      No notes yet.
+                    </p>
+                  )}
+                  <button
+                    onClick={() =>
+                      setDraft((d) => (d ? { ...d, notes: [...(d.notes ?? []), ''] } : d))
+                    }
+                    className="flex w-full items-center justify-center gap-1.5 rounded-lg border-2 border-dashed border-border py-2 text-sm text-muted-foreground transition-colors hover:border-ring hover:text-foreground"
+                  >
+                    <Plus className="h-4 w-4" />
+                    Add Note
+                  </button>
+                </div>
+              )}
+
               {/* Time expressions */}
               {activeTab === 'time' && (
                 <div className="space-y-3">
@@ -1273,6 +1545,69 @@ export default function SemanticModelPageV2() {
                         </div>
                       ),
                     )
+                  )}
+                </div>
+              )}
+
+              {/* Pending suggestions — corrections captured from chat feedback */}
+              {activeTab === 'suggestions' && (
+                <div className="space-y-3">
+                  {pendingSuggestions.length === 0 ? (
+                    <p className="py-4 text-center text-sm text-muted-foreground">
+                      No pending suggestions. Thumbs-down feedback on chat answers will
+                      surface corrections here.
+                    </p>
+                  ) : (
+                    pendingSuggestions.map((s) => (
+                      <div
+                        key={s.id}
+                        className="space-y-2 rounded-xl border border-border bg-card p-4"
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0 space-y-1">
+                            <p className="text-sm font-medium text-foreground">
+                              {correctionLabel(s)}
+                            </p>
+                            <p className="text-xs text-muted-foreground">
+                              Type:{' '}
+                              <span className="font-mono">
+                                {s.correction_type.replace(/_/g, ' ')}
+                              </span>
+                            </p>
+                            <pre className="overflow-x-auto rounded bg-muted px-2 py-1.5 font-mono text-xs text-muted-foreground">
+                              {JSON.stringify(s.value, null, 2)}
+                            </pre>
+                            <p className="text-[11px] text-muted-foreground">
+                              {new Date(s.created_at).toLocaleDateString('en-US', {
+                                month: 'short',
+                                day: 'numeric',
+                                hour: '2-digit',
+                                minute: '2-digit',
+                              })}
+                            </p>
+                          </div>
+                          <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
+                            <button
+                              onClick={() => applySuggestion.mutate(s.id)}
+                              disabled={applySuggestion.isPending}
+                              className="flex items-center gap-1 rounded-md bg-brand-gradient px-3 py-1.5 text-xs font-medium text-white shadow-gradient-btn hover:opacity-90 disabled:opacity-50"
+                            >
+                              <Check className="h-3 w-3" />
+                              Apply
+                            </button>
+                            <button
+                              onClick={() =>
+                                setDismissedIds((prev) => new Set([...prev, s.id]))
+                              }
+                              className="flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs text-muted-foreground hover:bg-muted"
+                            >
+                              <X className="h-3 w-3" />
+                              Dismiss
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))
                   )}
                 </div>
               )}

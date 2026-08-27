@@ -245,3 +245,34 @@ class TestPostgreSQLValidatorBlockedPatterns:
 
     def test_multi_statement_still_blocked(self):
         assert not self.v.validate("SELECT 1; SELECT 2").is_valid
+
+
+class TestUnparseableQueryFailsClosed:
+    """sqlparse >= 0.5.5 raises SQLParseError when its DoS guards trip.
+
+    On 0.5.4 the same input returned a silently ungrouped tree, so the validator
+    still reached ``get_type()``. Now the parse itself raises, and an unhandled
+    exception here would turn the one gate that keeps non-SELECT SQL out of the
+    customer's database into a 500 — so it must reject, never propagate.
+    """
+
+    def setup_method(self):
+        self.v = BaseSQLValidator()
+
+    def test_grouping_depth_limit_is_rejected(self):
+        query = "SELECT " + "(" * 300 + "1" + ")" * 300
+        result = self.v.validate(query)
+        assert not result.is_valid
+        assert "too complex" in (result.error_message or "")
+
+    def test_token_limit_is_rejected(self):
+        query = "SELECT * FROM t WHERE x IN (" + ",".join(str(i) for i in range(20000)) + ")"  # noqa: S608
+        result = self.v.validate(query)
+        assert not result.is_valid
+        assert "too complex" in (result.error_message or "")
+
+    def test_dml_past_the_parse_limit_is_still_rejected(self):
+        # Fail-closed means the DML never gets a second chance either.
+        ids = ",".join(str(i) for i in range(20000))
+        result = self.v.validate(f"DELETE FROM users WHERE id IN ({ids})")  # noqa: S608
+        assert not result.is_valid
