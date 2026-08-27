@@ -6,13 +6,15 @@ import { useQueryClient } from '@tanstack/react-query';
 import type { ElementType } from 'react';
 import { ThumbsUp, ThumbsDown, Zap, Copy, Check, RotateCcw, Pencil, Info, RefreshCw } from 'lucide-react';
 import logoImg from '@/assets/logo.png';
+import FeedbackCorrectionForm from './FeedbackCorrectionForm';
 import QueryHighlight from './QueryHighlight';
 import QueryReviewPanel from './QueryReviewPanel';
 import ResultsView from './ResultsView';
 import TokenUsageBadge from './TokenUsageBadge';
 import { chatApi } from '../api/chat';
+import { useAppStore } from '../store/appStore';
 import { cn } from '@/lib/utils';
-import type { ChatMessage as ChatMessageType } from '../types';
+import type { ChatMessage as ChatMessageType, SemanticCorrectionPayload } from '../types';
 
 interface Props {
   message: ChatMessageType;
@@ -74,6 +76,8 @@ async function copyToClipboard(text: string): Promise<void> {
 
 function ChatMessageBubble({ message, onRetry, onEdit, userQuestion: _userQuestion, onRefresh }: Props) {
   const queryClient = useQueryClient();
+  const connectionId = useAppStore((s) => s.activeConnectionId) ?? '';
+  const [correctionOpen, setCorrectionOpen] = useState(false);
   const [feedback, setFeedback] = useState<'positive' | 'negative' | null>(
     message.feedback === 'thumbs_up' ? 'positive'
     : message.feedback === 'thumbs_down' ? 'negative'
@@ -94,19 +98,37 @@ function ChatMessageBubble({ message, onRetry, onEdit, userQuestion: _userQuesti
     };
   }, []);
 
-  const sendFeedback = async (f: 'positive' | 'negative') => {
+  const sendFeedback = async (
+    f: 'positive' | 'negative',
+    correction?: SemanticCorrectionPayload,
+  ) => {
     if (feedbackSubmitting || feedback) return;
     setFeedbackSubmitting(true);
     setFeedback(f);
     try {
-      await chatApi.submitFeedback(message.id, f);
+      await chatApi.submitFeedback(message.id, f, correction);
       if (f === 'positive') {
         queryClient.invalidateQueries({ queryKey: ['examples'] });
+      }
+      if (correction) {
+        queryClient.invalidateQueries({ queryKey: ['semantic-suggestions', connectionId] });
       }
     } catch {
       setFeedback(null);
     } finally {
       setFeedbackSubmitting(false);
+    }
+  };
+
+  // A thumbs-down on a message that produced a query is the one moment the user knows
+  // exactly what the model got wrong, so offer the correction form instead of recording
+  // a bare negative. Without a query or a connection there is nothing to correct against.
+  const handleThumbsDown = () => {
+    if (feedback) return;
+    if (message.query_generated && connectionId) {
+      setCorrectionOpen(true);
+    } else {
+      void sendFeedback('negative');
     }
   };
 
@@ -329,9 +351,12 @@ function ChatMessageBubble({ message, onRetry, onEdit, userQuestion: _userQuesti
               />
               {showFeedback && (
                 <>
+                  {/* Also disabled while the correction form is open: setting positive
+                      feedback here would make the form's submit hit the `feedback` guard
+                      in sendFeedback and silently discard the typed correction. */}
                   <button
                     onClick={() => sendFeedback('positive')}
-                    disabled={feedbackSubmitting || !!feedback}
+                    disabled={feedbackSubmitting || !!feedback || correctionOpen}
                     title="Good answer"
                     className={cn(
                       'rounded-md p-1.5 transition-colors',
@@ -343,7 +368,7 @@ function ChatMessageBubble({ message, onRetry, onEdit, userQuestion: _userQuesti
                     <ThumbsUp className="h-3.5 w-3.5" />
                   </button>
                   <button
-                    onClick={() => sendFeedback('negative')}
+                    onClick={handleThumbsDown}
                     disabled={feedbackSubmitting || !!feedback}
                     title="Bad answer"
                     className={cn(
@@ -359,6 +384,21 @@ function ChatMessageBubble({ message, onRetry, onEdit, userQuestion: _userQuesti
               )}
             </div>
           </div>
+        )}
+
+        {/* Semantic-correction form (shown after thumbs-down on a query message) */}
+        {correctionOpen && (
+          <FeedbackCorrectionForm
+            connectionId={connectionId}
+            onSubmit={(c) => {
+              setCorrectionOpen(false);
+              void sendFeedback('negative', c);
+            }}
+            onSkip={() => {
+              setCorrectionOpen(false);
+              void sendFeedback('negative');
+            }}
+          />
         )}
 
         {/* Info banner — schema data unavailable */}

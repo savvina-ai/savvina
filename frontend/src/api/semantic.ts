@@ -2,7 +2,12 @@
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 import apiClient from './client';
-import type { SemanticModel } from '../types';
+import type {
+  DriftReport,
+  PaginatedResponse,
+  SemanticModel,
+  SemanticSuggestionResponse,
+} from '../types';
 
 interface GenerateInitResult {
   connection_id: string;
@@ -49,4 +54,24 @@ export const semanticApi = {
 
   delete: (connectionId: string) =>
     apiClient.delete(`/api/v1/connections/${connectionId}/semantic`).then(r => r.data),
+
+  /** 404s when there is no semantic model, or when no schema has been cached yet. */
+  getDrift: (connectionId: string) =>
+    apiClient
+      .get<DriftReport>(`/api/v1/connections/${connectionId}/semantic/drift`)
+      .then(r => r.data),
+
+  getSuggestions: (connectionId: string) =>
+    apiClient
+      .get<PaginatedResponse<SemanticSuggestionResponse>>(
+        `/api/v1/connections/${connectionId}/semantic/suggestions`,
+      )
+      .then(r => r.data.items),
+
+  applySuggestion: (connectionId: string, suggestionId: string) =>
+    apiClient
+      .post<SemanticModel>(
+        `/api/v1/connections/${connectionId}/semantic/suggestions/${suggestionId}/apply`,
+      )
+      .then(r => r.data),
 };
