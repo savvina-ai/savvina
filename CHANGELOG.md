@@ -2,6 +2,27 @@
 
 <!-- version list -->
 
+## v1.0.6 (2026-08-27)
+
+### Bug Fixes
+
+- **ci**: Restore semantic-release under GitPython 3.1.60
+  ([#14](https://github.com/savvina-ai/savvina/pull/14),
+  [`0a97ffe`](https://github.com/savvina-ai/savvina/commit/0a97ffebb87b53077cd8632c97862fb78339a040))
+
+- **deps**: Bump sqlparse to 0.6.0 and fail closed on its new SQLParseError
+  ([#13](https://github.com/savvina-ai/savvina/pull/13),
+  [`9732d57`](https://github.com/savvina-ai/savvina/commit/9732d5779c2278743def078cfe939dad3c711df4))
+
+- **semantic**: Stop new business metrics 422ing the model save. Seeds the metric_type discriminator
+  and aggregation the backend's union requires, so adding a metric no longer rejects the whole PUT.
+  Also syncs the frontend semantic types with models.py — surfacing segments, notes, table
+  grain/domain and the column intelligence fields — and closes the feedback loop by sending
+  semantic_correction on thumbs-down into a new Suggestions tab.
+  ([#13](https://github.com/savvina-ai/savvina/pull/13),
+  [`9732d57`](https://github.com/savvina-ai/savvina/commit/9732d5779c2278743def078cfe939dad3c711df4))
+
+
 ## v1.0.5 (2026-08-12)
 
 ### Bug Fixes
