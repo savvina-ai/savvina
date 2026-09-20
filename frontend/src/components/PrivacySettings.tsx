@@ -29,10 +29,12 @@ function TagList({
   label,
   items,
   onChange,
+  description,
 }: {
   label: string;
   items: string[];
   onChange: (items: string[]) => void;
+  description?: string;
 }) {
   const [draft, setDraft] = useState('');
 
@@ -47,6 +49,7 @@ function TagList({
   return (
     <div>
       <p className="text-sm font-medium text-foreground mb-1">{label}</p>
+      {description && <p className="text-xs text-muted-foreground mb-2">{description}</p>}
       <div className="flex gap-2 mb-2">
         <input
           type="text"
@@ -145,7 +148,12 @@ export default function PrivacySettingsForm({ settings, onChange }: Props) {
         onChange={(v) => set('include_row_counts', v)}
       />
       <TagList
-        label="Sensitive column patterns (excluded from schema)"
+        label="Sensitive column patterns (values masked)"
+        description="Matching columns stay in the schema, tagged [SENSITIVE]: the model may select,
+          filter, join, group and aggregate on them, but their values come back redacted. Sample
+          values from your database are not sent for these columns. Matched as a regular
+          expression, or as a substring if that fails. To hide a column outright, use Excluded
+          columns below."
         items={settings.sensitive_column_patterns}
         onChange={(v) => set('sensitive_column_patterns', v)}
       />
@@ -161,6 +169,8 @@ export default function PrivacySettingsForm({ settings, onChange }: Props) {
       />
       <TagList
         label="Excluded columns"
+        description="Removed from the schema and the semantic layer entirely — the model never
+          sees the name, so it cannot filter or join on it either."
         items={settings.excluded_columns}
         onChange={(v) => set('excluded_columns', v)}
       />

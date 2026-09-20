@@ -80,8 +80,11 @@ class TestGetSettings:
             "cache_enabled",
             "semantic_similarity_threshold",
             "embedding_model",
+            "db_pool_size",
+            "db_max_overflow",
             "schema_pruning_enabled",
             "schema_pruning_top_k",
+            "bcrypt_rounds",
         }
         assert required.issubset(body.keys())
 
@@ -104,9 +107,25 @@ class TestGetSettings:
         assert 0.0 <= body["semantic_similarity_threshold"] <= 1.0
 
 
+@pytest.fixture
+def _restore_singleton():
+    """Snapshot and restore the process-level Settings fields a PUT now writes through.
+
+    PUT /settings mutates the cached Settings object so hot-path readers see the change
+    without a restart; without this the mutation would leak into every later test.
+    """
+    from app.config import SINGLETON_SETTING_PARSERS, get_settings
+
+    s = get_settings()
+    saved = {key: getattr(s, key) for key in SINGLETON_SETTING_PARSERS}
+    yield
+    for key, value in saved.items():
+        setattr(s, key, value)
+
+
 class TestUpdateSettings:
     @pytest.fixture(autouse=True)
-    def _override_db(self):
+    def _override_db(self, _restore_singleton):
         mock = _make_settings_db()
         app.dependency_overrides[get_db] = lambda: mock
         yield
@@ -156,6 +175,29 @@ class TestUpdateSettings:
         after = (await http_client.get("/api/v1/settings")).json()
         assert after["default_query_timeout"] == original_timeout
 
+    async def test_can_update_pool_size(self, http_client):
+        resp = await http_client.put("/api/v1/settings", json={"db_pool_size": 5})
+        assert resp.status_code == 200
+        assert resp.json()["db_pool_size"] == 5
+
+    async def test_invalid_pool_size_returns_422(self, http_client):
+        resp = await http_client.put("/api/v1/settings", json={"db_pool_size": 0})
+        assert resp.status_code == 422
+
+    async def test_can_update_max_overflow(self, http_client):
+        resp = await http_client.put("/api/v1/settings", json={"db_max_overflow": 50})
+        assert resp.status_code == 200
+        assert resp.json()["db_max_overflow"] == 50
+
+    async def test_can_update_bcrypt_rounds(self, http_client):
+        resp = await http_client.put("/api/v1/settings", json={"bcrypt_rounds": 14})
+        assert resp.status_code == 200
+        assert resp.json()["bcrypt_rounds"] == 14
+
+    async def test_invalid_bcrypt_rounds_returns_422(self, http_client):
+        resp = await http_client.put("/api/v1/settings", json={"bcrypt_rounds": 9})
+        assert resp.status_code == 422
+
     async def test_can_toggle_schema_pruning(self, http_client):
         resp = await http_client.put(
             "/api/v1/settings",
@@ -186,7 +228,57 @@ class TestUpdateSettings:
             "cache_enabled",
             "semantic_similarity_threshold",
             "embedding_model",
+            "db_pool_size",
+            "db_max_overflow",
             "schema_pruning_enabled",
             "schema_pruning_top_k",
+            "bcrypt_rounds",
         }
         assert required.issubset(resp.json().keys())
+
+
+class TestUpdateWritesThroughToSingleton:
+    """A saved setting must reach the hot path, not just the DB-backed response.
+
+    `GET /settings` reads `app_settings`, but the query pipeline branches on the cached
+    `Settings` object (`settings.cache_enabled` in `services/pipeline.py`), which the
+    lifespan seeds once at boot. Without a write-through the toggle showed the new value
+    while the pipeline kept using the boot-time one until the next restart — the cache
+    read as enabled in the UI and never ran a lookup.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _override_db(self, _restore_singleton):
+        mock = _make_settings_db()
+        app.dependency_overrides[get_db] = lambda: mock
+        yield
+        app.dependency_overrides.pop(get_db, None)
+
+    async def test_cache_enabled_reaches_the_singleton(self, http_client):
+        from app.config import get_settings
+
+        await http_client.put("/api/v1/settings", json={"cache_enabled": False})
+        assert get_settings().cache_enabled is False
+
+        await http_client.put("/api/v1/settings", json={"cache_enabled": True})
+        assert get_settings().cache_enabled is True
+
+    async def test_threshold_reaches_the_singleton_as_float(self, http_client):
+        from app.config import get_settings
+
+        await http_client.put("/api/v1/settings", json={"semantic_similarity_threshold": 0.95})
+        assert get_settings().semantic_similarity_threshold == 0.95
+
+    async def test_schema_pruning_reaches_the_singleton(self, http_client):
+        from app.config import get_settings
+
+        await http_client.put("/api/v1/settings", json={"schema_pruning_enabled": False})
+        assert get_settings().schema_pruning_enabled is False
+
+    async def test_bcrypt_rounds_is_not_set_on_the_singleton(self, http_client):
+        """`Settings` has no bcrypt_rounds field — a setattr would raise and 500 the PUT."""
+        from app.config import get_settings
+
+        resp = await http_client.put("/api/v1/settings", json={"bcrypt_rounds": 13})
+        assert resp.status_code == 200
+        assert not hasattr(get_settings(), "bcrypt_rounds")

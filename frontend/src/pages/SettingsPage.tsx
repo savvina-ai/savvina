@@ -2,6 +2,7 @@
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 import { useState, useEffect, useMemo } from 'react';
+import { useSearchParams } from 'react-router';
 import { ConfirmDeleteDialog } from '../components/ui/confirm-delete-dialog';
 import { RefreshCw } from 'lucide-react';
 import {
@@ -22,12 +23,23 @@ import { settingsApi } from '../api/settings';
 import { cn } from '@/lib/utils';
 import type { ProviderStatus, VerifiedExample } from '../types';
 import { Button } from '../components/ui/button';
+import { apiErrorMessage } from '../lib/apiError';
 
-type Tab = 'providers' | 'safety' | 'cache' | 'examples';
+type Tab = 'providers' | 'execution' | 'optimization' | 'system' | 'examples';
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: 'providers', label: 'LLM Providers' },
+  { id: 'execution', label: 'Query Execution' },
+  { id: 'optimization', label: 'AI & Optimization' },
+  { id: 'system', label: 'System & Security' },
+  { id: 'examples', label: 'Examples Library' },
+];
+
+const isTab = (value: string | null): value is Tab =>
+  TABS.some((t) => t.id === value);
 
 // Only for truly custom/unknown compatible services (Gemini, Groq, Cerebras, Mistral now have dedicated types)
 const CUSTOM_SERVICES: { label: string; base_url: string; default_model: string }[] = [
-  { label: 'GitHub Models (Free)', base_url: 'https://models.inference.ai.azure.com', default_model: 'gpt-4o-mini' },
   { label: 'HuggingFace (Free)', base_url: 'https://router.huggingface.co/v1', default_model: 'meta-llama/Llama-3.2-3B-Instruct' },
   { label: 'Together.ai', base_url: 'https://api.together.xyz/v1', default_model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo' },
   { label: 'OpenRouter', base_url: 'https://openrouter.ai/api/v1', default_model: 'openrouter/free' },
@@ -72,6 +84,14 @@ function ProviderCard({ provider }: { provider: ProviderStatus }) {
       id: provider.id,
       payload: { api_key: apiKey || undefined, model, display_name: displayName, is_active: true },
     });
+    setApiKey('');
+    setEditing(false);
+  };
+
+  const handleCancel = () => {
+    // Closing the editor re-runs the `!editing` effect, which restores displayName and
+    // model from the provider. The API key is not derived from it — a typed-but-unsaved
+    // key would survive into the next Edit and get submitted, so clear it here.
     setApiKey('');
     setEditing(false);
   };
@@ -160,15 +180,20 @@ function ProviderCard({ provider }: { provider: ProviderStatus }) {
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
             placeholder="Display name"
+            autoComplete="off"
             className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           />
+          <p className="text-xs text-muted-foreground">A label shown in the model picker — purely cosmetic.</p>
           <input
             type="password"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
             placeholder="API key (leave blank to keep existing)"
+            autoComplete="new-password"
             className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           />
+          <p className="text-xs text-muted-foreground">Stored encrypted. Leave blank to keep the existing key.</p>
+          <p className="text-xs text-muted-foreground">The model used to generate SQL for this provider.</p>
           <div className="flex items-center gap-2">
             {modelOptions.length > 0 ? (
               <select
@@ -200,13 +225,23 @@ function ProviderCard({ provider }: { provider: ProviderStatus }) {
               </button>
             )}
           </div>
-          <button
-            onClick={handleSave}
-            disabled={update.isPending}
-            className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-          >
-            Save
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={handleSave}
+              disabled={update.isPending}
+              className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {update.isPending ? 'Saving…' : 'Save'}
+            </button>
+            <button
+              type="button"
+              onClick={handleCancel}
+              disabled={update.isPending}
+              className="rounded-md border border-border px-4 py-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
         </div>
       )}
 
@@ -278,8 +313,7 @@ function AddProviderInlineForm({
         setModel(models[0]);
       }
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setFetchModelsError(detail ?? 'Failed to fetch models');
+      setFetchModelsError(apiErrorMessage(e, 'Failed to fetch models'));
     }
   };
 
@@ -297,8 +331,7 @@ function AddProviderInlineForm({
       });
       setTestResult(data);
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setTestResult({ success: false, message: detail ?? 'Test failed' });
+      setTestResult({ success: false, message: apiErrorMessage(e, 'Test failed') });
     } finally {
       setIsTesting(false);
     }
@@ -336,6 +369,7 @@ function AddProviderInlineForm({
             autoComplete="off"
             className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           />
+          <p className="mt-1 text-xs text-muted-foreground">A label shown in the model picker — purely cosmetic.</p>
         </div>
         <div>
           <label className="text-xs text-muted-foreground">Model</label>
@@ -358,6 +392,7 @@ function AddProviderInlineForm({
               className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
             />
           )}
+          <p className="mt-1 text-xs text-muted-foreground">The model used to generate SQL for this provider.</p>
         </div>
         {isOllama && (
           <div className="col-span-2">
@@ -368,6 +403,7 @@ function AddProviderInlineForm({
               placeholder="http://localhost:11434"
               className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
             />
+            <p className="mt-1 text-xs text-muted-foreground">The provider's API endpoint.</p>
           </div>
         )}
         {!isOllama && (
@@ -384,6 +420,7 @@ function AddProviderInlineForm({
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 placeholder={envConfigured ? 'Leave blank to use env key' : ''}
+                autoComplete="new-password"
                 className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
               />
               <button
@@ -399,6 +436,7 @@ function AddProviderInlineForm({
                 )}
               </button>
             </div>
+            <p className="mt-1 text-xs text-muted-foreground">Stored encrypted; never displayed after saving.</p>
           </div>
         )}
         {isOllama && (
@@ -441,7 +479,7 @@ function AddProviderInlineForm({
         <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
           <span>✗</span>
           <span className="break-all">
-            {(create.error as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Failed to save provider'}
+            {apiErrorMessage(create.error, 'Failed to save provider')}
           </span>
         </div>
       )}
@@ -526,7 +564,7 @@ function ProviderSection({
   );
 }
 
-// Custom OpenAI-compatible provider form (GitHub Models, HuggingFace, Together, OpenRouter, custom URL)
+// Custom OpenAI-compatible provider form (HuggingFace, Together, OpenRouter, custom URL)
 function AddCustomProvider({ onClose }: { onClose: () => void }) {
   const [service, setService] = useState(CUSTOM_SERVICES[0]);
   const [apiKey, setApiKey] = useState('');
@@ -557,8 +595,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
         setModel(models[0]);
       }
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setFetchModelsError(detail ?? 'Failed to fetch models');
+      setFetchModelsError(apiErrorMessage(e, 'Failed to fetch models'));
     }
   };
 
@@ -574,8 +611,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
       });
       setTestResult(data);
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setTestResult({ success: false, message: detail ?? 'Test failed' });
+      setTestResult({ success: false, message: apiErrorMessage(e, 'Test failed') });
     } finally {
       setIsTesting(false);
     }
@@ -640,8 +676,10 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
           <input
             value={baseUrl}
             onChange={(e) => setBaseUrl(e.target.value)}
+            autoComplete="off"
             className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           />
+          <p className="mt-1 text-xs text-muted-foreground">The provider's API endpoint.</p>
         </div>
         <div>
           <label className="text-xs text-muted-foreground">Model</label>
@@ -663,6 +701,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
               className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
             />
           )}
+          <p className="mt-1 text-xs text-muted-foreground">The model used to generate SQL for this provider.</p>
         </div>
         <div className="col-span-2">
           <label className="text-xs text-muted-foreground">API Key</label>
@@ -671,6 +710,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
               type="password"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
+              autoComplete="new-password"
               className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
             />
             <button
@@ -686,6 +726,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
               )}
             </button>
           </div>
+          <p className="mt-1 text-xs text-muted-foreground">Stored encrypted; never displayed after saving.</p>
         </div>
       </div>
       {fetchModelsError && (
@@ -698,7 +739,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
         <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
           <span>✗</span>
           <span className="break-all">
-            {(create.error as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Failed to save provider'}
+            {apiErrorMessage(create.error, 'Failed to save provider')}
           </span>
         </div>
       )}
@@ -741,7 +782,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
   );
 }
 
-function QuerySafetyTab() {
+function QueryExecutionTab() {
   const queryClient = useQueryClient();
   const { data: settings, isLoading } = useQuery({
     queryKey: ['settings'],
@@ -754,37 +795,32 @@ function QuerySafetyTab() {
 
   const [queryTimeout, setQueryTimeout] = useState<number | null>(null);
   const [rowLimit, setRowLimit] = useState<number | null>(null);
-  const [poolSize, setPoolSize] = useState<number | null>(null);
-  const [maxOverflow, setMaxOverflow] = useState<number | null>(null);
-  const [bcryptRounds, setBcryptRounds] = useState<number | null>(null);
 
   useEffect(() => {
     if (!settings) return;
     // One-time initialise from server: `?? value` means "set only if not yet touched by user"
     setQueryTimeout((t) => t ?? settings.default_query_timeout);
     setRowLimit((r) => r ?? settings.default_row_limit);
-    setPoolSize((p) => p ?? settings.db_pool_size);
-    setMaxOverflow((m) => m ?? settings.db_max_overflow);
-    setBcryptRounds((b) => b ?? settings.bcrypt_rounds);
   }, [settings]);
 
   const handleSave = () => {
-    if (queryTimeout === null || rowLimit === null || poolSize === null || maxOverflow === null || bcryptRounds === null) return;
+    if (queryTimeout === null || rowLimit === null) return;
     update.mutate({
       default_query_timeout: queryTimeout,
       default_row_limit: rowLimit,
-      db_pool_size: poolSize,
-      db_max_overflow: maxOverflow,
-      bcrypt_rounds: bcryptRounds,
     });
   };
 
-  if (isLoading || queryTimeout === null || rowLimit === null || poolSize === null || maxOverflow === null || bcryptRounds === null) {
+  if (isLoading || queryTimeout === null || rowLimit === null) {
     return <div className="h-24 animate-pulse rounded-lg bg-muted" />;
   }
 
   return (
     <div className="space-y-6">
+      <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+        These limits guard against runaway queries. Settings are saved and applied
+        immediately — they take effect on the next query.
+      </p>
       <div>
         <div className="mb-1 flex justify-between">
           <label className="text-sm font-medium text-foreground">Query Timeout</label>
@@ -801,9 +837,61 @@ function QuerySafetyTab() {
         <input type="range" min={100} max={10000} step={100} value={rowLimit} onChange={(e) => setRowLimit(Number(e.target.value))} className="w-full accent-primary" />
         <p className="mt-1 text-xs text-muted-foreground">Truncate result sets larger than this many rows.</p>
       </div>
-      <div className="border-t border-border pt-6">
-        <h3 className="mb-4 text-sm font-semibold text-foreground">Database Connection Pool</h3>
-        <p className="mb-4 text-xs text-muted-foreground">Changes to pool settings take effect on the next process restart.</p>
+      <div className="flex items-center gap-3">
+        <button onClick={handleSave} disabled={update.isPending} className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50">
+          {update.isPending ? 'Saving…' : 'Save'}
+        </button>
+        {update.isSuccess && <span className="text-xs text-success">✓ Saved</span>}
+      </div>
+    </div>
+  );
+}
+
+function SystemSecurityTab() {
+  const queryClient = useQueryClient();
+  const { data: settings, isLoading } = useQuery({
+    queryKey: ['settings'],
+    queryFn: settingsApi.get,
+  });
+  const update = useMutation({
+    mutationFn: settingsApi.update,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['settings'] }),
+  });
+
+  const [poolSize, setPoolSize] = useState<number | null>(null);
+  const [maxOverflow, setMaxOverflow] = useState<number | null>(null);
+  const [bcryptRounds, setBcryptRounds] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!settings) return;
+    // One-time initialise from server: `?? value` means "set only if not yet touched by user"
+    setPoolSize((p) => p ?? settings.db_pool_size);
+    setMaxOverflow((m) => m ?? settings.db_max_overflow);
+    setBcryptRounds((b) => b ?? settings.bcrypt_rounds);
+  }, [settings]);
+
+  const handleSave = () => {
+    if (poolSize === null || maxOverflow === null || bcryptRounds === null) return;
+    update.mutate({
+      db_pool_size: poolSize,
+      db_max_overflow: maxOverflow,
+      bcrypt_rounds: bcryptRounds,
+    });
+  };
+
+  if (isLoading || poolSize === null || maxOverflow === null || bcryptRounds === null) {
+    return <div className="h-24 animate-pulse rounded-lg bg-muted" />;
+  }
+
+  return (
+    <div className="space-y-6">
+      <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+        Deployment-level knobs. Settings are saved immediately but take effect after the next
+        backend restart — except the bcrypt work factor, which applies on the next password operation.
+      </p>
+      <div>
+        <h3 className="mb-1 text-sm font-semibold text-foreground">Database Connection Pool</h3>
+        <p className="mb-4 text-xs text-muted-foreground">Tunes how many connections the app keeps open to its own database. Changes take effect on the next process restart.</p>
         <div className="space-y-4">
           <div>
             <div className="mb-1 flex justify-between">
@@ -844,8 +932,11 @@ function QuerySafetyTab() {
   );
 }
 
-function CacheSettingsSection() {
+function OptimizationSettingsSection() {
   const queryClient = useQueryClient();
+  // Every control in this section is staged locally and written only by Save — a toggle that
+  // wrote on click saved half the form behind the user's back, and left the other sliders
+  // looking saved when they were not.
   const { data: settings, isLoading } = useQuery({
     queryKey: ['settings'],
     queryFn: settingsApi.get,
@@ -872,11 +963,19 @@ function CacheSettingsSection() {
   }, [settings]);
 
   const handleSave = () => {
-    if (enabled === null || threshold === null || maxAgeDays === null || schemaPruningTopK === null) return;
+    if (
+      enabled === null ||
+      threshold === null ||
+      maxAgeDays === null ||
+      schemaPruningEnabled === null ||
+      schemaPruningTopK === null
+    )
+      return;
     update.mutate({
       cache_enabled: enabled,
       semantic_similarity_threshold: threshold,
       cache_max_age_days: maxAgeDays,
+      schema_pruning_enabled: schemaPruningEnabled,
       schema_pruning_top_k: schemaPruningTopK,
     });
   };
@@ -887,20 +986,19 @@ function CacheSettingsSection() {
 
   return (
     <div className="mb-4 space-y-4 border-b border-border pb-4">
+      <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+        These settings reduce LLM cost and latency — the cache reuses past answers, schema
+        pruning shrinks the prompt. Changes apply as soon as you press Save, except Cache Max
+        Age, which takes effect after the next backend restart.
+      </p>
+      <h3 className="text-sm font-semibold text-foreground">Query Cache</h3>
       <div className="flex items-center justify-between">
         <div>
           <p className="text-sm font-medium text-foreground">Enable Query Cache</p>
           <p className="text-xs text-muted-foreground">Cache semantically similar queries to skip LLM calls.</p>
         </div>
         <button
-          onClick={() => {
-            const next = !enabled;
-            setEnabled(next);
-            update.mutate(
-              { cache_enabled: next, semantic_similarity_threshold: threshold! },
-              { onError: () => setEnabled(!next) },
-            );
-          }}
+          onClick={() => setEnabled(!enabled)}
           className={cn(
             'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
             enabled ? 'bg-primary' : 'bg-muted-foreground',
@@ -923,7 +1021,7 @@ function CacheSettingsSection() {
           <span className="text-sm text-muted-foreground">{maxAgeDays} days</span>
         </div>
         <input type="range" min={1} max={365} step={1} value={maxAgeDays} onChange={(e) => setMaxAgeDays(Number(e.target.value))} className="w-full accent-primary" />
-        <p className="mt-1 text-xs text-muted-foreground">Cache entries older than this are automatically discarded.</p>
+        <p className="mt-1 text-xs text-muted-foreground">Cache entries older than this are automatically discarded. Applies after the next backend restart.</p>
       </div>
       <div className="border-t border-border pt-4">
         <h3 className="mb-4 text-sm font-semibold text-foreground">Schema Pruning</h3>
@@ -934,14 +1032,7 @@ function CacheSettingsSection() {
               <p className="text-xs text-muted-foreground">Filter schema context to the most relevant tables before each LLM call — reduces token usage significantly.</p>
             </div>
             <button
-              onClick={() => {
-                const next = !schemaPruningEnabled;
-                setSchemaPruningEnabled(next);
-                update.mutate(
-                  { schema_pruning_enabled: next },
-                  { onError: () => setSchemaPruningEnabled(!next) },
-                );
-              }}
+              onClick={() => setSchemaPruningEnabled(!schemaPruningEnabled)}
               className={cn(
                 'relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full transition-colors',
                 schemaPruningEnabled ? 'bg-primary' : 'bg-muted-foreground',
@@ -967,7 +1058,7 @@ function CacheSettingsSection() {
         {update.isSuccess && <span className="text-xs text-success">✓ Saved</span>}
         {update.isError && (
           <span className="text-xs text-destructive">
-            {(update.error as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Failed to save'}
+            {apiErrorMessage(update.error, 'Failed to save')}
           </span>
         )}
       </div>
@@ -1108,6 +1199,10 @@ function ExamplesTab({ connectionId }: { connectionId: string }) {
   return (
     <div className="space-y-4">
       <h3 className="text-sm font-semibold text-foreground">Verified Examples Library</h3>
+      <p className="text-xs text-muted-foreground">
+        Verified examples teach the model your preferred query patterns. For each new question,
+        the most similar examples are retrieved into the prompt, improving accuracy for your schema.
+      </p>
       {isLoading ? (
         <div className="h-16 animate-pulse rounded-lg bg-muted" />
       ) : (
@@ -1125,6 +1220,7 @@ function ExamplesTab({ connectionId }: { connectionId: string }) {
           placeholder="Natural language question"
           className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
         />
+        <p className="text-xs text-muted-foreground">The natural-language question a user might ask.</p>
         <textarea
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -1132,6 +1228,7 @@ function ExamplesTab({ connectionId }: { connectionId: string }) {
           rows={3}
           className="w-full rounded-md border border-border bg-background px-3 py-1.5 font-mono text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
         />
+        <p className="text-xs text-muted-foreground">The correct SQL that answers the question.</p>
         <button
           onClick={() => addExample.mutate()}
           disabled={!question || !query || addExample.isPending}
@@ -1145,7 +1242,17 @@ function ExamplesTab({ connectionId }: { connectionId: string }) {
 }
 
 export default function SettingsPage() {
-  const [activeTab, setActiveTab] = useState<Tab>('providers');
+  // The tab lives in the URL, not in local state, so a refresh or a shared link lands on the
+  // section the user was reading. An unknown or absent ?tab= falls back to the first tab.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tabParam = searchParams.get('tab');
+  const activeTab: Tab = isTab(tabParam) ? tabParam : 'providers';
+  const setActiveTab = (tab: Tab) => {
+    const next = new URLSearchParams(searchParams);
+    next.set('tab', tab);
+    // replace, so switching tabs does not bury the previous page under history entries.
+    setSearchParams(next, { replace: true });
+  };
   const [addingCustom, setAddingCustom] = useState(false);
   const { data: providers } = useProviders();
   const { activeConnectionId } = useAppStore();
@@ -1180,13 +1287,6 @@ export default function SettingsPage() {
     };
   }, [providers]);
 
-  const tabs: { id: Tab; label: string }[] = [
-    { id: 'providers', label: 'LLM Providers' },
-    { id: 'safety', label: 'Query Safety' },
-    { id: 'cache', label: 'Cache' },
-    { id: 'examples', label: 'Examples Library' },
-  ];
-
   return (
     <div className="flex-1 overflow-auto bg-background">
       <div className="mx-auto max-w-3xl px-4 py-8">
@@ -1194,7 +1294,7 @@ export default function SettingsPage() {
 
         {/* Tabs */}
         <div role="tablist" aria-label="Settings sections" className="mb-6 flex gap-1 border-b border-border">
-          {tabs.map((tab) => (
+          {TABS.map((tab) => (
             <button
               key={tab.id}
               role="tab"
@@ -1221,6 +1321,11 @@ export default function SettingsPage() {
         >
           {activeTab === 'providers' && (
             <div className="space-y-8">
+              <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                Configure the LLM providers that translate natural language into SQL. The colored dot
+                shows each provider's last health check: green = healthy, red = configured but failing,
+                grey = not configured.
+              </p>
               {namedGroups.map((group) => (
                 <ProviderSection
                   key={group.type}
@@ -1253,11 +1358,13 @@ export default function SettingsPage() {
             </div>
           )}
 
-          {activeTab === 'safety' && <QuerySafetyTab />}
+          {activeTab === 'execution' && <QueryExecutionTab />}
 
-          {activeTab === 'cache' && (
+          {activeTab === 'system' && <SystemSecurityTab />}
+
+          {activeTab === 'optimization' && (
             <div>
-              <CacheSettingsSection />
+              <OptimizationSettingsSection />
               {activeConnectionId ? (
                 <CacheStats connectionId={activeConnectionId} />
               ) : (
