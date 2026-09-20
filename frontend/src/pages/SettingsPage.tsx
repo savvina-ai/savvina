@@ -19,7 +19,7 @@ import CacheStats from '../components/CacheStats';
 import { useAppStore } from '../store/appStore';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { chatApi } from '../api/chat';
-import { settingsApi } from '../api/settings';
+import { useStagedSettings } from '../hooks/useStagedSettings';
 import { cn } from '@/lib/utils';
 import type { ProviderStatus, VerifiedExample } from '../types';
 import { Button } from '../components/ui/button';
@@ -782,38 +782,37 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
   );
 }
 
+interface SaveRowProps {
+  onSave: () => void;
+  dirty: boolean;
+  update: { isPending: boolean; isSuccess: boolean; isError: boolean; error: unknown };
+}
+
+/** Save button plus outcome for a staged-settings form. Shared so no tab can forget the error row. */
+function SaveRow({ onSave, dirty, update }: SaveRowProps) {
+  return (
+    <div className="flex items-center gap-3">
+      <button onClick={onSave} disabled={update.isPending || !dirty} className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50">
+        {update.isPending ? 'Saving…' : 'Save'}
+      </button>
+      {/* isSuccess stays true after the first save, so gate the badge on the form being clean. */}
+      {update.isSuccess && !dirty && <span className="text-xs text-success">✓ Saved</span>}
+      {update.isError && (
+        <span className="text-xs text-destructive">
+          {apiErrorMessage(update.error, 'Failed to save')}
+        </span>
+      )}
+    </div>
+  );
+}
+
+const SettingsSkeleton = () => <div className="h-24 animate-pulse rounded-lg bg-muted" />;
+
+const EXECUTION_KEYS = ['default_query_timeout', 'default_row_limit'] as const;
+
 function QueryExecutionTab() {
-  const queryClient = useQueryClient();
-  const { data: settings, isLoading } = useQuery({
-    queryKey: ['settings'],
-    queryFn: settingsApi.get,
-  });
-  const update = useMutation({
-    mutationFn: settingsApi.update,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['settings'] }),
-  });
-
-  const [queryTimeout, setQueryTimeout] = useState<number | null>(null);
-  const [rowLimit, setRowLimit] = useState<number | null>(null);
-
-  useEffect(() => {
-    if (!settings) return;
-    // One-time initialise from server: `?? value` means "set only if not yet touched by user"
-    setQueryTimeout((t) => t ?? settings.default_query_timeout);
-    setRowLimit((r) => r ?? settings.default_row_limit);
-  }, [settings]);
-
-  const handleSave = () => {
-    if (queryTimeout === null || rowLimit === null) return;
-    update.mutate({
-      default_query_timeout: queryTimeout,
-      default_row_limit: rowLimit,
-    });
-  };
-
-  if (isLoading || queryTimeout === null || rowLimit === null) {
-    return <div className="h-24 animate-pulse rounded-lg bg-muted" />;
-  }
+  const { values, set, dirty, save, update } = useStagedSettings(EXECUTION_KEYS);
+  if (!values) return <SettingsSkeleton />;
 
   return (
     <div className="space-y-6">
@@ -824,64 +823,29 @@ function QueryExecutionTab() {
       <div>
         <div className="mb-1 flex justify-between">
           <label className="text-sm font-medium text-foreground">Query Timeout</label>
-          <span className="text-sm text-muted-foreground">{queryTimeout}s</span>
+          <span className="text-sm text-muted-foreground">{values.default_query_timeout}s</span>
         </div>
-        <input type="range" min={5} max={300} step={5} value={queryTimeout} onChange={(e) => setQueryTimeout(Number(e.target.value))} className="w-full accent-primary" />
+        <input type="range" min={5} max={300} step={5} value={values.default_query_timeout} onChange={(e) => set('default_query_timeout', Number(e.target.value))} className="w-full accent-primary" />
         <p className="mt-1 text-xs text-muted-foreground">Cancel queries that run longer than this many seconds.</p>
       </div>
       <div>
         <div className="mb-1 flex justify-between">
           <label className="text-sm font-medium text-foreground">Row Limit</label>
-          <span className="text-sm text-muted-foreground">{rowLimit.toLocaleString()} rows</span>
+          <span className="text-sm text-muted-foreground">{values.default_row_limit.toLocaleString()} rows</span>
         </div>
-        <input type="range" min={100} max={10000} step={100} value={rowLimit} onChange={(e) => setRowLimit(Number(e.target.value))} className="w-full accent-primary" />
+        <input type="range" min={100} max={10000} step={100} value={values.default_row_limit} onChange={(e) => set('default_row_limit', Number(e.target.value))} className="w-full accent-primary" />
         <p className="mt-1 text-xs text-muted-foreground">Truncate result sets larger than this many rows.</p>
       </div>
-      <div className="flex items-center gap-3">
-        <button onClick={handleSave} disabled={update.isPending} className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50">
-          {update.isPending ? 'Saving…' : 'Save'}
-        </button>
-        {update.isSuccess && <span className="text-xs text-success">✓ Saved</span>}
-      </div>
+      <SaveRow onSave={save} dirty={dirty} update={update} />
     </div>
   );
 }
 
+const SYSTEM_KEYS = ['db_pool_size', 'db_max_overflow', 'bcrypt_rounds'] as const;
+
 function SystemSecurityTab() {
-  const queryClient = useQueryClient();
-  const { data: settings, isLoading } = useQuery({
-    queryKey: ['settings'],
-    queryFn: settingsApi.get,
-  });
-  const update = useMutation({
-    mutationFn: settingsApi.update,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['settings'] }),
-  });
-
-  const [poolSize, setPoolSize] = useState<number | null>(null);
-  const [maxOverflow, setMaxOverflow] = useState<number | null>(null);
-  const [bcryptRounds, setBcryptRounds] = useState<number | null>(null);
-
-  useEffect(() => {
-    if (!settings) return;
-    // One-time initialise from server: `?? value` means "set only if not yet touched by user"
-    setPoolSize((p) => p ?? settings.db_pool_size);
-    setMaxOverflow((m) => m ?? settings.db_max_overflow);
-    setBcryptRounds((b) => b ?? settings.bcrypt_rounds);
-  }, [settings]);
-
-  const handleSave = () => {
-    if (poolSize === null || maxOverflow === null || bcryptRounds === null) return;
-    update.mutate({
-      db_pool_size: poolSize,
-      db_max_overflow: maxOverflow,
-      bcrypt_rounds: bcryptRounds,
-    });
-  };
-
-  if (isLoading || poolSize === null || maxOverflow === null || bcryptRounds === null) {
-    return <div className="h-24 animate-pulse rounded-lg bg-muted" />;
-  }
+  const { values, set, dirty, save, update } = useStagedSettings(SYSTEM_KEYS);
+  if (!values) return <SettingsSkeleton />;
 
   return (
     <div className="space-y-6">
@@ -896,17 +860,17 @@ function SystemSecurityTab() {
           <div>
             <div className="mb-1 flex justify-between">
               <label className="text-sm font-medium text-foreground">Pool Size</label>
-              <span className="text-sm text-muted-foreground">{poolSize}</span>
+              <span className="text-sm text-muted-foreground">{values.db_pool_size}</span>
             </div>
-            <input type="range" min={1} max={50} step={1} value={poolSize} onChange={(e) => setPoolSize(Number(e.target.value))} className="w-full accent-primary" />
+            <input type="range" min={1} max={50} step={1} value={values.db_pool_size} onChange={(e) => set('db_pool_size', Number(e.target.value))} className="w-full accent-primary" />
             <p className="mt-1 text-xs text-muted-foreground">Persistent connections kept open. Increase for higher concurrency.</p>
           </div>
           <div>
             <div className="mb-1 flex justify-between">
               <label className="text-sm font-medium text-foreground">Max Overflow</label>
-              <span className="text-sm text-muted-foreground">{maxOverflow}</span>
+              <span className="text-sm text-muted-foreground">{values.db_max_overflow}</span>
             </div>
-            <input type="range" min={0} max={100} step={5} value={maxOverflow} onChange={(e) => setMaxOverflow(Number(e.target.value))} className="w-full accent-primary" />
+            <input type="range" min={0} max={100} step={5} value={values.db_max_overflow} onChange={(e) => set('db_max_overflow', Number(e.target.value))} className="w-full accent-primary" />
             <p className="mt-1 text-xs text-muted-foreground">Extra connections allowed above pool size during traffic spikes.</p>
           </div>
         </div>
@@ -916,80 +880,37 @@ function SystemSecurityTab() {
         <div>
           <div className="mb-1 flex justify-between">
             <label className="text-sm font-medium text-foreground">bcrypt Work Factor</label>
-            <span className="text-sm text-muted-foreground">{bcryptRounds}</span>
+            <span className="text-sm text-muted-foreground">{values.bcrypt_rounds}</span>
           </div>
-          <input type="range" min={10} max={16} step={1} value={bcryptRounds} onChange={(e) => setBcryptRounds(Number(e.target.value))} className="w-full accent-primary" />
+          <input type="range" min={10} max={16} step={1} value={values.bcrypt_rounds} onChange={(e) => set('bcrypt_rounds', Number(e.target.value))} className="w-full accent-primary" />
           <p className="mt-1 text-xs text-muted-foreground">Higher values slow down login slightly but make brute-force harder. Takes effect on the next password operation.</p>
         </div>
       </div>
-      <div className="flex items-center gap-3">
-        <button onClick={handleSave} disabled={update.isPending} className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50">
-          {update.isPending ? 'Saving…' : 'Save'}
-        </button>
-        {update.isSuccess && <span className="text-xs text-success">✓ Saved</span>}
-      </div>
+      <SaveRow onSave={save} dirty={dirty} update={update} />
     </div>
   );
 }
 
+const OPTIMIZATION_KEYS = [
+  'cache_enabled',
+  'semantic_similarity_threshold',
+  'cache_max_age_days',
+  'schema_pruning_enabled',
+  'schema_pruning_top_k',
+] as const;
+
 function OptimizationSettingsSection() {
-  const queryClient = useQueryClient();
   // Every control in this section is staged locally and written only by Save — a toggle that
   // wrote on click saved half the form behind the user's back, and left the other sliders
   // looking saved when they were not.
-  const { data: settings, isLoading } = useQuery({
-    queryKey: ['settings'],
-    queryFn: settingsApi.get,
-  });
-  const update = useMutation({
-    mutationFn: settingsApi.update,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['settings'] }),
-  });
-
-  const [enabled, setEnabled] = useState<boolean | null>(null);
-  const [threshold, setThreshold] = useState<number | null>(null);
-  const [maxAgeDays, setMaxAgeDays] = useState<number | null>(null);
-  const [schemaPruningEnabled, setSchemaPruningEnabled] = useState<boolean | null>(null);
-  const [schemaPruningTopK, setSchemaPruningTopK] = useState<number | null>(null);
-
-  useEffect(() => {
-    if (!settings) return;
-    // One-time initialise from server: `?? value` means "set only if not yet touched by user"
-    setEnabled((e) => e ?? settings.cache_enabled);
-    setThreshold((t) => t ?? settings.semantic_similarity_threshold);
-    setMaxAgeDays((d) => d ?? settings.cache_max_age_days);
-    setSchemaPruningEnabled((p) => p ?? settings.schema_pruning_enabled);
-    setSchemaPruningTopK((k) => k ?? settings.schema_pruning_top_k);
-  }, [settings]);
-
-  const handleSave = () => {
-    if (
-      enabled === null ||
-      threshold === null ||
-      maxAgeDays === null ||
-      schemaPruningEnabled === null ||
-      schemaPruningTopK === null
-    )
-      return;
-    update.mutate({
-      cache_enabled: enabled,
-      semantic_similarity_threshold: threshold,
-      cache_max_age_days: maxAgeDays,
-      schema_pruning_enabled: schemaPruningEnabled,
-      schema_pruning_top_k: schemaPruningTopK,
-    });
-  };
-
-  if (isLoading || enabled === null || threshold === null || maxAgeDays === null || schemaPruningEnabled === null || schemaPruningTopK === null) {
-    return <div className="h-16 animate-pulse rounded-lg bg-muted" />;
-  }
+  const { values, set, dirty, save, update } = useStagedSettings(OPTIMIZATION_KEYS);
+  if (!values) return <SettingsSkeleton />;
 
   return (
     <div className="mb-4 space-y-4 border-b border-border pb-4">
       <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
         These settings reduce LLM cost and latency — the cache reuses past answers, schema
-        pruning shrinks the prompt. Changes apply as soon as you press Save, except Cache Max
-        Age, which takes effect after the next backend restart.
+        pruning shrinks the prompt. Changes apply as soon as you press Save.
       </p>
       <h3 className="text-sm font-semibold text-foreground">Query Cache</h3>
       <div className="flex items-center justify-between">
@@ -998,30 +919,30 @@ function OptimizationSettingsSection() {
           <p className="text-xs text-muted-foreground">Cache semantically similar queries to skip LLM calls.</p>
         </div>
         <button
-          onClick={() => setEnabled(!enabled)}
+          onClick={() => set('cache_enabled', !values.cache_enabled)}
           className={cn(
             'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
-            enabled ? 'bg-primary' : 'bg-muted-foreground',
+            values.cache_enabled ? 'bg-primary' : 'bg-muted-foreground',
           )}
         >
-          <span className={cn('inline-block h-4 w-4 transform rounded-full bg-primary-foreground transition-transform', enabled ? 'translate-x-6' : 'translate-x-1')} />
+          <span className={cn('inline-block h-4 w-4 transform rounded-full bg-primary-foreground transition-transform', values.cache_enabled ? 'translate-x-6' : 'translate-x-1')} />
         </button>
       </div>
       <div>
         <div className="mb-1 flex justify-between">
           <label className="text-sm font-medium text-foreground">Similarity Threshold</label>
-          <span className="text-sm text-muted-foreground">{threshold.toFixed(2)}</span>
+          <span className="text-sm text-muted-foreground">{values.semantic_similarity_threshold.toFixed(2)}</span>
         </div>
-        <input type="range" min={0.5} max={1.0} step={0.01} value={threshold} onChange={(e) => setThreshold(Number(e.target.value))} className="w-full accent-primary" />
+        <input type="range" min={0.5} max={1.0} step={0.01} value={values.semantic_similarity_threshold} onChange={(e) => set('semantic_similarity_threshold', Number(e.target.value))} className="w-full accent-primary" />
         <p className="mt-1 text-xs text-muted-foreground">Higher values require closer matches before serving a cached result.</p>
       </div>
       <div>
         <div className="mb-1 flex justify-between">
           <label className="text-sm font-medium text-foreground">Cache Max Age</label>
-          <span className="text-sm text-muted-foreground">{maxAgeDays} days</span>
+          <span className="text-sm text-muted-foreground">{values.cache_max_age_days} days</span>
         </div>
-        <input type="range" min={1} max={365} step={1} value={maxAgeDays} onChange={(e) => setMaxAgeDays(Number(e.target.value))} className="w-full accent-primary" />
-        <p className="mt-1 text-xs text-muted-foreground">Cache entries older than this are automatically discarded. Applies after the next backend restart.</p>
+        <input type="range" min={1} max={365} step={1} value={values.cache_max_age_days} onChange={(e) => set('cache_max_age_days', Number(e.target.value))} className="w-full accent-primary" />
+        <p className="mt-1 text-xs text-muted-foreground">Cache entries older than this are automatically discarded.</p>
       </div>
       <div className="border-t border-border pt-4">
         <h3 className="mb-4 text-sm font-semibold text-foreground">Schema Pruning</h3>
@@ -1032,36 +953,26 @@ function OptimizationSettingsSection() {
               <p className="text-xs text-muted-foreground">Filter schema context to the most relevant tables before each LLM call — reduces token usage significantly.</p>
             </div>
             <button
-              onClick={() => setSchemaPruningEnabled(!schemaPruningEnabled)}
+              onClick={() => set('schema_pruning_enabled', !values.schema_pruning_enabled)}
               className={cn(
                 'relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full transition-colors',
-                schemaPruningEnabled ? 'bg-primary' : 'bg-muted-foreground',
+                values.schema_pruning_enabled ? 'bg-primary' : 'bg-muted-foreground',
               )}
             >
-              <span className={cn('inline-block h-4 w-4 transform rounded-full bg-primary-foreground transition-transform', schemaPruningEnabled ? 'translate-x-6' : 'translate-x-1')} />
+              <span className={cn('inline-block h-4 w-4 transform rounded-full bg-primary-foreground transition-transform', values.schema_pruning_enabled ? 'translate-x-6' : 'translate-x-1')} />
             </button>
           </div>
           <div>
             <div className="mb-1 flex justify-between">
               <label className="text-sm font-medium text-foreground">Max Tables (Top K)</label>
-              <span className="text-sm text-muted-foreground">{schemaPruningTopK}</span>
+              <span className="text-sm text-muted-foreground">{values.schema_pruning_top_k}</span>
             </div>
-            <input type="range" min={3} max={40} step={1} value={schemaPruningTopK} onChange={(e) => setSchemaPruningTopK(Number(e.target.value))} className="w-full accent-primary" />
+            <input type="range" min={3} max={40} step={1} value={values.schema_pruning_top_k} onChange={(e) => set('schema_pruning_top_k', Number(e.target.value))} className="w-full accent-primary" />
             <p className="mt-1 text-xs text-muted-foreground">Maximum number of tables passed to the LLM. Lower values reduce token usage; increase if queries span many tables.</p>
           </div>
         </div>
       </div>
-      <div className="flex items-center gap-3">
-        <button onClick={handleSave} disabled={update.isPending} className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50">
-          {update.isPending ? 'Saving…' : 'Save'}
-        </button>
-        {update.isSuccess && <span className="text-xs text-success">✓ Saved</span>}
-        {update.isError && (
-          <span className="text-xs text-destructive">
-            {apiErrorMessage(update.error, 'Failed to save')}
-          </span>
-        )}
-      </div>
+      <SaveRow onSave={save} dirty={dirty} update={update} />
     </div>
   );
 }

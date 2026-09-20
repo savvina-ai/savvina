@@ -20,7 +20,7 @@ Savvina AI lets you connect to a database, ask questions in natural language, an
 | Feature | Description |
 |---|---|
 | **Natural language to SQL** | Ask questions in plain English; get readable SQL and tabular results |
-| **Multi-LLM support** | Claude, OpenAI, Groq, Gemini, Cerebras, Mistral, Ollama — plus any OpenAI-compatible endpoint (GitHub Models, HuggingFace, Together.ai, OpenRouter, etc.) |
+| **Multi-LLM support** | Claude, OpenAI, Groq, Gemini, Cerebras, Mistral, Ollama — plus any OpenAI-compatible endpoint (HuggingFace, Together.ai, OpenRouter, etc.) |
 | **2 data sources** | PostgreSQL and MySQL / MariaDB — additional sources exist in commercial version |
 | **Free-tier ready** | Works out of the box with Groq (14,400 req/day free) or Google Gemini (1,500 req/day free) |
 | **Local LLM via Ollama** | Run entirely offline with Ollama — no data leaves your machine |
@@ -122,7 +122,7 @@ The adapter interface is documented in [docs/development/adding-a-datasource.md]
 
 ## Supported LLM Providers
 
-Claude, OpenAI, Groq, Gemini, Cerebras, Mistral, Ollama, and any OpenAI-compatible endpoint (GitHub Models, HuggingFace, Together.ai, OpenRouter, vLLM, LM Studio, etc.).
+Claude, OpenAI, Groq, Gemini, Cerebras, Mistral, Ollama, and any OpenAI-compatible endpoint (HuggingFace, Together.ai, OpenRouter, vLLM, LM Studio, etc.).
 
 See [docs/user-guide/06_llm-providers.md](docs/user-guide/06_llm-providers.md) for the full provider list, configuration details, and default models.
 

@@ -20,6 +20,7 @@ from app.cache.query_cache import (
     _normalize,
     has_temporal_reference,
 )
+from app.config import get_settings
 
 # ── Shared mock helpers ────────────────────────────────────────────────────────
 
@@ -407,17 +408,19 @@ class TestFreshCondition:
 
 
 class TestQueryCachePruneExpired:
-    async def test_zero_max_age_returns_zero_without_db_call(self):
+    async def test_zero_max_age_returns_zero_without_db_call(self, monkeypatch):
         """When TTL is disabled, prune_expired is a no-op."""
-        cache = QueryCache("all-MiniLM-L6-v2", 0.92, max_age_days=0)
+        monkeypatch.setattr(get_settings(), "cache_max_age_days", 0)
+        cache = QueryCache("all-MiniLM-L6-v2", 0.92)
         db = _mock_db()
         deleted = await cache.prune_expired(db)
         assert deleted == 0
         db.execute.assert_not_called()
         db.commit.assert_not_called()
 
-    async def test_prune_executes_delete_and_commits(self):
-        cache = QueryCache("all-MiniLM-L6-v2", 0.92, max_age_days=30)
+    async def test_prune_executes_delete_and_commits(self, monkeypatch):
+        monkeypatch.setattr(get_settings(), "cache_max_age_days", 30)
+        cache = QueryCache("all-MiniLM-L6-v2", 0.92)
         db = MagicMock()
         db.execute = AsyncMock(return_value=MockResult(rowcount=3))
         db.commit = AsyncMock()
@@ -425,21 +428,62 @@ class TestQueryCachePruneExpired:
         db.execute.assert_called_once()
         db.commit.assert_called_once()
 
-    async def test_prune_returns_rowcount(self):
-        cache = QueryCache("all-MiniLM-L6-v2", 0.92, max_age_days=30)
+    async def test_prune_returns_rowcount(self, monkeypatch):
+        monkeypatch.setattr(get_settings(), "cache_max_age_days", 30)
+        cache = QueryCache("all-MiniLM-L6-v2", 0.92)
         db = MagicMock()
         db.execute = AsyncMock(return_value=MockResult(rowcount=7))
         db.commit = AsyncMock()
         deleted = await cache.prune_expired(db)
         assert deleted == 7
 
-    async def test_prune_returns_zero_when_nothing_deleted(self):
-        cache = QueryCache("all-MiniLM-L6-v2", 0.92, max_age_days=30)
+    async def test_prune_returns_zero_when_nothing_deleted(self, monkeypatch):
+        monkeypatch.setattr(get_settings(), "cache_max_age_days", 30)
+        cache = QueryCache("all-MiniLM-L6-v2", 0.92)
         db = MagicMock()
         db.execute = AsyncMock(return_value=MockResult(rowcount=0))
         db.commit = AsyncMock()
         deleted = await cache.prune_expired(db)
         assert deleted == 0
+
+
+# ── QueryCache reads the TTL live ──────────────────────────────────────────────
+
+
+class TestQueryCacheMaxAgeIsLive:
+    """`cache_max_age_days` is not captured at construction.
+
+    routers/chat.py builds one QueryCache and lru_caches it for the process lifetime,
+    so a PUT /settings write-through can only reach the freshness window if every
+    lookup/prune reads the current value off the Settings singleton — the same way
+    the similarity threshold already does.
+    """
+
+    async def test_lookup_reads_max_age_from_settings_on_every_call(self, monkeypatch):
+        cache = QueryCache("all-MiniLM-L6-v2", 0.92)  # one instance, like chat.py
+        for days in (0, 7):
+            monkeypatch.setattr(get_settings(), "cache_max_age_days", days)
+            # Exact hit: scalar_one_or_none() returns an entry, so the embedding model
+            # is never touched.
+            db = _mock_db(single=_make_cache_entry())
+            with patch("app.cache.query_cache._fresh_condition", wraps=_fresh_condition) as fc:
+                await cache.lookup("conn-1", "How many users?", db)
+            fc.assert_called_once_with(days)
+
+    async def test_prune_reads_max_age_from_settings_on_every_call(self, monkeypatch):
+        cache = QueryCache("all-MiniLM-L6-v2", 0.92)
+
+        monkeypatch.setattr(get_settings(), "cache_max_age_days", 0)
+        db = _mock_db()
+        assert await cache.prune_expired(db) == 0
+        db.execute.assert_not_called()
+
+        monkeypatch.setattr(get_settings(), "cache_max_age_days", 30)
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=MockResult(rowcount=2))
+        db.commit = AsyncMock()
+        assert await cache.prune_expired(db) == 2
+        db.execute.assert_called_once()
 
 
 # ── ExampleLibrary dataclass ──────────────────────────────────────────────────

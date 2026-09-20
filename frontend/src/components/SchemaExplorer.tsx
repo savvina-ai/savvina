@@ -10,6 +10,7 @@ import { useConnectionSchema } from '../hooks/useConnections';
 import { connectionsApi } from '../api/connections';
 import { semanticApi } from '../api/semantic';
 import { cn } from '@/lib/utils';
+import { apiErrorMessage } from '@/lib/apiError';
 import type { SchemaTable, SchemaColumn } from '../types';
 
 interface SchemaData {
@@ -181,9 +182,7 @@ export default function SchemaExplorer({ onClose, embedded = false }: Props) {
       await queryClient.invalidateQueries({ queryKey: ['schema', activeConnectionId] });
       await queryClient.invalidateQueries({ queryKey: ['semantic', activeConnectionId] });
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      const msg = detail ?? 'Schema refresh failed';
-      setRefreshError(msg);
+      setRefreshError(apiErrorMessage(e, 'Schema refresh failed'));
     } finally {
       setIsRefreshing(false);
     }

@@ -20,6 +20,7 @@ import {
 import DynamicConnectionForm from '../components/DynamicConnectionForm'
 import { datasourcesApi } from '../api/datasources'
 import { getDatasourceIcon } from '@/lib/datasourceIcons'
+import { apiErrorMessage } from '@/lib/apiError'
 import { useProviders, useCreateProvider, useFetchModels } from '../hooks/useProviders'
 import type { DataSourceInfo } from '../types'
 
@@ -160,9 +161,7 @@ function Step1Database({ onSave, onSkip }: StepProps) {
       const result = await connectionsApi.testNew(selectedSource.source_type, config)
       setTestResult(result)
     } catch (err: unknown) {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? ''
-      setTestResult({ success: false, message: detail || 'Connection test failed.' })
+      setTestResult({ success: false, message: apiErrorMessage(err, 'Connection test failed.') })
     } finally {
       setTesting(false)
     }
@@ -183,9 +182,7 @@ function Step1Database({ onSave, onSkip }: StepProps) {
       })
       onSave()
     } catch (err: unknown) {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? ''
-      setError(detail || 'Could not save connection. You can skip and add it later.')
+      setError(apiErrorMessage(err, 'Could not save connection. You can skip and add it later.'))
     } finally {
       setSaving(false)
     }
@@ -372,8 +369,7 @@ function Step2Provider({ onSave, onSkip }: StepProps) {
         setModel(models[0])
       }
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      setFetchModelsError(detail ?? 'Failed to fetch models')
+      setFetchModelsError(apiErrorMessage(e, 'Failed to fetch models'))
     }
   }
 
@@ -394,9 +390,7 @@ function Step2Provider({ onSave, onSkip }: StepProps) {
       })
       setTestResult(data)
     } catch (err: unknown) {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? ''
-      setTestResult({ success: false, message: detail || 'Connection test failed.' })
+      setTestResult({ success: false, message: apiErrorMessage(err, 'Connection test failed.') })
     } finally {
       setTesting(false)
     }
@@ -418,9 +412,7 @@ function Step2Provider({ onSave, onSkip }: StepProps) {
       })
       onSave()
     } catch (err: unknown) {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? ''
-      setError(detail || 'Could not save provider. You can skip and configure it later.')
+      setError(apiErrorMessage(err, 'Could not save provider. You can skip and configure it later.'))
     }
   }
 

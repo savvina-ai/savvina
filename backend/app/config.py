@@ -214,6 +214,11 @@ class Settings(BaseSettings):
 DEFAULT_QUERY_TIMEOUT: int = Settings.model_fields["default_query_timeout"].default
 DEFAULT_ROW_LIMIT: int = Settings.model_fields["default_row_limit"].default
 
+# bcrypt work factor when no `app_settings` row overrides it. Not a Settings field: it
+# is read from the DB per password operation (routers/auth.py) and reported by the
+# settings router, and both must agree on the fallback.
+DEFAULT_BCRYPT_ROUNDS: int = 12
+
 # Every key PUT /api/settings persists to the `app_settings` table, with the parser
 # that turns its stored string back into a typed value. Both the settings router and
 # the startup restore in main.py read this map — duplicating it once let the two drift.

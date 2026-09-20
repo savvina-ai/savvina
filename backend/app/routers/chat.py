@@ -60,7 +60,7 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 @lru_cache(maxsize=1)
 def _get_shared_cache() -> QueryCache:
     s = get_settings()
-    return QueryCache(s.embedding_model, s.semantic_similarity_threshold, s.cache_max_age_days)
+    return QueryCache(s.embedding_model, s.semantic_similarity_threshold)
 
 
 @lru_cache(maxsize=1)

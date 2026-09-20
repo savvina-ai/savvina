@@ -84,10 +84,12 @@ class QueryCache:
         self,
         embedding_model_name: str,
         similarity_threshold: float,
-        max_age_days: int = 30,
     ) -> None:
+        # No TTL is captured here. routers/chat.py builds one instance and lru_caches it
+        # for the process lifetime, so `cache_max_age_days` is read live from
+        # get_settings() in lookup()/prune_expired() — like the similarity threshold —
+        # and a PUT /settings write-through reaches the freshness window without a restart.
         self._model_name = embedding_model_name
-        self._max_age_days = max_age_days
         self._model = None
         self._model_lock = threading.Lock()
 
@@ -108,11 +110,12 @@ class QueryCache:
         """
         normalized = _normalize(question)
         is_temporal = has_temporal_reference(question)
+        max_age_days = get_settings().cache_max_age_days  # live, see __init__
 
         # Temporal questions get a tight freshness window so stale time-relative
         # SQL is never reused (e.g., "last month revenue" means different SQL
         # on different days).
-        effective_max_age = _TEMPORAL_EXACT_TTL_DAYS if is_temporal else self._max_age_days
+        effective_max_age = _TEMPORAL_EXACT_TTL_DAYS if is_temporal else max_age_days
         fresh = _fresh_condition(effective_max_age)
 
         # ── 1. Exact match ────────────────────────────────────────────────────
@@ -149,7 +152,7 @@ class QueryCache:
             .where(
                 QueryCacheEntry.connection_id == connection_id,
                 QueryCacheEntry.question_embedding.is_not(None),
-                _fresh_condition(self._max_age_days),
+                _fresh_condition(max_age_days),
             )
             .order_by(dist_col)
             .limit(1)
@@ -336,11 +339,12 @@ class QueryCache:
         Delete all entries that have exceeded the configured TTL.
 
         Returns the number of rows deleted.  Safe to call on a schedule
-        (e.g. a background task) — a no-op when ``max_age_days`` is 0.
+        (e.g. a background task) — a no-op when ``cache_max_age_days`` is 0.
         """
-        if self._max_age_days == 0:
+        max_age_days = get_settings().cache_max_age_days  # live, see __init__
+        if max_age_days == 0:
             return 0
-        cutoff = datetime.now(UTC) - timedelta(days=self._max_age_days)
+        cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
         result = await db.execute(
             delete(QueryCacheEntry).where(
                 func.coalesce(

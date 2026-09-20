@@ -18,6 +18,7 @@ import {
 import { useAuthStore } from '@/store/authStore'
 import { authApi } from '@/api/auth'
 import { cn } from '@/lib/utils'
+import { apiErrorMessage } from '@/lib/apiError'
 import type { CurrentUser, SessionInfo } from '@/types/auth'
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
@@ -101,11 +102,7 @@ export default function ProfilePage() {
       setPasswordStatus({ type: 'success', msg: 'Password changed successfully' })
     },
     onError: (err: unknown) => {
-      const detail =
-        err && typeof err === 'object' && 'response' in err
-          ? (err as { response: { data: { detail: string } } }).response?.data?.detail
-          : null
-      setPasswordStatus({ type: 'error', msg: detail || 'Failed to change password' })
+      setPasswordStatus({ type: 'error', msg: apiErrorMessage(err, 'Failed to change password') })
     },
   })
 

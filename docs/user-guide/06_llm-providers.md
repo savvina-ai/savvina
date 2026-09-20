@@ -10,7 +10,7 @@ Savvina AI supports multiple LLM providers through a unified adapter interface. 
 |---|---|---|
 | `claude` | `ClaudeProvider` | Anthropic Claude models |
 | `openai` | `OpenAIProvider` | OpenAI GPT models |
-| `openai_compatible` | `OpenAICompatibleProvider` | Any OpenAI-compatible API (GitHub Models, HuggingFace, Together.ai, OpenRouter, custom) |
+| `openai_compatible` | `OpenAICompatibleProvider` | Any OpenAI-compatible API (HuggingFace, Together.ai, OpenRouter, custom) |
 | `groq` | `GroqProvider` | Groq |
 | `gemini` | `GeminiProvider` | Google Gemini |
 | `cerebras` | `CerebrasProvider` | Cerebras |
@@ -36,7 +36,7 @@ Savvina AI supports multiple LLM providers through a unified adapter interface. 
 6. Click **Test** to verify connectivity
 7. Click **Add** to save the config
 
-For **Custom Providers** (OpenRouter, HuggingFace, Together.ai, GitHub Models, custom URL), click **+ Add Custom Provider**. Enter the base URL and API key first, then click **Fetch Models** to populate the model dropdown. Click **Cancel** to dismiss the form without saving.
+For **Custom Providers** (OpenRouter, HuggingFace, Together.ai, custom URL), click **+ Add Custom Provider**. Enter the base URL and API key first, then click **Fetch Models** to populate the model dropdown. Click **Cancel** to dismiss the form without saving.
 
 ### Via Environment Variables
 
@@ -95,12 +95,6 @@ If fetching fails (invalid key, network issue), the dropdown falls back to any p
 - **Default model:** `mistral-large-latest`
 - Base URL: `https://api.mistral.ai/v1`
 - Models fetched from `https://api.mistral.ai/v1/models`; only models with `capabilities.completion_chat: true` are included; embed and moderation models are excluded
-
-### GitHub Models
-
-- **Default model:** `DeepSeek-R1`
-- Base URL: `https://models.inference.ai.azure.com`
-- Uses your GitHub personal access token as the API key
 
 ### HuggingFace
 

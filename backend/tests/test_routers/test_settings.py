@@ -106,6 +106,21 @@ class TestGetSettings:
         body = resp.json()
         assert 0.0 <= body["semantic_similarity_threshold"] <= 1.0
 
+    async def test_bcrypt_rounds_defaults_to_constant(self, http_client):
+        """With no persisted row the reported work factor is the one hashing uses."""
+        from app.config import DEFAULT_BCRYPT_ROUNDS
+
+        resp = await http_client.get("/api/v1/settings")
+        assert resp.json()["bcrypt_rounds"] == DEFAULT_BCRYPT_ROUNDS
+
+
+def test_settings_update_fields_match_mutable_parsers():
+    """Every PUT field needs a parser, or the persisted row is unreadable at boot."""
+    from app.config import MUTABLE_SETTING_PARSERS
+    from app.schemas.settings import SettingsUpdate
+
+    assert set(SettingsUpdate.model_fields) == set(MUTABLE_SETTING_PARSERS)
+
 
 @pytest.fixture
 def _restore_singleton():
@@ -213,6 +228,28 @@ class TestUpdateSettings:
         )
         assert resp.status_code == 422
 
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("default_query_timeout", 60),
+            ("default_row_limit", 250),
+            ("cache_enabled", False),
+            ("cache_max_age_days", 7),
+            ("cache_max_age_days", 0),  # ge=0: "TTL off" must persist, not be dropped
+            ("semantic_similarity_threshold", 0.95),
+            ("db_pool_size", 5),
+            ("db_max_overflow", 50),
+            ("schema_pruning_enabled", False),
+            ("schema_pruning_top_k", 8),
+            ("bcrypt_rounds", 14),
+        ],
+    )
+    async def test_every_mutable_key_round_trips_through_get(self, http_client, key, value):
+        """PUT persists the typed value as a string; GET parses it back to the same value."""
+        resp = await http_client.put("/api/v1/settings", json={key: value})
+        assert resp.status_code == 200
+        assert (await http_client.get("/api/v1/settings")).json()[key] == value
+
     async def test_response_has_all_required_fields(self, http_client):
         resp = await http_client.put(
             "/api/v1/settings",
@@ -282,3 +319,29 @@ class TestUpdateWritesThroughToSingleton:
         resp = await http_client.put("/api/v1/settings", json={"bcrypt_rounds": 13})
         assert resp.status_code == 200
         assert not hasattr(get_settings(), "bcrypt_rounds")
+
+    async def test_cache_max_age_days_reaches_lookup_without_restart(self, http_client):
+        """The shared QueryCache is built once and lru_cached in routers/chat.py, so the
+        TTL has to be read live from the singleton on every lookup — a PUT after the
+        cache was constructed must change the freshness window it queries with."""
+        from unittest.mock import patch
+
+        from app.cache.query_cache import QueryCache, _fresh_condition
+        from app.config import get_settings
+
+        cache = QueryCache("all-MiniLM-L6-v2", 0.9)  # constructed before the PUT
+
+        await http_client.put("/api/v1/settings", json={"cache_max_age_days": 3})
+        assert get_settings().cache_max_age_days == 3
+
+        # An exact hit on the first execute() means the embedding model is never loaded.
+        entry = MagicMock()
+        entry.id = "entry-1"
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = entry
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=result)
+        db.commit = AsyncMock()
+        with patch("app.cache.query_cache._fresh_condition", wraps=_fresh_condition) as fc:
+            await cache.lookup("conn-1", "How many users?", db)
+        fc.assert_called_once_with(3)

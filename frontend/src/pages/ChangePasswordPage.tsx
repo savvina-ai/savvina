@@ -12,6 +12,7 @@ import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 import { Label } from '../components/ui/label'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { apiErrorMessage } from '../lib/apiError'
 
 export default function ChangePasswordPage() {
   const [password, setPassword] = useState('')
@@ -48,10 +49,7 @@ export default function ChangePasswordPage() {
       await authApi.resetPassword(password)
       navigate('/login', { replace: true })
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        'Something went wrong. Please try again.'
-      setError(msg)
+      setError(apiErrorMessage(err, 'Something went wrong. Please try again.'))
     } finally {
       setSubmitting(false)
     }

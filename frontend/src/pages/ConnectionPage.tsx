@@ -39,6 +39,7 @@ import {
 import { useAppStore } from '../store/appStore';
 import { cn } from '@/lib/utils';
 import { getDatasourceIcon } from '@/lib/datasourceIcons';
+import { apiErrorMessage } from '@/lib/apiError';
 import type { DataSourceInfo, PrivacySettings, Connection } from '../types';
 
 const DEFAULT_PRIVACY: PrivacySettings = {
@@ -191,8 +192,7 @@ function EditConnectionPanel({ conn, onClose }: { conn: Connection; onClose: () 
       });
       setTestResult(result);
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setError(detail ?? 'Test failed');
+      setError(apiErrorMessage(e, 'Test failed'));
     }
   };
 
@@ -209,8 +209,7 @@ function EditConnectionPanel({ conn, onClose }: { conn: Connection; onClose: () 
       }
       onClose();
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setError(detail ?? 'Failed to save');
+      setError(apiErrorMessage(e, 'Failed to save'));
     } finally {
       setIsSaving(false);
     }
@@ -465,8 +464,7 @@ export default function ConnectionPage() {
       });
       setTestResult(result);
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setError(detail ?? 'Test failed');
+      setError(apiErrorMessage(e, 'Test failed'));
     }
   };
 
@@ -484,8 +482,7 @@ export default function ConnectionPage() {
       setTestResult(testRes);
     } catch (e: unknown) {
       if (!isMounted.current) return;
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setError(detail ?? 'Connection test failed — check your credentials');
+      setError(apiErrorMessage(e, 'Connection test failed — check your credentials'));
       setIsSavingFlow(false);
       return;
     }
@@ -505,8 +502,7 @@ export default function ConnectionPage() {
       navigate('/chat');
     } catch (e: unknown) {
       if (!isMounted.current) return;
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setError(detail ?? 'Failed to save connection');
+      setError(apiErrorMessage(e, 'Failed to save connection'));
     } finally {
       if (isMounted.current) setIsSavingFlow(false);
     }

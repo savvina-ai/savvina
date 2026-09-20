@@ -277,19 +277,6 @@ async def lifespan(app: FastAPI):
         await _tok_db.commit()
     logger.info("Expired tokens cleaned up")
 
-    # Prune stale query cache entries that have exceeded their configured TTL.
-    from .cache.query_cache import QueryCache as _QueryCache
-
-    async with async_session_maker() as _cache_db:
-        _cache = _QueryCache(
-            settings.embedding_model,
-            settings.semantic_similarity_threshold,
-            settings.cache_max_age_days,
-        )
-        _pruned = await _cache.prune_expired(_cache_db)
-    if _pruned:
-        logger.info("Pruned %d expired query cache entries", _pruned)
-
     # Restore persisted settings overrides saved via PUT /api/settings.
     from sqlalchemy import select
 
@@ -304,11 +291,23 @@ async def lifespan(app: FastAPI):
     # values read straight from the DB (bcrypt_rounds) that have no Settings field.
     async with async_session_maker() as _db:
         _rows = (await _db.execute(select(AppSetting))).scalars().all()
+    _restored = 0
     for _row in _rows:
         if _row.key in SINGLETON_SETTING_PARSERS:
             setattr(settings, _row.key, SINGLETON_SETTING_PARSERS[_row.key](_row.value))
-    if _rows:
-        logger.info("Restored %d persisted settings override(s)", len(_rows))
+            _restored += 1
+    if _restored:
+        logger.info("Restored %d persisted settings override(s)", _restored)
+
+    # Prune stale query cache entries that have exceeded their configured TTL. Runs after
+    # the restore above so a persisted cache_max_age_days governs the first prune too.
+    from .cache.query_cache import QueryCache as _QueryCache
+
+    async with async_session_maker() as _cache_db:
+        _cache = _QueryCache(settings.embedding_model, settings.semantic_similarity_threshold)
+        _pruned = await _cache.prune_expired(_cache_db)
+    if _pruned:
+        logger.info("Pruned %d expired query cache entries", _pruned)
 
     # Recreate the database engine if pool size was overridden via settings.
     # The engine is created at import time with defaults; here we swap it out

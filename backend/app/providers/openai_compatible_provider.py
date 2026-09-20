@@ -1,7 +1,7 @@
 # Copyright (c) 2025 Savvina AI Ltd
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-"""OpenAI-compatible provider — GitHub Models, HuggingFace, Together, OpenRouter."""
+"""OpenAI-compatible provider — HuggingFace, Together, OpenRouter, custom endpoints."""
 
 from __future__ import annotations
 
@@ -32,8 +32,8 @@ def _normalize_model_id(model_id: str) -> str:
 class OpenAICompatibleProvider(OpenAIProvider):
     """Generic provider for any service exposing an OpenAI-compatible Chat Completions API.
 
-    For use with GitHub Models, HuggingFace Inference, Together.ai, OpenRouter,
-    or any custom base_url endpoint.  Named services (Gemini, Groq, Cerebras,
+    For use with HuggingFace Inference, Together.ai, OpenRouter, or any custom
+    base_url endpoint.  Named services (Gemini, Groq, Cerebras,
     Mistral) have their own dedicated provider classes.
     ``generate_response`` is inherited from OpenAIProvider unchanged.
     """
@@ -139,10 +139,6 @@ class OpenAICompatibleProvider(OpenAIProvider):
                     "required": True,
                     "options": [
                         {
-                            "label": "GitHub Models (Free)",
-                            "value": "https://models.inference.ai.azure.com",
-                        },
-                        {
                             "label": "HuggingFace (Free)",
                             "value": "https://router.huggingface.co/v1",
                         },
@@ -174,10 +170,6 @@ class OpenAICompatibleProvider(OpenAIProvider):
                 },
             ],
             "presets": {
-                "github": {
-                    "base_url": "https://models.inference.ai.azure.com",
-                    "model": "DeepSeek-R1",
-                },
                 "huggingface": {
                     "base_url": "https://router.huggingface.co/v1",
                     "model": "Qwen/Qwen2.5-Coder-32B-Instruct",

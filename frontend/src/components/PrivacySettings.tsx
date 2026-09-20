@@ -149,10 +149,10 @@ export default function PrivacySettingsForm({ settings, onChange }: Props) {
       />
       <TagList
         label="Sensitive column patterns (values masked)"
-        description="Matching columns stay in the schema, tagged [SENSITIVE]: the model may select,
-          filter, join, group and aggregate on them, but their values come back redacted. Sample
-          values from your database are not sent for these columns. Matched as a regular
-          expression, or as a substring if that fails. To hide a column outright, use Excluded
+        description="Columns whose name contains one of these words (case-insensitive) stay in the
+          schema tagged [SENSITIVE]. The model is told not to select them and to use other
+          identifiers instead; sample values are never sent for them, and if a query does return
+          one its values are redacted. To hide a column from the model entirely, use Excluded
           columns below."
         items={settings.sensitive_column_patterns}
         onChange={(v) => set('sensitive_column_patterns', v)}

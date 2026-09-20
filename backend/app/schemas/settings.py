@@ -37,11 +37,10 @@ class SettingsUpdate(BaseModel):
     workers see them in responses immediately (reads are DB-authoritative) and in
     their own hot path at next restart.
 
-    Two exceptions. ``db_pool_size`` and ``db_max_overflow`` only take effect after a
-    restart in any worker, because the engine is built once at startup.
-    ``bcrypt_rounds`` is read from the DB per password operation, so it applies
-    immediately everywhere and is never set on the singleton (``Settings`` has no
-    such field).
+    The only restart-bound keys are ``db_pool_size`` and ``db_max_overflow``: the
+    engine is built once at startup in every worker. ``bcrypt_rounds`` is read from
+    the DB per password operation, so it applies immediately everywhere and is never
+    set on the singleton (``Settings`` has no such field).
 
     To revert a setting to its default, delete the corresponding row from
     ``app_settings``.

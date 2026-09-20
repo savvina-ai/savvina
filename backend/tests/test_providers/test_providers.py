@@ -659,12 +659,15 @@ class TestOpenAICompatibleProvider:
         assert "api_key" in field_names
         assert "model" in field_names
 
-    def test_get_config_schema_presets_include_github_and_huggingface(self):
+    def test_get_config_schema_presets_match_offered_services(self):
+        """GitHub Models was dropped (deprecated endpoint); the preset and the Service
+        option must go together or the wizard offers what the settings page does not."""
         schema = OpenAICompatibleProvider.get_config_schema()
         presets = schema["presets"]
-        assert "github" in presets
-        assert "huggingface" in presets
-        assert "azure.com" in presets["github"]["base_url"]
+        assert "github" not in presets
+        assert {"huggingface", "together", "openrouter"} <= set(presets)
+        service_field = next(f for f in schema["fields"] if f["name"] == "base_url")
+        assert all("github" not in o["label"].lower() for o in service_field["options"])
 
     async def test_generate_response_inherits_openai_logic(self):
         mock_completion = _fake_openai_response(_STRUCTURED, model="llama-3.3-70b-versatile")
