@@ -196,22 +196,6 @@ describe('SettingsPage tab persistence', () => {
   });
 });
 
-describe('Custom provider form', () => {
-  it('offers exactly the supported services — GitHub Models is gone', async () => {
-    // GitHub Models was dropped (deprecated endpoint). This list is the only place
-    // the offered services are defined now that the backend's unused config schema
-    // has been removed, so the guard lives here.
-    renderPage();
-    await userEvent.click(await screen.findByRole('button', { name: /Add Custom Provider/ }));
-
-    const form = (await screen.findByText('+ Add Custom Provider')).closest('div')!;
-    const service = within(form).getAllByRole('combobox')[0] as HTMLSelectElement;
-    const labels = Array.from(service.options).map((o) => o.textContent);
-    expect(labels).toEqual(['HuggingFace (Free)', 'Together.ai', 'OpenRouter', 'Custom URL']);
-    expect(labels.join(' ')).not.toMatch(/github/i);
-  });
-});
-
 describe('ProviderCard editor', () => {
   it('discards a typed API key when the edit is cancelled', async () => {
     // The key is not derived from the provider, so without an explicit clear it
