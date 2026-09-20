@@ -2,6 +2,37 @@
 
 <!-- version list -->
 
+## v2.0.0 (2026-09-20)
+
+### Bug Fixes
+
+- **settings**: Read cache TTL live, share staged-settings and error handling across tabs, and
+  finish the GitHub Models removal ([#15](https://github.com/savvina-ai/savvina/pull/15),
+  [`86efe30`](https://github.com/savvina-ai/savvina/commit/86efe30d7732f183d575f49e074d095892e74704))
+
+- **settings**: Write settings through to the runtime singleton, stage cache/pruning toggles until
+  Save, and restructure the tabs ([#15](https://github.com/savvina-ai/savvina/pull/15),
+  [`86efe30`](https://github.com/savvina-ai/savvina/commit/86efe30d7732f183d575f49e074d095892e74704))
+
+### Chores
+
+- **deps**: Update frontend dev dependencies to clear all nine npm audit advisories
+  ([#15](https://github.com/savvina-ai/savvina/pull/15),
+  [`86efe30`](https://github.com/savvina-ai/savvina/commit/86efe30d7732f183d575f49e074d095892e74704))
+
+### Documentation
+
+- Correct the docs where they disagreed with the code, and delete the unused provider config schema
+  they described ([#15](https://github.com/savvina-ai/savvina/pull/15),
+  [`86efe30`](https://github.com/savvina-ai/savvina/commit/86efe30d7732f183d575f49e074d095892e74704))
+
+### Refactoring
+
+- **providers**: Remove env-var LLM API keys so provider credentials come only from encrypted
+  UI-saved configs ([#15](https://github.com/savvina-ai/savvina/pull/15),
+  [`86efe30`](https://github.com/savvina-ai/savvina/commit/86efe30d7732f183d575f49e074d095892e74704))
+
+
 ## v1.0.6 (2026-08-27)
 
 ### Bug Fixes

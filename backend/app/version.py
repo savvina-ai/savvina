@@ -7,4 +7,4 @@ Rewritten in place by python-semantic-release on every release — see
 `[tool.semantic_release]` in the root `pyproject.toml`. Do not edit by hand.
 """
 
-__version__ = "1.0.6"
+__version__ = "2.0.0"
