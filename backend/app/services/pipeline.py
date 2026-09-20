@@ -194,7 +194,7 @@ def _compress_prompt(
 async def _build_provider(
     provider_id_or_name: str, db: AsyncSession
 ) -> tuple[BaseLLMProvider, str, int]:
-    """Instantiate an LLM provider, preferring saved DB config over env defaults.
+    """Instantiate an LLM provider from its saved, encrypted DB config.
 
     Accepts either a config UUID (specific instance, as sent by the frontend
     ProviderSelector) or a provider-type name (e.g. "claude").

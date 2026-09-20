@@ -6,37 +6,41 @@ Savvina AI has two independent suites: a pytest suite for the backend and a Vite
 
 ## Running Tests
 
-### Inside Docker (Recommended)
+### Local Virtual Environment (what CI runs)
 
-Matches the production environment exactly:
-
-```bash
-# Run all tests
-docker compose run --rm backend pytest tests/ -v
-
-# Run a specific test file
-docker compose run --rm backend pytest tests/test_routers/test_chat.py -v
-
-# Run a specific test class
-docker compose run --rm backend pytest tests/test_routers/test_connections.py::TestCreateConnection -v
-
-# Run with test output even on passing tests
-docker compose run --rm backend pytest tests/ -v -s
-
-# Run and stop on first failure
-docker compose run --rm backend pytest tests/ -x
-```
-
-### Local Virtual Environment
-
-If you have Python 3.12 and the backend dependencies installed locally:
+CI installs `requirements-dev.txt` on Python 3.12 and runs pytest from `backend/`:
 
 ```bash
 cd backend
-pytest tests/ -v
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt   # requirements.txt + pytest, pytest-asyncio, ruff
+.venv/bin/python -m pytest tests/ -v
+
+# One file / one class
+.venv/bin/python -m pytest tests/test_routers/test_chat.py -v
+.venv/bin/python -m pytest tests/test_routers/test_connections.py::TestCreateConnection -v
+
+# Output from passing tests, or stop at the first failure
+.venv/bin/python -m pytest tests/ -v -s
+.venv/bin/python -m pytest tests/ -x
+
+# Lint exactly as CI does
+.venv/bin/ruff check .
 ```
 
-**Note:** The `ENCRYPTION_KEY` env var is set automatically by `tests/conftest.py` at collection time — you don't need to set it yourself.
+### Inside Docker
+
+The runtime image ships **no test dependencies and no `tests/` directory** — `docker compose run --rm backend pytest` cannot work. To run the suite against the image's interpreter, mount the backend directory and install the two test packages into its venv first:
+
+```bash
+docker compose run --rm --no-deps --entrypoint sh -v ./backend:/src -w /src backend -lc \
+  '/app/venv/bin/python -m pip install -q pytest==9.0.3 pytest-asyncio==1.3.0 &&
+   /app/venv/bin/python -m pytest tests/ -q'
+```
+
+`--no-deps` keeps it from starting the database; nothing in the suite needs one. The install lives only in that throwaway container, so it repeats on every run.
+
+**Note:** `ENCRYPTION_KEY`, `JWT_SECRET_KEY` and `DATABASE_URL` are all set by `tests/conftest.py` at collection time — you don't need to set them yourself, and no real database is contacted.
 
 ---
 
@@ -44,36 +48,59 @@ pytest tests/ -v
 
 ```
 backend/tests/
-├── conftest.py                    ← Global fixtures: ENCRYPTION_KEY, FakeRecord, MockConnection, MockPool
-├── test_config.py                 ← Settings loading, env var aliases
+├── conftest.py                    ← Global fixtures: test env keys, FakeRecord, MockConnection, MockPool
+├── test_config.py                 ← Settings loading, env var aliases, field validators
 ├── test_encryption.py             ← Fernet encrypt/decrypt round-trips
-├── test_models/
-│   └── test_models_and_schemas.py ← ORM model construction, Pydantic schema validation
+├── test_privacy.py                ← PrivacySettings: sensitive column detection, exclusions
 ├── test_registry.py               ← register_datasource, register_provider decorators
+├── test_utils_formatting.py       ← `format_bytes`, `format_row_count`
+├── test_auth/
+│   ├── test_password.py           ← Hashing, strength rules, bcrypt cost factor
+│   ├── test_quota.py              ← Placeholder — org quotas were replaced by license-based user counts
+│   └── test_tokens.py             ← Access/refresh token issue, rotation, revocation
+├── test_cache/
+│   └── test_query_cache.py        ← Exact + semantic lookup, TTL, hit counting, pruning
 ├── test_datasources/
 │   ├── test_postgresql.py         ← PostgreSQL adapter: connect, introspect, execute, validate
 │   ├── test_mysql.py              ← MySQL adapter: connect, introspect, execute, validate
 │   └── test_streaming.py          ← SSE streaming integration tests
+├── test_overhead/
+│   └── test_no_user_table_scans.py ← introspect / column stats / sample values must read only catalog + pg_stats, never user tables
+├── test_providers/
+│   ├── test_providers.py          ← Health checks, generate_response, parse_llm_response
+│   ├── test_claude_error_handling.py  ← Anthropic API error → user-facing message mapping
+│   └── test_openai_error_handling.py  ← Same for the OpenAI client
+├── test_semantic/
+│   ├── test_generator.py          ← SemanticModelGenerator with mocked LLM
+│   ├── test_formatter.py          ← SemanticFormatter prompt rendering
+│   └── test_models.py             ← Semantic Pydantic models and discriminated unions
+├── test_services/                 ← the pipeline, stage by stage (~20 files)
+│   ├── test_chat_service.py       ← Full pipeline scenarios end-to-end
+│   ├── test_pipeline_stages.py    ← Individual stage behaviour
+│   ├── test_prompt_builder.py     ← PromptBuilder output structure
+│   ├── test_schema_pruning.py     ← Table selection, relevance scoring
+│   ├── test_relevance_filter.py   ← Semantic-model narrowing
+│   ├── test_compress_prompt.py    ← Context-window budgeting
+│   ├── test_sql_correction.py     ← Retry on invalid SQL
+│   ├── test_execution_correction.py / test_zero_result_correction.py
+│   ├── test_stream_message.py / test_stream_execution.py / test_sse_utils.py
+│   ├── test_entity_resolver.py / test_intent_classifier.py
+│   ├── test_inject_order_by.py / test_validate_columns.py / test_schema_utils_parse_limits.py
+│   ├── test_export_service.py     ← CSV / XLSX / PDF export
+│   ├── test_llm_error_handling.py ← Provider errors surfaced through the service
+│   └── test_tpm_warning.py        ← Tokens-per-minute warning thresholds
 ├── test_validators/
 │   └── test_sql_validator.py      ← BaseSQLValidator and PostgreSQLValidator rules
-├── test_providers/
-│   └── test_providers.py          ← Provider health checks, generate_response, parse_llm_response
-├── test_semantic/
-│   └── test_semantic_generator.py ← SemanticModelGenerator with mocked LLM
-├── test_services/
-│   ├── test_prompt_builder.py     ← PromptBuilder output structure
-│   └── test_chat_service.py       ← Full pipeline: 7 scenarios end-to-end
-├── test_cache/
-│   └── test_query_cache.py        ← Cache lookup, hit counting, eviction
-├── test_privacy.py                ← PrivacySettings: sensitive column detection, exclusions
 └── test_routers/
-    ├── conftest.py                ← MockResult, _mock_db(), _make_conn(), http_client fixture
+    ├── conftest.py                ← MockResult, _mock_db(), _make_conn(), auth + http_client fixtures
+    ├── test_auth.py               ← All /api/v1/auth/* endpoints
     ├── test_datasources.py        ← GET /api/v1/datasources
     ├── test_connections.py        ← All /api/v1/connections/* endpoints
     ├── test_semantic.py           ← All /api/v1/connections/{id}/semantic/* endpoints
-    ├── test_providers.py          ← All /api/providers/* endpoints
+    ├── test_semantic_v2.py        ← Three-phase generation + suggestions endpoints
+    ├── test_providers.py          ← All /api/v1/providers/* endpoints
     ├── test_chat.py               ← All /api/v1/chat/* endpoints
-    └── test_settings.py           ← GET/PUT /api/settings
+    └── test_settings.py           ← GET/PUT /api/v1/settings
 ```
 
 ---
@@ -96,16 +123,18 @@ testpaths = tests
 
 ### `ENCRYPTION_KEY`
 
-The top-level `conftest.py` sets `os.environ["ENCRYPTION_KEY"]` before any app module is imported, then clears the `get_settings()` LRU cache to force a fresh `Settings()` build:
+The top-level `conftest.py` sets every env var `Settings` requires before any app module is imported — `database.py` calls `get_settings()` at import time to build the engine — then clears the `get_settings()` LRU cache to force a fresh `Settings()` build:
 
 ```python
 TEST_ENCRYPTION_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 os.environ["ENCRYPTION_KEY"] = TEST_ENCRYPTION_KEY
+os.environ["JWT_SECRET_KEY"] = "a" * 64
+os.environ["DATABASE_URL"] = "postgresql+asyncpg://savvina:changeme@db:5432/savvina_test"
 from app.config import get_settings
 get_settings.cache_clear()
 ```
 
-This ensures consistent behavior regardless of whether a real key is in the host environment.
+The values are forced regardless of what the host or container already has set, so local and Docker runs behave identically. No real database is contacted — router tests mock the session.
 
 ### asyncpg Mocks
 
@@ -142,6 +171,10 @@ This fixture:
 - Yields the client for use in tests
 
 **Always use the `http_client` fixture for router tests.** Do not create your own `AsyncClient`.
+
+### Authentication
+
+Every router except the public share routes depends on `get_current_active_user`. The autouse `apply_default_auth` fixture overrides it with a mock admin user (and stubs `get_token_payload`), so tests make authenticated requests without sending a token. To test as somebody else, override the dependency yourself with `_make_regular_user()` — the autouse `clear_overrides` fixture resets everything after the test.
 
 ### `MockResult`
 
@@ -351,15 +384,15 @@ The test suite covers:
 |---|---|---|
 | Config loading | `test_config.py` | Env var aliases, default values |
 | Encryption | `test_encryption.py` | Encrypt/decrypt round-trip, wrong key |
-| ORM models | `test_models/` | Model construction, Pydantic serialization |
 | Adapter registry | `test_registry.py` | Unknown source type raises ValueError |
+| Auth | `test_auth/`, `test_routers/test_auth.py` | Password rules, token rotation/revocation, quotas |
 | PostgreSQL adapter | `test_datasources/test_postgresql.py` | Connect, introspect, execute, privacy filtering |
 | MySQL adapter | `test_datasources/test_mysql.py` | Connect, introspect, execute, validate |
-| SQL validator | `test_validators/` | 20+ cases for blocked keywords, CTEs, LIMIT |
+| SQL validator | `test_validators/` | 40+ cases for blocked keywords, CTEs, LIMIT |
 | Providers | `test_providers/` | Health check, generate_response, response parsing |
 | Prompt builder | `test_services/test_prompt_builder.py` | Section ordering, intent hints, entity context, conditional sections (semantic, few-shot, time expressions) |
-| Chat service | `test_services/test_chat_service.py` | 7 end-to-end pipeline scenarios |
-| Query cache | `test_cache/` | Exact match, semantic match, hit count |
+| Chat service | `test_services/test_chat_service.py` | End-to-end pipeline scenarios: cache hits, corrections, streaming, privacy |
+| Query cache | `test_cache/` | Exact match, semantic match, hit count, live TTL |
 | Privacy | `test_privacy.py` | Sensitive column detection, exclusion lists |
 | All routers | `test_routers/` | Happy path + error cases for every endpoint |
 
@@ -406,7 +439,7 @@ Node 22.22 or newer is required (`engines` in `frontend/package.json`); react-ro
 | `src/**/__tests__/*.test.ts(x)` | The tests, colocated with the code they cover |
 | `src/test/setup.ts` | Global setup — MSW lifecycle and Testing Library config |
 | `src/test/server.ts` | MSW server plus the default handler set |
-| `src/test/factories.ts` | Typed builders: `makeConnection`, `makeChatMessage`, `makeChatResponse`, `makeChatSession`, `makeQueryResults`, `makeProviderStatus` |
+| `src/test/factories.ts` | Typed builders: `makeConnection`, `makeChatMessage`, `makeChatResponse`, `makeChatSession`, `makeQueryResults`, `makeProviderStatus`, `makeAppSettings` |
 
 `globals: true` is set, so `describe`/`it`/`expect` need no import. jsdom runs with the page URL set to `http://localhost:8000`, which is why MSW handlers are registered against absolute `http://localhost:8000/...` URLs.
 

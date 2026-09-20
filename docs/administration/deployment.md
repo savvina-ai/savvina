@@ -11,7 +11,7 @@ This guide covers deploying Savvina AI to a production server. The application i
 - Linux server (Ubuntu 22.04+ or RHEL 9+ recommended)
 - Docker Engine 24+ and Docker Compose plugin (`docker compose`, not `docker-compose`)
 - At least 4 GB RAM; 8 GB+ recommended under concurrent load
-- At least 30 GB disk — the backend image alone is ~11 GB (sentence-transformer model baked in); budget an additional 5–10 GB for the PostgreSQL data volume (`./volumes/app-db/`) depending on query history and cache volume, plus headroom for Docker build cache and OS
+- At least 30 GB disk — the backend image alone is ~11 GB (fastembed ONNX embedding model baked in); budget an additional 5–10 GB for the PostgreSQL data volume (`./volumes/app-db/`) depending on query history and cache volume, plus headroom for Docker build cache and OS
 - A domain name with DNS pointing to the server (for HTTPS)
 - At least one LLM API key, entered in the UI after first login (see [Provider Setup](../user-guide/06_llm-providers.md))
 
@@ -288,7 +288,7 @@ Then pull a model:
 docker compose exec ollama ollama pull llama3
 ```
 
-The Ollama container is accessible from the backend at `http://ollama:11434` (within the Docker network). Configure it in the UI via **Settings → Providers → Add Provider → Ollama**.
+The Ollama container is accessible from the backend at `http://ollama:11434` (within the Docker network). Configure it in the UI via **Settings → LLM Providers → + Add Ollama (Local) config**.
 
 ---
 

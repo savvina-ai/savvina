@@ -213,7 +213,8 @@ async def fetch_models_for_type(
     """Fetch available models from a provider API using the supplied credentials.
 
     Intended for use *before* saving a config so the user can pick a model
-    from a live list.  Falls back to the hardcoded model list on error.
+    from a live list.  Unreachable hosts and rejected keys surface as 502;
+    other failures fall back to an empty list.
     """
     try:
         cls = get_provider_class(body.provider_type)

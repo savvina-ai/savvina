@@ -49,7 +49,8 @@ from __future__ import annotations
 
 import logging
 
-from .base import ModelInfo
+from ..config import get_settings
+from .base import _HTTP_TIMEOUT_S, ModelInfo, _raise_if_fetch_error
 from .openai_provider import OpenAIProvider, _parse_openai_models_response
 from .registry import register_provider
 
@@ -65,6 +66,8 @@ class MyProvider(OpenAIProvider):
     provider_name = "myprovider"
     display_name = "My Provider"
     default_model = "my-model-70b"  # surfaced in the UI and used when no model is configured
+    max_output_tokens = 32768   # caps max_tokens on every generation call
+    context_window = 131_072    # used by the prompt-compression / context-exceeded retry
 
     _BASE_URL = "https://api.myprovider.com/v1"
     _DEFAULT_MODEL = "my-model-70b"
@@ -98,20 +101,28 @@ class MyProvider(OpenAIProvider):
         import httpx
 
         url = f"{(base_url or cls._BASE_URL).rstrip('/')}/models"
+        verify = get_settings().verify_ssl
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S, verify=verify) as client:
                 resp = await client.get(url, headers={"Authorization": f"Bearer {api_key}"})
                 resp.raise_for_status()
                 data: list[dict] = resp.json().get("data", [])
             return _parse_openai_models_response(data, _MY_EXCLUDE)
-        except Exception:
-            logger.warning("fetch_available_models failed for myprovider")
+        except Exception as exc:
+            _raise_if_fetch_error(exc, "myprovider")
             return []
 ```
+
+Two details in that `except` block are not optional:
+
+- **`_raise_if_fetch_error(exc, name)`** (`base.py`) re-raises connection failures as `ProviderConnectError` and HTTP 401/403 as `ProviderAuthError`. The providers router turns both into a `502` with a readable message, so the user sees "Invalid API key" instead of an empty dropdown. Anything else is logged and swallowed, and the `return []` below it is the fallback for those cases.
+- **`verify=get_settings().verify_ssl`** — `VERIFY_SSL` is documented as applying to *all* provider HTTP clients. A client built without it breaks TLS-intercepted deployments.
 
 `OpenAIProvider` provides `generate_response()` and `health_check()` via the `openai` Python client. `_parse_openai_models_response` handles standard OpenAI-format model lists: it filters out inactive models, models with `context_window < 4096`, and any model whose ID contains a keyword from the exclusion set.
 
 If the provider's models endpoint uses a non-standard response format (like Mistral's `capabilities` object or `max_context_length`), write a custom parser method instead of using `_parse_openai_models_response`. See `MistralProvider._parse_mistral_models()` for an example.
+
+**Providers have no `get_config_schema()`** — that is a datasource-only contract, where `DynamicConnectionForm` renders the connection form from the adapter's schema. The provider form is hand-written in `frontend/src/pages/SettingsPage.tsx`: named providers get an API-key field plus a model picker, and the custom-provider form reads its service list from the `CUSTOM_SERVICES` constant at the top of that file. A new provider needs a frontend change only if its form differs from that shape.
 
 ---
 
@@ -133,6 +144,11 @@ class BaseLLMProvider(ABC):
     provider_name: str = ""
     display_name: str = ""
     default_model: str = ""  # set this in every subclass — shown in the UI and used as the runtime fallback
+
+    max_output_tokens: int = 8192        # requested max_tokens is clamped to this
+    context_window: int | None = None    # total input+output limit; None = no known hard limit
+    chars_per_token: float = 4.0         # budget used by prompt compression
+    supports_prompt_caching: bool = False  # cache_control blocks; only Claude is True
 
     @abstractmethod
     async def generate_response(
@@ -164,6 +180,19 @@ class BaseLLMProvider(ABC):
     ) -> list[ModelInfo]:
         """Fetch live models from the provider API. Default: returns []. Override in each provider."""
         return []
+
+    async def generate_structured(
+        self,
+        system_prompt: str,
+        user_message: str,
+        schema_type: type[BaseModel],
+        model: str | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ) -> BaseModel:
+        """Not abstract — the base implementation asks for JSON and validates the reply.
+        Override only if the API has native structured output (Claude tool-use,
+        OpenAI json_object)."""
 ```
 
 ### `generate_response()`
@@ -243,7 +272,7 @@ class MyProvider(BaseLLMProvider):
 
 ### `health_check()`
 
-Called by `POST /api/providers/{config_id}/test`. Returns `(True, "")` on success or `(False, "error detail")` on failure. For API-based providers, send a minimal one-token request. The result is never stored — it's purely a connectivity check.
+Called by `POST /api/v1/providers/{config_id}/test`. Returns `(True, "")` on success or `(False, "error detail")` on failure. For API-based providers, send a minimal one-token request. The result is never stored — it's purely a connectivity check.
 
 ### Response parsing
 
@@ -257,18 +286,21 @@ Add the import to `backend/app/providers/__init__.py`:
 
 ```python
 # backend/app/providers/__init__.py
-from . import claude_provider       # noqa: F401
-from . import openai_provider       # noqa: F401
-from . import openai_compatible_provider  # noqa: F401
-from . import groq_provider         # noqa: F401
-from . import gemini_provider       # noqa: F401
-from . import cerebras_provider     # noqa: F401
-from . import mistral_provider      # noqa: F401
-from . import ollama_provider       # noqa: F401
-from . import myprovider_provider   # noqa: F401  ← add this
+# Import all providers to trigger @register_provider decorators
+from . import (  # noqa: F401
+    cerebras_provider,
+    claude_provider,
+    gemini_provider,
+    groq_provider,
+    mistral_provider,
+    myprovider_provider,   # ← add this (the list is alphabetical)
+    ollama_provider,
+    openai_compatible_provider,
+    openai_provider,
+)
 ```
 
-The provider appears immediately in `GET /api/providers` and the chat toolbar dropdown.
+The provider appears immediately in `GET /api/v1/providers` and the chat toolbar dropdown.
 
 ---
 
@@ -379,10 +411,12 @@ Run tests:
 - [ ] `health_check()` returns `(bool, str)` tuple
 - [ ] `get_available_models()` returns `[]` (no hardcoded list)
 - [ ] `fetch_available_models()` overridden — calls the provider's `/models` endpoint and returns `list[ModelInfo]`
+- [ ] `fetch_available_models()` calls `_raise_if_fetch_error(exc, name)` before falling back to `[]`, and passes `verify=get_settings().verify_ssl` to its HTTP client
+- [ ] `max_output_tokens` and `context_window` set to the provider's real limits
 - [ ] `__init__.py` updated with new import
 - [ ] Tests pass: `.venv/bin/pytest backend/tests/ -v`
-- [ ] `GET /api/providers` shows `provider_name` in available providers list and `current_model` matches `default_model`
-- [ ] `POST /api/providers/test` returns `{"success": true}` with a real API key
-- [ ] `POST /api/providers/models` returns a non-empty list with a real API key
+- [ ] `GET /api/v1/providers` shows `provider_name` in available providers list and `current_model` matches `default_model`
+- [ ] `POST /api/v1/providers/test` returns `{"success": true}` with a real API key
+- [ ] `POST /api/v1/providers/models` returns a non-empty list with a real API key
 - [ ] Provider appears in the chat toolbar provider dropdown
 - [ ] A full chat request using this provider returns a valid SQL query

@@ -111,7 +111,7 @@ The query cache stores LLM-generated SQL queries indexed by natural language que
 
 **Per-connection (recommended):**
 
-Via the UI: **Settings → Connections → [connection name] → Clear Cache**
+Via the UI: **Settings → AI & Optimization → Query Cache → Clear All**. This clears the cache for the *active* connection — switch connections first if you need to clear a different one. Individual entries can be deleted from the same panel.
 
 Via API:
 
@@ -143,7 +143,7 @@ curl http://localhost:8000/api/v1/chat/examples/<connection_id>
 curl -X DELETE http://localhost:8000/api/v1/chat/examples/<example_id>
 ```
 
-Or use the **Settings → Connections → [connection name] → Examples** section in the UI.
+Or use the **Settings → Examples Library** tab in the UI, which manages the examples of the active connection.
 
 ---
 

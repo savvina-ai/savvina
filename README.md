@@ -107,7 +107,7 @@ Navigate to **https://localhost:3000**
 
 On first boot, create your admin account by entering your name, email, and password. A two-step setup wizard then walks you through connecting a database and configuring an LLM provider.
 
-Then go to **Settings → Add Provider**, select Groq or Gemini, paste your key, and start chatting.
+Then go to **Settings → LLM Providers**, click **+ Add Groq config** (or Gemini), paste your key, click **Add**, and start chatting.
 
 ---
 
@@ -148,7 +148,7 @@ docker compose up --build
 
 > Prefer editing `COMPOSE_PROFILES` over passing `--profile` on the command line: the CLI flag **replaces** the value from `.env` rather than adding to it, so `docker compose --profile test-dbs up` would silently stop the `local-db` container from starting.
 
-The sample databases are available on ports **5435** (PostgreSQL) and **3307** (MySQL). Configure them in the UI under **Settings → Add Connection** using user `savvina` and whichever password applies — your `.env` override or the `savvina_demo` default.
+The sample databases are available on ports **5435** (PostgreSQL) and **3307** (MySQL). Add them from **Connections** in the left sidebar using user `savvina` and whichever password applies — your `.env` override or the `savvina_demo` default.
 
 See [docs/infrastructure/docker.md](docs/infrastructure/docker.md) for full details.
 
@@ -176,7 +176,7 @@ docker exec -it savvina-ollama-1 ollama pull llama3
 docker exec -it savvina-ollama-1 ollama pull qwen2.5-coder:7b
 ```
 
-In the Savvina AI UI, go to **Settings → Add Provider → Ollama (Local)** and select your pulled model.
+In the Savvina AI UI, go to **Settings → LLM Providers**, click **+ Add Ollama (Local) config**, and select your pulled model.
 
 ---
 

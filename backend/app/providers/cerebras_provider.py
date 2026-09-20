@@ -70,25 +70,3 @@ class CerebrasProvider(OpenAIProvider):
         except Exception as exc:
             _raise_if_fetch_error(exc, "cerebras")
             return []
-
-    @classmethod
-    def get_config_schema(cls) -> dict:
-        """Config schema for the frontend dynamic form."""
-        return {
-            "fields": [
-                {
-                    "name": "api_key",
-                    "type": "password",
-                    "label": "Cerebras API Key",
-                    "required": True,
-                    "placeholder": "csk-...",
-                },
-                {
-                    "name": "model",
-                    "type": "string",
-                    "label": "Model",
-                    "required": False,
-                    "placeholder": f"e.g. {cls._DEFAULT_MODEL}",
-                },
-            ],
-        }

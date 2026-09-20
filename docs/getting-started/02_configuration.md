@@ -98,18 +98,20 @@ A provider with no saved config shows a grey "not configured" dot on the Setting
 | `DEFAULT_QUERY_TIMEOUT` | int | `30` | Maximum seconds a generated SQL query may run before being cancelled. Applies at the database driver level. |
 | `DEFAULT_ROW_LIMIT` | int | `1000` | Maximum rows returned per query. If a generated query lacks a `LIMIT` clause, the validator automatically appends one. |
 
+Both are also editable from **Settings → Query Execution**. Once saved there, the value in `app_settings` wins and the environment variable is only the fallback used before a row exists — see [Runtime Settings](#runtime-settings-managed-in-the-ui).
+
 ---
 
 ## Cache Settings
 
-The query cache stores question → SQL pairs and uses sentence-transformer embeddings for semantic similarity matching.
+The query cache stores question → SQL pairs and uses fastembed ONNX embeddings for semantic similarity matching.
 
-**Cache enabled** and **semantic similarity threshold** are managed from the UI (Settings page) and persisted in the database — do not set them as environment variables.
+**Cache enabled** and **semantic similarity threshold** are managed from the UI (**Settings → AI & Optimization**) and persisted in the database — do not set them as environment variables.
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
 | `EMBEDDING_MODEL` | string | `BAAI/bge-small-en-v1.5` | fastembed ONNX model used to compute question embeddings. **Warning:** Changing this model invalidates all stored embeddings. Clear the cache (`DELETE FROM query_cache`) before deploying a model change. |
-| `CACHE_MAX_AGE_DAYS` | int | `30` | Cache entries not accessed within this window are excluded from semantic lookup. Set to `0` to disable TTL. |
+| `CACHE_MAX_AGE_DAYS` | int | `30` | Cache entries not accessed within this window are excluded from semantic lookup. Set to `0` to disable TTL. Startup default only — **Settings → AI & Optimization** writes `cache_max_age_days` to `app_settings`, and the cache reads that value live on every lookup. |
 
 ---
 
@@ -147,9 +149,13 @@ TRUSTED_PROXIES=["127.0.0.1","10.0.0.0/8","203.0.113.5/32"]
 
 ## Runtime Settings (managed in the UI)
 
-These are stored in the `app_settings` table and edited from the **Settings** page, not the environment. The values in `config.py` are only the initial defaults used before a row exists — setting them as environment variables on a running install has no effect, because the database value wins.
+These are stored in the `app_settings` table and edited from the **Settings** page. An environment variable (or the default in `config.py`) only supplies the value until a row exists for that key; once the setting has been saved from the UI, the database value wins and changing the environment variable has no effect.
 
-Changes are read from the database on each request, so every worker picks them up immediately without a restart. The two connection-pool settings are the exception: they are applied when the engine is created, so they take effect on the **next process restart**.
+`GET`/`PUT /api/v1/settings` answer from the database, so a saved value is reflected in the UI immediately in every worker. How quickly it changes *behaviour* depends on the setting:
+
+- **Immediately, everywhere:** `bcrypt_rounds` — read from `app_settings` on each password operation.
+- **Immediately in the worker that served the save, at next restart elsewhere:** every other setting except the two below. The request pipeline reads the process-wide `Settings` object, which `PUT /api/v1/settings` writes through for the serving worker only; other workers keep their boot-time value until they restart and the lifespan restore re-applies the saved rows. Single-worker deployments — the default Docker stack — therefore pick everything up at once.
+- **Next process restart:** `db_pool_size` and `db_max_overflow`, because the SQLAlchemy engine is built once at startup in every worker.
 
 | Setting | Default | Description |
 |---|---|---|

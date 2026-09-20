@@ -23,14 +23,14 @@ Savvina AI supports multiple LLM providers through a unified adapter interface. 
 
 ### Via the UI
 
-1. Go to **Settings → Providers**
+1. Go to **Settings → LLM Providers**
 2. Click the **+ Add \<Provider\> config** button for the provider type you want
 3. Fill in the form:
    - **API Key** — required for every provider except Ollama; stored encrypted and never displayed again after saving
    - **Display Name** — label shown in the provider dropdown (e.g., "Groq — Free Tier")
-   - **Base URL** — required only for `openai_compatible`; pre-filled for named providers
-   - **Temperature** — default `0.0` (deterministic, recommended for SQL generation)
-   - **Max Tokens** — default `4096`
+   - **Base URL** — only asked for by the custom-provider form and Ollama; the named providers use their own endpoint
+
+   **Temperature** and **Max Tokens** are stored on every config but are not part of the form: a config created from the UI gets `0.0` and `4096`. Both are settable over the API (`PUT /api/v1/providers/{config_id}/config`), though only `max_tokens` currently affects requests — see [How the Provider Is Selected](#how-the-provider-is-selected-for-a-chat-request).
 4. Once you've entered an API key, click **Fetch Models** to pull the live model list from the provider's API. A dropdown appears with all available models sorted alphabetically.
 5. Select a model from the dropdown (or type one manually if Fetch Models was skipped). The model is pre-filled with the provider's default if one is available.
 6. Click **Test** to verify connectivity
@@ -92,7 +92,7 @@ If fetching fails (invalid key, network issue), the dropdown falls back to any p
 
 ### HuggingFace
 
-- **Default model:** `Qwen/Qwen2.5-Coder-32B-Instruct`
+- **Default model:** `meta-llama/Llama-3.2-3B-Instruct` (what the custom-provider form pre-fills)
 - Base URL: `https://router.huggingface.co/v1`
 - Uses HuggingFace API token
 
@@ -145,16 +145,23 @@ The chat toolbar has a provider dropdown listing all saved provider configs. Sel
 
 ## Health Checks
 
-Click **Test** next to any saved provider config to run a live health check. The backend instantiates the provider and sends a minimal one-token completion request (`max_tokens=1`). Results:
+Click **Test** next to any saved provider config to run a live health check. The backend instantiates the provider and makes the cheapest call that proves the credentials work. What that call is depends on the provider:
+
+| Provider | Health check |
+|---|---|
+| Claude, Groq, Gemini, Cerebras, Mistral | One-token completion (`max_tokens=1`) |
+| OpenAI | `GET /v1/models` via the OpenAI client |
+| Custom OpenAI-compatible | Short completion (`max_tokens=10`); fails fast with "No model configured" if the config has no model |
+| Ollama | `GET /api/tags` |
+
+Results:
 
 | Result | Meaning |
 |---|---|
 | ✅ Healthy | API key is valid and the service is reachable |
 | ❌ Unhealthy | Either the key is invalid, the model doesn't exist, or the service is down |
 
-The health check never stores any data or affects your usage quota meaningfully (one token).
-
-For Ollama, the health check pings `GET /api/tags` instead of making a completion request.
+The health check never stores any data or affects your usage quota meaningfully.
 
 ---
 
@@ -170,8 +177,10 @@ When you send a message, the frontend sends the provider config UUID (not the ty
 
 1. Looks up the `ProviderConfig` by UUID in the database
 2. Decrypts the stored API key (a config without one is rejected — there is no env-var fallback)
-3. Constructs the provider instance with the stored model, base URL, and temperature
-4. Calls `generate_response()` with the stored model as the default; if the model field is empty, the provider's hardcoded `default_model` is used automatically
+3. Constructs the provider instance with the stored model and base URL
+4. Calls `generate_response()` with the stored model as the default and `max_tokens` capped at the provider's own output limit; if the model field is empty, the provider's hardcoded `default_model` is used automatically
+
+The config's **temperature** column is not read on this path: every LLM call Savvina makes — SQL generation, correction, intent classification, semantic-model generation — runs at `temperature=0.0`, which is what NL-to-SQL wants. Setting it over the API has no effect today.
 
 If the UUID lookup fails (e.g., provider name sent instead of UUID), the backend falls back to looking up the most recently updated config matching that provider type.
 

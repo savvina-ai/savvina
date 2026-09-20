@@ -146,7 +146,7 @@ The application entry point:
 3. Imports all SQLAlchemy models so `Base.metadata` is populated
 4. Runs `alembic upgrade head` via `entrypoint.sh` before uvicorn starts (schema migrations)
 5. Bootstraps default admin user and cleans up expired tokens on startup
-6. Pre-warms the sentence-transformer embedding model on startup
+6. Pre-warms the fastembed ONNX embedding model on startup
 7. Registers all routers under `/api/v1`
 
 ### Routers
@@ -246,8 +246,8 @@ See [Semantic Model Generation](semantic-model-generation.md) for the full call 
 
 `cache/query_cache.py` — process-level singleton (`@lru_cache(maxsize=1)`):
 - **Level 1:** Exact match on normalized (lowercase, stripped) question text
-- **Level 2:** Cosine similarity of sentence-transformer embeddings vs. all cached entries for the same connection
-- TTL filtering: entries not accessed within `CACHE_MAX_AGE_DAYS` are excluded from lookup
+- **Level 2:** Cosine similarity of fastembed ONNX embeddings vs. all cached entries for the same connection
+- TTL filtering: entries not accessed within `cache_max_age_days` are excluded from lookup. The value is read live from settings on every lookup, so a change saved in the UI applies without a restart
 - `hit_count` uses a server-side increment to avoid read-modify-write races
 
 `cache/example_library.py` — stores thumbs-up verified question → query pairs as few-shot examples for future prompts. `find_similar_examples()` applies three filters before returning: dialect match (no cross-dialect mixing), cosine similarity ≥ 0.4 (low-scoring examples hurt accuracy), then top-3 by score.
@@ -294,7 +294,7 @@ The app database stores user accounts, encrypted credentials, session history, c
 
 ### Why a Process-Level Cache Singleton?
 
-Loading a sentence-transformer model takes 1–3 seconds. Using `@lru_cache(maxsize=1)` on `_get_shared_cache()` ensures the model is loaded once at startup and reused across all requests. The pre-warm call in `lifespan()` ensures the first real user request doesn't pay the cold-start penalty.
+Loading the embedding model takes 1–3 seconds. Using `@lru_cache(maxsize=1)` on `_get_shared_cache()` ensures the model is loaded once at startup and reused across all requests. The pre-warm call in `lifespan()` ensures the first real user request doesn't pay the cold-start penalty.
 
 ### Why Fernet and Not bcrypt/Argon2?
 

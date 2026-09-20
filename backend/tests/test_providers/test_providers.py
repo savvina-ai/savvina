@@ -650,25 +650,6 @@ class TestOpenAICompatibleProvider:
         models = OpenAICompatibleProvider.get_available_models()
         assert models == []
 
-    def test_get_config_schema_has_fields_and_presets(self):
-        schema = OpenAICompatibleProvider.get_config_schema()
-        assert "fields" in schema
-        assert "presets" in schema
-        field_names = [f["name"] for f in schema["fields"]]
-        assert "base_url" in field_names
-        assert "api_key" in field_names
-        assert "model" in field_names
-
-    def test_get_config_schema_presets_match_offered_services(self):
-        """GitHub Models was dropped (deprecated endpoint); the preset and the Service
-        option must go together or the wizard offers what the settings page does not."""
-        schema = OpenAICompatibleProvider.get_config_schema()
-        presets = schema["presets"]
-        assert "github" not in presets
-        assert {"huggingface", "together", "openrouter"} <= set(presets)
-        service_field = next(f for f in schema["fields"] if f["name"] == "base_url")
-        assert all("github" not in o["label"].lower() for o in service_field["options"])
-
     async def test_generate_response_inherits_openai_logic(self):
         mock_completion = _fake_openai_response(_STRUCTURED, model="llama-3.3-70b-versatile")
         self.provider._client.chat.completions.create = AsyncMock(return_value=mock_completion)
@@ -745,25 +726,6 @@ class TestGroqProvider:
         # Models are fetched dynamically; the static list is intentionally empty
         assert GroqProvider.get_available_models() == []
 
-    def test_get_config_schema_has_api_key_and_model(self):
-        schema = GroqProvider.get_config_schema()
-        assert "fields" in schema
-        field_names = [f["name"] for f in schema["fields"]]
-        assert "api_key" in field_names
-        assert "model" in field_names
-
-    def test_get_config_schema_no_base_url_field(self):
-        # Named provider — no service selector dropdown
-        schema = GroqProvider.get_config_schema()
-        field_names = [f["name"] for f in schema["fields"]]
-        assert "base_url" not in field_names
-
-    def test_get_config_schema_model_field_is_string_type(self):
-        schema = GroqProvider.get_config_schema()
-        model_field = next(f for f in schema["fields"] if f["name"] == "model")
-        assert model_field["type"] == "string"
-        assert "placeholder" in model_field
-
     async def test_health_check_success(self):
         mock_response = MagicMock()
         self.provider._client.chat.completions.create = AsyncMock(return_value=mock_response)
@@ -815,24 +777,6 @@ class TestGeminiProvider:
         # Models are fetched dynamically; the static list is intentionally empty
         assert GeminiProvider.get_available_models() == []
 
-    def test_get_config_schema_has_api_key_and_model(self):
-        schema = GeminiProvider.get_config_schema()
-        assert "fields" in schema
-        field_names = [f["name"] for f in schema["fields"]]
-        assert "api_key" in field_names
-        assert "model" in field_names
-
-    def test_get_config_schema_no_base_url_field(self):
-        schema = GeminiProvider.get_config_schema()
-        field_names = [f["name"] for f in schema["fields"]]
-        assert "base_url" not in field_names
-
-    def test_get_config_schema_model_field_is_string_type(self):
-        schema = GeminiProvider.get_config_schema()
-        model_field = next(f for f in schema["fields"] if f["name"] == "model")
-        assert model_field["type"] == "string"
-        assert "placeholder" in model_field
-
     async def test_health_check_success(self):
         mock_response = MagicMock()
         self.provider._client.chat.completions.create = AsyncMock(return_value=mock_response)
@@ -873,24 +817,6 @@ class TestCerebrasProvider:
     def test_get_available_models_returns_empty(self):
         # Models are fetched dynamically; the static list is intentionally empty
         assert CerebrasProvider.get_available_models() == []
-
-    def test_get_config_schema_has_api_key_and_model(self):
-        schema = CerebrasProvider.get_config_schema()
-        assert "fields" in schema
-        field_names = [f["name"] for f in schema["fields"]]
-        assert "api_key" in field_names
-        assert "model" in field_names
-
-    def test_get_config_schema_no_base_url_field(self):
-        schema = CerebrasProvider.get_config_schema()
-        field_names = [f["name"] for f in schema["fields"]]
-        assert "base_url" not in field_names
-
-    def test_get_config_schema_model_field_is_string_type(self):
-        schema = CerebrasProvider.get_config_schema()
-        model_field = next(f for f in schema["fields"] if f["name"] == "model")
-        assert model_field["type"] == "string"
-        assert "placeholder" in model_field
 
     async def test_health_check_success(self):
         mock_response = MagicMock()
@@ -936,24 +862,6 @@ class TestMistralProvider:
     def test_get_available_models_returns_empty(self):
         # Models are fetched dynamically; the static list is intentionally empty
         assert MistralProvider.get_available_models() == []
-
-    def test_get_config_schema_has_api_key_and_model(self):
-        schema = MistralProvider.get_config_schema()
-        assert "fields" in schema
-        field_names = [f["name"] for f in schema["fields"]]
-        assert "api_key" in field_names
-        assert "model" in field_names
-
-    def test_get_config_schema_no_base_url_field(self):
-        schema = MistralProvider.get_config_schema()
-        field_names = [f["name"] for f in schema["fields"]]
-        assert "base_url" not in field_names
-
-    def test_get_config_schema_model_field_is_string_type(self):
-        schema = MistralProvider.get_config_schema()
-        model_field = next(f for f in schema["fields"] if f["name"] == "model")
-        assert model_field["type"] == "string"
-        assert "placeholder" in model_field
 
     async def test_health_check_success(self):
         mock_response = MagicMock()

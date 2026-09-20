@@ -240,11 +240,10 @@ Click **Skip** on any step to go straight to the dashboard.
 If you skipped the setup wizard, or want to add more providers:
 
 1. Click **Settings** in the left sidebar
-2. Click **Providers → Add Provider**
-3. Select your provider type (e.g., **Groq**)
-4. Enter your API key and select a model (e.g., `llama-3.3-70b-versatile`)
-5. Click **Test** to verify connectivity
-6. Click **Save**
+2. Stay on the **LLM Providers** tab and click **+ Add \<Provider\> config** for the provider you want (e.g., **+ Add Groq config**). For a service without its own entry — OpenRouter, Together.ai, a self-hosted endpoint — use **+ Add Custom Provider** instead.
+3. Enter your API key, then click **Fetch Models** and pick a model (e.g., `llama-3.3-70b-versatile`)
+4. Click **Test** to verify connectivity
+5. Click **Add** to save the config
 
 See [LLM Providers](../user-guide/06_llm-providers.md) for a full list of supported providers and recommended models.
 
@@ -255,9 +254,8 @@ See [LLM Providers](../user-guide/06_llm-providers.md) for a full list of suppor
 If you skipped the setup wizard, or want to add more connections:
 
 1. Click **Connections** in the left sidebar
-2. Click **New Connection**
-3. Select your data source type (e.g., **PostgreSQL**)
-4. Fill in the connection form
+2. On the **Connect a Data Source** screen, select your data source type (e.g., **PostgreSQL**)
+3. Fill in the connection form
 
 To connect to the **bundled sample PostgreSQL database** that comes with the Docker stack:
 

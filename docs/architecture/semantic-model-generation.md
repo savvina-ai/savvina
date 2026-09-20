@@ -239,7 +239,7 @@ TIME EXPRESSIONS (use these for date-based questions):
   "this_month" = DATE_TRUNC('month', CURRENT_DATE)
 ```
 
-`include_time_exprs` is set to `False` for non-temporal questions (`_has_temporal_reference()` check in `PromptBuilder`) to avoid emitting all 15 time-expression snippets on every turn.
+`include_time_exprs` is set to `False` for non-temporal questions (`has_temporal_reference()` check in `PromptBuilder`) to avoid emitting all 15 time-expression snippets on every turn.
 
 `SemanticFormatter._append_column_summary()` groups columns by semantic type into `Aggregate with`, `Group by`, `Date columns`, and `Identifiers` blocks — giving the LLM a pre-computed column-role summary rather than requiring it to infer roles from raw types.
 

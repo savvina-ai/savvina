@@ -331,11 +331,11 @@ Two-pass filtering of the stored `Connection.semantic_model`:
 
 **File:** `cache/query_cache.py` → `QueryCache.lookup(connection_id, question, db)`  
 **Dataclass:** `cache/query_cache.py` → `CacheHit`  
-**Pattern detector:** `_has_temporal_reference(question)` (used to bypass semantic similarity)
+**Pattern detector:** `has_temporal_reference(question)` (used to bypass semantic similarity)
 
 The `QueryCache` singleton (loaded once at startup via `routers/chat.py: _get_shared_cache()`) performs:
 
-1. `_has_temporal_reference(question)` — temporal questions (e.g. "last 7 days") skip semantic similarity; exact match TTL is capped at 1 day
+1. `has_temporal_reference(question)` — temporal questions (e.g. "last 7 days") skip semantic similarity; exact match TTL is capped at 1 day
 2. Exact match: `connection_id` + `question.lower().strip()` within `cache_max_age_days` TTL
 3. Semantic match (non-temporal only): compute 384-dim embedding, load all cached embeddings for this connection from `query_cache`, compute cosine similarity, return best hit if ≥ `semantic_similarity_threshold` (default 0.87)
 4. On hit: server-side `hit_count` increment + `last_hit_at` update (race-safe)
