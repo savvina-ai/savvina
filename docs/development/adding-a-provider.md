@@ -122,7 +122,7 @@ Two details in that `except` block are not optional:
 
 If the provider's models endpoint uses a non-standard response format (like Mistral's `capabilities` object or `max_context_length`), write a custom parser method instead of using `_parse_openai_models_response`. See `MistralProvider._parse_mistral_models()` for an example.
 
-**Providers have no `get_config_schema()`** — that is a datasource-only contract, where `DynamicConnectionForm` renders the connection form from the adapter's schema. The provider form is hand-written in `frontend/src/pages/SettingsPage.tsx`: named providers get an API-key field plus a model picker, and the custom-provider form reads its service list from the `CUSTOM_SERVICES` constant at the top of that file. A new provider needs a frontend change only if its form differs from that shape.
+**Providers have no `get_config_schema()`** — that is a datasource-only contract, where `DynamicConnectionForm` renders the connection form from the adapter's schema. The provider form is hand-written in `frontend/src/pages/SettingsPage.tsx`: named providers get an API-key field plus a model picker, and the custom-provider form reads its service list from `CUSTOM_SERVICES` in `frontend/src/lib/customServices.ts`, which is pinned by `src/lib/__tests__/customServices.test.ts`. A new provider needs a frontend change only if its form differs from that shape.
 
 ---
 

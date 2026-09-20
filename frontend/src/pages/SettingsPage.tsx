@@ -24,6 +24,7 @@ import { cn } from '@/lib/utils';
 import type { ProviderStatus, VerifiedExample } from '../types';
 import { Button } from '../components/ui/button';
 import { apiErrorMessage } from '../lib/apiError';
+import { CUSTOM_SERVICES } from '../lib/customServices';
 
 type Tab = 'providers' | 'execution' | 'optimization' | 'system' | 'examples';
 
@@ -37,14 +38,6 @@ const TABS: { id: Tab; label: string }[] = [
 
 const isTab = (value: string | null): value is Tab =>
   TABS.some((t) => t.id === value);
-
-// Only for truly custom/unknown compatible services (Gemini, Groq, Cerebras, Mistral now have dedicated types)
-const CUSTOM_SERVICES: { label: string; base_url: string; default_model: string }[] = [
-  { label: 'HuggingFace (Free)', base_url: 'https://router.huggingface.co/v1', default_model: 'meta-llama/Llama-3.2-3B-Instruct' },
-  { label: 'Together.ai', base_url: 'https://api.together.xyz/v1', default_model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo' },
-  { label: 'OpenRouter', base_url: 'https://openrouter.ai/api/v1', default_model: 'openrouter/free' },
-  { label: 'Custom URL', base_url: '', default_model: '' },
-];
 
 function ProviderCard({ provider }: { provider: ProviderStatus }) {
   const [apiKey, setApiKey] = useState('');
