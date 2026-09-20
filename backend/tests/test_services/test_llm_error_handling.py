@@ -57,8 +57,6 @@ def _make_settings(**overrides) -> MagicMock:
     s = MagicMock()
     s.encryption_key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
     s.cache_enabled = True
-    s.anthropic_api_key = "test-anthropic-key"
-    s.openai_api_key = "test-openai-key"
     s.ollama_base_url = "http://localhost:11434"
     s.default_query_timeout = 30
     s.default_row_limit = 1000
@@ -128,19 +126,39 @@ _PIPELINE_MODULE = "app.services.pipeline"
 _FACTORY_MODULE = "app.providers._factory"
 
 
-def _make_null_db() -> MagicMock:
+def _make_provider_config() -> MagicMock:
+    """Return a mock ProviderConfig row carrying a stored (encrypted) API key.
+
+    API keys come only from saved configs — there is no env-var fallback — so
+    every test that reaches the LLM path needs one of these for the factory's
+    provider lookup to succeed.
+    """
+    cfg = MagicMock()
+    cfg.id = "cfg-1"
+    cfg.provider_type = "claude"
+    cfg.api_key_encrypted = b"encrypted-key"
+    cfg.base_url = None
+    cfg.model = ""
+    cfg.max_tokens = 4096
+    return cfg
+
+
+def _make_null_db(provider_config: MagicMock | None = None) -> MagicMock:
     """Return a mock AsyncSession where all execute() calls return empty results.
 
     Used to patch ``_create_session`` in ``pipeline`` so that ``_generate_query``'s
-    internal DB reads (cache lookup, examples, history, provider config) fall through
-    to ``None`` / empty without hitting a real database.
+    internal DB reads (cache lookup, examples, history) fall through to ``None`` /
+    empty without hitting a real database.
     Also suitable for Session B in ``process_message`` (write-path): all execute
     calls return a null result and the commit/flush/add stubs are async-safe.
+
+    *provider_config* is what ``scalars().first()`` returns — the factory's
+    provider-type lookup is the only pipeline read that uses ``first()``.
     """
     null_result = MagicMock()
     null_result.scalar_one_or_none = MagicMock(return_value=None)
     scalars_mock = MagicMock()
-    scalars_mock.first = MagicMock(return_value=None)
+    scalars_mock.first = MagicMock(return_value=provider_config)
     null_result.scalars = MagicMock(return_value=scalars_mock)
     db = MagicMock()
     db.execute = AsyncMock(return_value=null_result)
@@ -192,6 +210,22 @@ def _patch_create_provider(provider):
     return patch(f"{_FACTORY_MODULE}.create_provider", return_value=provider)
 
 
+@contextmanager
+def _patch_pipeline_session():
+    """Patch the pipeline's ``_create_session`` with a mock session that serves a
+    saved provider config carrying a stored key, and stub the factory's
+    ``decrypt_value`` so that key resolves without a real Fernet secret."""
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                f"{_PIPELINE_MODULE}._create_session",
+                _mock_session_factory(_make_null_db(provider_config=_make_provider_config())),
+            )
+        )
+        stack.enter_context(patch(f"{_FACTORY_MODULE}.decrypt_value", return_value="sk-stored"))
+        yield
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 
@@ -223,7 +257,7 @@ class TestLLMErrorHandling:
             _patch_decrypt({"host": "localhost"}),
             _patch_create_datasource(adapter),
             _patch_create_provider(failing_provider),
-            patch(f"{_PIPELINE_MODULE}._create_session", _mock_session_factory(_make_null_db())),
+            _patch_pipeline_session(),
             patch(f"{_MODULE}._create_session", _mock_two_sessions(db, _make_null_db())),
         ):
             resp = await service.process_message(
@@ -262,7 +296,7 @@ class TestLLMErrorHandling:
             _patch_decrypt({"host": "localhost"}),
             _patch_create_datasource(adapter),
             _patch_create_provider(failing_provider),
-            patch(f"{_PIPELINE_MODULE}._create_session", _mock_session_factory(_make_null_db())),
+            _patch_pipeline_session(),
             patch(f"{_MODULE}._create_session", _mock_two_sessions(db, _make_null_db())),
         ):
             resp = await service.process_message(
@@ -301,7 +335,7 @@ class TestLLMErrorHandling:
             _patch_decrypt({"host": "localhost"}),
             _patch_create_datasource(adapter),
             _patch_create_provider(failing_provider),
-            patch(f"{_PIPELINE_MODULE}._create_session", _mock_session_factory(_make_null_db())),
+            _patch_pipeline_session(),
             patch(f"{_MODULE}._create_session", _mock_two_sessions(db, _make_null_db())),
         ):
             await service.process_message(
@@ -336,7 +370,7 @@ class TestLLMErrorHandling:
             _patch_decrypt({"host": "localhost"}),
             _patch_create_datasource(adapter),
             _patch_create_provider(failing_provider),
-            patch(f"{_PIPELINE_MODULE}._create_session", _mock_session_factory(_make_null_db())),
+            _patch_pipeline_session(),
             patch(f"{_MODULE}._create_session", _mock_two_sessions(db, _make_null_db())),
         ):
             await service.process_message(
@@ -394,7 +428,7 @@ class TestLLMErrorHandling:
                 f"{_FACTORY_MODULE}.create_provider",
                 side_effect=ValueError("Unknown provider"),
             ),
-            patch(f"{_PIPELINE_MODULE}._create_session", _mock_session_factory(_make_null_db())),
+            _patch_pipeline_session(),
             patch(f"{_MODULE}._create_session", _mock_two_sessions(db, _make_null_db())),
         ):
             resp = await service.process_message(

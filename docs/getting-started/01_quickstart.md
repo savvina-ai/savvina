@@ -85,7 +85,7 @@ python -c "import secrets; print(secrets.token_urlsafe(24))"
 
 ## Step 4 — Get a Free LLM API Key
 
-You need at least one LLM provider configured before you can query data. You can also add providers later through the UI — no restart required.
+You need at least one LLM provider configured before you can query data. API keys are entered in the UI — in the setup wizard after your first login, or at any time under **Settings → LLM Providers** — and stored encrypted in the app database. They are **not** read from `.env`, so nothing here goes in a config file; just have the key ready.
 
 ### Option A — Groq (Recommended)
 
@@ -93,31 +93,21 @@ Groq offers the most generous free tier with the fastest inference.
 
 1. Sign up at **https://console.groq.com** (no credit card required)
 2. Go to **API Keys → Create API Key**
-3. Add to `.env`:
-   ```
-   GROQ_API_KEY=gsk_...
-   ```
+3. Copy the key (begins with `gsk_`)
 
 ### Option B — Google Gemini
 
 1. Sign up at **https://aistudio.google.com** (requires a Google account)
 2. Click **Get API Key → Create API key**
-3. Add to `.env`:
-   ```
-   GEMINI_API_KEY=AIza...
-   ```
+3. Copy the key (begins with `AIza`)
 
 ### Option C — Anthropic Claude (Paid)
 
-```
-ANTHROPIC_API_KEY=sk-ant-...
-```
+Create a key at **https://console.anthropic.com** (begins with `sk-ant-`).
 
 ### Option D — OpenAI (Paid)
 
-```
-OPENAI_API_KEY=sk-...
-```
+Create a key at **https://platform.openai.com/api-keys** (begins with `sk-`).
 
 > You can add more providers later through the **Settings** page in the UI without restarting.
 

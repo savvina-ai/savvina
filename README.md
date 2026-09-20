@@ -72,12 +72,14 @@ That's the whole database setup: `.env.example` already ships `COMPOSE_PROFILES=
 **Option A — Groq (recommended, 14,400 requests/day free):**
 1. Sign up at https://console.groq.com
 2. Create an API key
-3. Add to `.env`: `GROQ_API_KEY=gsk_...`
+3. Keep it handy — you enter it in the setup wizard after first login (or later under **Settings → LLM Providers**)
 
 **Option B — Google Gemini (1,500 requests/day free):**
 1. Sign up at https://aistudio.google.com
 2. Create an API key
-3. Add to `.env`: `GEMINI_API_KEY=AIza...`
+3. Keep it handy — you enter it in the setup wizard after first login (or later under **Settings → LLM Providers**)
+
+API keys are entered only through the UI and stored encrypted; they are not read from `.env`.
 
 ### 3. Generate TLS certificates
 

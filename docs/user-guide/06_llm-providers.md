@@ -26,27 +26,21 @@ Savvina AI supports multiple LLM providers through a unified adapter interface. 
 1. Go to **Settings → Providers**
 2. Click the **+ Add \<Provider\> config** button for the provider type you want
 3. Fill in the form:
-   - **API Key** — if the key is already set via an environment variable, the label shows **✓ env key configured — leave blank to use it** and the field is optional
+   - **API Key** — required for every provider except Ollama; stored encrypted and never displayed again after saving
    - **Display Name** — label shown in the provider dropdown (e.g., "Groq — Free Tier")
    - **Base URL** — required only for `openai_compatible`; pre-filled for named providers
    - **Temperature** — default `0.0` (deterministic, recommended for SQL generation)
    - **Max Tokens** — default `4096`
-4. Once you've entered an API key (or an env key is present), click **Fetch Models** to pull the live model list from the provider's API. A dropdown appears with all available models sorted alphabetically.
+4. Once you've entered an API key, click **Fetch Models** to pull the live model list from the provider's API. A dropdown appears with all available models sorted alphabetically.
 5. Select a model from the dropdown (or type one manually if Fetch Models was skipped). The model is pre-filled with the provider's default if one is available.
 6. Click **Test** to verify connectivity
 7. Click **Add** to save the config
 
 For **Custom Providers** (OpenRouter, HuggingFace, Together.ai, custom URL), click **+ Add Custom Provider**. Enter the base URL and API key first, then click **Fetch Models** to populate the model dropdown. Click **Cancel** to dismiss the form without saving.
 
-### Via Environment Variables
+### No environment-variable keys
 
-Set the provider's API key in `.env` (see [Configuration](../getting-started/02_configuration.md) for variable names). When a key is present but no saved UI config exists for that provider:
-
-- The settings page shows a **green "Configured via environment variable · default model: X"** banner for that provider type.
-- The backend uses the env key and the provider's hardcoded default model for all queries — no UI action is required for the provider to work.
-- You can still click **+ Add config** to create a saved config (e.g., to select a different model or set a display name). The API key field is optional when an env key is detected; leave it blank and the env key is used.
-
-For key priority rules (env var vs. saved config) and model resolution details, see [Configuration — LLM Provider Keys](../getting-started/02_configuration.md#llm-provider-keys).
+Provider API keys are read **only** from saved configs. Setting `GROQ_API_KEY`, `ANTHROPIC_API_KEY` or similar in `.env` has no effect — a provider without a saved config shows a grey "not configured" dot and cannot be selected for chat. The only provider-related environment variables are `OLLAMA_BASE_URL` and `VERIFY_SSL`; see [Configuration — LLM Providers](../getting-started/02_configuration.md#llm-providers).
 
 ---
 
@@ -175,7 +169,7 @@ In corporate environments with TLS-intercepting proxies, set `VERIFY_SSL=false` 
 When you send a message, the frontend sends the provider config UUID (not the type name). The backend:
 
 1. Looks up the `ProviderConfig` by UUID in the database
-2. Decrypts the stored API key (or falls back to the env var if no key is stored)
+2. Decrypts the stored API key (a config without one is rejected — there is no env-var fallback)
 3. Constructs the provider instance with the stored model, base URL, and temperature
 4. Calls `generate_response()` with the stored model as the default; if the model field is empty, the provider's hardcoded `default_model` is used automatically
 

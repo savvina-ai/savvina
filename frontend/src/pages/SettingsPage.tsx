@@ -272,19 +272,15 @@ function AddProviderInlineForm({
   providerType,
   displayNameHint,
   availableModels,
-  envConfigured = false,
-  defaultModel,
   onClose,
 }: {
   providerType: string;
   displayNameHint: string;
   availableModels: string[];
-  envConfigured?: boolean;
-  defaultModel?: string;
   onClose: () => void;
 }) {
   const [apiKey, setApiKey] = useState('');
-  const [model, setModel] = useState(defaultModel ?? availableModels[0] ?? '');
+  const [model, setModel] = useState(availableModels[0] ?? '');
   const [baseUrl, setBaseUrl] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [dynamicModels, setDynamicModels] = useState<string[]>([]);
@@ -317,7 +313,7 @@ function AddProviderInlineForm({
     }
   };
 
-  const canFetchModels = isOllama ? true : apiKey.length > 5 || envConfigured;
+  const canFetchModels = isOllama ? true : apiKey.length > 5;
 
   const handleTest = async () => {
     setIsTesting(true);
@@ -408,18 +404,12 @@ function AddProviderInlineForm({
         )}
         {!isOllama && (
           <div className="col-span-2">
-            <label className="text-xs text-muted-foreground">
-              API Key
-              {envConfigured && (
-                <span className="ml-2 text-success">✓ env key configured — leave blank to use it</span>
-              )}
-            </label>
+            <label className="text-xs text-muted-foreground">API Key</label>
             <div className="mt-1 flex gap-2">
               <input
                 type="password"
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
-                placeholder={envConfigured ? 'Leave blank to use env key' : ''}
                 autoComplete="new-password"
                 className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
               />
@@ -487,13 +477,13 @@ function AddProviderInlineForm({
         <Button
           variant="default"
           onClick={handleTest}
-          disabled={isTesting || (!isOllama && !apiKey && !envConfigured)}
+          disabled={isTesting || (!isOllama && !apiKey)}
         >
           {isTesting ? 'Testing…' : 'Test'}
         </Button>
         <button
           onClick={handleAdd}
-          disabled={create.isPending || (!isOllama && !apiKey && !envConfigured)}
+          disabled={create.isPending || (!isOllama && !apiKey)}
           className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
         >
           {create.isPending ? 'Adding…' : 'Add'}
@@ -524,7 +514,6 @@ function ProviderSection({
 }) {
   const [adding, setAdding] = useState(false);
   const savedConfigs = configs.filter((p) => p.id !== null);
-  const envConfig = configs.find((p) => p.id === null && p.is_configured);
 
   return (
     <div className="space-y-2">
@@ -534,22 +523,11 @@ function ProviderSection({
       {savedConfigs.map((p) => (
         <ProviderCard key={p.id} provider={p} />
       ))}
-      {envConfig && (
-        <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          <span className="h-2 w-2 rounded-full bg-success shrink-0" />
-          <span>
-            Configured via environment variable · default model:{' '}
-            <span className="font-mono text-foreground">{envConfig.current_model || '—'}</span>
-          </span>
-        </div>
-      )}
       {adding ? (
         <AddProviderInlineForm
           providerType={providerType}
           displayNameHint={displayName}
           availableModels={availableModels}
-          envConfigured={!!envConfig}
-          defaultModel={envConfig?.current_model}
           onClose={() => setAdding(false)}
         />
       ) : (

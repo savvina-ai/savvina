@@ -32,24 +32,25 @@ from ..utils.encryption import decrypt_value, encrypt_value
 router = APIRouter(prefix="/providers", tags=["providers"])
 
 
-def _is_configured(provider_name: str, config: ProviderConfig | None, settings) -> bool:
-    """Return True when the provider has usable credentials."""
+def _is_configured(provider_name: str, config: ProviderConfig | None) -> bool:
+    """Return True when the provider has usable credentials.
+
+    API keys come exclusively from the saved config's encrypted key — there is
+    no environment-variable fallback.
+    """
     if provider_name == "ollama":
         # Ollama requires no API key, but only treat it as configured when a
         # DB record exists OR OLLAMA_BASE_URL was explicitly set in the env
         # (not just the compile-time default).  This prevents the provider
-        # from appearing as "env-configured" on installations that have never
+        # from appearing as configured on installations that have never
         # touched Ollama.
         return config is not None or bool(os.environ.get("OLLAMA_BASE_URL"))
-    if config and config.api_key_encrypted:
-        return True
-    return bool(settings.env_api_key(provider_name))
+    return bool(config and config.api_key_encrypted)
 
 
 def _build_status(
     provider_name: str,
     config: ProviderConfig | None,
-    settings,
     *,
     is_healthy: bool = False,
 ) -> ProviderStatusResponse:
@@ -80,7 +81,7 @@ def _build_status(
         provider_type=provider_name,
         display_name=display_name,
         provider_display_name=provider_display_name,
-        is_configured=_is_configured(provider_name, config, settings),
+        is_configured=_is_configured(provider_name, config),
         is_healthy=is_healthy,
         is_active=config.is_active if config else False,
         current_model=current_model,
@@ -165,15 +166,14 @@ async def list_providers(
     db: AsyncSession = Depends(get_db),
 ) -> PaginatedResponse[ProviderStatusResponse]:
     """List all saved provider configs plus any registered providers without a config."""
-    settings = get_settings()
     result = await db.execute(select(ProviderConfig).order_by(ProviderConfig.updated_at.desc()))
     all_configs = result.scalars().all()
-    responses = [_build_status(cfg.provider_type, cfg, settings) for cfg in all_configs]
+    responses = [_build_status(cfg.provider_type, cfg) for cfg in all_configs]
 
     configured_types = {cfg.provider_type for cfg in all_configs}
     for p in list_available_providers():
         if p["name"] not in configured_types:
-            responses.append(_build_status(p["name"], None, settings))
+            responses.append(_build_status(p["name"], None))
 
     total = len(responses)
     page = responses[offset : offset + limit]
@@ -192,9 +192,8 @@ async def test_new_provider(
         if body.provider_type == "ollama":
             kwargs["base_url"] = body.base_url or settings.ollama_base_url
         else:
-            api_key = body.api_key or settings.env_api_key(body.provider_type)
             kwargs = _build_provider_kwargs(
-                body.provider_type, api_key, body.model, body.base_url, settings
+                body.provider_type, body.api_key, body.model, body.base_url, settings
             )
         provider = create_provider(body.provider_type, **kwargs)
     except ValueError as e:
@@ -220,10 +219,8 @@ async def fetch_models_for_type(
         cls = get_provider_class(body.provider_type)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    settings = get_settings()
-    api_key = body.api_key or settings.env_api_key(body.provider_type)
     try:
-        models: list[ModelInfo] = await cls.fetch_available_models(api_key, body.base_url)
+        models: list[ModelInfo] = await cls.fetch_available_models(body.api_key, body.base_url)
     except ProviderConnectError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except ProviderAuthError as exc:
@@ -262,7 +259,7 @@ async def create_provider_config(
     _apply_update(config, body, settings)
     await db.commit()
     await db.refresh(config)
-    return _build_status(provider_type, config, settings)
+    return _build_status(provider_type, config)
 
 
 @router.get("/{config_id}", response_model=ProviderStatusResponse)
@@ -272,9 +269,8 @@ async def get_provider(
     db: AsyncSession = Depends(get_db),
 ) -> ProviderStatusResponse:
     """Return the status of a specific saved provider config."""
-    settings = get_settings()
     config = await _get_config_or_404(config_id, db)
-    return _build_status(config.provider_type, config, settings)
+    return _build_status(config.provider_type, config)
 
 
 @router.put("/{config_id}/config", response_model=ProviderStatusResponse)
@@ -294,7 +290,7 @@ async def update_provider_config(
     _apply_update(config, body, settings)
     await db.commit()
     await db.refresh(config)
-    return _build_status(config.provider_type, config, settings)
+    return _build_status(config.provider_type, config)
 
 
 @router.delete("/{config_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -329,11 +325,12 @@ async def refresh_saved_provider_models(
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     api_key: str | None = None
-    if provider_name != "ollama":
-        if config.api_key_encrypted:
-            api_key = decrypt_value(config.api_key_encrypted, settings.encryption_key)
-        else:
-            api_key = settings.env_api_key(provider_name)
+    if provider_name != "ollama" and config.api_key_encrypted:
+        api_key = decrypt_value(config.api_key_encrypted, settings.encryption_key)
+    if provider_name != "ollama" and not api_key:
+        raise HTTPException(
+            status_code=400, detail=f"No API key configured for provider '{provider_name}'"
+        )
 
     base_url = config.base_url or (settings.ollama_base_url if provider_name == "ollama" else None)
     try:
@@ -376,12 +373,11 @@ async def test_provider(
     if provider_name == "ollama":
         kwargs["base_url"] = config.base_url or settings.ollama_base_url
     else:
-        api_key: str | None = None
-        if config.api_key_encrypted:
-            api_key = decrypt_value(config.api_key_encrypted, settings.encryption_key)
-        else:
-            api_key = settings.env_api_key(provider_name)
-
+        api_key: str | None = (
+            decrypt_value(config.api_key_encrypted, settings.encryption_key)
+            if config.api_key_encrypted
+            else None
+        )
         try:
             kwargs = _build_provider_kwargs(
                 provider_name, api_key, config.model or None, config.base_url, settings

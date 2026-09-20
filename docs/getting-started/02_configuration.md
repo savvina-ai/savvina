@@ -52,29 +52,18 @@ DATABASE_URL=postgresql+asyncpg://USER:PASSWORD@your-db-host.example.com:5432/sa
 
 ---
 
-## LLM Provider Keys
+## LLM Providers
 
-At least one LLM provider must be configured before any chat queries can be made. Provider API keys set here act as environment-level defaults; they can be overridden or supplemented per-provider in the UI (**Settings → Providers**).
+At least one LLM provider must be configured before any chat queries can be made. Provider API keys are entered **only through the UI** (the setup wizard on first login, or **Settings → LLM Providers**) and stored in the app database encrypted with `ENCRYPTION_KEY`. No environment variable is read for provider keys — `ANTHROPIC_API_KEY`, `GROQ_API_KEY` and the like are ignored if set.
 
-| Variable | Provider | Notes |
+The only provider-related environment variables are:
+
+| Variable | Purpose | Notes |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Anthropic Claude | Begins with `sk-ant-` |
-| `OPENAI_API_KEY` | OpenAI GPT | Begins with `sk-` |
-| `GROQ_API_KEY` | Groq | Begins with `gsk_` — free tier available |
-| `GEMINI_API_KEY` | Google Gemini | Begins with `AIza` — free tier available |
-| `CEREBRAS_API_KEY` | Cerebras | Free tier available |
-| `MISTRAL_API_KEY` | Mistral | Free tier available |
-| `OLLAMA_BASE_URL` | Ollama (local) | Default: `http://ollama:11434`. No key required. |
+| `OLLAMA_BASE_URL` | Ollama (local) base URL | Default: `http://ollama:11434`. Ollama needs no API key. |
+| `VERIFY_SSL` | TLS verification for all provider calls | Default `true`; see [SSL / TLS Settings](#ssl--tls-settings). |
 
-### Priority: UI Config vs. Environment Variable
-
-When a chat request specifies a provider, the backend looks for credentials in this order:
-1. Saved DB config for that provider (created via **Settings → Providers**)
-2. Corresponding environment variable from the list above
-
-This means you can provision keys via environment variables for automation, while individual users can override them through the UI.
-
-**What the UI shows for env-only providers:** If a key is set via env var but no saved config exists, the Settings page displays a green *"Configured via environment variable · default model: X"* banner for that provider. The provider is fully functional — it uses the env key and the provider's hardcoded default model. To select a different model, click **+ Add config** and leave the API key field blank (the env key is used automatically).
+A provider with no saved config shows a grey "not configured" dot on the Settings page and cannot be selected for chat until a config with a key is added.
 
 **Model resolution:** `GET /api/v1/providers` always returns `current_model` as the model that will actually be used — the saved model if one is set, or the provider's default model otherwise. An empty `current_model` should never appear in a correctly configured provider.
 
@@ -223,11 +212,8 @@ DATABASE_URL=postgresql+asyncpg://savvina:<strong-password>@db:5432/savvina_app
 # Option B — external/managed PostgreSQL (comment out the three lines above):
 # DATABASE_URL=postgresql+asyncpg://USER:PASSWORD@your-host:5432/savvina_app
 
-# ── LLM Providers (set at least one) ─────────────────────────────────────
-GROQ_API_KEY=gsk_...
-# GEMINI_API_KEY=AIza...
-# ANTHROPIC_API_KEY=sk-ant-...
-# OPENAI_API_KEY=sk-...
+# ── LLM Providers ─────────────────────────────────────────────────────────
+# API keys are entered in the UI (Settings → LLM Providers); none go here.
 
 # ── App ──────────────────────────────────────────────────────────────────
 LOG_LEVEL=INFO

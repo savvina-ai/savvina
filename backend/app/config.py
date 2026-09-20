@@ -53,13 +53,7 @@ class Settings(BaseSettings):
     # Encryption
     encryption_key: str  # Fernet key, REQUIRED
 
-    # LLM Providers (optional — user configures via UI)
-    anthropic_api_key: str | None = None
-    openai_api_key: str | None = None
-    groq_api_key: str | None = None
-    gemini_api_key: str | None = None
-    cerebras_api_key: str | None = None
-    mistral_api_key: str | None = None
+    # LLM Providers — configured via admin UI only; no env-var API keys accepted
     ollama_base_url: str = "http://ollama:11434"
     # Set false in corporate TLS-intercepted environments if custom CA trust
     # cannot be installed into the container.  Applies to all LLM providers.
@@ -191,23 +185,6 @@ class Settings(BaseSettings):
                     'Generate one with: python -c "import secrets; print(secrets.token_hex(32))"'
                 )
         return self
-
-    def env_api_key(self, provider_name: str) -> str | None:
-        """Return the env-var API key for a named provider, or None.
-
-        Single source of truth — used by routers and services to avoid
-        repeating the provider-name → settings-attribute mapping.
-        """
-        _map: dict[str, str | None] = {
-            "claude": self.anthropic_api_key,
-            "openai": self.openai_api_key,
-            "openai_compatible": self.openai_api_key,
-            "groq": self.groq_api_key,
-            "gemini": self.gemini_api_key,
-            "cerebras": self.cerebras_api_key,
-            "mistral": self.mistral_api_key,
-        }
-        return _map.get(provider_name)
 
 
 # Re-exported for routers that reference these constants directly.

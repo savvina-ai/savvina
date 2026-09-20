@@ -74,6 +74,22 @@ class TestListProviders:
         if "ollama" in providers:
             assert providers["ollama"]["is_configured"] is False
 
+    async def test_env_api_key_does_not_configure_provider(self, http_client, monkeypatch):
+        """API keys come only from saved configs — an env var must not mark a provider ready."""
+        from app.config import get_settings
+
+        monkeypatch.setenv("GROQ_API_KEY", "gsk_from_env")
+        get_settings.cache_clear()
+        try:
+            db = _mock_db(MockResult(rows=[]))
+            app.dependency_overrides[get_db] = lambda: db
+            resp = await http_client.get("/api/v1/providers")
+        finally:
+            get_settings.cache_clear()
+        providers = {p["provider_type"]: p for p in resp.json()["items"]}
+        assert providers["groq"]["id"] is None
+        assert providers["groq"]["is_configured"] is False
+
     async def test_is_healthy_always_false_on_list(self, http_client):
         db = _mock_db(MockResult(rows=[]))
         app.dependency_overrides[get_db] = lambda: db
@@ -251,11 +267,7 @@ class TestTestProvider:
         config = _make_prov_config(id="cfg-1", provider_type="openai", api_key_encrypted=None)
         db = _mock_db(MockResult(single=config))
         app.dependency_overrides[get_db] = lambda: db
-        with patch("app.routers.providers.get_settings") as mock_settings:
-            s = MagicMock()
-            s.env_api_key = MagicMock(return_value=None)
-            mock_settings.return_value = s
-            resp = await http_client.post("/api/v1/providers/cfg-1/test")
+        resp = await http_client.post("/api/v1/providers/cfg-1/test")
         assert resp.status_code == 400
 
     async def test_returns_provider_name_in_response(self, http_client):
@@ -290,6 +302,38 @@ class TestTestProvider:
         ):
             resp = await http_client.post("/api/v1/providers/cfg-1/test")
         assert resp.status_code == 200
+
+
+class TestRefreshSavedProviderModels:
+    """Tests for POST /api/v1/providers/{config_id}/models (fetch with saved credentials)."""
+
+    async def test_no_stored_api_key_returns_400(self, http_client):
+        config = _make_prov_config(id="cfg-1", provider_type="claude", api_key_encrypted=None)
+        db = _mock_db(MockResult(single=config))
+        app.dependency_overrides[get_db] = lambda: db
+        mock_cls = MagicMock()
+        mock_cls.fetch_available_models = AsyncMock(return_value=[])
+        with patch("app.routers.providers.get_provider_class", return_value=mock_cls):
+            resp = await http_client.post("/api/v1/providers/cfg-1/models")
+        assert resp.status_code == 400
+        assert "No API key configured" in resp.json()["detail"]
+        mock_cls.fetch_available_models.assert_not_called()
+
+    async def test_stored_api_key_is_used(self, http_client):
+        config = _make_prov_config(
+            id="cfg-1", provider_type="claude", api_key_encrypted=b"enc", base_url=None
+        )
+        db = _mock_db(MockResult(single=config))
+        app.dependency_overrides[get_db] = lambda: db
+        mock_cls = MagicMock()
+        mock_cls.fetch_available_models = AsyncMock(return_value=[])
+        with (
+            patch("app.routers.providers.get_provider_class", return_value=mock_cls),
+            patch("app.routers.providers.decrypt_value", return_value="sk-stored"),
+        ):
+            resp = await http_client.post("/api/v1/providers/cfg-1/models")
+        assert resp.status_code == 200
+        mock_cls.fetch_available_models.assert_awaited_once_with("sk-stored", None)
 
 
 class TestTestNewProvider:
@@ -350,7 +394,6 @@ class TestTestNewProvider:
     async def test_missing_api_key_returns_400(self, http_client):
         with patch("app.routers.providers.get_settings") as ms:
             ms.return_value.verify_ssl = True
-            ms.return_value.env_api_key.return_value = None
             resp = await http_client.post(
                 "/api/v1/providers/test",
                 json={"provider_type": "claude"},

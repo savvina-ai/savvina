@@ -112,6 +112,38 @@ describe('AI & Optimization tab', () => {
   });
 });
 
+describe('LLM Providers tab', () => {
+  it('always requires an API key in the add form; there is no environment-variable fallback', async () => {
+    // Keys live only in saved configs. A provider row without a saved config must
+    // not unlock the form or promise an env key, whatever the backend reports.
+    server.use(
+      http.get(`${API}/api/v1/providers`, () =>
+        HttpResponse.json({
+          items: [
+            makeProviderStatus({
+              id: null,
+              provider_type: 'groq',
+              display_name: 'Groq',
+              provider_display_name: 'Groq',
+              is_configured: true,
+              is_active: false,
+            }),
+          ],
+          total: 1,
+          limit: 50,
+          offset: 0,
+        }),
+      ),
+    );
+    renderPage();
+    await userEvent.click(await screen.findByRole('button', { name: '+ Add Groq config' }));
+
+    expect(screen.queryByText(/environment variable/)).toBeNull();
+    expect(screen.queryByText(/env key/)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Add' })).toBeDisabled();
+  });
+});
+
 describe('Query Execution tab', () => {
   it('shows a 422 validation error instead of silently keeping the unsaved value', async () => {
     server.use(

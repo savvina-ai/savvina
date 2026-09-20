@@ -47,12 +47,6 @@ class TestGetSettings:
         default = Settings.model_fields["debug"].default
         assert default is False
 
-    def test_llm_keys_optional_by_default(self):
-        s = get_settings()
-        # These are None if not set in the environment
-        assert s.anthropic_api_key is None or isinstance(s.anthropic_api_key, str)
-        assert s.openai_api_key is None or isinstance(s.openai_api_key, str)
-
     def test_log_format_default_is_json(self):
         assert Settings.model_fields["log_format"].default == "json"
 

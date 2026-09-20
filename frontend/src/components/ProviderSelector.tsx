@@ -17,7 +17,7 @@ export default function ProviderSelector({ value, onChange }: Props) {
   const ref = useRef<HTMLDivElement>(null);
 
   const configured = useMemo(
-    () => providers?.filter((p) => p.is_configured && (p.is_active || p.id == null)) ?? [],
+    () => providers?.filter((p) => p.is_configured && p.is_active) ?? [],
     [providers],
   );
   const providerKey = (p: { id: string | null; provider_type: string }) =>

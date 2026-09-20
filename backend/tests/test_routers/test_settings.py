@@ -92,8 +92,6 @@ class TestGetSettings:
         resp = await http_client.get("/api/v1/settings")
         body = resp.json()
         assert "encryption_key" not in body
-        assert "anthropic_api_key" not in body
-        assert "openai_api_key" not in body
 
     async def test_numeric_fields_are_positive(self, http_client):
         resp = await http_client.get("/api/v1/settings")

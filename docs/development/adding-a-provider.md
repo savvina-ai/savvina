@@ -272,40 +272,7 @@ The provider appears immediately in `GET /api/providers` and the chat toolbar dr
 
 ---
 
-## Step 4: Add the Environment Variable (Optional)
-
-If you want users to be able to configure the API key via `.env` without going through the UI, add it to `backend/app/config.py`:
-
-```python
-# In class Settings(BaseSettings):
-myprovider_api_key: str | None = Field(default=None, alias="MYPROVIDER_API_KEY")
-```
-
-Then register it in `env_api_key()`:
-
-```python
-def env_api_key(self, provider_name: str) -> str | None:
-    mapping = {
-        "claude": self.anthropic_api_key,
-        "openai": self.openai_api_key,
-        "groq": self.groq_api_key,
-        "gemini": self.gemini_api_key,
-        "cerebras": self.cerebras_api_key,
-        "mistral": self.mistral_api_key,
-        "myprovider": self.myprovider_api_key,  # ← add this
-    }
-    return mapping.get(provider_name)
-```
-
-Add to `.env.example`:
-
-```
-MYPROVIDER_API_KEY=your-key-here
-```
-
----
-
-## Step 5: Write Tests
+## Step 4: Write Tests
 
 Create `backend/tests/test_providers/test_myprovider.py`:
 
@@ -413,7 +380,6 @@ Run tests:
 - [ ] `get_available_models()` returns `[]` (no hardcoded list)
 - [ ] `fetch_available_models()` overridden — calls the provider's `/models` endpoint and returns `list[ModelInfo]`
 - [ ] `__init__.py` updated with new import
-- [ ] (Optional) `config.py` updated with env var support
 - [ ] Tests pass: `.venv/bin/pytest backend/tests/ -v`
 - [ ] `GET /api/providers` shows `provider_name` in available providers list and `current_model` matches `default_model`
 - [ ] `POST /api/providers/test` returns `{"success": true}` with a real API key
