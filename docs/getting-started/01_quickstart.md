@@ -85,7 +85,7 @@ python -c "import secrets; print(secrets.token_urlsafe(24))"
 
 ## Step 4 — Get a Free LLM API Key
 
-You need at least one LLM provider configured before you can query data. You can also add providers later through the UI — no restart required.
+You need at least one LLM provider configured before you can query data. API keys are entered in the UI — in the setup wizard after your first login, or at any time under **Settings → LLM Providers** — and stored encrypted in the app database. They are **not** read from `.env`, so nothing here goes in a config file; just have the key ready.
 
 ### Option A — Groq (Recommended)
 
@@ -93,31 +93,21 @@ Groq offers the most generous free tier with the fastest inference.
 
 1. Sign up at **https://console.groq.com** (no credit card required)
 2. Go to **API Keys → Create API Key**
-3. Add to `.env`:
-   ```
-   GROQ_API_KEY=gsk_...
-   ```
+3. Copy the key (begins with `gsk_`)
 
 ### Option B — Google Gemini
 
 1. Sign up at **https://aistudio.google.com** (requires a Google account)
 2. Click **Get API Key → Create API key**
-3. Add to `.env`:
-   ```
-   GEMINI_API_KEY=AIza...
-   ```
+3. Copy the key (begins with `AIza`)
 
 ### Option C — Anthropic Claude (Paid)
 
-```
-ANTHROPIC_API_KEY=sk-ant-...
-```
+Create a key at **https://console.anthropic.com** (begins with `sk-ant-`).
 
 ### Option D — OpenAI (Paid)
 
-```
-OPENAI_API_KEY=sk-...
-```
+Create a key at **https://platform.openai.com/api-keys** (begins with `sk-`).
 
 > You can add more providers later through the **Settings** page in the UI without restarting.
 
@@ -250,11 +240,10 @@ Click **Skip** on any step to go straight to the dashboard.
 If you skipped the setup wizard, or want to add more providers:
 
 1. Click **Settings** in the left sidebar
-2. Click **Providers → Add Provider**
-3. Select your provider type (e.g., **Groq**)
-4. Enter your API key and select a model (e.g., `llama-3.3-70b-versatile`)
-5. Click **Test** to verify connectivity
-6. Click **Save**
+2. Stay on the **LLM Providers** tab and click **+ Add \<Provider\> config** for the provider you want (e.g., **+ Add Groq config**). For a service without its own entry — OpenRouter, Together.ai, a self-hosted endpoint — use **+ Add Custom Provider** instead.
+3. Enter your API key, then click **Fetch Models** and pick a model (e.g., `llama-3.3-70b-versatile`)
+4. Click **Test** to verify connectivity
+5. Click **Add** to save the config
 
 See [LLM Providers](../user-guide/06_llm-providers.md) for a full list of supported providers and recommended models.
 
@@ -265,9 +254,8 @@ See [LLM Providers](../user-guide/06_llm-providers.md) for a full list of suppor
 If you skipped the setup wizard, or want to add more connections:
 
 1. Click **Connections** in the left sidebar
-2. Click **New Connection**
-3. Select your data source type (e.g., **PostgreSQL**)
-4. Fill in the connection form
+2. On the **Connect a Data Source** screen, select your data source type (e.g., **PostgreSQL**)
+3. Fill in the connection form
 
 To connect to the **bundled sample PostgreSQL database** that comes with the Docker stack:
 

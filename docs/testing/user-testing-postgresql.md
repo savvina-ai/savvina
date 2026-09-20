@@ -311,7 +311,7 @@ both providers produce valid, comparable SQL.
 
 - Step 8 returning a cache badge — thumbs-down in step 4 may not have invalidated correctly.
 - One provider referencing non-existent columns or wrong table aliases.
-- Provider health-check failures — check `/api/providers/test`.
+- Provider health-check failures — check `/api/v1/providers/test`.
 
 ---
 

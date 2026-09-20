@@ -1,7 +1,7 @@
 // Copyright (c) 2025 Savvina AI Ltd
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-import type { Connection, ChatMessage, ChatResponse, ChatSession, QueryResults, ProviderStatus } from '../types';
+import type { AppSettings, Connection, ChatMessage, ChatResponse, ChatSession, QueryResults, ProviderStatus } from '../types';
 
 export function makeConnection(overrides?: Partial<Connection>): Connection {
   return {
@@ -99,6 +99,27 @@ export function makeProviderStatus(overrides?: Partial<ProviderStatus>): Provide
     available_models: ['claude-sonnet-4-5-20250929', 'claude-haiku-4-5-20251001'],
     base_url: null,
     updated_at: '2026-01-01T00:00:00Z',
+    ...overrides,
+  };
+}
+
+export function makeAppSettings(overrides?: Partial<AppSettings>): AppSettings {
+  return {
+    app_name: 'Savvina AI',
+    debug: false,
+    log_level: 'INFO',
+    ollama_base_url: 'http://localhost:11434',
+    default_query_timeout: 30,
+    default_row_limit: 1000,
+    cache_enabled: true,
+    cache_max_age_days: 30,
+    semantic_similarity_threshold: 0.87,
+    embedding_model: 'all-MiniLM-L6-v2',
+    db_pool_size: 10,
+    db_max_overflow: 20,
+    schema_pruning_enabled: true,
+    schema_pruning_top_k: 15,
+    bcrypt_rounds: 12,
     ...overrides,
   };
 }

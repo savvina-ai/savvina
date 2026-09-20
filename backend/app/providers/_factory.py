@@ -78,8 +78,6 @@ async def resolve_provider_config(
     if config and config.api_key_encrypted:
         api_key = decrypt_value(config.api_key_encrypted, settings.encryption_key)
         base_url = config.base_url
-    else:
-        api_key = settings.env_api_key(provider_name)
 
     if not api_key:
         raise ValueError(f"No API key configured for provider '{provider_name}'")

@@ -94,25 +94,3 @@ class MistralProvider(OpenAIProvider):
             seen.add(model_id)
             results.append(ModelInfo(id=model_id, context_window=ctx))
         return results
-
-    @classmethod
-    def get_config_schema(cls) -> dict:
-        """Config schema for the frontend dynamic form."""
-        return {
-            "fields": [
-                {
-                    "name": "api_key",
-                    "type": "password",
-                    "label": "Mistral API Key",
-                    "required": True,
-                    "placeholder": "...",
-                },
-                {
-                    "name": "model",
-                    "type": "string",
-                    "label": "Model",
-                    "required": False,
-                    "placeholder": f"e.g. {cls._DEFAULT_MODEL}",
-                },
-            ],
-        }

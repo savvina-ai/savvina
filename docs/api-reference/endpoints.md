@@ -878,15 +878,17 @@ Generate a PDF combining several query results into one document. Rate limited t
 
 ### `GET /api/v1/providers`
 
-List all saved provider configs. Each entry shows status, model, and configuration — but never the decrypted API key.
+List all saved provider configs, plus every registered provider type that has no config yet. Each entry shows status, model, and configuration — but never the decrypted API key.
 
-**Response `200`:** `ProviderStatusResponse[]`
+**Query parameters:** `limit` (max 200, default 50), `offset` (default 0).
+
+**Response `200`:** `PaginatedResponse[ProviderStatusResponse]`
 
 ---
 
 ### `POST /api/v1/providers/test`
 
-Test a provider configuration before saving it. Returns success/failure without creating any DB records.
+Test a provider configuration before saving it. Returns success/failure without creating any DB records. `api_key` is required for every provider except `ollama` — there is no environment-variable fallback, so a request without one is rejected.
 
 **Request body:**
 ```json
@@ -907,7 +909,7 @@ Test a provider configuration before saving it. Returns success/failure without 
 
 ### `POST /api/v1/providers/models`
 
-Fetch available model IDs from a provider's API using the supplied credentials, **before** saving a config. Returns a sorted list of model ID strings. Falls back to an empty list if the provider's models endpoint is unreachable or credentials are invalid.
+Fetch available model IDs from a provider's API using the supplied credentials, **before** saving a config. Returns a sorted list of model ID strings. An unreachable host or rejected credentials return `502`; other failures (an unexpected response shape, say) are logged and return an empty list.
 
 **Request body:**
 ```json
@@ -923,6 +925,7 @@ Fetch available model IDs from a provider's API using the supplied credentials, 
 **Response `200`:** `string[]` — sorted model IDs, e.g. `["gemma2-9b-it", "llama-3.3-70b-versatile", ...]`
 
 **Response `400`:** Unknown `provider_type`
+**Response `502`:** The provider API could not be reached, or it rejected the key (HTTP 401/403)
 
 ---
 
@@ -942,6 +945,8 @@ Create a new saved provider configuration.
   "is_active": true
 }
 ```
+
+`temperature` and `max_tokens` are not part of the UI form — a config created there gets `0.0` and `4096`. `max_tokens` caps each generation call (clamped to the provider's own output limit); `temperature` is stored but not currently read — every LLM call runs at `0.0`.
 
 **Response `201`:** `ProviderStatusResponse`
 
@@ -979,8 +984,9 @@ Fetch available models using a **saved** config's stored credentials and persist
 
 **Response `200`:** `string[]` — sorted model IDs
 
-**Response `400`:** Unknown provider type
+**Response `400`:** Unknown provider type, or the config stores no API key (every provider except `ollama` needs one)
 **Response `404`:** Config not found
+**Response `502`:** The provider API could not be reached, or it rejected the key (HTTP 401/403)
 
 ---
 
@@ -999,24 +1005,32 @@ Run a live health check on a saved provider config using its stored credentials.
 
 ### `GET /api/v1/settings`
 
-Return the current application settings (non-sensitive fields only).
+Return the current application settings (non-sensitive fields only). Mutable values come from the `app_settings` table, so every worker reports the same thing right after a save; the rest are the process's environment-derived values.
 
 **Response `200`:**
 ```json
 {
-  "cache_enabled": true,
-  "semantic_similarity_threshold": 0.87,
-  "embedding_model": "BAAI/bge-small-en-v1.5",
-  "cache_max_age_days": 30,
+  "app_name": "Savvina AI",
+  "debug": false,
+  "log_level": "INFO",
+  "ollama_base_url": "http://ollama:11434",
   "default_query_timeout": 30,
   "default_row_limit": 1000,
-  "log_level": "INFO"
+  "cache_enabled": true,
+  "cache_max_age_days": 30,
+  "semantic_similarity_threshold": 0.87,
+  "embedding_model": "BAAI/bge-small-en-v1.5",
+  "db_pool_size": 10,
+  "db_max_overflow": 20,
+  "schema_pruning_enabled": true,
+  "schema_pruning_top_k": 15,
+  "bcrypt_rounds": 12
 }
 ```
 
 ### `PUT /api/v1/settings`
 
-Update application settings. Changes take effect immediately without restart.
+Update application settings. Each key is persisted to `app_settings` and survives restarts; the response is the full `GET` payload re-read from the database.
 
 **Request body (all fields optional):**
 ```json
@@ -1025,6 +1039,10 @@ Update application settings. Changes take effect immediately without restart.
   "default_row_limit": 500
 }
 ```
+
+**Accepted keys and bounds:** `default_query_timeout` (≥ 1), `default_row_limit` (≥ 1), `cache_enabled`, `cache_max_age_days` (≥ 0), `semantic_similarity_threshold` (0.0–1.0), `db_pool_size` (1–100), `db_max_overflow` (0–200), `schema_pruning_enabled`, `schema_pruning_top_k` (3–100), `bcrypt_rounds` (10–16). A value outside its bounds returns `422`; unrecognised keys are ignored rather than rejected. To restore a default, delete the row from `app_settings`.
+
+**When a change takes effect:** reads are database-backed, so `GET /api/v1/settings` reflects the new value in every worker at once. Behaviour follows more slowly in a multi-worker deployment: `bcrypt_rounds` is read from the database per password operation and applies everywhere immediately; the rest of the keys are written through to the serving worker's cached settings and reach other workers at their next restart; `db_pool_size` and `db_max_overflow` need a restart in every worker, because the engine is built at startup.
 
 ---
 
@@ -1037,6 +1055,8 @@ Update application settings. Changes take effect immediately without restart.
 | 204 | Success, no content |
 | 400 | Bad request (invalid input, connection failed, validation error) |
 | 404 | Resource not found |
+| 422 | Request body failed schema validation (FastAPI/pydantic) |
 | 500 | Server error (LLM failure, unexpected exception) |
+| 502 | Upstream provider unreachable or rejected the credentials (provider model-fetch endpoints) |
 
 Errors return a JSON body: `{"detail": "Human-readable error message"}`

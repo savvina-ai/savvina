@@ -1,6 +1,7 @@
 # Copyright (c) 2025 Savvina AI Ltd
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
+from collections.abc import Callable
 from functools import lru_cache
 import logging
 import secrets
@@ -52,13 +53,7 @@ class Settings(BaseSettings):
     # Encryption
     encryption_key: str  # Fernet key, REQUIRED
 
-    # LLM Providers (optional — user configures via UI)
-    anthropic_api_key: str | None = None
-    openai_api_key: str | None = None
-    groq_api_key: str | None = None
-    gemini_api_key: str | None = None
-    cerebras_api_key: str | None = None
-    mistral_api_key: str | None = None
+    # LLM Providers — configured via admin UI only; no env-var API keys accepted
     ollama_base_url: str = "http://ollama:11434"
     # Set false in corporate TLS-intercepted environments if custom CA trust
     # cannot be installed into the container.  Applies to all LLM providers.
@@ -191,27 +186,41 @@ class Settings(BaseSettings):
                 )
         return self
 
-    def env_api_key(self, provider_name: str) -> str | None:
-        """Return the env-var API key for a named provider, or None.
-
-        Single source of truth — used by routers and services to avoid
-        repeating the provider-name → settings-attribute mapping.
-        """
-        _map: dict[str, str | None] = {
-            "claude": self.anthropic_api_key,
-            "openai": self.openai_api_key,
-            "openai_compatible": self.openai_api_key,
-            "groq": self.groq_api_key,
-            "gemini": self.gemini_api_key,
-            "cerebras": self.cerebras_api_key,
-            "mistral": self.mistral_api_key,
-        }
-        return _map.get(provider_name)
-
 
 # Re-exported for routers that reference these constants directly.
 DEFAULT_QUERY_TIMEOUT: int = Settings.model_fields["default_query_timeout"].default
 DEFAULT_ROW_LIMIT: int = Settings.model_fields["default_row_limit"].default
+
+# bcrypt work factor when no `app_settings` row overrides it. Not a Settings field: it
+# is read from the DB per password operation (routers/auth.py) and reported by the
+# settings router, and both must agree on the fallback.
+DEFAULT_BCRYPT_ROUNDS: int = 12
+
+# Every key PUT /api/settings persists to the `app_settings` table, with the parser
+# that turns its stored string back into a typed value. Both the settings router and
+# the startup restore in main.py read this map — duplicating it once let the two drift.
+MUTABLE_SETTING_PARSERS: dict[str, Callable[[str], object]] = {
+    "default_query_timeout": int,
+    "default_row_limit": int,
+    "cache_enabled": lambda v: v.lower() == "true",
+    "cache_max_age_days": int,
+    "semantic_similarity_threshold": float,
+    "db_pool_size": int,
+    "db_max_overflow": int,
+    "schema_pruning_enabled": lambda v: v.lower() == "true",
+    "schema_pruning_top_k": int,
+    "bcrypt_rounds": int,
+}
+
+# The subset the lifespan restore and the PUT write-through may setattr back onto the
+# cached Settings object. Not every persisted setting has a field there: `bcrypt_rounds`
+# is read from the DB per password operation (so a change applies without a restart) and
+# `Settings` has no such field — pydantic raises ValueError on setattr for an unknown
+# field, which in lifespan means the application refuses to boot the moment someone
+# saves one.
+SINGLETON_SETTING_PARSERS: dict[str, Callable[[str], object]] = {
+    key: parse for key, parse in MUTABLE_SETTING_PARSERS.items() if key in Settings.model_fields
+}
 
 
 @lru_cache(maxsize=1)

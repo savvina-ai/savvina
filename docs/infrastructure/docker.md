@@ -341,7 +341,7 @@ On startup (`entrypoint.sh` + `lifespan` in `main.py`):
 2. Configure Python logging
 3. Bootstrap default admin user if none exists
 4. Import all datasource adapters and LLM providers (triggers `@register_*` decorators)
-5. Pre-warm the sentence-transformer embedding model via `asyncio.to_thread`
+5. Pre-warm the fastembed ONNX embedding model via `asyncio.to_thread`
 6. Start accepting requests
 
 ---

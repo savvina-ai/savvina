@@ -1,7 +1,7 @@
 # Copyright (c) 2025 Savvina AI Ltd
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-"""OpenAI-compatible provider — GitHub Models, HuggingFace, Together, OpenRouter."""
+"""OpenAI-compatible provider — HuggingFace, Together, OpenRouter, custom endpoints."""
 
 from __future__ import annotations
 
@@ -32,8 +32,8 @@ def _normalize_model_id(model_id: str) -> str:
 class OpenAICompatibleProvider(OpenAIProvider):
     """Generic provider for any service exposing an OpenAI-compatible Chat Completions API.
 
-    For use with GitHub Models, HuggingFace Inference, Together.ai, OpenRouter,
-    or any custom base_url endpoint.  Named services (Gemini, Groq, Cerebras,
+    For use with HuggingFace Inference, Together.ai, OpenRouter, or any custom
+    base_url endpoint.  Named services (Gemini, Groq, Cerebras,
     Mistral) have their own dedicated provider classes.
     ``generate_response`` is inherited from OpenAIProvider unchanged.
     """
@@ -126,69 +126,3 @@ class OpenAICompatibleProvider(OpenAIProvider):
         except Exception as exc:
             _raise_if_fetch_error(exc, f"openai_compatible ({base_url})")
             return []
-
-    @classmethod
-    def get_config_schema(cls) -> dict:
-        """Config schema for the frontend dynamic form."""
-        return {
-            "fields": [
-                {
-                    "name": "base_url",
-                    "type": "select",
-                    "label": "Service",
-                    "required": True,
-                    "options": [
-                        {
-                            "label": "GitHub Models (Free)",
-                            "value": "https://models.inference.ai.azure.com",
-                        },
-                        {
-                            "label": "HuggingFace (Free)",
-                            "value": "https://router.huggingface.co/v1",
-                        },
-                        {"label": "Together.ai", "value": "https://api.together.xyz/v1"},
-                        {"label": "OpenRouter", "value": "https://openrouter.ai/api/v1"},
-                        {"label": "Custom URL", "value": "custom"},
-                    ],
-                },
-                {
-                    "name": "custom_base_url",
-                    "type": "string",
-                    "label": "Custom Base URL",
-                    "required": False,
-                    "placeholder": "https://your-service.com/v1",
-                    "required_if": {"base_url": "custom"},
-                },
-                {
-                    "name": "api_key",
-                    "type": "password",
-                    "label": "API Key",
-                    "required": True,
-                },
-                {
-                    "name": "model",
-                    "type": "string",
-                    "label": "Model Name",
-                    "required": True,
-                    "placeholder": "e.g., gpt-4o-mini, meta-llama/Llama-3.3-70B",
-                },
-            ],
-            "presets": {
-                "github": {
-                    "base_url": "https://models.inference.ai.azure.com",
-                    "model": "DeepSeek-R1",
-                },
-                "huggingface": {
-                    "base_url": "https://router.huggingface.co/v1",
-                    "model": "Qwen/Qwen2.5-Coder-32B-Instruct",
-                },
-                "together": {
-                    "base_url": "https://api.together.xyz/v1",
-                    "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-                },
-                "openrouter": {
-                    "base_url": "https://openrouter.ai/api/v1",
-                    "model": "openrouter/free",
-                },
-            },
-        }

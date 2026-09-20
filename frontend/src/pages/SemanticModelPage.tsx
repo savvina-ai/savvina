@@ -22,6 +22,7 @@ import { useProviders } from '../hooks/useProviders';
 import { useConnections } from '../hooks/useConnections';
 import { useAuthStore } from '../store/authStore';
 import { cn } from '@/lib/utils';
+import { apiErrorMessage } from '@/lib/apiError';
 import type {
   DerivedColumn,
   DriftReport,
@@ -187,17 +188,6 @@ function GenerateConfirmDialog({ onConfirm, onCancel }: ConfirmDialogProps) {
       </div>
     </div>
   );
-}
-
-
-// ── API error helper ──────────────────────────────────────────────────────
-
-function apiErrorMessage(err: unknown): string {
-  if (err && typeof err === 'object' && 'response' in err) {
-    const axErr = err as { response?: { data?: { detail?: string } } };
-    return axErr.response?.data?.detail ?? String(err);
-  }
-  return String(err);
 }
 
 // ── Suggestions ───────────────────────────────────────────────────────────
@@ -769,7 +759,7 @@ export default function SemanticModelPageV2() {
           {/* Generation error */}
           {generate.error && (
             <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-              Generation failed: {apiErrorMessage(generate.error)}
+              Generation failed: {apiErrorMessage(generate.error, 'Unknown error')}
             </div>
           )}
 

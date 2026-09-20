@@ -17,6 +17,7 @@ import {
 } from '../components/ui/card'
 import logoImg from '@/assets/logo-full.png'
 import logoImgDark from '@/assets/logo-full-dark.png'
+import { apiErrorMessage } from '@/lib/apiError'
 
 export default function SetupPage() {
   const needsSetup = useAuthStore((s) => s.needsSetup)
@@ -67,9 +68,7 @@ export default function SetupPage() {
       })
       navigate('/setup/wizard', { replace: true })
     } catch (err: unknown) {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? ''
-      setError(detail || 'Account creation failed. Please try again.')
+      setError(apiErrorMessage(err, 'Account creation failed. Please try again.'))
     } finally {
       setSubmitting(false)
     }

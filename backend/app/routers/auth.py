@@ -25,7 +25,7 @@ from ..auth.tokens import (
     create_refresh_token,
     hash_refresh_token,
 )
-from ..config import get_settings
+from ..config import DEFAULT_BCRYPT_ROUNDS, get_settings
 from ..database import get_db
 from ..models.app_settings import AppSetting
 from ..models.chat import ChatMessage, ChatSession
@@ -90,7 +90,7 @@ def _validate_password_strength(password: str) -> None:
 
 async def _get_bcrypt_rounds(db: AsyncSession) -> int:
     row = await db.scalar(select(AppSetting).where(AppSetting.key == "bcrypt_rounds"))
-    return int(row.value) if row else 12
+    return int(row.value) if row else DEFAULT_BCRYPT_ROUNDS
 
 
 def _get_ip(request: Request) -> str | None:

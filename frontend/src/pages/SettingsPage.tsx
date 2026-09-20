@@ -2,6 +2,7 @@
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 import { useState, useEffect, useMemo } from 'react';
+import { useSearchParams } from 'react-router';
 import { ConfirmDeleteDialog } from '../components/ui/confirm-delete-dialog';
 import { RefreshCw } from 'lucide-react';
 import {
@@ -18,16 +19,27 @@ import CacheStats from '../components/CacheStats';
 import { useAppStore } from '../store/appStore';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { chatApi } from '../api/chat';
-import { settingsApi } from '../api/settings';
+import { useStagedSettings } from '../hooks/useStagedSettings';
 import { cn } from '@/lib/utils';
 import type { ProviderStatus, VerifiedExample } from '../types';
 import { Button } from '../components/ui/button';
+import { apiErrorMessage } from '../lib/apiError';
 
-type Tab = 'providers' | 'safety' | 'cache' | 'examples';
+type Tab = 'providers' | 'execution' | 'optimization' | 'system' | 'examples';
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: 'providers', label: 'LLM Providers' },
+  { id: 'execution', label: 'Query Execution' },
+  { id: 'optimization', label: 'AI & Optimization' },
+  { id: 'system', label: 'System & Security' },
+  { id: 'examples', label: 'Examples Library' },
+];
+
+const isTab = (value: string | null): value is Tab =>
+  TABS.some((t) => t.id === value);
 
 // Only for truly custom/unknown compatible services (Gemini, Groq, Cerebras, Mistral now have dedicated types)
 const CUSTOM_SERVICES: { label: string; base_url: string; default_model: string }[] = [
-  { label: 'GitHub Models (Free)', base_url: 'https://models.inference.ai.azure.com', default_model: 'gpt-4o-mini' },
   { label: 'HuggingFace (Free)', base_url: 'https://router.huggingface.co/v1', default_model: 'meta-llama/Llama-3.2-3B-Instruct' },
   { label: 'Together.ai', base_url: 'https://api.together.xyz/v1', default_model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo' },
   { label: 'OpenRouter', base_url: 'https://openrouter.ai/api/v1', default_model: 'openrouter/free' },
@@ -72,6 +84,14 @@ function ProviderCard({ provider }: { provider: ProviderStatus }) {
       id: provider.id,
       payload: { api_key: apiKey || undefined, model, display_name: displayName, is_active: true },
     });
+    setApiKey('');
+    setEditing(false);
+  };
+
+  const handleCancel = () => {
+    // Closing the editor re-runs the `!editing` effect, which restores displayName and
+    // model from the provider. The API key is not derived from it — a typed-but-unsaved
+    // key would survive into the next Edit and get submitted, so clear it here.
     setApiKey('');
     setEditing(false);
   };
@@ -160,15 +180,20 @@ function ProviderCard({ provider }: { provider: ProviderStatus }) {
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
             placeholder="Display name"
+            autoComplete="off"
             className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           />
+          <p className="text-xs text-muted-foreground">A label shown in the model picker — purely cosmetic.</p>
           <input
             type="password"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
             placeholder="API key (leave blank to keep existing)"
+            autoComplete="new-password"
             className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           />
+          <p className="text-xs text-muted-foreground">Stored encrypted. Leave blank to keep the existing key.</p>
+          <p className="text-xs text-muted-foreground">The model used to generate SQL for this provider.</p>
           <div className="flex items-center gap-2">
             {modelOptions.length > 0 ? (
               <select
@@ -200,13 +225,23 @@ function ProviderCard({ provider }: { provider: ProviderStatus }) {
               </button>
             )}
           </div>
-          <button
-            onClick={handleSave}
-            disabled={update.isPending}
-            className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-          >
-            Save
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={handleSave}
+              disabled={update.isPending}
+              className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {update.isPending ? 'Saving…' : 'Save'}
+            </button>
+            <button
+              type="button"
+              onClick={handleCancel}
+              disabled={update.isPending}
+              className="rounded-md border border-border px-4 py-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
         </div>
       )}
 
@@ -237,19 +272,15 @@ function AddProviderInlineForm({
   providerType,
   displayNameHint,
   availableModels,
-  envConfigured = false,
-  defaultModel,
   onClose,
 }: {
   providerType: string;
   displayNameHint: string;
   availableModels: string[];
-  envConfigured?: boolean;
-  defaultModel?: string;
   onClose: () => void;
 }) {
   const [apiKey, setApiKey] = useState('');
-  const [model, setModel] = useState(defaultModel ?? availableModels[0] ?? '');
+  const [model, setModel] = useState(availableModels[0] ?? '');
   const [baseUrl, setBaseUrl] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [dynamicModels, setDynamicModels] = useState<string[]>([]);
@@ -278,12 +309,11 @@ function AddProviderInlineForm({
         setModel(models[0]);
       }
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setFetchModelsError(detail ?? 'Failed to fetch models');
+      setFetchModelsError(apiErrorMessage(e, 'Failed to fetch models'));
     }
   };
 
-  const canFetchModels = isOllama ? true : apiKey.length > 5 || envConfigured;
+  const canFetchModels = isOllama ? true : apiKey.length > 5;
 
   const handleTest = async () => {
     setIsTesting(true);
@@ -297,8 +327,7 @@ function AddProviderInlineForm({
       });
       setTestResult(data);
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setTestResult({ success: false, message: detail ?? 'Test failed' });
+      setTestResult({ success: false, message: apiErrorMessage(e, 'Test failed') });
     } finally {
       setIsTesting(false);
     }
@@ -336,6 +365,7 @@ function AddProviderInlineForm({
             autoComplete="off"
             className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           />
+          <p className="mt-1 text-xs text-muted-foreground">A label shown in the model picker — purely cosmetic.</p>
         </div>
         <div>
           <label className="text-xs text-muted-foreground">Model</label>
@@ -358,6 +388,7 @@ function AddProviderInlineForm({
               className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
             />
           )}
+          <p className="mt-1 text-xs text-muted-foreground">The model used to generate SQL for this provider.</p>
         </div>
         {isOllama && (
           <div className="col-span-2">
@@ -368,22 +399,18 @@ function AddProviderInlineForm({
               placeholder="http://localhost:11434"
               className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
             />
+            <p className="mt-1 text-xs text-muted-foreground">The provider's API endpoint.</p>
           </div>
         )}
         {!isOllama && (
           <div className="col-span-2">
-            <label className="text-xs text-muted-foreground">
-              API Key
-              {envConfigured && (
-                <span className="ml-2 text-success">✓ env key configured — leave blank to use it</span>
-              )}
-            </label>
+            <label className="text-xs text-muted-foreground">API Key</label>
             <div className="mt-1 flex gap-2">
               <input
                 type="password"
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
-                placeholder={envConfigured ? 'Leave blank to use env key' : ''}
+                autoComplete="new-password"
                 className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
               />
               <button
@@ -399,6 +426,7 @@ function AddProviderInlineForm({
                 )}
               </button>
             </div>
+            <p className="mt-1 text-xs text-muted-foreground">Stored encrypted; never displayed after saving.</p>
           </div>
         )}
         {isOllama && (
@@ -441,7 +469,7 @@ function AddProviderInlineForm({
         <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
           <span>✗</span>
           <span className="break-all">
-            {(create.error as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Failed to save provider'}
+            {apiErrorMessage(create.error, 'Failed to save provider')}
           </span>
         </div>
       )}
@@ -449,13 +477,13 @@ function AddProviderInlineForm({
         <Button
           variant="default"
           onClick={handleTest}
-          disabled={isTesting || (!isOllama && !apiKey && !envConfigured)}
+          disabled={isTesting || (!isOllama && !apiKey)}
         >
           {isTesting ? 'Testing…' : 'Test'}
         </Button>
         <button
           onClick={handleAdd}
-          disabled={create.isPending || (!isOllama && !apiKey && !envConfigured)}
+          disabled={create.isPending || (!isOllama && !apiKey)}
           className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
         >
           {create.isPending ? 'Adding…' : 'Add'}
@@ -486,7 +514,6 @@ function ProviderSection({
 }) {
   const [adding, setAdding] = useState(false);
   const savedConfigs = configs.filter((p) => p.id !== null);
-  const envConfig = configs.find((p) => p.id === null && p.is_configured);
 
   return (
     <div className="space-y-2">
@@ -496,22 +523,11 @@ function ProviderSection({
       {savedConfigs.map((p) => (
         <ProviderCard key={p.id} provider={p} />
       ))}
-      {envConfig && (
-        <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          <span className="h-2 w-2 rounded-full bg-success shrink-0" />
-          <span>
-            Configured via environment variable · default model:{' '}
-            <span className="font-mono text-foreground">{envConfig.current_model || '—'}</span>
-          </span>
-        </div>
-      )}
       {adding ? (
         <AddProviderInlineForm
           providerType={providerType}
           displayNameHint={displayName}
           availableModels={availableModels}
-          envConfigured={!!envConfig}
-          defaultModel={envConfig?.current_model}
           onClose={() => setAdding(false)}
         />
       ) : (
@@ -526,7 +542,7 @@ function ProviderSection({
   );
 }
 
-// Custom OpenAI-compatible provider form (GitHub Models, HuggingFace, Together, OpenRouter, custom URL)
+// Custom OpenAI-compatible provider form (HuggingFace, Together, OpenRouter, custom URL)
 function AddCustomProvider({ onClose }: { onClose: () => void }) {
   const [service, setService] = useState(CUSTOM_SERVICES[0]);
   const [apiKey, setApiKey] = useState('');
@@ -557,8 +573,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
         setModel(models[0]);
       }
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setFetchModelsError(detail ?? 'Failed to fetch models');
+      setFetchModelsError(apiErrorMessage(e, 'Failed to fetch models'));
     }
   };
 
@@ -574,8 +589,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
       });
       setTestResult(data);
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setTestResult({ success: false, message: detail ?? 'Test failed' });
+      setTestResult({ success: false, message: apiErrorMessage(e, 'Test failed') });
     } finally {
       setIsTesting(false);
     }
@@ -640,8 +654,10 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
           <input
             value={baseUrl}
             onChange={(e) => setBaseUrl(e.target.value)}
+            autoComplete="off"
             className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           />
+          <p className="mt-1 text-xs text-muted-foreground">The provider's API endpoint.</p>
         </div>
         <div>
           <label className="text-xs text-muted-foreground">Model</label>
@@ -663,6 +679,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
               className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
             />
           )}
+          <p className="mt-1 text-xs text-muted-foreground">The model used to generate SQL for this provider.</p>
         </div>
         <div className="col-span-2">
           <label className="text-xs text-muted-foreground">API Key</label>
@@ -671,6 +688,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
               type="password"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
+              autoComplete="new-password"
               className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
             />
             <button
@@ -686,6 +704,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
               )}
             </button>
           </div>
+          <p className="mt-1 text-xs text-muted-foreground">Stored encrypted; never displayed after saving.</p>
         </div>
       </div>
       {fetchModelsError && (
@@ -698,7 +717,7 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
         <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
           <span>✗</span>
           <span className="break-all">
-            {(create.error as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Failed to save provider'}
+            {apiErrorMessage(create.error, 'Failed to save provider')}
           </span>
         </div>
       )}
@@ -741,84 +760,95 @@ function AddCustomProvider({ onClose }: { onClose: () => void }) {
   );
 }
 
-function QuerySafetyTab() {
-  const queryClient = useQueryClient();
-  const { data: settings, isLoading } = useQuery({
-    queryKey: ['settings'],
-    queryFn: settingsApi.get,
-  });
-  const update = useMutation({
-    mutationFn: settingsApi.update,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['settings'] }),
-  });
+interface SaveRowProps {
+  onSave: () => void;
+  dirty: boolean;
+  update: { isPending: boolean; isSuccess: boolean; isError: boolean; error: unknown };
+}
 
-  const [queryTimeout, setQueryTimeout] = useState<number | null>(null);
-  const [rowLimit, setRowLimit] = useState<number | null>(null);
-  const [poolSize, setPoolSize] = useState<number | null>(null);
-  const [maxOverflow, setMaxOverflow] = useState<number | null>(null);
-  const [bcryptRounds, setBcryptRounds] = useState<number | null>(null);
+/** Save button plus outcome for a staged-settings form. Shared so no tab can forget the error row. */
+function SaveRow({ onSave, dirty, update }: SaveRowProps) {
+  return (
+    <div className="flex items-center gap-3">
+      <button onClick={onSave} disabled={update.isPending || !dirty} className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50">
+        {update.isPending ? 'Saving…' : 'Save'}
+      </button>
+      {/* isSuccess stays true after the first save, so gate the badge on the form being clean. */}
+      {update.isSuccess && !dirty && <span className="text-xs text-success">✓ Saved</span>}
+      {update.isError && (
+        <span className="text-xs text-destructive">
+          {apiErrorMessage(update.error, 'Failed to save')}
+        </span>
+      )}
+    </div>
+  );
+}
 
-  useEffect(() => {
-    if (!settings) return;
-    // One-time initialise from server: `?? value` means "set only if not yet touched by user"
-    setQueryTimeout((t) => t ?? settings.default_query_timeout);
-    setRowLimit((r) => r ?? settings.default_row_limit);
-    setPoolSize((p) => p ?? settings.db_pool_size);
-    setMaxOverflow((m) => m ?? settings.db_max_overflow);
-    setBcryptRounds((b) => b ?? settings.bcrypt_rounds);
-  }, [settings]);
+const SettingsSkeleton = () => <div className="h-24 animate-pulse rounded-lg bg-muted" />;
 
-  const handleSave = () => {
-    if (queryTimeout === null || rowLimit === null || poolSize === null || maxOverflow === null || bcryptRounds === null) return;
-    update.mutate({
-      default_query_timeout: queryTimeout,
-      default_row_limit: rowLimit,
-      db_pool_size: poolSize,
-      db_max_overflow: maxOverflow,
-      bcrypt_rounds: bcryptRounds,
-    });
-  };
+const EXECUTION_KEYS = ['default_query_timeout', 'default_row_limit'] as const;
 
-  if (isLoading || queryTimeout === null || rowLimit === null || poolSize === null || maxOverflow === null || bcryptRounds === null) {
-    return <div className="h-24 animate-pulse rounded-lg bg-muted" />;
-  }
+function QueryExecutionTab() {
+  const { values, set, dirty, save, update } = useStagedSettings(EXECUTION_KEYS);
+  if (!values) return <SettingsSkeleton />;
 
   return (
     <div className="space-y-6">
+      <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+        These limits guard against runaway queries. Settings are saved and applied
+        immediately — they take effect on the next query.
+      </p>
       <div>
         <div className="mb-1 flex justify-between">
           <label className="text-sm font-medium text-foreground">Query Timeout</label>
-          <span className="text-sm text-muted-foreground">{queryTimeout}s</span>
+          <span className="text-sm text-muted-foreground">{values.default_query_timeout}s</span>
         </div>
-        <input type="range" min={5} max={300} step={5} value={queryTimeout} onChange={(e) => setQueryTimeout(Number(e.target.value))} className="w-full accent-primary" />
+        <input type="range" min={5} max={300} step={5} value={values.default_query_timeout} onChange={(e) => set('default_query_timeout', Number(e.target.value))} className="w-full accent-primary" />
         <p className="mt-1 text-xs text-muted-foreground">Cancel queries that run longer than this many seconds.</p>
       </div>
       <div>
         <div className="mb-1 flex justify-between">
           <label className="text-sm font-medium text-foreground">Row Limit</label>
-          <span className="text-sm text-muted-foreground">{rowLimit.toLocaleString()} rows</span>
+          <span className="text-sm text-muted-foreground">{values.default_row_limit.toLocaleString()} rows</span>
         </div>
-        <input type="range" min={100} max={10000} step={100} value={rowLimit} onChange={(e) => setRowLimit(Number(e.target.value))} className="w-full accent-primary" />
+        <input type="range" min={100} max={10000} step={100} value={values.default_row_limit} onChange={(e) => set('default_row_limit', Number(e.target.value))} className="w-full accent-primary" />
         <p className="mt-1 text-xs text-muted-foreground">Truncate result sets larger than this many rows.</p>
       </div>
-      <div className="border-t border-border pt-6">
-        <h3 className="mb-4 text-sm font-semibold text-foreground">Database Connection Pool</h3>
-        <p className="mb-4 text-xs text-muted-foreground">Changes to pool settings take effect on the next process restart.</p>
+      <SaveRow onSave={save} dirty={dirty} update={update} />
+    </div>
+  );
+}
+
+const SYSTEM_KEYS = ['db_pool_size', 'db_max_overflow', 'bcrypt_rounds'] as const;
+
+function SystemSecurityTab() {
+  const { values, set, dirty, save, update } = useStagedSettings(SYSTEM_KEYS);
+  if (!values) return <SettingsSkeleton />;
+
+  return (
+    <div className="space-y-6">
+      <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+        Deployment-level knobs. Settings are saved immediately but take effect after the next
+        backend restart — except the bcrypt work factor, which applies on the next password operation.
+      </p>
+      <div>
+        <h3 className="mb-1 text-sm font-semibold text-foreground">Database Connection Pool</h3>
+        <p className="mb-4 text-xs text-muted-foreground">Tunes how many connections the app keeps open to its own database. Changes take effect on the next process restart.</p>
         <div className="space-y-4">
           <div>
             <div className="mb-1 flex justify-between">
               <label className="text-sm font-medium text-foreground">Pool Size</label>
-              <span className="text-sm text-muted-foreground">{poolSize}</span>
+              <span className="text-sm text-muted-foreground">{values.db_pool_size}</span>
             </div>
-            <input type="range" min={1} max={50} step={1} value={poolSize} onChange={(e) => setPoolSize(Number(e.target.value))} className="w-full accent-primary" />
+            <input type="range" min={1} max={50} step={1} value={values.db_pool_size} onChange={(e) => set('db_pool_size', Number(e.target.value))} className="w-full accent-primary" />
             <p className="mt-1 text-xs text-muted-foreground">Persistent connections kept open. Increase for higher concurrency.</p>
           </div>
           <div>
             <div className="mb-1 flex justify-between">
               <label className="text-sm font-medium text-foreground">Max Overflow</label>
-              <span className="text-sm text-muted-foreground">{maxOverflow}</span>
+              <span className="text-sm text-muted-foreground">{values.db_max_overflow}</span>
             </div>
-            <input type="range" min={0} max={100} step={5} value={maxOverflow} onChange={(e) => setMaxOverflow(Number(e.target.value))} className="w-full accent-primary" />
+            <input type="range" min={0} max={100} step={5} value={values.db_max_overflow} onChange={(e) => set('db_max_overflow', Number(e.target.value))} className="w-full accent-primary" />
             <p className="mt-1 text-xs text-muted-foreground">Extra connections allowed above pool size during traffic spikes.</p>
           </div>
         </div>
@@ -828,101 +858,68 @@ function QuerySafetyTab() {
         <div>
           <div className="mb-1 flex justify-between">
             <label className="text-sm font-medium text-foreground">bcrypt Work Factor</label>
-            <span className="text-sm text-muted-foreground">{bcryptRounds}</span>
+            <span className="text-sm text-muted-foreground">{values.bcrypt_rounds}</span>
           </div>
-          <input type="range" min={10} max={16} step={1} value={bcryptRounds} onChange={(e) => setBcryptRounds(Number(e.target.value))} className="w-full accent-primary" />
+          <input type="range" min={10} max={16} step={1} value={values.bcrypt_rounds} onChange={(e) => set('bcrypt_rounds', Number(e.target.value))} className="w-full accent-primary" />
           <p className="mt-1 text-xs text-muted-foreground">Higher values slow down login slightly but make brute-force harder. Takes effect on the next password operation.</p>
         </div>
       </div>
-      <div className="flex items-center gap-3">
-        <button onClick={handleSave} disabled={update.isPending} className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50">
-          {update.isPending ? 'Saving…' : 'Save'}
-        </button>
-        {update.isSuccess && <span className="text-xs text-success">✓ Saved</span>}
-      </div>
+      <SaveRow onSave={save} dirty={dirty} update={update} />
     </div>
   );
 }
 
-function CacheSettingsSection() {
-  const queryClient = useQueryClient();
-  const { data: settings, isLoading } = useQuery({
-    queryKey: ['settings'],
-    queryFn: settingsApi.get,
-  });
-  const update = useMutation({
-    mutationFn: settingsApi.update,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['settings'] }),
-  });
+const OPTIMIZATION_KEYS = [
+  'cache_enabled',
+  'semantic_similarity_threshold',
+  'cache_max_age_days',
+  'schema_pruning_enabled',
+  'schema_pruning_top_k',
+] as const;
 
-  const [enabled, setEnabled] = useState<boolean | null>(null);
-  const [threshold, setThreshold] = useState<number | null>(null);
-  const [maxAgeDays, setMaxAgeDays] = useState<number | null>(null);
-  const [schemaPruningEnabled, setSchemaPruningEnabled] = useState<boolean | null>(null);
-  const [schemaPruningTopK, setSchemaPruningTopK] = useState<number | null>(null);
-
-  useEffect(() => {
-    if (!settings) return;
-    // One-time initialise from server: `?? value` means "set only if not yet touched by user"
-    setEnabled((e) => e ?? settings.cache_enabled);
-    setThreshold((t) => t ?? settings.semantic_similarity_threshold);
-    setMaxAgeDays((d) => d ?? settings.cache_max_age_days);
-    setSchemaPruningEnabled((p) => p ?? settings.schema_pruning_enabled);
-    setSchemaPruningTopK((k) => k ?? settings.schema_pruning_top_k);
-  }, [settings]);
-
-  const handleSave = () => {
-    if (enabled === null || threshold === null || maxAgeDays === null || schemaPruningTopK === null) return;
-    update.mutate({
-      cache_enabled: enabled,
-      semantic_similarity_threshold: threshold,
-      cache_max_age_days: maxAgeDays,
-      schema_pruning_top_k: schemaPruningTopK,
-    });
-  };
-
-  if (isLoading || enabled === null || threshold === null || maxAgeDays === null || schemaPruningEnabled === null || schemaPruningTopK === null) {
-    return <div className="h-16 animate-pulse rounded-lg bg-muted" />;
-  }
+function OptimizationSettingsSection() {
+  // Every control in this section is staged locally and written only by Save — a toggle that
+  // wrote on click saved half the form behind the user's back, and left the other sliders
+  // looking saved when they were not.
+  const { values, set, dirty, save, update } = useStagedSettings(OPTIMIZATION_KEYS);
+  if (!values) return <SettingsSkeleton />;
 
   return (
     <div className="mb-4 space-y-4 border-b border-border pb-4">
+      <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+        These settings reduce LLM cost and latency — the cache reuses past answers, schema
+        pruning shrinks the prompt. Changes apply as soon as you press Save.
+      </p>
+      <h3 className="text-sm font-semibold text-foreground">Query Cache</h3>
       <div className="flex items-center justify-between">
         <div>
           <p className="text-sm font-medium text-foreground">Enable Query Cache</p>
           <p className="text-xs text-muted-foreground">Cache semantically similar queries to skip LLM calls.</p>
         </div>
         <button
-          onClick={() => {
-            const next = !enabled;
-            setEnabled(next);
-            update.mutate(
-              { cache_enabled: next, semantic_similarity_threshold: threshold! },
-              { onError: () => setEnabled(!next) },
-            );
-          }}
+          onClick={() => set('cache_enabled', !values.cache_enabled)}
           className={cn(
             'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
-            enabled ? 'bg-primary' : 'bg-muted-foreground',
+            values.cache_enabled ? 'bg-primary' : 'bg-muted-foreground',
           )}
         >
-          <span className={cn('inline-block h-4 w-4 transform rounded-full bg-primary-foreground transition-transform', enabled ? 'translate-x-6' : 'translate-x-1')} />
+          <span className={cn('inline-block h-4 w-4 transform rounded-full bg-primary-foreground transition-transform', values.cache_enabled ? 'translate-x-6' : 'translate-x-1')} />
         </button>
       </div>
       <div>
         <div className="mb-1 flex justify-between">
           <label className="text-sm font-medium text-foreground">Similarity Threshold</label>
-          <span className="text-sm text-muted-foreground">{threshold.toFixed(2)}</span>
+          <span className="text-sm text-muted-foreground">{values.semantic_similarity_threshold.toFixed(2)}</span>
         </div>
-        <input type="range" min={0.5} max={1.0} step={0.01} value={threshold} onChange={(e) => setThreshold(Number(e.target.value))} className="w-full accent-primary" />
+        <input type="range" min={0.5} max={1.0} step={0.01} value={values.semantic_similarity_threshold} onChange={(e) => set('semantic_similarity_threshold', Number(e.target.value))} className="w-full accent-primary" />
         <p className="mt-1 text-xs text-muted-foreground">Higher values require closer matches before serving a cached result.</p>
       </div>
       <div>
         <div className="mb-1 flex justify-between">
           <label className="text-sm font-medium text-foreground">Cache Max Age</label>
-          <span className="text-sm text-muted-foreground">{maxAgeDays} days</span>
+          <span className="text-sm text-muted-foreground">{values.cache_max_age_days} days</span>
         </div>
-        <input type="range" min={1} max={365} step={1} value={maxAgeDays} onChange={(e) => setMaxAgeDays(Number(e.target.value))} className="w-full accent-primary" />
+        <input type="range" min={1} max={365} step={1} value={values.cache_max_age_days} onChange={(e) => set('cache_max_age_days', Number(e.target.value))} className="w-full accent-primary" />
         <p className="mt-1 text-xs text-muted-foreground">Cache entries older than this are automatically discarded.</p>
       </div>
       <div className="border-t border-border pt-4">
@@ -934,43 +931,26 @@ function CacheSettingsSection() {
               <p className="text-xs text-muted-foreground">Filter schema context to the most relevant tables before each LLM call — reduces token usage significantly.</p>
             </div>
             <button
-              onClick={() => {
-                const next = !schemaPruningEnabled;
-                setSchemaPruningEnabled(next);
-                update.mutate(
-                  { schema_pruning_enabled: next },
-                  { onError: () => setSchemaPruningEnabled(!next) },
-                );
-              }}
+              onClick={() => set('schema_pruning_enabled', !values.schema_pruning_enabled)}
               className={cn(
                 'relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full transition-colors',
-                schemaPruningEnabled ? 'bg-primary' : 'bg-muted-foreground',
+                values.schema_pruning_enabled ? 'bg-primary' : 'bg-muted-foreground',
               )}
             >
-              <span className={cn('inline-block h-4 w-4 transform rounded-full bg-primary-foreground transition-transform', schemaPruningEnabled ? 'translate-x-6' : 'translate-x-1')} />
+              <span className={cn('inline-block h-4 w-4 transform rounded-full bg-primary-foreground transition-transform', values.schema_pruning_enabled ? 'translate-x-6' : 'translate-x-1')} />
             </button>
           </div>
           <div>
             <div className="mb-1 flex justify-between">
               <label className="text-sm font-medium text-foreground">Max Tables (Top K)</label>
-              <span className="text-sm text-muted-foreground">{schemaPruningTopK}</span>
+              <span className="text-sm text-muted-foreground">{values.schema_pruning_top_k}</span>
             </div>
-            <input type="range" min={3} max={40} step={1} value={schemaPruningTopK} onChange={(e) => setSchemaPruningTopK(Number(e.target.value))} className="w-full accent-primary" />
+            <input type="range" min={3} max={40} step={1} value={values.schema_pruning_top_k} onChange={(e) => set('schema_pruning_top_k', Number(e.target.value))} className="w-full accent-primary" />
             <p className="mt-1 text-xs text-muted-foreground">Maximum number of tables passed to the LLM. Lower values reduce token usage; increase if queries span many tables.</p>
           </div>
         </div>
       </div>
-      <div className="flex items-center gap-3">
-        <button onClick={handleSave} disabled={update.isPending} className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50">
-          {update.isPending ? 'Saving…' : 'Save'}
-        </button>
-        {update.isSuccess && <span className="text-xs text-success">✓ Saved</span>}
-        {update.isError && (
-          <span className="text-xs text-destructive">
-            {(update.error as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Failed to save'}
-          </span>
-        )}
-      </div>
+      <SaveRow onSave={save} dirty={dirty} update={update} />
     </div>
   );
 }
@@ -1108,6 +1088,10 @@ function ExamplesTab({ connectionId }: { connectionId: string }) {
   return (
     <div className="space-y-4">
       <h3 className="text-sm font-semibold text-foreground">Verified Examples Library</h3>
+      <p className="text-xs text-muted-foreground">
+        Verified examples teach the model your preferred query patterns. For each new question,
+        the most similar examples are retrieved into the prompt, improving accuracy for your schema.
+      </p>
       {isLoading ? (
         <div className="h-16 animate-pulse rounded-lg bg-muted" />
       ) : (
@@ -1125,6 +1109,7 @@ function ExamplesTab({ connectionId }: { connectionId: string }) {
           placeholder="Natural language question"
           className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
         />
+        <p className="text-xs text-muted-foreground">The natural-language question a user might ask.</p>
         <textarea
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -1132,6 +1117,7 @@ function ExamplesTab({ connectionId }: { connectionId: string }) {
           rows={3}
           className="w-full rounded-md border border-border bg-background px-3 py-1.5 font-mono text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
         />
+        <p className="text-xs text-muted-foreground">The correct SQL that answers the question.</p>
         <button
           onClick={() => addExample.mutate()}
           disabled={!question || !query || addExample.isPending}
@@ -1145,7 +1131,17 @@ function ExamplesTab({ connectionId }: { connectionId: string }) {
 }
 
 export default function SettingsPage() {
-  const [activeTab, setActiveTab] = useState<Tab>('providers');
+  // The tab lives in the URL, not in local state, so a refresh or a shared link lands on the
+  // section the user was reading. An unknown or absent ?tab= falls back to the first tab.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tabParam = searchParams.get('tab');
+  const activeTab: Tab = isTab(tabParam) ? tabParam : 'providers';
+  const setActiveTab = (tab: Tab) => {
+    const next = new URLSearchParams(searchParams);
+    next.set('tab', tab);
+    // replace, so switching tabs does not bury the previous page under history entries.
+    setSearchParams(next, { replace: true });
+  };
   const [addingCustom, setAddingCustom] = useState(false);
   const { data: providers } = useProviders();
   const { activeConnectionId } = useAppStore();
@@ -1180,13 +1176,6 @@ export default function SettingsPage() {
     };
   }, [providers]);
 
-  const tabs: { id: Tab; label: string }[] = [
-    { id: 'providers', label: 'LLM Providers' },
-    { id: 'safety', label: 'Query Safety' },
-    { id: 'cache', label: 'Cache' },
-    { id: 'examples', label: 'Examples Library' },
-  ];
-
   return (
     <div className="flex-1 overflow-auto bg-background">
       <div className="mx-auto max-w-3xl px-4 py-8">
@@ -1194,7 +1183,7 @@ export default function SettingsPage() {
 
         {/* Tabs */}
         <div role="tablist" aria-label="Settings sections" className="mb-6 flex gap-1 border-b border-border">
-          {tabs.map((tab) => (
+          {TABS.map((tab) => (
             <button
               key={tab.id}
               role="tab"
@@ -1221,6 +1210,11 @@ export default function SettingsPage() {
         >
           {activeTab === 'providers' && (
             <div className="space-y-8">
+              <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                Configure the LLM providers that translate natural language into SQL. The colored dot
+                shows each provider's last health check: green = healthy, red = configured but failing,
+                grey = not configured.
+              </p>
               {namedGroups.map((group) => (
                 <ProviderSection
                   key={group.type}
@@ -1253,11 +1247,13 @@ export default function SettingsPage() {
             </div>
           )}
 
-          {activeTab === 'safety' && <QuerySafetyTab />}
+          {activeTab === 'execution' && <QueryExecutionTab />}
 
-          {activeTab === 'cache' && (
+          {activeTab === 'system' && <SystemSecurityTab />}
+
+          {activeTab === 'optimization' && (
             <div>
-              <CacheSettingsSection />
+              <OptimizationSettingsSection />
               {activeConnectionId ? (
                 <CacheStats connectionId={activeConnectionId} />
               ) : (

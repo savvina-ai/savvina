@@ -83,25 +83,3 @@ class GroqProvider(OpenAIProvider):
         except Exception as exc:
             _raise_if_fetch_error(exc, "groq")
             return []
-
-    @classmethod
-    def get_config_schema(cls) -> dict:
-        """Config schema for the frontend dynamic form."""
-        return {
-            "fields": [
-                {
-                    "name": "api_key",
-                    "type": "password",
-                    "label": "Groq API Key",
-                    "required": True,
-                    "placeholder": "gsk_...",
-                },
-                {
-                    "name": "model",
-                    "type": "string",
-                    "label": "Model",
-                    "required": False,
-                    "placeholder": f"e.g. {cls._DEFAULT_MODEL}",
-                },
-            ],
-        }

@@ -20,7 +20,7 @@ Savvina AI lets you connect to a database, ask questions in natural language, an
 | Feature | Description |
 |---|---|
 | **Natural language to SQL** | Ask questions in plain English; get readable SQL and tabular results |
-| **Multi-LLM support** | Claude, OpenAI, Groq, Gemini, Cerebras, Mistral, Ollama — plus any OpenAI-compatible endpoint (GitHub Models, HuggingFace, Together.ai, OpenRouter, etc.) |
+| **Multi-LLM support** | Claude, OpenAI, Groq, Gemini, Cerebras, Mistral, Ollama — plus any OpenAI-compatible endpoint (HuggingFace, Together.ai, OpenRouter, etc.) |
 | **2 data sources** | PostgreSQL and MySQL / MariaDB — additional sources exist in commercial version |
 | **Free-tier ready** | Works out of the box with Groq (14,400 req/day free) or Google Gemini (1,500 req/day free) |
 | **Local LLM via Ollama** | Run entirely offline with Ollama — no data leaves your machine |
@@ -72,12 +72,14 @@ That's the whole database setup: `.env.example` already ships `COMPOSE_PROFILES=
 **Option A — Groq (recommended, 14,400 requests/day free):**
 1. Sign up at https://console.groq.com
 2. Create an API key
-3. Add to `.env`: `GROQ_API_KEY=gsk_...`
+3. Keep it handy — you enter it in the setup wizard after first login (or later under **Settings → LLM Providers**)
 
 **Option B — Google Gemini (1,500 requests/day free):**
 1. Sign up at https://aistudio.google.com
 2. Create an API key
-3. Add to `.env`: `GEMINI_API_KEY=AIza...`
+3. Keep it handy — you enter it in the setup wizard after first login (or later under **Settings → LLM Providers**)
+
+API keys are entered only through the UI and stored encrypted; they are not read from `.env`.
 
 ### 3. Generate TLS certificates
 
@@ -105,7 +107,7 @@ Navigate to **https://localhost:3000**
 
 On first boot, create your admin account by entering your name, email, and password. A two-step setup wizard then walks you through connecting a database and configuring an LLM provider.
 
-Then go to **Settings → Add Provider**, select Groq or Gemini, paste your key, and start chatting.
+Then go to **Settings → LLM Providers**, click **+ Add Groq config** (or Gemini), paste your key, click **Add**, and start chatting.
 
 ---
 
@@ -122,7 +124,7 @@ The adapter interface is documented in [docs/development/adding-a-datasource.md]
 
 ## Supported LLM Providers
 
-Claude, OpenAI, Groq, Gemini, Cerebras, Mistral, Ollama, and any OpenAI-compatible endpoint (GitHub Models, HuggingFace, Together.ai, OpenRouter, vLLM, LM Studio, etc.).
+Claude, OpenAI, Groq, Gemini, Cerebras, Mistral, Ollama, and any OpenAI-compatible endpoint (HuggingFace, Together.ai, OpenRouter, vLLM, LM Studio, etc.).
 
 See [docs/user-guide/06_llm-providers.md](docs/user-guide/06_llm-providers.md) for the full provider list, configuration details, and default models.
 
@@ -146,7 +148,7 @@ docker compose up --build
 
 > Prefer editing `COMPOSE_PROFILES` over passing `--profile` on the command line: the CLI flag **replaces** the value from `.env` rather than adding to it, so `docker compose --profile test-dbs up` would silently stop the `local-db` container from starting.
 
-The sample databases are available on ports **5435** (PostgreSQL) and **3307** (MySQL). Configure them in the UI under **Settings → Add Connection** using user `savvina` and whichever password applies — your `.env` override or the `savvina_demo` default.
+The sample databases are available on ports **5435** (PostgreSQL) and **3307** (MySQL). Add them from **Connections** in the left sidebar using user `savvina` and whichever password applies — your `.env` override or the `savvina_demo` default.
 
 See [docs/infrastructure/docker.md](docs/infrastructure/docker.md) for full details.
 
@@ -174,7 +176,7 @@ docker exec -it savvina-ollama-1 ollama pull llama3
 docker exec -it savvina-ollama-1 ollama pull qwen2.5-coder:7b
 ```
 
-In the Savvina AI UI, go to **Settings → Add Provider → Ollama (Local)** and select your pulled model.
+In the Savvina AI UI, go to **Settings → LLM Providers**, click **+ Add Ollama (Local) config**, and select your pulled model.
 
 ---
 

@@ -31,9 +31,19 @@ class SettingsResponse(BaseModel):
 class SettingsUpdate(BaseModel):
     """Mutable settings that can be changed at runtime via PUT /api/settings.
 
-    Changes are persisted to the ``app_settings`` database table and survive
-    process restarts. To revert a setting to its default, delete the
-    corresponding row from ``app_settings``.
+    Changes are persisted to the ``app_settings`` table and survive restarts. They
+    are also written through to the serving worker's cached ``get_settings()``
+    singleton, so the runtime hot path picks them up without a restart; other
+    workers see them in responses immediately (reads are DB-authoritative) and in
+    their own hot path at next restart.
+
+    The only restart-bound keys are ``db_pool_size`` and ``db_max_overflow``: the
+    engine is built once at startup in every worker. ``bcrypt_rounds`` is read from
+    the DB per password operation, so it applies immediately everywhere and is never
+    set on the singleton (``Settings`` has no such field).
+
+    To revert a setting to its default, delete the corresponding row from
+    ``app_settings``.
     """
 
     default_query_timeout: int | None = Field(default=None, ge=1)
