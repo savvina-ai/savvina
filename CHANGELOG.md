@@ -2,6 +2,30 @@
 
 <!-- version list -->
 
+## v2.1.0 (2026-09-22)
+
+### Bug Fixes
+
+- Publish multi-arch images to Docker Hub, move TLS out of the frontend container, and close review
+  findings ([#17](https://github.com/savvina-ai/savvina/pull/17),
+  [`9c91a21`](https://github.com/savvina-ai/savvina/commit/9c91a210dc9e9706f9d358ff9746dd571bb972cd))
+
+### Features
+
+- Docker hub setup ([#17](https://github.com/savvina-ai/savvina/pull/17),
+  [`9c91a21`](https://github.com/savvina-ai/savvina/commit/9c91a210dc9e9706f9d358ff9746dd571bb972cd))
+
+### Refactoring
+
+- **settings**: Move the custom-provider service list into its own module so a test can pin which
+  services are offered ([#17](https://github.com/savvina-ai/savvina/pull/17),
+  [`9c91a21`](https://github.com/savvina-ai/savvina/commit/9c91a210dc9e9706f9d358ff9746dd571bb972cd))
+
+- **settings**: Move the custom-provider service list into its own module so a test can pin which
+  services are offered ([#16](https://github.com/savvina-ai/savvina/pull/16),
+  [`adcf021`](https://github.com/savvina-ai/savvina/commit/adcf021c12da35b0ef1cc5fdaa13a9bcade8c0ee))
+
+
 ## v2.0.0 (2026-09-20)
 
 ### Bug Fixes
