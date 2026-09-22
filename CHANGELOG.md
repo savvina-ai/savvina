@@ -2,6 +2,17 @@
 
 <!-- version list -->
 
+## v2.1.1 (2026-09-22)
+
+### Bug Fixes
+
+- **setup**: Fix .env corruption from UID/GID append and improve sample-db docs in README
+  ([`fed7296`](https://github.com/savvina-ai/savvina/commit/fed7296d357795b896bb200973577e2b7438b19f))
+
+- **test-dbs**: Derive sample Postgres dates from CURRENT_DATE so seeded data stays current
+  ([`2c0d44a`](https://github.com/savvina-ai/savvina/commit/2c0d44aa559dee65d0dc8b9c628a8b1ec4acc383))
+
+
 ## v2.1.0 (2026-09-22)
 
 ### Bug Fixes
