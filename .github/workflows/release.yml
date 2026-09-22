@@ -8,18 +8,23 @@ permissions:
   contents: write       # push tag + CHANGELOG.md commit
   issues: write         # comment on linked issues when release ships
   pull-requests: write  # comment on linked PRs when release ships
+  actions: write        # dispatch docker-publish.yml for the new tag
 
 jobs:
+  # Gate: the audits CI runs on every push also run here, before a release is
+  # cut. CI's copies race this workflow rather than gating it, and the
+  # "[skip ci]" release commit never triggers them at all -- so without this a
+  # tag could be cut from a tree with a known-vulnerable dependency.
+  audit:
+    name: Dependency audit
+    uses: ./.github/workflows/dependency-audit.yml
+
   release:
     name: Semantic Release
+    needs: [audit]
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Debug token
-        run: echo "Token length=${#TOKEN}"
-        env:
-          TOKEN: ${{ secrets.RELEASE_TOKEN }}
-
       - name: Checkout (full history)
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -31,6 +36,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Record pre-release HEAD
+        id: before
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Install python-semantic-release
         run: pip install python-semantic-release==10.5.3
 
@@ -38,3 +47,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: python scripts/run_semantic_release.py version
+
+      - name: Publish Docker images for the new tag
+        # The release commit carries "[skip ci]", and GitHub honours that for the
+        # tag push as well, so docker-publish.yml never fires from the tag itself.
+        # workflow_dispatch is exempt from the GITHUB_TOKEN no-recursive-trigger rule.
+        # docker-publish.yml's `promote` job promotes the tag to `latest` once
+        # every build-push leg has succeeded, when it is the newest release on
+        # main, so one dispatch is enough.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE_SHA: ${{ steps.before.outputs.sha }}
+        run: |
+          if [ "$(git rev-parse HEAD)" = "$BEFORE_SHA" ]; then
+            echo "semantic-release created no release; nothing to publish."
+            exit 0
+          fi
+          tag="$(git describe --tags --exact-match HEAD)"
+          echo "Dispatching Docker Publish for $tag"
+          gh workflow run docker-publish.yml --ref "$tag"

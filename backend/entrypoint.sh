@@ -64,8 +64,14 @@ until alembic upgrade head; do
     sleep 2
 done
 
+# uvicorn's ProxyHeadersMiddleware is enabled by default (proxy_headers=True,
+# forwarded_allow_ips falls back to "127.0.0.1"), which would let any peer
+# connecting from loopback rewrite scope["scheme"] and scope["client"] via
+# X-Forwarded-Proto / X-Forwarded-For. Those feed the refresh cookie's Secure
+# flag, the HSTS header (app/auth/proxy.py), and the rate-limit key
+# (app/auth/limiter.py::_real_ip), so it must be off explicitly.
 if [ "${RELOAD:-0}" = "1" ]; then
-    exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/app
+    exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/app --no-proxy-headers
 else
-    exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+    exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-proxy-headers
 fi

@@ -3,6 +3,7 @@
 
 """Tests for app/config.py — Settings and get_settings()."""
 
+import re
 from typing import ClassVar
 
 from pydantic import ValidationError
@@ -151,3 +152,64 @@ class TestResolveJwtSecret:
         key = "a" * 32
         s = Settings(**self._BASE, jwt_secret_key=key)
         assert s.jwt_secret_key == key
+
+
+class TestBehindTlsProxy:
+    _BASE: ClassVar[dict] = {
+        "database_url": "postgresql+asyncpg://u:p@localhost/db",
+        "encryption_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "jwt_secret_key": "a" * 64,
+        "debug": False,
+    }
+
+    def test_defaults_to_false(self):
+        # Explicit kwarg-free construction: the field default must be off, so a
+        # plain-HTTP localhost/LAN install never issues a Secure cookie by accident.
+        assert Settings.model_fields["behind_tls_proxy"].default is False
+
+    def test_https_origin_without_flag_is_rejected(self):
+        """An https:// origin means a TLS proxy fronts the UI; without the flag the
+        refresh cookie would silently lose Secure and HSTS — refuse to start instead."""
+        with pytest.raises(ValidationError, match="BEHIND_TLS_PROXY is not set"):
+            Settings(
+                **self._BASE,
+                cors_origins=["https://savvina.example.com"],
+                behind_tls_proxy=False,
+            )
+
+    def test_https_origin_with_flag_is_accepted(self):
+        s = Settings(
+            **self._BASE,
+            cors_origins=["https://savvina.example.com"],
+            behind_tls_proxy=True,
+        )
+        assert s.behind_tls_proxy is True
+
+    def test_mixed_origins_only_need_flag_for_the_https_one(self):
+        with pytest.raises(ValidationError, match=re.escape("'https://savvina.example.com'")):
+            Settings(
+                **self._BASE,
+                cors_origins=["http://localhost:3000", "https://savvina.example.com"],
+                behind_tls_proxy=False,
+            )
+
+    def test_http_origins_do_not_need_flag(self):
+        s = Settings(
+            **self._BASE,
+            cors_origins=["http://localhost:3000", "http://192.168.1.50:3000"],
+            behind_tls_proxy=False,
+        )
+        assert s.behind_tls_proxy is False
+
+    def test_flag_with_only_http_origins_is_allowed(self):
+        """localhost alongside a TLS proxy is a legitimate dev setup — no reverse check."""
+        s = Settings(**self._BASE, cors_origins=["http://localhost:3000"], behind_tls_proxy=True)
+        assert s.behind_tls_proxy is True
+
+    def test_debug_skips_the_check(self):
+        s = Settings(
+            **{**self._BASE, "debug": True},
+            cors_origins=["https://savvina.example.com"],
+            behind_tls_proxy=False,
+        )
+        assert s.behind_tls_proxy is False

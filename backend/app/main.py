@@ -42,6 +42,7 @@ from . import models  # noqa: F401
 
 # Import all LLM providers to trigger @register_provider decorators
 from . import providers as _providers_pkg  # noqa: F401
+from .auth.proxy import get_effective_scheme
 from .config import get_settings
 from .core.logging_config import configure_logging as _configure_logging
 from .core.request_context import request_id_var
@@ -155,7 +156,17 @@ class SecurityHeadersMiddleware:
                 headers.append("X-Content-Type-Options", "nosniff")
                 headers.append("X-Frame-Options", "DENY")
                 headers.append("Referrer-Policy", "strict-origin-when-cross-origin")
-                if not get_settings().debug:
+                _settings = get_settings()
+                if (
+                    not _settings.debug
+                    and get_effective_scheme(scope, _settings.behind_tls_proxy) == "https"
+                ):
+                    # Only sent when the browser was actually on HTTPS — declared via
+                    # BEHIND_TLS_PROXY, or a TLS socket on uvicorn itself. The frontend
+                    # container speaks plain HTTP, so sending this unconditionally (or
+                    # on a client-supplied X-Forwarded-Proto) would HSTS-pin browsers to
+                    # a host that may never terminate TLS (see
+                    # docs/administration/maintenance.md's upgrade-path section).
                     headers.append(
                         "Strict-Transport-Security",
                         f"max-age={_HSTS_MAX_AGE}; includeSubDomains",

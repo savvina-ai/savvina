@@ -99,7 +99,23 @@ class Settings(BaseSettings):
 
     # Rate limiting
     auth_rate_limit: str = "10/minute"
-    trusted_proxies: list[str] = ["127.0.0.1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    trusted_proxies: list[str] = [
+        "127.0.0.1",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "::1",
+        "fc00::/7",
+    ]
+
+    # Set to true when a TLS-terminating reverse proxy (Caddy, nginx, Traefik, a
+    # cloud load balancer) fronts the stack, so every request the backend sees
+    # was HTTPS at the browser. Decides the refresh cookie's Secure flag and the
+    # HSTS header. Deliberately an explicit setting rather than something
+    # inferred from X-Forwarded-Proto: on a plain-HTTP install that header is
+    # client-controllable (the bundled nginx passes it through), and behind a
+    # real proxy it can simply be missing — inference fails open both ways.
+    behind_tls_proxy: bool = False
 
     # Frontend-only settings — configurable from the settings page, persisted in DB.
     # These live on Settings so that setattr() in main.py (which restores DB overrides)
@@ -158,6 +174,29 @@ class Settings(BaseSettings):
                     raise ValueError(
                         f"Insecure CORS origin {origin!r} — use https:// in production "
                         f"or set DEBUG=true for local development"
+                    )
+        return self
+
+    @model_validator(mode="after")
+    def require_tls_flag_for_https_origins(self) -> "Settings":
+        """An https:// origin means the browser reaches the UI through a TLS proxy.
+
+        Without BEHIND_TLS_PROXY=true the refresh cookie would be issued without
+        the Secure flag and HSTS withheld — a silent downgrade rather than a
+        visible misconfiguration — so refuse to start instead. Only one direction
+        is checked: the flag with only http:// origins (e.g. localhost next to a
+        proxy) is a legitimate dev setup.
+        """
+        if not self.debug and not self.behind_tls_proxy:
+            for origin in self.cors_origins:
+                if origin.startswith("https://"):
+                    raise ValueError(
+                        f"CORS origin {origin!r} is https:// but BEHIND_TLS_PROXY is not set. "
+                        "Set BEHIND_TLS_PROXY=true in .env when a TLS-terminating reverse "
+                        "proxy serves the UI over HTTPS, so the session cookie is marked "
+                        "Secure and Strict-Transport-Security is sent. If you reach the UI "
+                        "over plain http:// (localhost or a private LAN IP), change this "
+                        "origin's scheme to http:// instead — do not set the flag."
                     )
         return self
 

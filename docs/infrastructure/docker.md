@@ -219,15 +219,15 @@ The image is built from `backend/Dockerfile` using a three-stage build:
 
 ```dockerfile
 # ── model stage — cached independently of Python deps ─────────────────────────
-FROM python:3.12-slim AS model-cache
+FROM --platform=$BUILDPLATFORM python:3.12-slim AS model-cache
 RUN pip install --no-cache-dir fastembed
 ENV FASTEMBED_CACHE_PATH=/app/fastembed_cache
-RUN for i in 1 2 3; do \
-        python -c "from fastembed import TextEmbedding; \
-                   list(TextEmbedding(model_name='BAAI/bge-small-en-v1.5').embed(['warmup']))" \
-        && break; \
-        echo "Retry $i..."; sleep 5; \
-    done
+# Optional HF_TOKEN arrives as a BuildKit secret (never a build arg), so it
+# is not recorded in this stage's config or history. download_model.sh
+# retries three times and then fails the build rather than producing an
+# image without the embedding model.
+COPY download_model.sh /download_model.sh
+RUN --mount=type=secret,id=hf_token sh /download_model.sh
 
 # ── builder ───────────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS builder
@@ -348,115 +348,34 @@ On startup (`entrypoint.sh` + `lifespan` in `main.py`):
 
 ## `frontend`
 
-The React application compiled and served by Nginx over HTTPS.
+The React application compiled and served by Nginx over plain HTTP.
 
 ```yaml
 frontend:
+  image: savvinaai/savvina-frontend:${SAVVINA_IMAGE_TAG:-latest}
   build: ./frontend
   ports:
-    - "${APP_PORT:-3000}:8443"
-  volumes:
-    - ./volumes/certs:/etc/nginx/certs:ro
+    - "${APP_PORT:-3000}:8080"
   depends_on:
     backend:
       condition: service_healthy
 ```
 
-The frontend Dockerfile in `frontend/` is a two-stage build. The build stage (`node:22-alpine`) runs `npm ci` and `npm run build`; the runtime stage starts from a bare `alpine:3.21`, installs nginx with `apk add --no-cache nginx`, and copies `dist/` into `/usr/share/nginx/html`. It is deliberately not `nginx:alpine` — starting from bare Alpine and running `apk upgrade` in the same layer means the image ships current Alpine packages rather than whatever was current when the upstream nginx image was last published. Nginx serves the static files over HTTPS and proxies `/api/` requests to the backend.
+The frontend Dockerfile in `frontend/` is a two-stage build. The build stage (`node:22-alpine`) runs `npm ci` and `npm run build`; the runtime stage starts from a bare `alpine:3.21`, installs nginx with `apk add --no-cache nginx`, and copies `dist/` into `/usr/share/nginx/html`. It is deliberately not `nginx:alpine` — starting from bare Alpine and running `apk upgrade` in the same layer means the image ships current Alpine packages rather than whatever was current when the upstream nginx image was last published. Nginx serves the static files and proxies `/api/` requests to the backend.
 
-**Port:** Host `${APP_PORT:-3000}` → container `8443` (Nginx HTTPS). Port 80 inside the container issues a permanent redirect to HTTPS.
+**Port:** Host `${APP_PORT:-3000}` → container `8080` (Nginx, HTTP). The container does not terminate TLS.
 
-**TLS certificates:** Nginx reads the cert and key from `/etc/nginx/certs/` inside the container, which is bind-mounted from `./volumes/certs/` on the host. The cert filenames expected by `frontend/nginx.conf` are:
+**Pre-built image:** `docker compose pull` fetches `savvinaai/savvina-frontend:<SAVVINA_IMAGE_TAG>` (default `latest`, multi-arch `linux/amd64` + `linux/arm64`) from Docker Hub; `docker compose up --build` builds it locally instead.
 
-| File | Purpose |
-|---|---|
-| `volumes/certs/localhost+1.pem` | Certificate (chain) |
-| `volumes/certs/localhost+1-key.pem` | Private key |
-
-Place your own cert/key files here for production (see [HTTPS setup](#https-setup) below).
-
-**API proxy:** Requests to `/api/*` are forwarded to `http://backend:8000` within the Docker network. No CORS issues because the proxy is same-origin from the browser's perspective.
+**API proxy:** Requests to `/api/*` are forwarded to `http://backend:8000` within the Docker network. No CORS issues because the proxy is same-origin from the browser's perspective. Nginx forwards `Host`, `X-Real-IP`, and `X-Forwarded-For` only. `X-Real-IP` is the direct peer's address unless `TRUSTED_LB_CIDR` is set, in which case `docker-entrypoint.sh` renders `set_real_ip_from` / `real_ip_header X-Forwarded-For` directives into the config at startup and the address comes from the header the trusted proxy set when the direct peer falls inside one of those ranges — see [Rate Limiting and Proxy Trust](../getting-started/02_configuration.md#rate-limiting-and-proxy-trust). Whether the session cookie is marked `Secure` (and HSTS sent) is decided by the backend's `BEHIND_TLS_PROXY` setting, never by an `X-Forwarded-Proto` header — see [HTTPS Behind a Reverse Proxy](../getting-started/02_configuration.md#https-behind-a-reverse-proxy).
 
 The frontend waits for the backend health check before Nginx starts — this prevents the UI from loading in a state where API calls would fail.
 
 ---
 
-## HTTPS Setup
+## HTTPS
 
-TLS is terminated inside the `frontend` container by Nginx. You supply the certificate files — the stack does not generate or renew them automatically. This means any cert source works: mkcert, Let's Encrypt, a commercial CA, or your organisation's internal CA.
-
-### Local development (mkcert)
-
-[mkcert](https://github.com/FiloSottile/mkcert) generates locally-trusted certs and installs its CA into the OS/browser trust store so no warnings appear.
-
-```bash
-# Install mkcert (Debian/Ubuntu/WSL) — fetches the latest release automatically
-sudo apt install libnss3-tools
-curl -Lo mkcert "$(curl -s https://api.github.com/repos/FiloSottile/mkcert/releases/latest \
-  | grep browser_download_url | grep linux-amd64 | cut -d '"' -f 4)"
-chmod +x mkcert && sudo mv mkcert /usr/local/bin/
-```
-
-```bash
-# Install mkcert (RHEL / Fedora / CentOS)
-sudo dnf install nss-tools
-curl -Lo mkcert "$(curl -s https://api.github.com/repos/FiloSottile/mkcert/releases/latest \
-  | grep browser_download_url | grep linux-amd64 | cut -d '"' -f 4)"
-chmod +x mkcert && sudo mv mkcert /usr/local/bin/
-```
-
-```bash
-# Install the CA (run once)
-mkcert -install
-
-# Generate certs for localhost and 127.0.0.1
-mkdir -p volumes/certs
-cd volumes/certs
-mkcert localhost 127.0.0.1
-cd ../..
-```
-
-This produces `localhost+1.pem` and `localhost+1-key.pem` — exactly the filenames Nginx expects. After `docker compose up --build`, the app is accessible at `https://localhost:<APP_PORT>` with a green padlock.
-
-> **WSL users:** `mkcert -install` inside WSL only updates the Linux certificate store — it does not reach the Windows browser trust store. To avoid certificate warnings in Chrome/Edge/Firefox on Windows, also run `mkcert -install` once from a **Windows** Command Prompt or PowerShell (requires mkcert installed on the Windows side via `winget install FiloSottile.mkcert`).
-
-**Accessing from a custom hostname or remote machine:** include the extra hostname in the `mkcert` command:
-
-```bash
-mkcert localhost 127.0.0.1 your-hostname.example.com
-```
-
-The cert filename changes when more SANs are added (e.g. `localhost+2.pem` for three SANs) — update `frontend/nginx.conf` to match:
-
-```nginx
-ssl_certificate     /etc/nginx/certs/localhost+2.pem;
-ssl_certificate_key /etc/nginx/certs/localhost+2-key.pem;
-```
-
-Update `CORS_ORIGINS` in `.env` to include every origin users will access the app from:
-
-```bash
-CORS_ORIGINS=["https://localhost:3000","https://your-hostname.example.com:3000"]
-```
-
-### Production (custom certs)
-
-Drop your certificate files into `volumes/certs/` and update the filenames in `frontend/nginx.conf`:
-
-```nginx
-ssl_certificate     /etc/nginx/certs/fullchain.pem;
-ssl_certificate_key /etc/nginx/certs/privkey.pem;
-```
-
-Let's Encrypt with Certbot on the host:
-
-```bash
-certbot certonly --standalone -d yourdomain.com
-cp /etc/letsencrypt/live/yourdomain.com/fullchain.pem volumes/certs/
-cp /etc/letsencrypt/live/yourdomain.com/privkey.pem   volumes/certs/
-```
-
-Then rebuild the frontend image (`docker compose build frontend`) so Nginx picks up the updated config, and restart. The certs themselves are bind-mounted, so you can rotate them without a rebuild — just copy the new files and run `docker compose exec frontend nginx -s reload`.
+The stack itself speaks plain HTTP, which is what you want for `localhost` and trusted LAN use. To serve it over HTTPS, put a TLS-terminating reverse proxy in front of the frontend port and bind the frontend to `127.0.0.1`. Set `BEHIND_TLS_PROXY=true` in `.env` so the backend marks the session cookie `Secure` and sends HSTS; the proxy must disable response buffering and allow read timeouts of at least 300 s (900 s for semantic-model generation) so streamed chat responses are not cut off. A worked Caddy example is in [Deployment → Configure HTTPS](../administration/deployment.md#5-configure-https).
 
 ---
 
@@ -552,9 +471,15 @@ Named volumes (managed by Docker) vs. bind-mounts (host paths):
 
 ## Development Overrides
 
-`docker-compose.override.yaml` is committed to the repository and picked up automatically by every `docker compose` command — you do not create it, and there is nothing to opt into. It provides:
+`docker-compose.override.yaml` is committed to the repository and picked up automatically by every `docker compose` command — you do not create it, and there is nothing to opt into. It provides volume permissions and two one-off helpers (below). Backend hot-reload lives in a second, opt-in file:
 
-**Backend hot-reload.** It bind-mounts `./backend/app` into the container and sets `RELOAD: "1"`, which `backend/entrypoint.sh` reads to start uvicorn with `--reload`. Editing backend source therefore takes effect without a rebuild. Note that the mechanism is the environment variable, not a `command:` override — `entrypoint.sh` still needs to run `alembic upgrade head` before uvicorn starts.
+**Backend hot-reload (`docker-compose.dev.yaml`).** Bind-mounts `./backend/app` into the container and sets `RELOAD: "1"`, which `backend/entrypoint.sh` reads to start uvicorn with `--reload`. Editing backend source then takes effect without a rebuild. The mechanism is the environment variable, not a `command:` override — `entrypoint.sh` still needs to run `alembic upgrade head` before uvicorn starts. Enable it by adding to `.env`:
+
+```bash
+COMPOSE_FILE=docker-compose.yaml:docker-compose.override.yaml:docker-compose.dev.yaml
+```
+
+It is deliberately not part of the automatic override: with pre-built images (`docker compose pull`) the bind-mount would run this checkout's code on top of the image's `alembic/` migrations, and the two can disagree.
 
 **Volume permissions.** An `init-permissions` service (running as root) creates and chowns the bind-mounted directories under `./volumes/` before anything else starts. The `backend`, `frontend`, `sample-mysql` and `sample-postgres` services all declare `depends_on: init-permissions` with `condition: service_completed_successfully`, so this always runs first.
 

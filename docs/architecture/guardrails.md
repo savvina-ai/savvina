@@ -27,7 +27,7 @@ Appends OWASP-recommended response headers on every reply:
 - `X-Content-Type-Options: nosniff`
 - `X-Frame-Options: DENY`
 - `Referrer-Policy: strict-origin-when-cross-origin`
-- `Strict-Transport-Security: max-age=31536000; includeSubDomains`
+- `Strict-Transport-Security: max-age=31536000; includeSubDomains` — only when `BEHIND_TLS_PROXY=true` (or the request reached uvicorn itself over TLS); the container speaks plain HTTP, and the header is never derived from `X-Forwarded-Proto`, so a plain-HTTP install can't be HSTS-pinned by a client-supplied header — see [HTTPS Behind a Reverse Proxy](../getting-started/02_configuration.md#https-behind-a-reverse-proxy), which also governs the refresh cookie's `Secure` flag
 - `Content-Security-Policy: default-src 'none'` on `/api/` routes; a tighter self-only policy on frontend assets
 - `Cache-Control: no-store` on all `/api/v1/auth` responses
 

@@ -24,6 +24,15 @@ TEST_ENCRYPTION_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 os.environ["ENCRYPTION_KEY"] = TEST_ENCRYPTION_KEY
 os.environ["JWT_SECRET_KEY"] = "a" * 64  # 64-char key satisfies the >= 32 char validator
 os.environ["DATABASE_URL"] = "postgresql+asyncpg://savvina:changeme@db:5432/savvina_test"
+# Pin DEBUG=false so tests exercise the production CORS/HSTS validators regardless
+# of a DEBUG=true left in a developer's root .env (config.py reads ../.env too).
+os.environ["DEBUG"] = "false"
+# Pin CORS_ORIGINS to the default so a developer's root .env cannot change which
+# CORS/TLS validators the test suite exercises.
+os.environ["CORS_ORIGINS"] = '["http://localhost:3000"]'
+# Pin BEHIND_TLS_PROXY=false so tests exercise the flag-off behavior (no Secure
+# cookie, no HSTS) regardless of a BEHIND_TLS_PROXY=true left in a developer's root .env.
+os.environ["BEHIND_TLS_PROXY"] = "false"
 
 # Clear the lru_cache so a fresh Settings() is built from the env vars above
 from app.config import get_settings  # noqa: E402

@@ -9,30 +9,7 @@
 
 ![Savvina AI demo](docs/assets/demo.gif)
 
-**Self-hosted conversational analytics — query your database with plain English.**
-
 Savvina AI lets you connect to a database, ask questions in natural language, and receive generated SQL queries along with formatted results. It auto-generates a business-language semantic model from your schema, caches frequent queries for speed, and gives you full control over what data reaches the LLM and how queries are executed.
-
----
-
-## Features
-
-| Feature | Description |
-|---|---|
-| **Natural language to SQL** | Ask questions in plain English; get readable SQL and tabular results |
-| **Multi-LLM support** | Claude, OpenAI, Groq, Gemini, Cerebras, Mistral, Ollama — plus any OpenAI-compatible endpoint (HuggingFace, Together.ai, OpenRouter, etc.) |
-| **2 data sources** | PostgreSQL and MySQL / MariaDB — additional sources exist in commercial version |
-| **Free-tier ready** | Works out of the box with Groq (14,400 req/day free) or Google Gemini (1,500 req/day free) |
-| **Local LLM via Ollama** | Run entirely offline with Ollama — no data leaves your machine |
-| **Auto semantic model** | LLM-generated business glossary translates cryptic column names into plain language |
-| **Two-level cache** | Exact + semantic similarity caching reduces redundant LLM calls |
-| **Privacy controls** | Per-connection controls over what metadata (sample values, comments, row counts) reaches the LLM |
-| **Three execution modes** | Auto-execute, Review-first, or Generate-only — choose your trust level per connection |
-| **Read-only safety** | All generated SQL is validated before execution; only SELECT statements are permitted |
-| **Fernet encryption** | Database credentials and API keys are always encrypted at rest |
-| **Extensible adapters** | Adding a new data source or LLM provider requires only one new file |
-| **Report Builder** | Assemble query results from chat history into a PDF report; export individual results as CSV, XLSX, or PNG |
-| **Shared sessions** | Share a read-only link to any chat message or full session |
 
 ---
 
@@ -42,8 +19,10 @@ Savvina AI lets you connect to a database, ask questions in natural language, an
 
 ### Prerequisites
 
-- Docker + Docker Compose (v2)
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (includes Compose v2) — or Docker Engine + [Compose plugin](https://docs.docker.com/compose/install/linux/) on a Linux server without Docker Desktop
 - 4 GB RAM minimum (8 GB recommended for local Ollama)
+
+See [Quickstart → Prerequisites](docs/getting-started/01_quickstart.md#prerequisites) if you need to install Docker first.
 
 ### 1. Clone and configure
 
@@ -69,54 +48,69 @@ That's the whole database setup: `.env.example` already ships `COMPOSE_PROFILES=
 
 ### 2. Get a free LLM API key
 
-**Option A — Groq (recommended, 14,400 requests/day free):**
-1. Sign up at https://console.groq.com
-2. Create an API key
-3. Keep it handy — you enter it in the setup wizard after first login (or later under **Settings → LLM Providers**)
+**Option A — Groq (recommended, no card required):** sign up at [console.groq.com](https://console.groq.com) and create an API key. Free-tier limits vary by model and are enforced per organization — check yours at [console.groq.com/settings/limits](https://console.groq.com/settings/limits); general-purpose models are commonly around 1,000 requests/day, with some legacy models allowed much higher.
 
-**Option B — Google Gemini (1,500 requests/day free):**
-1. Sign up at https://aistudio.google.com
-2. Create an API key
-3. Keep it handy — you enter it in the setup wizard after first login (or later under **Settings → LLM Providers**)
+**Option B — Google Gemini (no card required):** sign up at [aistudio.google.com](https://aistudio.google.com) and create an API key. Free-tier requests/day vary by model (recent Flash/Flash-Lite models have ranged from roughly 20 to 250+ req/day) and change without much notice — check current limits at [ai.google.dev/gemini-api/docs/rate-limits](https://ai.google.dev/gemini-api/docs/rate-limits) or [aistudio.google.com](https://aistudio.google.com/rate-limit).
 
-API keys are entered only through the UI and stored encrypted; they are not read from `.env`.
+Keep the key handy — you enter it in step 4. API keys are entered only through the UI and stored encrypted; they are not read from `.env`.
 
-### 3. Generate TLS certificates
+### 3. Start the stack
 
-Nginx serves over HTTPS and will not start without a certificate. Use [mkcert](https://github.com/FiloSottile/mkcert) to generate locally-trusted certs:
+**Option A — pre-built images (no compiling):** every release publishes multi-arch images (`linux/amd64` and `linux/arm64`, so Apple Silicon, Raspberry Pi and most NAS boxes are covered) to Docker Hub as [`savvinaai/savvina-backend`](https://hub.docker.com/r/savvinaai/savvina-backend) and [`savvinaai/savvina-frontend`](https://hub.docker.com/r/savvinaai/savvina-frontend):
 
 ```bash
-mkcert -install          # installs local CA once (run as your normal user)
-mkdir -p volumes/certs
-cd volumes/certs && mkcert localhost 127.0.0.1 && cd ../..
+docker compose pull
+docker compose up --no-build
 ```
 
-See [HTTPS Setup](docs/infrastructure/docker.md#https-setup) for installation instructions, WSL notes, and custom hostname support.
+`latest` is the newest release. To pin a release, add `SAVVINA_IMAGE_TAG=v2.0.0` (any tag from the [releases page](https://github.com/savvina-ai/savvina/releases)) to `.env` before pulling.
 
-### 4. Start the stack
+> **Note:** with pre-built images the backend runs the code baked into the image, so pinning `SAVVINA_IMAGE_TAG` pins the application code, dependencies, and migrations together. Backend hot-reload from your local checkout is a separate opt-in (`docker-compose.dev.yaml`, see [Development Overrides](docs/infrastructure/docker.md#development-overrides)); don't combine it with Option A, or the checkout's code runs against the image's migrations.
+
+**Option B — build from source:** use this if you have changed the code:
 
 ```bash
 docker compose up --build
 ```
 
-Wait for all services to show as healthy (about 60–120 seconds on first build). Volume permissions are prepared automatically by the `init-permissions` service.
+Wait for all services to show as healthy — migrations run on every start, so first boot can take a minute or two even with pre-built images, and longer on a first build. Volume permissions are prepared automatically by the `init-permissions` service.
 
-### 5. Open the UI
+### 4. Open the UI
 
-Navigate to **https://localhost:3000**
+The stack serves plain HTTP; that is fine for local and LAN use. For anything reachable from the internet, put a TLS-terminating reverse proxy in front (see [Deployment → Configure HTTPS](docs/administration/deployment.md#5-configure-https)).
 
-On first boot, create your admin account by entering your name, email, and password. A two-step setup wizard then walks you through connecting a database and configuring an LLM provider.
+Navigate to **http://localhost:3000**
 
-Then go to **Settings → LLM Providers**, click **+ Add Groq config** (or Gemini), paste your key, click **Add**, and start chatting.
+> Reaching the UI at any other host or IP (e.g. a LAN address)? Set `CORS_ORIGINS` in `.env` to that exact origin and restart the backend, or login will fail with a 403 — see [Quickstart → Step 7](docs/getting-started/01_quickstart.md#step-7--create-your-admin-account) for a worked example. Upgrading from an older, HTTPS-only release? See [Upgrading from a TLS-terminating release](docs/administration/maintenance.md#upgrading-from-a-tls-terminating-release).
+
+On first boot, create your admin account by entering your name, email, and password. A two-step setup wizard then walks you through connecting a database and configuring an LLM provider — paste the key from step 2 there, or add it later under **Settings → LLM Providers** with **+ Add Groq config** (or Gemini).
+
+---
+
+## Features
+
+| Feature | Description |
+|---|---|
+| **Natural language to SQL** | Ask questions in plain English; get readable SQL and tabular results |
+| **Multi-LLM support** | Claude, OpenAI, Groq, Gemini, Ollama and more — see [Supported LLM Providers](#supported-llm-providers) |
+| **2 data sources** | PostgreSQL and MySQL / MariaDB — additional sources exist in commercial version |
+| **Free-tier ready** | Works out of the box with Groq or Google Gemini — both offer a free API tier with no card required |
+| **Local LLM via Ollama** | Run entirely offline with Ollama — no data leaves your machine |
+| **Auto semantic model** | LLM-generated business glossary translates cryptic column names into plain language |
+| **Two-level cache** | Exact + semantic similarity caching reduces redundant LLM calls |
+| **Privacy controls** | Per-connection controls over what metadata (sample values, comments, row counts) reaches the LLM |
+| **Three execution modes** | Auto-execute, Review-first, or Generate-only — choose your trust level per connection |
+| **Read-only safety** | All generated SQL is validated before execution; only SELECT statements are permitted |
+| **Fernet encryption** | Database credentials and API keys are always encrypted at rest |
+| **Extensible adapters** | Adding a new data source or LLM provider requires only one new file |
+| **Report Builder** | Assemble query results from chat history into a PDF report; export individual results as CSV, XLSX, or PNG |
+| **Shared sessions** | Share a read-only link to any chat message or full session |
 
 ---
 
 ## Supported Data Sources
 
-| Source | Driver | Notes |
-|---|---|---|
-| **PostgreSQL** | asyncpg | Full schema introspection, row counts, column comments |
-| **MySQL / MariaDB** | aiomysql | Full schema introspection, row counts, column comments |
+**PostgreSQL** (asyncpg) and **MySQL / MariaDB** (aiomysql) — both with full schema introspection, row counts, and column comments.
 
 The adapter interface is documented in [docs/development/adding-a-datasource.md](docs/development/adding-a-datasource.md).
 
@@ -132,19 +126,13 @@ See [docs/user-guide/06_llm-providers.md](docs/user-guide/06_llm-providers.md) f
 
 ## Using Sample Databases (No Real Database Required)
 
-The `test-dbs` profile starts two pre-seeded demo databases — PostgreSQL and MySQL — so you can try Savvina AI without connecting to a real data source. Add it to `COMPOSE_PROFILES` in `.env` alongside your database mode:
+The `test-dbs` profile starts two pre-seeded demo databases — PostgreSQL and MySQL — so you can try Savvina AI without connecting to a real data source. Add it to `COMPOSE_PROFILES` in `.env` alongside your database mode, then start the stack as in [step 3](#3-start-the-stack):
 
 ```bash
 COMPOSE_PROFILES=local-db,test-dbs
 ```
 
 These are throwaway demo containers bound to localhost, so they fall back to built-in passwords (`savvina_demo`) if you leave `SAMPLE_POSTGRES_PASSWORD`, `SAMPLE_MYSQL_PASSWORD`, and `SAMPLE_MYSQL_ROOT_PASSWORD` unset. Set them in `.env` to override.
-
-Then start the stack as usual:
-
-```bash
-docker compose up --build
-```
 
 > Prefer editing `COMPOSE_PROFILES` over passing `--profile` on the command line: the CLI flag **replaces** the value from `.env` rather than adding to it, so `docker compose --profile test-dbs up` would silently stop the `local-db` container from starting.
 
@@ -156,19 +144,13 @@ See [docs/infrastructure/docker.md](docs/infrastructure/docker.md) for full deta
 
 ## Using Ollama (Local LLM)
 
-Add the `local-llm` profile to `COMPOSE_PROFILES` in `.env` to include the Ollama service:
+Add the `local-llm` profile to `COMPOSE_PROFILES` in `.env` to include the Ollama service, then start the stack as in [step 3](#3-start-the-stack):
 
 ```bash
 COMPOSE_PROFILES=local-db,local-llm
 ```
 
-Then start the stack:
-
-```bash
-docker compose up --build
-```
-
-Then pull a model (in a separate terminal while the stack is running):
+Pull a model in a separate terminal while the stack is running:
 
 ```bash
 docker exec -it savvina-ollama-1 ollama pull llama3

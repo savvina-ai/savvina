@@ -8,10 +8,19 @@ This guide takes you from zero to your first natural-language SQL query in under
 
 | Requirement | Minimum | Notes |
 |---|---|---|
-| Docker | 24+ | Docker Desktop or Docker Engine |
-| Docker Compose | v2 | Bundled with Docker Desktop |
+| Docker | 24+ | [Docker Desktop](https://www.docker.com/products/docker-desktop/) (macOS, Windows, Linux) or Docker Engine + [CLI plugin](https://docs.docker.com/compose/install/) on Linux servers |
+| Docker Compose | v2 | Bundled with Docker Desktop; installed separately as a CLI plugin on plain Docker Engine |
 | RAM | 4 GB | 8 GB recommended for Ollama |
 | Internet | Required | To pull Docker images and call LLM APIs |
+
+Don't have Docker yet? Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) for your OS, then verify it's running:
+
+```bash
+docker --version          # Docker version 24.x or newer
+docker compose version    # Docker Compose version v2.x
+```
+
+On Linux without Docker Desktop, follow the [Docker Engine install guide](https://docs.docker.com/engine/install/) for your distribution, then install the [Compose plugin](https://docs.docker.com/compose/install/linux/) separately — the standalone `docker-compose` (v1, with a hyphen) is not supported.
 
 ---
 
@@ -125,72 +134,18 @@ This step is safe to skip on macOS and Windows Docker Desktop.
 
 ---
 
-## Step 6 — Generate TLS Certificates (Required)
+## Step 6 — Start the Stack
 
-Nginx serves the frontend over HTTPS and will not start without a certificate. Use [mkcert](https://github.com/FiloSottile/mkcert) to generate locally-trusted certs in one command.
-
-### Install mkcert
-
-**macOS**
-```bash
-brew install mkcert
-```
-
-**Windows (PowerShell)**
-```powershell
-winget install FiloSottile.mkcert
-```
-
-**Debian / Ubuntu / WSL**
-```bash
-sudo apt install libnss3-tools
-curl -Lo mkcert "$(curl -s https://api.github.com/repos/FiloSottile/mkcert/releases/latest \
-  | grep browser_download_url | grep linux-amd64 | cut -d '"' -f 4)"
-chmod +x mkcert && sudo mv mkcert /usr/local/bin/
-```
-
-**RHEL / Fedora / CentOS**
-```bash
-sudo dnf install nss-tools
-curl -Lo mkcert "$(curl -s https://api.github.com/repos/FiloSottile/mkcert/releases/latest \
-  | grep browser_download_url | grep linux-amd64 | cut -d '"' -f 4)"
-chmod +x mkcert && sudo mv mkcert /usr/local/bin/
-```
-
-### Install the local CA (once per machine)
+**Option A — pre-built images (no compiling):**
 
 ```bash
-mkcert -install
+docker compose pull
+docker compose up --no-build
 ```
 
-> **WSL users:** the command above installs the CA into the Linux certificate store, which is enough for `curl` and server-side tools. To make Chrome/Edge/Firefox on *Windows* trust the cert without a warning, you also need to run `mkcert -install` once from a **Windows** Command Prompt or PowerShell (after installing mkcert for Windows via `winget`).
+Multi-arch images (`linux/amd64`, `linux/arm64`) are published to Docker Hub as `savvinaai/savvina-backend` and `savvinaai/savvina-frontend`. `latest` is the newest release; set `SAVVINA_IMAGE_TAG=v2.0.0` in `.env` to pin a release. First start takes about a minute (image download plus database migrations).
 
-### Generate the certificates
-
-```bash
-mkdir -p volumes/certs
-cd volumes/certs
-mkcert localhost 127.0.0.1
-cd ../..
-```
-
-This produces `localhost+1.pem` and `localhost+1-key.pem` — exactly the filenames Nginx expects.
-
-**Accessing from a custom hostname** (e.g. a corporate server or another machine on your network): add the hostname to the mkcert command:
-
-```bash
-mkcert localhost 127.0.0.1 your-hostname.example.com
-```
-
-Then update `CORS_ORIGINS` in `.env` to include that origin:
-
-```bash
-CORS_ORIGINS=["https://localhost:3000","https://your-hostname.example.com:3000"]
-```
-
----
-
-## Step 7 — Start the Stack
+**Option B — build from source** (needed if you changed the code):
 
 ```bash
 docker compose up --build
@@ -198,11 +153,13 @@ docker compose up --build
 
 The first build downloads Docker base images and installs Python/Node packages — expect 3–5 minutes. Subsequent starts take about 10–20 seconds.
 
+Backend code changes take effect on the next `docker compose up --build`. For hot-reload without rebuilding, opt into `docker-compose.dev.yaml` — see [Development Overrides](../infrastructure/docker.md#development-overrides).
+
 > **Speed tip:** The build downloads the fastembed ONNX embedding model from HuggingFace. Anonymous downloads are rate-limited and can slow or fail the build. Setting a free HuggingFace token in `.env` avoids the limit:
 > ```
 > HF_TOKEN=hf_...   # huggingface.co → Settings → Access Tokens (read-only token)
 > ```
-> The token is only used at build time and is never included in the final image.
+> The token is mounted as a BuildKit secret for the single download step only, so it is never recorded in any image layer or config.
 
 Wait until you see all services healthy:
 
@@ -213,9 +170,31 @@ Wait until you see all services healthy:
 
 ---
 
-## Step 8 — Create Your Admin Account
+## Step 7 — Create Your Admin Account
 
-Navigate to **https://localhost:3000** (or `https://<your-hostname>:<APP_PORT>` if you changed `APP_PORT` or are accessing from a custom hostname).
+Navigate to **http://localhost:3000** (or `http://<private-LAN-IP>:<APP_PORT>` — e.g. `http://192.168.1.50:3000` — if you changed `APP_PORT` or are reaching it from another machine). Do **not** use a custom hostname over plain HTTP; as the note below explains, the backend refuses to start with one as a CORS origin.
+
+> **Reaching the UI at anything other than `http://localhost:3000`?** Set `CORS_ORIGINS` in `.env` first, or login will fail with a `403 Origin not allowed`. The backend only accepts requests whose browser `Origin` matches this list, and it defaults to `["http://localhost:3000"]` alone — a LAN IP, a different hostname, or even `http://127.0.0.1:3000` all count as different origins.
+>
+> Set it to the exact origin (scheme + host + port) you'll open in the browser:
+>
+> ```bash
+> # Reaching the UI from another machine on your LAN by IP, e.g. http://192.168.1.50:3000
+> # (also fine for other private ranges: 10.x.x.x, 172.16-31.x.x)
+> CORS_ORIGINS=["http://192.168.1.50:3000"]
+> ```
+>
+> A custom hostname over plain HTTP (e.g. `http://savvina.local:3000`) is **not supported** — the backend refuses to start rather than accept it as a CORS origin. Either use the machine's private IP address as the origin instead, or put a TLS-terminating reverse proxy in front and use its `https://` origin (see [Deployment → Configure HTTPS](../administration/deployment.md#5-configure-https)):
+>
+> ```bash
+> CORS_ORIGINS=["https://savvina.example.com"]
+> ```
+>
+> `CORS_ORIGINS` is baked in at process startup, so recreate the backend after editing it (`restart` alone reuses the old environment):
+>
+> ```bash
+> docker compose up -d backend
+> ```
 
 On first boot you will see a **Create Admin Account** screen. Fill in:
 
@@ -235,7 +214,7 @@ Click **Skip** on any step to go straight to the dashboard.
 
 ---
 
-## Step 9 — Configure Your LLM Provider
+## Step 8 — Configure Your LLM Provider
 
 If you skipped the setup wizard, or want to add more providers:
 
@@ -249,7 +228,7 @@ See [LLM Providers](../user-guide/06_llm-providers.md) for a full list of suppor
 
 ---
 
-## Step 10 — Connect to a Database
+## Step 9 — Connect to a Database
 
 If you skipped the setup wizard, or want to add more connections:
 
@@ -278,7 +257,7 @@ For MySQL connections, see [Connecting to Data](../user-guide/02_connecting-to-d
 
 ---
 
-## Step 11 — Ask Your First Question
+## Step 10 — Ask Your First Question
 
 1. Click **Chat** in the left sidebar
 2. Select your saved connection from the connection dropdown
@@ -299,7 +278,7 @@ Savvina AI will:
 
 ---
 
-## Step 12 — Generate a Semantic Model (Optional but Recommended)
+## Step 11 — Generate a Semantic Model (Optional but Recommended)
 
 The semantic model translates cryptic column names (like `cx_tp_cd`) into plain English (like "Customer Type: E=Enterprise, S=SMB"). It dramatically improves query accuracy.
 

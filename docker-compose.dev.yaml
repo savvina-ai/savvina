@@ -1,0 +1,14 @@
+# Development-only additions. Not loaded automatically — opt in with
+#   COMPOSE_FILE=docker-compose.yaml:docker-compose.override.yaml:docker-compose.dev.yaml
+# in .env (or the equivalent -f flags). Kept out of docker-compose.override.yaml
+# so `docker compose pull && docker compose up --no-build` runs the pulled
+# image's code and migrations together, rather than this checkout's app/ on
+# top of the image's alembic/.
+services:
+  backend:
+    # Bind-mount source so code changes are picked up without rebuilding.
+    # RELOAD=1 activates uvicorn --reload in entrypoint.sh.
+    volumes:
+      - ./backend/app:/app/app
+    environment:
+      RELOAD: "1"

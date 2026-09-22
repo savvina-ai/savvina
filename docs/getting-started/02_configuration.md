@@ -60,7 +60,7 @@ The only provider-related environment variables are:
 
 | Variable | Purpose | Notes |
 |---|---|---|
-| `OLLAMA_BASE_URL` | Ollama (local) base URL | Default: `http://ollama:11434`. Ollama needs no API key. |
+| `OLLAMA_BASE_URL` | Ollama (local) base URL | Default: `http://ollama:11434`. Ollama needs no API key. **Merely setting this variable — even to the same value as the default — is what makes Ollama appear as a configured provider in the UI.** Leaving it unset is what keeps Ollama hidden on installations that never use it. |
 | `VERIFY_SSL` | TLS verification for all provider calls | Default `true`; see [SSL / TLS Settings](#ssl--tls-settings). |
 
 A provider with no saved config shows a grey "not configured" dot on the Settings page and cannot be selected for chat until a config with a key is added.
@@ -131,18 +131,37 @@ The query cache stores question → SQL pairs and uses fastembed ONNX embeddings
 | Variable | Type | Default | Description |
 |---|---|---|---|
 | `AUTH_RATE_LIMIT` | string | `10/minute` | Rate limit applied to authentication endpoints (login, register, refresh, password reset, profile update). Uses `slowapi` syntax, e.g. `20/minute`, `100/hour`. |
-| `TRUSTED_PROXIES` | JSON array | `["127.0.0.1","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"]` | CIDR ranges whose `X-Real-IP` header is believed when determining the client IP. |
+| `TRUSTED_PROXIES` | JSON array | `["127.0.0.1","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","::1","fc00::/7"]` | CIDR ranges (IPv4 and IPv6) whose direct connection is trusted to set `X-Real-IP` (client IP). |
 
-**`TRUSTED_PROXIES` decides which IP gets rate limited.** If the request's *direct* peer address falls inside one of these ranges, the client IP is taken from the `X-Real-IP` header; otherwise the direct peer address is used and the header is ignored. Note it is `X-Real-IP` specifically — `X-Forwarded-For` is not consulted, so a proxy that only sets the latter will leave every request attributed to the proxy itself. That same resolved IP is what login attempts are logged against.
+**`TRUSTED_PROXIES` decides one thing: which IP a request is attributed to.** If the request's *direct* TCP peer is inside one of these ranges, the client IP is taken from the `X-Real-IP` header; otherwise the direct peer address is used and the header is ignored. Note it is `X-Real-IP` specifically — `X-Forwarded-For` is not consulted, so a proxy that only sets the latter will leave every request attributed to the proxy itself. That resolved IP is the rate-limit key and is what login attempts are logged against. It has no bearing on HTTPS, the session cookie's `Secure` flag, or HSTS — those are governed by `BEHIND_TLS_PROXY` (next section), not by any header.
 
-The default trusts loopback plus all three RFC1918 private ranges, which is right for the standard deployment — the frontend Nginx container proxying to the backend over the Docker network. Two cases need attention:
+The default trusts loopback plus all three RFC1918 private IPv4 ranges, plus IPv6 loopback (`::1`) and unique-local addresses (`fc00::/7`), which is right for the standard deployment — the frontend Nginx container proxying to the backend over the Docker network. Two cases need attention:
 
-- **A reverse proxy outside those ranges** (a cloud load balancer on a public address, say) will not be trusted, so every request appears to come from the proxy and all clients share one rate-limit bucket. Add the proxy's range, and make sure it sets `X-Real-IP`.
+- **A reverse proxy in front of the frontend container.** The bundled nginx is what sets `X-Real-IP`, and it sets it to its own direct peer — the proxy — unless told which peers to trust. Set `TRUSTED_LB_CIDR` (a frontend-container variable, comma-separated CIDRs, e.g. `172.16.0.0/12` for a proxy on the same host) so nginx takes the client address from the proxy's `X-Forwarded-For` instead. Without it every request appears to come from the proxy and all clients share one rate-limit bucket. `TRUSTED_PROXIES` itself usually needs no change here, since nginx is on the Docker network.
 - **The backend reachable directly from untrusted networks** — do not widen this. Any client that can connect from a trusted range could then spoof `X-Real-IP` and evade rate limiting entirely by rotating the header.
 
 Set it as a JSON array string, like `CORS_ORIGINS`:
 ```bash
 TRUSTED_PROXIES=["127.0.0.1","10.0.0.0/8","203.0.113.5/32"]
+```
+
+---
+
+## HTTPS Behind a Reverse Proxy
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `BEHIND_TLS_PROXY` | bool | `false` | Set to `true` when a TLS-terminating reverse proxy serves the UI over `https://`. Turns on the session cookie's `Secure` flag and the `Strict-Transport-Security` header. |
+
+The backend and the frontend container only ever speak plain HTTP; TLS, if any, terminates at a reverse proxy you put in front (see [Deployment → Configure HTTPS](../administration/deployment.md#5-configure-https)). The backend therefore cannot see whether the *browser's* connection was HTTPS, and it does not try to guess from `X-Forwarded-Proto`: on a plain-HTTP install that header is whatever the client sent, and behind a real proxy it may simply be missing — inferring from it fails open in both directions. You declare it instead:
+
+- **Plain `http://` on localhost or a LAN IP** (the Quickstart setup): leave it unset. A `Secure` cookie would be refused by the browser and every login would silently fail at the first token refresh.
+- **`https://` through a reverse proxy:** set `BEHIND_TLS_PROXY=true`. The backend refuses to start if `CORS_ORIGINS` contains an `https://` origin while this is off, so the misconfiguration is a visible startup error rather than a session cookie quietly issued without `Secure`.
+
+The check is one-directional: `BEHIND_TLS_PROXY=true` with only `http://localhost` origins is allowed (a common dev setup next to a proxy).
+
+```bash
+BEHIND_TLS_PROXY=true
 ```
 
 ---
@@ -199,7 +218,12 @@ python -c "import secrets; print(secrets.token_urlsafe(24))"
 | `COMPOSE_PROFILES` | *(unset)* | Comma-separated list of active Docker Compose profiles. `local-db` starts the bundled PostgreSQL app container. `test-dbs` starts the sample PostgreSQL and MySQL containers pre-seeded with demo data. `local-llm` starts Ollama. Combine as needed: `local-db,test-dbs`. Leave unset when using an external managed database. |
 | `LOCAL_UID` | `1000` | Backend container runs as this user ID. Set to your host UID on Linux/WSL to avoid volume permission issues: `echo "LOCAL_UID=$(id -u)" >> .env` |
 | `LOCAL_GID` | `1000` | Backend container group ID. Set with: `echo "LOCAL_GID=$(id -g)" >> .env` |
-| `HF_TOKEN` | *(unset)* | Hugging Face access token passed as a **build-time** argument to `docker compose build`. Avoids anonymous rate-limiting when the `model-cache` stage downloads the fastembed ONNX model (`BAAI/bge-small-en-v1.5`) from HuggingFace. Not used at runtime. A free read-only token is sufficient — get one at huggingface.co → Settings → Access Tokens. |
+| `HF_TOKEN` | *(unset)* | Hugging Face access token used **only during `docker compose build`**. Avoids anonymous rate-limiting when the `model-cache` stage downloads the fastembed ONNX model (`BAAI/bge-small-en-v1.5`) from HuggingFace. It is passed as a BuildKit secret mount, not a build arg, so it is never recorded in any image layer or config. Not used at runtime. A free read-only token is sufficient — get one at huggingface.co → Settings → Access Tokens. |
+| `SAVVINA_IMAGE_TAG` | `latest` | Tag of the `savvinaai/savvina-backend` and `savvinaai/savvina-frontend` images that `docker compose pull` fetches. `latest` is the newest release; pin one with e.g. `SAVVINA_IMAGE_TAG=v2.0.0`. With `docker compose up --build`, Compose still builds from local source but stamps the result with this tag — it does not change what gets built. |
+| `PG_UID` | `70` | UID that `init-permissions` chowns the `sample-postgres` volume to. Only needed if the bundled sample-Postgres image (`test-dbs` profile) is swapped for one that runs as a different UID. |
+| `PG_GID` | `70` | GID for the same `sample-postgres` volume chown. Pairs with `PG_UID`. |
+| `MYSQL_UID` | `999` | UID that `init-permissions` chowns the `sample-mysql` volume to. Only needed if the bundled sample-MySQL image (`test-dbs` profile) is swapped for one that runs as a different UID. |
+| `MYSQL_GID` | `999` | GID for the same `sample-mysql` volume chown. Pairs with `MYSQL_UID`. |
 
 ---
 
@@ -234,6 +258,15 @@ DEFAULT_ROW_LIMIT=1000
 # ── CORS (add your deployment URL here) ───────────────────────────────────
 # CORS_ORIGINS=["http://localhost:3000","https://analytics.example.com"]
 
+# ── HTTPS behind a reverse proxy ─────────────────────────────────────────
+# Required (true) whenever CORS_ORIGINS has an https:// entry; see
+# "HTTPS Behind a Reverse Proxy" above.
+# BEHIND_TLS_PROXY=false
+
+# ── Rate limiting / proxy trust (usually no change needed) ────────────────
+# See "Rate Limiting and Proxy Trust" above.
+# TRUSTED_PROXIES=["127.0.0.1","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","::1","fc00::/7"]
+
 # ── Sample database passwords (only needed with test-dbs profile) ─────────
 # COMPOSE_PROFILES=local-db,test-dbs   ← add test-dbs to enable these containers
 SAMPLE_POSTGRES_PASSWORD=<strong-password>
@@ -243,21 +276,35 @@ SAMPLE_MYSQL_PASSWORD=<strong-password>
 # ── Host UID/GID (Linux/WSL only) ─────────────────────────────────────────
 LOCAL_UID=1000
 LOCAL_GID=1000
+# Only needed if the sample-postgres/sample-mysql images are swapped for ones
+# running as a different UID/GID — see Docker-Specific Settings above.
+# PG_UID=70
+# PG_GID=70
+# MYSQL_UID=999
+# MYSQL_GID=999
 
 # ── Build optimisation (optional) ─────────────────────────────────────────
 # Avoids HuggingFace anonymous rate-limiting during `docker compose build`.
 # Free read-only token: huggingface.co → Settings → Access Tokens
 HF_TOKEN=
+
+# ── Pre-built images (optional) ────────────────────────────────────────────
+# Tag of the savvinaai/savvina-* images `docker compose pull` fetches.
+# SAVVINA_IMAGE_TAG=latest
 ```
 
 ---
 
 ## Applying Changes
 
-Configuration changes require a backend restart:
+Configuration is read at container startup, not per request, so an edited `.env` only takes effect once the affected container is recreated. `docker compose restart` reuses the existing container and its old environment — use `docker compose up -d <service>` instead:
 
 ```bash
-docker compose restart backend
+# Most settings (JWT_SECRET_KEY, CORS_ORIGINS, BEHIND_TLS_PROXY, LLM/database config, etc.)
+docker compose up -d backend
+
+# Frontend-facing settings (APP_PORT, TRUSTED_LB_CIDR)
+docker compose up -d frontend
 ```
 
 If you changed `ENCRYPTION_KEY` (which requires re-encrypting all stored secrets — see [Encryption Key Rotation](../administration/maintenance.md#encryption-key-rotation)):
