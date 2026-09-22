@@ -945,12 +945,15 @@ BEGIN
 END $$;
 
 -- Guaranteed seed: customers 11 (Petros Andreou) and 27 (Vasilis Samaras) each have
--- exactly one order in every month of Q1 2026 so the test question
+-- exactly one order in every month of the PREVIOUS calendar quarter so the test question
 -- "Which customers placed at least one order in every month of the last quarter?"
 -- always returns 2 rows regardless of the random seed above.
+-- Dates are derived from CURRENT_DATE rather than written literally: pinned to a fixed
+-- quarter they stop satisfying the question as soon as the calendar moves past it.
 DO $$
 DECLARE
   prod_price NUMERIC(12,2);
+  q_start    TIMESTAMP := date_trunc('quarter', CURRENT_DATE)::TIMESTAMP - INTERVAL '3 months';
 BEGIN
   SELECT base_price INTO prod_price FROM ecommerce.products WHERE id = 22;
 
@@ -959,12 +962,12 @@ BEGIN
      subtotal, discount_amount, shipping_amount, tax_amount, total_amount,
      currency, shipping_country, shipping_city, ordered_at, shipped_at, delivered_at)
   VALUES
-    ('ORD-SEED-C11-JAN', 11, 'delivered', 'paid', 'credit_card', prod_price, 0, 0, round(prod_price*0.24,2), round(prod_price*1.24,2), 'EUR', 'Greece', 'Athens', '2026-01-10 10:00:00', '2026-01-12 10:00:00', '2026-01-15 10:00:00'),
-    ('ORD-SEED-C11-FEB', 11, 'delivered', 'paid', 'credit_card', prod_price, 0, 0, round(prod_price*0.24,2), round(prod_price*1.24,2), 'EUR', 'Greece', 'Athens', '2026-02-10 10:00:00', '2026-02-12 10:00:00', '2026-02-15 10:00:00'),
-    ('ORD-SEED-C11-MAR', 11, 'delivered', 'paid', 'credit_card', prod_price, 0, 0, round(prod_price*0.24,2), round(prod_price*1.24,2), 'EUR', 'Greece', 'Athens', '2026-03-10 10:00:00', '2026-03-12 10:00:00', '2026-03-15 10:00:00'),
-    ('ORD-SEED-C27-JAN', 27, 'delivered', 'paid', 'credit_card', prod_price, 0, 0, round(prod_price*0.24,2), round(prod_price*1.24,2), 'EUR', 'Greece', 'Athens', '2026-01-20 10:00:00', '2026-01-22 10:00:00', '2026-01-25 10:00:00'),
-    ('ORD-SEED-C27-FEB', 27, 'delivered', 'paid', 'credit_card', prod_price, 0, 0, round(prod_price*0.24,2), round(prod_price*1.24,2), 'EUR', 'Greece', 'Athens', '2026-02-18 10:00:00', '2026-02-20 10:00:00', '2026-02-23 10:00:00'),
-    ('ORD-SEED-C27-MAR', 27, 'delivered', 'paid', 'credit_card', prod_price, 0, 0, round(prod_price*0.24,2), round(prod_price*1.24,2), 'EUR', 'Greece', 'Athens', '2026-03-22 10:00:00', '2026-03-24 10:00:00', '2026-03-27 10:00:00');
+    ('ORD-SEED-C11-JAN', 11, 'delivered', 'paid', 'credit_card', prod_price, 0, 0, round(prod_price*0.24,2), round(prod_price*1.24,2), 'EUR', 'Greece', 'Athens', q_start + INTERVAL '9 days 10 hours', q_start + INTERVAL '11 days 10 hours', q_start + INTERVAL '14 days 10 hours'),
+    ('ORD-SEED-C11-FEB', 11, 'delivered', 'paid', 'credit_card', prod_price, 0, 0, round(prod_price*0.24,2), round(prod_price*1.24,2), 'EUR', 'Greece', 'Athens', q_start + INTERVAL '1 months' + INTERVAL '9 days 10 hours', q_start + INTERVAL '1 months' + INTERVAL '11 days 10 hours', q_start + INTERVAL '1 months' + INTERVAL '14 days 10 hours'),
+    ('ORD-SEED-C11-MAR', 11, 'delivered', 'paid', 'credit_card', prod_price, 0, 0, round(prod_price*0.24,2), round(prod_price*1.24,2), 'EUR', 'Greece', 'Athens', q_start + INTERVAL '2 months' + INTERVAL '9 days 10 hours', q_start + INTERVAL '2 months' + INTERVAL '11 days 10 hours', q_start + INTERVAL '2 months' + INTERVAL '14 days 10 hours'),
+    ('ORD-SEED-C27-JAN', 27, 'delivered', 'paid', 'credit_card', prod_price, 0, 0, round(prod_price*0.24,2), round(prod_price*1.24,2), 'EUR', 'Greece', 'Athens', q_start + INTERVAL '19 days 10 hours', q_start + INTERVAL '21 days 10 hours', q_start + INTERVAL '24 days 10 hours'),
+    ('ORD-SEED-C27-FEB', 27, 'delivered', 'paid', 'credit_card', prod_price, 0, 0, round(prod_price*0.24,2), round(prod_price*1.24,2), 'EUR', 'Greece', 'Athens', q_start + INTERVAL '1 months' + INTERVAL '17 days 10 hours', q_start + INTERVAL '1 months' + INTERVAL '19 days 10 hours', q_start + INTERVAL '1 months' + INTERVAL '22 days 10 hours'),
+    ('ORD-SEED-C27-MAR', 27, 'delivered', 'paid', 'credit_card', prod_price, 0, 0, round(prod_price*0.24,2), round(prod_price*1.24,2), 'EUR', 'Greece', 'Athens', q_start + INTERVAL '2 months' + INTERVAL '21 days 10 hours', q_start + INTERVAL '2 months' + INTERVAL '23 days 10 hours', q_start + INTERVAL '2 months' + INTERVAL '26 days 10 hours');
 
   -- Add one order_item per seed order so joins on order_items don't leave them orphaned
   INSERT INTO ecommerce.order_items (order_id, product_id, quantity, unit_price, discount_pct, line_total)
@@ -1758,6 +1761,103 @@ JOIN hr.employees e      ON d.id = e.department_id AND e.is_active = TRUE
 LEFT JOIN hr.training_records tr ON e.id = tr.employee_id
 GROUP BY d.id, d.name, tr.category
 ORDER BY d.name, tr.category;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- RECENCY SHIFT — keep the statically-dated rows current
+--
+-- Most activity above is generated relative to NOW() and is therefore always
+-- current on a fresh seed. The blocks below were written with literal calendar
+-- dates, so without this step they drift further into the past every month and
+-- questions like "which coupons are active?" or "which campaigns are running?"
+-- return nothing at all.
+--
+-- For each table we read its own newest date as that block's intended "today"
+-- and move every row by the same offset. Gaps between rows are preserved
+-- exactly, so every trend, streak and ordering the demo questions rely on
+-- survives untouched.
+--
+-- Deliberately NOT shifted:
+--   • ecommerce.customers.date_of_birth and hr.employees.hire_date/date_of_birth
+--     — facts about people, not activity. Shifting them would silently change
+--       everyone's age and tenure.
+--   • anything generated from NOW() above — it is already current, and shifting
+--     it again would push it into the future.
+--
+-- Anchors differ because "newest row" means different things: a last login is
+-- a past event, a coupon's valid_until is a future boundary that has to stay
+-- ahead of today for the coupon to read as active.
+-- ─────────────────────────────────────────────────────────────────────────────
+DO $$
+DECLARE
+  d INT;
+BEGIN
+  -- newest row lands on TODAY (most recent past event)
+  SELECT CURRENT_DATE - MAX(last_login_at)::DATE INTO d FROM ecommerce.customers;
+  IF d IS NOT NULL AND d <> 0 THEN
+    UPDATE ecommerce.customers
+       SET created_at    = created_at    + d * INTERVAL '1 day',
+           last_login_at = last_login_at + d * INTERVAL '1 day';
+  END IF;
+
+  SELECT CURRENT_DATE - MAX(last_restocked_at)::DATE INTO d FROM inventory.stock;
+  IF d IS NOT NULL AND d <> 0 THEN
+    UPDATE inventory.stock
+       SET last_restocked_at = last_restocked_at + d * INTERVAL '1 day';
+  END IF;
+
+  SELECT CURRENT_DATE - MAX(review_date) INTO d FROM hr.performance_reviews;
+  IF d IS NOT NULL AND d <> 0 THEN
+    UPDATE hr.performance_reviews SET review_date = review_date + d;
+  END IF;
+
+  SELECT CURRENT_DATE - MAX(effective_date) INTO d FROM hr.salary_history;
+  IF d IS NOT NULL AND d <> 0 THEN
+    UPDATE hr.salary_history SET effective_date = effective_date + d;
+  END IF;
+
+  SELECT CURRENT_DATE - MAX(end_date) INTO d FROM analytics.ab_tests;
+  IF d IS NOT NULL AND d <> 0 THEN
+    UPDATE analytics.ab_tests
+       SET start_date = start_date + d,
+           end_date   = end_date   + d;
+  END IF;
+
+  -- anchored on the newest START, not the newest completion. The most recent rows
+  -- here are trainings still in progress (completed_at IS NULL) that begin a year
+  -- after the last completion, so anchoring on completions would drag every start
+  -- ~2.5 years forward and leave trainings that begin in the future. Anchoring on
+  -- started_at also leaves the oldest certificates past their expiry, without which
+  -- hr.v_training_compliance.expired_certs would be permanently zero.
+  SELECT CURRENT_DATE - MAX(started_at) INTO d FROM hr.training_records;
+  IF d IS NOT NULL AND d <> 0 THEN
+    UPDATE hr.training_records
+       SET started_at   = started_at   + d,
+           completed_at = completed_at + d,
+           expires_at   = expires_at   + d;
+  END IF;
+
+  -- newest row lands in the FUTURE, so the rows flagged active/running read that way
+  SELECT (CURRENT_DATE + 30) - MAX(end_date) INTO d FROM hr.leave_requests;
+  IF d IS NOT NULL AND d <> 0 THEN
+    UPDATE hr.leave_requests
+       SET start_date = start_date + d,
+           end_date   = end_date   + d;
+  END IF;
+
+  SELECT (CURRENT_DATE + 30) - MAX(end_date) INTO d FROM analytics.marketing_campaigns;
+  IF d IS NOT NULL AND d <> 0 THEN
+    UPDATE analytics.marketing_campaigns
+       SET start_date = start_date + d,
+           end_date   = end_date   + d;
+  END IF;
+
+  SELECT (CURRENT_DATE + 90) - MAX(valid_until)::DATE INTO d FROM ecommerce.coupons;
+  IF d IS NOT NULL AND d <> 0 THEN
+    UPDATE ecommerce.coupons
+       SET valid_from  = valid_from  + d * INTERVAL '1 day',
+           valid_until = valid_until + d * INTERVAL '1 day';
+  END IF;
+END $$;
 
 -- Final summary
 DO $$
