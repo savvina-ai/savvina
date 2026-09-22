@@ -1,16 +1,18 @@
 # ── model stage — cached independently of Python deps ─────────────────────────
 # Isolated so that changes to requirements.txt never bust this layer.
-FROM python:3.12-slim AS model-cache
-ARG HF_TOKEN
-ENV HF_TOKEN=${HF_TOKEN}
+# Runs on the build machine's own platform: the downloaded ONNX + tokenizer
+# files are architecture-independent, and running the warm-up under QEMU when
+# cross-building linux/arm64 in CI is painfully slow.
+FROM --platform=$BUILDPLATFORM python:3.12-slim AS model-cache
 RUN pip install --no-cache-dir fastembed
 ENV FASTEMBED_CACHE_PATH=/app/fastembed_cache
-RUN for i in 1 2 3; do \
-        python -c "from fastembed import TextEmbedding; \
-                   list(TextEmbedding(model_name='BAAI/bge-small-en-v1.5').embed(['warmup']))" \
-        && break; \
-        echo "Retry $i..."; sleep 5; \
-    done
+# The optional HuggingFace token arrives as a BuildKit secret, not a build arg:
+# a build arg would be recorded in this stage's config and layer history. The
+# secret file exists only for the duration of this RUN; when no secret is
+# supplied the mount is skipped and the download is anonymous. The script
+# fails the build if the download cannot be completed.
+COPY download_model.sh /download_model.sh
+RUN --mount=type=secret,id=hf_token sh /download_model.sh
 
 # ── builder ───────────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS builder

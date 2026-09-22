@@ -55,12 +55,6 @@ services:
         condition: service_completed_successfully
 
   backend:
-    # Bind-mount source so code changes are picked up without rebuilding.
-    # RELOAD=1 activates uvicorn --reload in entrypoint.sh.
-    volumes:
-      - ./backend/app:/app/app
-    environment:
-      RELOAD: "1"
     depends_on:
       init-permissions:
         condition: service_completed_successfully

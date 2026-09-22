@@ -27,7 +27,7 @@ cd savvina
 cp .env.example .env
 ```
 
-Follow [Quick Start steps 1–3](../../README.md#1-clone-and-configure) to set `APP_DB_PASSWORD` (plus the sample database passwords, if you enable the `test-dbs` profile), obtain at least one LLM API key (entered in the UI after first login, not in `.env`), and generate TLS certificates.
+Follow [Quick Start steps 1–2](../../README.md#1-clone-and-configure) to set `APP_DB_PASSWORD` (plus the sample database passwords, if you enable the `test-dbs` profile) and obtain at least one LLM API key (entered in the UI after first login, not in `.env`). TLS is not part of the local Quick Start — see [section 5](#5-configure-https) below to put a reverse proxy in front of this deployment.
 
 `ENCRYPTION_KEY` and `JWT_SECRET_KEY` are **not** set by hand: the backend generates them on first boot and persists them to `/app/data/secrets.env` inside the data volume. Back up `ENCRYPTION_KEY` immediately after that first start — losing it makes every stored credential and API key permanently unreadable.
 
@@ -107,7 +107,7 @@ INFO:     Embedding model loaded
 INFO:     Uvicorn running on http://0.0.0.0:8000
 ```
 
-The embedding model download happens automatically on first startup and is cached in the Docker image layer.
+The embedding model is downloaded and baked into the backend image at build time — `docker compose up --build` above already did this, so nothing downloads at container startup. Pulling a pre-built image instead (`docker compose pull`; see [Quick Start → 3. Start the stack](../../README.md#3-start-the-stack)) gets the model with no download at all, since it's already in the image.
 
 ---
 
@@ -119,76 +119,50 @@ On a fresh deployment, the **first person to open the browser** is taken to the 
 
 ## 5. Configure HTTPS
 
-TLS is handled by the Nginx server inside the `frontend` container. You supply the certificate files; the stack does not generate or renew them.
+The `frontend` container serves plain HTTP on container port `8080` (published as `APP_PORT`, default `3000`) and does not terminate TLS. For any deployment reachable beyond your own machine, put a TLS-terminating reverse proxy in front of it and expose only the proxy.
 
-### Obtain a certificate
-
-**Let's Encrypt (recommended):**
+[Caddy](https://caddyserver.com/) needs the least configuration: it obtains and renews Let's Encrypt certificates on its own.
 
 ```bash
-apt install certbot -y
-certbot certonly --standalone -d yourdomain.com
+apt install caddy -y
 ```
 
-**Commercial or internal CA:** obtain `fullchain.pem` (certificate + chain) and `privkey.pem` (private key) from your provider.
+`/etc/caddy/Caddyfile`:
 
-### Install the certificate
-
-Copy your cert and key into the `volumes/certs/` directory on the server:
+```
+yourdomain.com {
+    header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    reverse_proxy 127.0.0.1:3000
+}
+```
 
 ```bash
-cp /etc/letsencrypt/live/yourdomain.com/fullchain.pem volumes/certs/
-cp /etc/letsencrypt/live/yourdomain.com/privkey.pem   volumes/certs/
+systemctl reload caddy
 ```
 
-Then update the filenames in `frontend/nginx.conf`:
+Then bind the frontend to localhost so only Caddy can reach it (see [section 6](#6-expose-ports-or-keep-internal)).
 
-```nginx
-ssl_certificate     /etc/nginx/certs/fullchain.pem;
-ssl_certificate_key /etc/nginx/certs/privkey.pem;
-```
+Any other proxy (nginx, Traefik, HAProxy, a cloud load balancer) works the same way. Four requirements:
 
-Rebuild the frontend image once so Nginx picks up the config change:
-
-```bash
-docker compose build frontend && docker compose up -d frontend
-```
-
-For subsequent cert renewals (no config change), you only need to copy the new files and reload Nginx — no rebuild required:
-
-```bash
-# Copy renewed certs
-cp /etc/letsencrypt/live/yourdomain.com/fullchain.pem volumes/certs/
-cp /etc/letsencrypt/live/yourdomain.com/privkey.pem   volumes/certs/
-
-# Reload Nginx inside the running container
-docker compose exec frontend nginx -s reload
-```
+- Tell the backend it is behind TLS: set `BEHIND_TLS_PROXY=true` in `.env`. This is what marks the session cookie `Secure` and turns on `Strict-Transport-Security`. The backend deliberately does not infer it from `X-Forwarded-Proto` — a proxy that omits that header loses nothing, and a client that sets it gains nothing — and it refuses to start if `CORS_ORIGINS` contains an `https://` origin while the flag is off.
+- Set the HSTS header: like the Caddy example above, `header Strict-Transport-Security "max-age=31536000; includeSubDomains"` (or your proxy's equivalent). The backend only sends `Strict-Transport-Security` on `/api/*` responses; nginx serves the HTML and static bundle directly, so without this the first navigation reaches the browser with no HSTS.
+- Allow long-lived streaming responses: disable response buffering and set read timeouts of at least 300 s (900 s for `/api/v1/connections/*/semantic/generate`), otherwise chat streaming stalls.
+- Pass the client address through: the proxy must set `X-Forwarded-For` — Caddy, Traefik and cloud load balancers do by default; an nginx front proxy needs an explicit `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` — and `TRUSTED_LB_CIDR` in `.env` must name the range the proxy connects from: `172.16.0.0/12` for a proxy on the same host, which reaches the container via the Docker bridge gateway (Docker's default address pool — if your daemon uses a different one, leave `TRUSTED_LB_CIDR` unset and check the first field of the newest line in `volumes/frontend-logs/access.log` for the real address), and bind the published frontend port to `127.0.0.1` so only the proxy can reach it. Without `TRUSTED_LB_CIDR` set, nginx sees the proxy as the client, so all users share the auth rate limit (`10/minute` by default) and every login attempt is logged against the proxy's IP.
 
 ### Update CORS_ORIGINS
 
-Add your production domain to `CORS_ORIGINS` in `.env`:
+Add your production domain to `CORS_ORIGINS` in `.env`, alongside the flag from above:
 
 ```bash
 CORS_ORIGINS=["https://yourdomain.com"]
+BEHIND_TLS_PROXY=true
+TRUSTED_LB_CIDR=172.16.0.0/12
 ```
 
-Then restart the backend to apply:
+Then recreate the two containers so they pick up the new environment (`restart` alone reuses the old one):
 
 ```bash
-docker compose restart backend
-```
-
-### Automate Let's Encrypt renewal
-
-Add a cron job on the host to renew and reload:
-
-```bash
-# /etc/cron.d/savvina-certbot
-0 3 * * * root certbot renew --quiet && \
-  cp /etc/letsencrypt/live/yourdomain.com/fullchain.pem /path/to/savvina/volumes/certs/ && \
-  cp /etc/letsencrypt/live/yourdomain.com/privkey.pem   /path/to/savvina/volumes/certs/ && \
-  docker compose -f /path/to/savvina/docker-compose.yaml exec frontend nginx -s reload
+docker compose up -d backend frontend
 ```
 
 ---
@@ -212,7 +186,7 @@ services:
       - "127.0.0.1:8000:8000"  # only accessible from localhost
   frontend:
     ports:
-      - "127.0.0.1:3000:80"
+      - "127.0.0.1:3000:8080"
 ```
 
 ---
@@ -359,14 +333,19 @@ Common causes:
 - `ENCRYPTION_KEY` missing or malformed (must be a valid Fernet key)
 - Port 8000 already in use on the host
 
-### Embedding model download fails
+### Build fails downloading the embedding model
 
-The model (`BAAI/bge-small-en-v1.5`) is downloaded from HuggingFace Hub at first startup. If the server has no internet access, you must pre-bake the model into the Docker image. Add to the `Dockerfile`:
+The model (`BAAI/bge-small-en-v1.5`) is pulled from HuggingFace Hub during `docker compose up --build`, by `backend/download_model.sh`. It retries three times and then fails the build, rather than producing an image with no model that would fail later at runtime.
 
-```dockerfile
-ENV FASTEMBED_CACHE_PATH=/app/fastembed_cache
-RUN python -c "from fastembed import TextEmbedding; list(TextEmbedding(model_name='BAAI/bge-small-en-v1.5').embed(['warmup']))"
+Anonymous downloads are rate-limited, which is the usual cause. Put a free read-only token in `.env` and rebuild:
+
+```bash
+HF_TOKEN=hf_...   # huggingface.co → Settings → Access Tokens
 ```
+
+The token is mounted as a BuildKit secret for that one step, so it is never recorded in an image layer.
+
+If the build host has no internet access to HuggingFace at all, use the pre-built images instead (`docker compose pull`; see [Quick Start → 3. Start the stack](../../README.md#3-start-the-stack)) — the model is already inside them.
 
 ### LLM calls fail with SSL errors
 

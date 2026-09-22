@@ -12,6 +12,7 @@ import { makeAppSettings, makeProviderStatus } from '../../test/factories';
 import { useAppStore } from '../../store/appStore';
 import SettingsPage from '../SettingsPage';
 import type { AppSettings } from '../../types';
+import { CUSTOM_SERVICES } from '../../lib/customServices';
 
 const API = 'http://localhost:8000';
 
@@ -193,6 +194,20 @@ describe('SettingsPage tab persistence', () => {
     renderPage();
     await openTab(/Query Execution/);
     expect(await screen.findByTestId('search')).toHaveTextContent('?tab=execution');
+  });
+});
+
+describe('Custom provider form', () => {
+  it('renders every CUSTOM_SERVICES entry as a service option, in order', async () => {
+    // customServices.test.ts pins what the list contains; this pins that the
+    // form actually renders that list rather than a hardcoded or filtered copy.
+    renderPage();
+    await userEvent.click(await screen.findByRole('button', { name: /Add Custom Provider/ }));
+
+    const form = (await screen.findByText('+ Add Custom Provider')).closest('div')!;
+    const service = within(form).getAllByRole('combobox')[0] as HTMLSelectElement;
+    const labels = Array.from(service.options).map((o) => o.textContent);
+    expect(labels).toEqual(CUSTOM_SERVICES.map((s) => s.label));
   });
 });
 

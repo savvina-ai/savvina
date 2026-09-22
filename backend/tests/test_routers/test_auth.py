@@ -12,10 +12,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 if TYPE_CHECKING:
     from httpx import AsyncClient
 
+from fastapi import Response
+from starlette.requests import Request
+
 from app.auth.dependencies import get_current_active_user
+from app.config import get_settings
 from app.database import get_db
 from app.main import app
 from app.models.user import RefreshToken, User
+from app.routers.auth import _set_refresh_cookie
 
 from .conftest import MockResult, _default_user, _mock_db
 
@@ -750,3 +755,229 @@ class TestJtiRevocation:
 
         result = await get_current_user(token=token, db=db)
         assert result is user
+
+
+# ── Refresh cookie Secure flag ──────────────────────────────────────────────────
+
+
+def _request_with_scheme(
+    scheme: str,
+    *,
+    client_host: str = "127.0.0.1",
+    forwarded_proto: str | None = None,
+) -> Request:
+    """Bare Starlette request with a given accepted-socket scheme.
+
+    ``client_host`` is the direct TCP peer and ``forwarded_proto``, when given,
+    becomes the raw ``X-Forwarded-Proto`` header value. Both exist only so the
+    tests can prove neither is consulted any more — the Secure flag is decided
+    by ``Settings.behind_tls_proxy`` and the socket scheme, nothing else.
+    """
+    headers = []
+    if forwarded_proto is not None:
+        headers.append((b"x-forwarded-proto", forwarded_proto.encode()))
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/v1/auth/login",
+            "headers": headers,
+            "query_string": b"",
+            "scheme": scheme,
+            "server": ("testserver", 80),
+            "client": (client_host, 12345),
+        }
+    )
+
+
+def _settings_behind_tls_proxy(value: bool):
+    """A copy of the test Settings with behind_tls_proxy forced to ``value``.
+
+    ``model_copy(update=...)`` skips validators, so the conftest's default
+    http://localhost CORS origins don't interfere either way.
+    """
+    return get_settings().model_copy(update={"behind_tls_proxy": value})
+
+
+class TestRefreshCookieSecureFlag:
+    def test_https_request_sets_secure_flag(self) -> None:
+        resp = Response()
+        _set_refresh_cookie(resp, "tok", get_settings(), _request_with_scheme("https"))
+        # Substring check on the attribute itself, not the whole header — symmetric
+        # with test_http_request_omits_secure_flag below.
+        assert "; secure" in resp.headers["set-cookie"].lower()
+
+    def test_http_request_omits_secure_flag(self) -> None:
+        resp = Response()
+        _set_refresh_cookie(resp, "tok", get_settings(), _request_with_scheme("http"))
+        header = resp.headers["set-cookie"].lower()
+        # Substring check on the attribute itself, not the whole header — a raw
+        # "secure" in header could pass accidentally (e.g. via the domain/path).
+        assert "; secure" not in header
+
+    def test_cookie_keeps_httponly_and_strict_samesite(self) -> None:
+        resp = Response()
+        _set_refresh_cookie(resp, "tok", get_settings(), _request_with_scheme("http"))
+        header = resp.headers["set-cookie"].lower()
+        assert "httponly" in header
+        assert "samesite=strict" in header
+
+
+# ── Refresh cookie Secure flag — BEHIND_TLS_PROXY ───────────────────────────────
+#
+# The backend only ever speaks plain HTTP in the standard deployment, so whether
+# the *browser* was on HTTPS is declared by the operator (BEHIND_TLS_PROXY), not
+# inferred from X-Forwarded-Proto — which any client on a plain-HTTP install can
+# set, and which a real TLS proxy can just as easily omit.
+
+
+class TestRefreshCookieBehindTlsProxy:
+    def test_flag_set_makes_cookie_secure_over_plain_http_socket(self) -> None:
+        resp = Response()
+        _set_refresh_cookie(
+            resp, "tok", _settings_behind_tls_proxy(True), _request_with_scheme("http")
+        )
+        assert "; secure" in resp.headers["set-cookie"].lower()
+
+    def test_flag_unset_ignores_forwarded_https_from_trusted_range_peer(self) -> None:
+        """Regression for the client-supplied X-Forwarded-Proto hole: even a peer inside
+        the trusted-proxy ranges (the bundled nginx, or any LAN host reaching port 8000)
+        must not be able to flip Secure via the header."""
+        resp = Response()
+        request = _request_with_scheme("http", client_host="172.18.0.5", forwarded_proto="https")
+        _set_refresh_cookie(resp, "tok", _settings_behind_tls_proxy(False), request)
+        assert "; secure" not in resp.headers["set-cookie"].lower()
+
+    def test_flag_set_ignores_forwarded_http(self) -> None:
+        """Regression for the fail-open hole: a proxy that omits or sends a wrong
+        X-Forwarded-Proto cannot strip Secure once the operator has declared TLS."""
+        resp = Response()
+        request = _request_with_scheme("http", client_host="172.18.0.5", forwarded_proto="http")
+        _set_refresh_cookie(resp, "tok", _settings_behind_tls_proxy(True), request)
+        assert "; secure" in resp.headers["set-cookie"].lower()
+
+
+# ── Shared effective-scheme helper (app.auth.proxy) ──────────────────────────────
+#
+# _set_refresh_cookie and SecurityHeadersMiddleware both need "was the browser on
+# HTTPS" — factored into app.auth.proxy.get_effective_scheme so the answer lives
+# in exactly one place.
+
+
+class TestGetEffectiveScheme:
+    def test_behind_tls_proxy_wins_over_http_socket(self) -> None:
+        from app.auth.proxy import get_effective_scheme
+
+        assert get_effective_scheme({"scheme": "http"}, True) == "https"
+
+    def test_not_behind_proxy_uses_socket_scheme(self) -> None:
+        from app.auth.proxy import get_effective_scheme
+
+        assert get_effective_scheme({"scheme": "http"}, False) == "http"
+        assert get_effective_scheme({"scheme": "https"}, False) == "https"
+
+    def test_socket_scheme_is_lowercased(self) -> None:
+        from app.auth.proxy import get_effective_scheme
+
+        assert get_effective_scheme({"scheme": "HTTPS"}, False) == "https"
+
+    def test_missing_scheme_defaults_to_http(self) -> None:
+        from app.auth.proxy import get_effective_scheme
+
+        assert get_effective_scheme({}, False) == "http"
+
+    def test_forwarded_proto_is_never_consulted(self) -> None:
+        """Even from a trusted-range peer, X-Forwarded-Proto: https must not upgrade."""
+        from app.auth.proxy import get_effective_scheme
+
+        scope = {
+            "scheme": "http",
+            "client": ("172.18.0.5", 12345),
+            "headers": [(b"x-forwarded-proto", b"https")],
+        }
+        assert get_effective_scheme(scope, False) == "http"
+
+    def test_truthy_non_bool_flag_counts_as_behind_proxy(self) -> None:
+        """A hand-built settings dict may carry 1 rather than True; treat it as set."""
+        from app.auth.proxy import get_effective_scheme
+
+        assert get_effective_scheme({"scheme": "http"}, 1) == "https"
+
+
+# ── SecurityHeadersMiddleware — HSTS gating on effective scheme ──────────────────
+
+
+async def _run_security_headers_middleware(scope: dict) -> list[tuple[bytes, bytes]]:
+    """Drive SecurityHeadersMiddleware directly against a raw ASGI scope.
+
+    Pure-ASGI middleware (see app.main) takes a scope/receive/send triple, not a
+    FastAPI Request, so it is exercised the same way here rather than going through
+    the httpx/ASGITransport client — that transport pins scope["scheme"] for the
+    whole test session, which would prevent varying it per test.
+    """
+    from app.main import SecurityHeadersMiddleware
+
+    async def inner_app(scope, receive, send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def receive() -> dict:
+        return {"type": "http.disconnect"}
+
+    sent: list[dict] = []
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    middleware = SecurityHeadersMiddleware(inner_app)
+    await middleware(scope, receive, send)
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    return start["headers"]
+
+
+def _base_scope(scheme: str, client_host: str = "127.0.0.1") -> dict:
+    return {
+        "type": "http",
+        "method": "GET",
+        "path": "/healthz",
+        "headers": [],
+        "scheme": scheme,
+        "client": (client_host, 12345),
+    }
+
+
+_HSTS_HEADER = (b"strict-transport-security", b"max-age=31536000; includeSubDomains")
+
+
+class TestSecurityHeadersMiddlewareHSTS:
+    async def test_hsts_sent_over_direct_https_socket(self) -> None:
+        headers = await _run_security_headers_middleware(_base_scope("https"))
+        assert _HSTS_HEADER in headers
+
+    async def test_hsts_omitted_over_plain_http(self) -> None:
+        headers = await _run_security_headers_middleware(_base_scope("http"))
+        names = [name for name, _ in headers]
+        assert b"strict-transport-security" not in names
+
+    async def test_hsts_omitted_when_forwarded_https_but_flag_unset(self) -> None:
+        """A client (or the bundled nginx passing a client's header through) cannot
+        turn HSTS on by sending X-Forwarded-Proto: https — only the flag can."""
+        scope = _base_scope("http", client_host="172.18.0.5")
+        scope["headers"] = [(b"x-forwarded-proto", b"https")]
+        headers = await _run_security_headers_middleware(scope)
+        names = [name for name, _ in headers]
+        assert b"strict-transport-security" not in names
+
+    async def test_hsts_sent_when_behind_tls_proxy(self) -> None:
+        # SecurityHeadersMiddleware calls get_settings() per response and app.main
+        # imports it by name, so patching the module attribute is enough.
+        with patch("app.main.get_settings", return_value=_settings_behind_tls_proxy(True)):
+            headers = await _run_security_headers_middleware(_base_scope("http"))
+        assert _HSTS_HEADER in headers
+
+    async def test_hsts_omitted_in_debug_even_behind_tls_proxy(self) -> None:
+        debug_settings = get_settings().model_copy(update={"behind_tls_proxy": True, "debug": True})
+        with patch("app.main.get_settings", return_value=debug_settings):
+            headers = await _run_security_headers_middleware(_base_scope("http"))
+        names = [name for name, _ in headers]
+        assert b"strict-transport-security" not in names

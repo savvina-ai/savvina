@@ -1,0 +1,208 @@
+name: Docker Publish
+
+# One build per release. release.yml dispatches this workflow for the new
+# vX.Y.Z tag (the release commit carries "[skip ci]", which GitHub honours for
+# the tag push too, so the tag trigger below never fires on its own — it exists
+# for tags pushed by hand). The tag build pushes vX.Y.Z for both images; the
+# `promote` job then, only if BOTH pushes succeeded and the tag is the newest
+# release on main, re-tags the same two manifests as `latest` — no second
+# build, and `latest` only moves once both images have published successfully.
+# A manual dispatch on any branch builds both images for both arches and
+# pushes nothing (a Dockerfile smoke test). To refresh a released image, e.g.
+# to pick up patched base layers, re-run this workflow on the release's tag:
+#   gh workflow run docker-publish.yml --ref vX.Y.Z
+# That re-pushes vX.Y.Z and re-promotes it to latest if it is still newest.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One publish per ref at a time, but never cancel a half-pushed multi-arch manifest.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Gate: an amd64 build of every image is scanned before anything is pushed.
+  # The whole matrix must pass, so a CVE in one image also blocks the other —
+  # a release never lands half-published. arm64 is not scanned separately: the
+  # two arches install the same package sets, so amd64 findings stand in for both.
+  scan:
+    name: Scan ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: backend
+            context: ./backend
+            dockerfile: ./backend/Dockerfile
+          - image: frontend
+            context: ./frontend
+            dockerfile: ./frontend/Dockerfile
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # Not pushing from this job — logging in only so base-image pulls use the
+      # account's Docker Hub rate limit instead of the shared runner IP's.
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build amd64 image for scanning
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          load: true
+          tags: savvina-${{ matrix.image }}:scan
+          secrets: |
+            hf_token=${{ secrets.HF_TOKEN }}
+          # Same scope as build-push, so the amd64 layers this job produces are
+          # cache hits there and only arm64 is actually rebuilt.
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: savvina-${{ matrix.image }}:scan
+          scanners: vuln
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          # Unfixed CVEs in the base image can't be actioned by a rebuild, so they
+          # report but don't block. Drop this to fail on those too.
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+
+  build-push:
+    name: Build & push ${{ matrix.image }}
+    needs: [scan]
+    runs-on: ubuntu-24.04
+    # linux/arm64 runs under QEMU; the backend's pip install is slow there.
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Paths mirror the build: sections in docker-compose.yaml.
+          - image: backend
+            context: ./backend
+            dockerfile: ./backend/Dockerfile
+          - image: frontend
+            context: ./frontend
+            dockerfile: ./frontend/Dockerfile
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: savvinaai/savvina-${{ matrix.image }}
+          # tag vX.Y.Z (dispatched by release.yml) -> vX.Y.Z; the `promote` job
+          #   re-tags both images as latest once every leg of this matrix has
+          #   pushed and the tag is the newest release on main. `latest` is
+          #   never pushed directly, so it can only ever be a released manifest.
+          # workflow_dispatch on any branch -> no tags (build only, nothing pushed)
+          tags: |
+            type=raw,value=${{ github.ref_name }},enable=${{ github.ref_type == 'tag' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ steps.meta.outputs.tags != '' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Optional HuggingFace token for the backend's model-cache stage. Passed
+          # as a BuildKit secret (mounted only during that RUN), never as a build
+          # arg, so it cannot end up in any stage's config or layer history. The
+          # frontend Dockerfile simply never mounts it. Empty when the secret is unset.
+          secrets: |
+            hf_token=${{ secrets.HF_TOKEN }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  # Runs only when every build-push leg succeeded (that is what `needs` on a
+  # matrix job means), so `latest` is moved for both images or for neither.
+  promote:
+    name: Promote release to latest
+    needs: [build-push]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # scripts/latest_promotable.sh needs origin/main and every tag.
+          fetch-depth: 0
+
+      - name: Decide whether the tag becomes latest
+        id: check
+        # Exit 0 -> promote, exit 1 -> a legitimate refusal (older tag, tag not
+        # on main), anything else -> the check itself could not run. The last
+        # case must fail the job: swallowing it would leave `latest` stale
+        # with a green run. The script prints the reason on stdout.
+        run: |
+          set -u
+          status=0
+          sh scripts/latest_promotable.sh "$GITHUB_REF_NAME" || status=$?
+          case "$status" in
+            0) echo "promote=true" >> "$GITHUB_OUTPUT" ;;
+            1) echo "promote=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::latest_promotable.sh exited $status: the promotability check could not run, so latest was left untouched. Fix the checkout, then re-run this job."
+              exit "$status"
+              ;;
+          esac
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.promote == 'true'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to Docker Hub
+        if: steps.check.outputs.promote == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Re-tag both images as latest
+        if: steps.check.outputs.promote == 'true'
+        # Re-tags the manifests build-push just pushed; nothing is rebuilt.
+        run: |
+          set -eu
+          for image in backend frontend; do
+            docker buildx imagetools create \
+              -t "savvinaai/savvina-${image}:latest" \
+              "savvinaai/savvina-${image}:${GITHUB_REF_NAME}"
+          done

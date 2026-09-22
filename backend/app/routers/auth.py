@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 from ..auth.dependencies import get_current_active_user, get_token_payload
 from ..auth.password import hash_password, verify_password
+from ..auth.proxy import get_effective_scheme
 from ..auth.tokens import (
     create_access_token,
     create_refresh_token,
@@ -54,13 +55,30 @@ _MIN_PASSWORD_LEN = 12
 _REFRESH_COOKIE_NAME = "savvina_rt"
 
 
-def _set_refresh_cookie(response: Response, raw_token: str, settings) -> None:
-    """Write the refresh token into an HttpOnly cookie."""
+def _set_refresh_cookie(response: Response, raw_token: str, settings, request: Request) -> None:
+    """Write the refresh token into an HttpOnly cookie.
+
+    The Secure flag follows ``app.auth.proxy.get_effective_scheme``: on when
+    ``BEHIND_TLS_PROXY`` is set (a TLS-terminating reverse proxy fronts the
+    stack, so the browser's connection was HTTPS) or when uvicorn itself
+    accepted the connection over TLS; off for the plain-HTTP localhost/LAN
+    deployment, where a browser would refuse to store a Secure cookie and every
+    login would silently fail at the first token refresh.
+
+    ``X-Forwarded-Proto`` is not consulted — see ``app.auth.proxy`` for why.
+    uvicorn's own client-address rewriting is explicitly disabled via
+    ``--no-proxy-headers`` in entrypoint.sh: leaving it on (uvicorn's default)
+    would let any peer overwrite ``scope["client"]`` via a spoofed
+    X-Forwarded-For, which breaks the rate limiter's trusted-proxy check
+    (app.auth.limiter._real_ip) and removes its throttling entirely.
+    """
+    scheme = get_effective_scheme(request.scope, settings.behind_tls_proxy)
+
     response.set_cookie(
         key=_REFRESH_COOKIE_NAME,
         value=raw_token,
         httponly=True,
-        secure=not settings.debug,
+        secure=scheme == "https",
         samesite="strict",
         max_age=settings.refresh_token_expire_days * 86_400,
         path="/",
@@ -200,7 +218,7 @@ async def register(
     await _store_refresh_token(user.id, raw_refresh, db, request)
 
     settings = get_settings()
-    _set_refresh_cookie(response, raw_refresh, settings)
+    _set_refresh_cookie(response, raw_refresh, settings, request)
     access = create_access_token(user_id=user.id)
     return LoginResponse(
         access_token=access,
@@ -239,7 +257,7 @@ async def login(
     await _store_refresh_token(user.id, raw_refresh, db, request)
 
     settings = get_settings()
-    _set_refresh_cookie(response, raw_refresh, settings)
+    _set_refresh_cookie(response, raw_refresh, settings, request)
     access = create_access_token(user_id=user.id)
     return LoginResponse(
         access_token=access,
@@ -335,7 +353,7 @@ async def refresh_token(
     )
     await db.commit()
 
-    _set_refresh_cookie(response, raw_new, settings)
+    _set_refresh_cookie(response, raw_new, settings, request)
     new_access = create_access_token(user_id=user.id)
     return TokenPairResponse(
         access_token=new_access,

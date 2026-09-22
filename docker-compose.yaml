@@ -102,11 +102,16 @@ services:
       - savvina
 
   backend:
+    # Pre-built multi-arch image from Docker Hub (docker compose pull); the
+    # build: block below is used instead by docker compose up --build.
+    image: savvinaai/savvina-backend:${SAVVINA_IMAGE_TAG:-latest}
     build:
       context: ./backend
       dockerfile: Dockerfile
-      args:
-        HF_TOKEN: ${HF_TOKEN:-}
+      # Optional HuggingFace token for the model download, mounted as a BuildKit
+      # secret so it never lands in the image config or layer history.
+      secrets:
+        - hf_token
     # Override the Dockerfile's appuser with the host developer's UID/GID so
     # bind-mounted volumes (./volumes/backend-data) are writable without root.
     # Intentional UID mismatch: the process runs as the host UID, not appuser.
@@ -149,14 +154,21 @@ services:
       - savvina
 
   frontend:
+    image: savvinaai/savvina-frontend:${SAVVINA_IMAGE_TAG:-latest}
     build: ./frontend
     user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     restart: unless-stopped
+    environment:
+      # Address range of a reverse proxy in front of this container, whose
+      # X-Forwarded-For nginx then trusts for the client IP (see .env.example).
+      # Empty, the default, leaves the rewrite off.
+      TRUSTED_LB_CIDR: ${TRUSTED_LB_CIDR:-}
     ports:
-      # Bound to localhost for local dev. Remove the 127.0.0.1: prefix for external access in production.
-      - "0.0.0.0:${APP_PORT:-3000}:8443"
+      # Plain HTTP, bound to all interfaces so LAN devices can reach a trial
+      # install. For anything beyond local/LAN use, bind to 127.0.0.1 and put a
+      # TLS-terminating reverse proxy in front (docs/administration/deployment.md).
+      - "0.0.0.0:${APP_PORT:-3000}:8080"
     volumes:
-      - ./volumes/certs:/etc/nginx/certs:ro
       - ./volumes/frontend-run:/run/nginx
       - ./volumes/frontend-tmp:/var/lib/nginx
       - ./volumes/frontend-logs:/var/log/nginx
@@ -164,7 +176,7 @@ services:
       backend:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://127.0.0.1:8443/ >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ >/dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -200,6 +212,12 @@ services:
             - capabilities: [gpu]
     networks:
       - savvina
+
+# Build-time only. Read from HF_TOKEN in the shell or .env; empty when unset,
+# which the Dockerfile treats as an anonymous download.
+secrets:
+  hf_token:
+    environment: HF_TOKEN
 
 volumes:
   ollama_models:
