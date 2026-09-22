@@ -32,8 +32,7 @@ cd savvina
 cp .env.example .env
 
 # WSL / Linux: run containers as you, so mounted volumes stay writable
-echo "LOCAL_UID=$(id -u)" >> .env
-echo "LOCAL_GID=$(id -g)" >> .env
+printf '\nLOCAL_UID=%s\nLOCAL_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 ```
 
 Open `.env` and set one value — a password for the bundled app database:
@@ -43,6 +42,14 @@ APP_DB_PASSWORD=<strong-password>     # python -c "import secrets; print(secrets
 ```
 
 That's the whole database setup: `.env.example` already ships `COMPOSE_PROFILES=local-db` to start the bundled PostgreSQL container, and Compose derives the connection URL from your password. To use an external or managed database instead, comment out `COMPOSE_PROFILES` and `APP_DB_PASSWORD` and set `DATABASE_URL` to your provider's connection string.
+
+**Just want to play around, without a database of your own?** Add the `test-dbs` profile as well — it starts two demo databases (PostgreSQL and MySQL) pre-seeded with sample data, so you have something to ask questions about from the first login:
+
+```bash
+COMPOSE_PROFILES=local-db,test-dbs
+```
+
+Leave the `SAMPLE_*` passwords in `.env` empty and they fall back to `savvina_demo`. You add these as connections in the UI after step 4 — see [Using Sample Databases](#using-sample-databases-no-real-database-required) for the ports and credentials.
 
 > **Encryption and JWT keys are generated for you.** On first boot the backend creates `ENCRYPTION_KEY` and `JWT_SECRET_KEY` and persists them to `/app/data/secrets.env` in the data volume — do not add them to `.env`. Back up `ENCRYPTION_KEY` after the first start; losing it makes all stored credentials and API keys permanently unreadable. See [Quickstart](docs/getting-started/01_quickstart.md#encryption_key-and-jwt_secret_key-docker--auto-generated) for bare-metal setups.
 
@@ -74,6 +81,14 @@ docker compose up --build
 ```
 
 Wait for all services to show as healthy — migrations run on every start, so first boot can take a minute or two even with pre-built images, and longer on a first build. Volume permissions are prepared automatically by the `init-permissions` service.
+
+Both commands run in the foreground, which is what you want on a first start — the logs show migrations running and tell you if something fails. Add `-d` (after `up`) to detach instead and get your prompt back:
+
+```bash
+docker compose up -d --no-build
+docker compose logs -f backend   # follow startup
+docker compose ps                # check every service reports healthy
+```
 
 ### 4. Open the UI
 
@@ -132,11 +147,11 @@ The `test-dbs` profile starts two pre-seeded demo databases — PostgreSQL and M
 COMPOSE_PROFILES=local-db,test-dbs
 ```
 
-These are throwaway demo containers bound to localhost, so they fall back to built-in passwords (`savvina_demo`) if you leave `SAMPLE_POSTGRES_PASSWORD`, `SAMPLE_MYSQL_PASSWORD`, and `SAMPLE_MYSQL_ROOT_PASSWORD` unset. Set them in `.env` to override.
+These are throwaway demo containers bound to localhost, so they fall back to built-in passwords if you leave `SAMPLE_POSTGRES_PASSWORD`, `SAMPLE_MYSQL_PASSWORD`, and `SAMPLE_MYSQL_ROOT_PASSWORD` empty or unset — `.env.example` ships them empty, which is enough. Set them in `.env` to override.
 
 > Prefer editing `COMPOSE_PROFILES` over passing `--profile` on the command line: the CLI flag **replaces** the value from `.env` rather than adding to it, so `docker compose --profile test-dbs up` would silently stop the `local-db` container from starting.
 
-The sample databases are available on ports **5435** (PostgreSQL) and **3307** (MySQL). Add them from **Connections** in the left sidebar using user `savvina` and whichever password applies — your `.env` override or the `savvina_demo` default.
+The sample databases are available on ports **5435** (PostgreSQL, database `savvina_test`) and **3307** (MySQL, database `sample_delivery`). Add them from **Connections** in the left sidebar using user `savvina` and whichever password applies — your `.env` override or the `savvina_demo` default. (`SAMPLE_MYSQL_ROOT_PASSWORD` is separate and defaults to `savvina_demo_root`; Savvina doesn't need it.)
 
 See [docs/infrastructure/docker.md](docs/infrastructure/docker.md) for full details.
 

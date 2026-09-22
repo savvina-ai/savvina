@@ -216,8 +216,8 @@ python -c "import secrets; print(secrets.token_urlsafe(24))"
 | Variable | Default | Description |
 |---|---|---|
 | `COMPOSE_PROFILES` | *(unset)* | Comma-separated list of active Docker Compose profiles. `local-db` starts the bundled PostgreSQL app container. `test-dbs` starts the sample PostgreSQL and MySQL containers pre-seeded with demo data. `local-llm` starts Ollama. Combine as needed: `local-db,test-dbs`. Leave unset when using an external managed database. |
-| `LOCAL_UID` | `1000` | Backend container runs as this user ID. Set to your host UID on Linux/WSL to avoid volume permission issues: `echo "LOCAL_UID=$(id -u)" >> .env` |
-| `LOCAL_GID` | `1000` | Backend container group ID. Set with: `echo "LOCAL_GID=$(id -g)" >> .env` |
+| `LOCAL_UID` | `1000` | Backend container runs as this user ID. Leave unset unless your host UID differs from 1000; on Linux/WSL set both with `printf '\nLOCAL_UID=%s\nLOCAL_GID=%s\n' "$(id -u)" "$(id -g)" >> .env` to avoid volume permission issues. |
+| `LOCAL_GID` | `1000` | Backend container group ID. Set together with `LOCAL_UID` above. |
 | `HF_TOKEN` | *(unset)* | Hugging Face access token used **only during `docker compose build`**. Avoids anonymous rate-limiting when the `model-cache` stage downloads the fastembed ONNX model (`BAAI/bge-small-en-v1.5`) from HuggingFace. It is passed as a BuildKit secret mount, not a build arg, so it is never recorded in any image layer or config. Not used at runtime. A free read-only token is sufficient — get one at huggingface.co → Settings → Access Tokens. |
 | `SAVVINA_IMAGE_TAG` | `latest` | Tag of the `savvinaai/savvina-backend` and `savvinaai/savvina-frontend` images that `docker compose pull` fetches. `latest` is the newest release; pin one with e.g. `SAVVINA_IMAGE_TAG=v2.0.0`. With `docker compose up --build`, Compose still builds from local source but stamps the result with this tag — it does not change what gets built. |
 | `PG_UID` | `70` | UID that `init-permissions` chowns the `sample-postgres` volume to. Only needed if the bundled sample-Postgres image (`test-dbs` profile) is swapped for one that runs as a different UID. |
@@ -273,9 +273,7 @@ SAMPLE_POSTGRES_PASSWORD=<strong-password>
 SAMPLE_MYSQL_ROOT_PASSWORD=<strong-password>
 SAMPLE_MYSQL_PASSWORD=<strong-password>
 
-# ── Host UID/GID (Linux/WSL only) ─────────────────────────────────────────
-LOCAL_UID=1000
-LOCAL_GID=1000
+# ── Host UID/GID (Linux/WSL only; omit to accept the 1000:1000 default) ───
 # Only needed if the sample-postgres/sample-mysql images are swapped for ones
 # running as a different UID/GID — see Docker-Specific Settings above.
 # PG_UID=70
