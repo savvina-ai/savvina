@@ -7,6 +7,8 @@
 [![Python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org/)
 [![Latest Release](https://img.shields.io/github/v/release/savvina-ai/savvina)](https://github.com/savvina-ai/savvina/releases)
 
+🌐 [savvina.ai](https://savvina.ai/) · 🐳 [Docker Hub — backend](https://hub.docker.com/r/savvinaai/savvina-backend) · 🐳 [Docker Hub — frontend](https://hub.docker.com/r/savvinaai/savvina-frontend)
+
 ![Savvina AI demo](docs/assets/demo.gif)
 
 Savvina AI lets you connect to a database, ask questions in natural language, and receive generated SQL queries along with formatted results. It auto-generates a business-language semantic model from your schema, caches frequent queries for speed, and gives you full control over what data reaches the LLM and how queries are executed.
@@ -15,7 +17,7 @@ Savvina AI lets you connect to a database, ask questions in natural language, an
 
 ## Quick Start (Free — No API Costs)
 
-> This Quick Start is for **local development** only. Production use requires a [commercial license](COMMERCIAL.md) — contact [savvina.ai](https://savvina.ai) to get started.
+> This Quick Start is for **local development** only. Production use requires a [commercial license](COMMERCIAL.md) — contact [savvina.ai](https://savvina.ai/) to get started.
 
 ### Prerequisites
 
