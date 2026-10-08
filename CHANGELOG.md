@@ -2,6 +2,31 @@
 
 <!-- version list -->
 
+## v2.1.2 (2026-10-08)
+
+### Bug Fixes
+
+- **deps**: Bump axios to 1.20.0 and brace-expansion to 5.0.12 and 1.1.21 to clear their security
+  advisories ([#20](https://github.com/savvina-ai/savvina/pull/20),
+  [`54beab4`](https://github.com/savvina-ai/savvina/commit/54beab4c3704dd601dab40deeab47027204dde50))
+
+- **deps**: Bump PyJWT to 2.15.1 to clear the open PyJWT security advisories
+  ([#20](https://github.com/savvina-ai/savvina/pull/20),
+  [`54beab4`](https://github.com/savvina-ai/savvina/commit/54beab4c3704dd601dab40deeab47027204dde50))
+
+### Continuous Integration
+
+- **audit**: Allow the unfixable build-time braces advisory in the frontend dependency audit
+  ([#20](https://github.com/savvina-ai/savvina/pull/20),
+  [`54beab4`](https://github.com/savvina-ai/savvina/commit/54beab4c3704dd601dab40deeab47027204dde50))
+
+### Documentation
+
+- **readme**: Add project website and Docker Hub links
+  ([#19](https://github.com/savvina-ai/savvina/pull/19),
+  [`5b8f67d`](https://github.com/savvina-ai/savvina/commit/5b8f67ddc90431abd8a6e6098ac9903435eda1dd))
+
+
 ## v2.1.1 (2026-09-22)
 
 ### Bug Fixes
