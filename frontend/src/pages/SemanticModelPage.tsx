@@ -318,6 +318,43 @@ type Tab =
   | 'time'
   | 'suggestions';
 
+const MAX_GENERATION_RETRIES = 4;
+
+/** Cancellation flag shared by every call in one generation run. */
+type RetryToken = { cancelled: boolean };
+
+/**
+ * Retry a generation call on a throttle or a dropped connection.
+ *
+ * 429 covers both our own per-IP limiter and an upstream provider throttle, which the
+ * backend maps to 429 rather than 422 precisely so this retry can see it. Any other
+ * status is permanent for this run, and continuing would burn the remaining batches
+ * against a provider that is going to refuse them too — so the first permanent failure
+ * cancels the shared token.
+ *
+ * Module-level rather than a closure inside the full-run mutation, because the
+ * globals-only "Finish with what's generated" path must share this exact policy rather
+ * than carry a second copy of it.
+ */
+async function withRetry<T>(call: () => Promise<T>, token: RetryToken): Promise<T | undefined> {
+  for (let attempt = 0; attempt < MAX_GENERATION_RETRIES; attempt++) {
+    if (token.cancelled) return undefined;
+    try {
+      return await call();
+    } catch (err: unknown) {
+      const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+      const isNetworkError = axios.isAxiosError(err) && !err.response;
+      const isRetryable = status === 429 || isNetworkError;
+      if (!isRetryable || attempt === MAX_GENERATION_RETRIES - 1) {
+        token.cancelled = true;
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, 2000 * 2 ** attempt));
+    }
+  }
+  return undefined;
+}
+
 // ── Main component ────────────────────────────────────────────────────────
 
 export default function SemanticModelPageV2() {
@@ -340,6 +377,9 @@ export default function SemanticModelPageV2() {
     tables_done: number;
     tables_total: number;
     batch_size: number;
+    // Which phase the label describes. Tables is the batch loop; globals is the single
+    // trailing call that builds metrics and joins over whatever tables exist.
+    phase?: 'tables' | 'globals';
   } | null>(null);
 
   // Relationship add form
@@ -419,45 +459,47 @@ export default function SemanticModelPageV2() {
     }
   }, [configuredProviders, selectedProvider]);
 
+  // Both generation paths — a full run and "Finish with what's generated" — end the
+  // same way, so they share one pair of handlers rather than drifting apart.
+  const handleGenerationSuccess = (m: SemanticModel) => {
+    // The cache write is what retires the partial banner: it reads `model` (server
+    // truth), not `draft`, and the response carries generation_status: 'complete'.
+    queryClient.setQueryData(['semantic', connectionId], m);
+    setDraft(m);
+    setShowConfirm(false);
+    setGenProgress(null);
+  };
+  const handleGenerationError = () => {
+    setGenProgress(null);
+    queryClient.invalidateQueries({ queryKey: ['semantic', connectionId] });
+  };
+
   const generate = useMutation({
-    mutationFn: async (_args: { resumeFromBatch?: number } = {}) => {
+    mutationFn: async () => {
       const providerParam = selectedProvider || undefined;
 
-      // Always call init — it sets generation_status=TABLES_PARTIAL in the DB,
-      // which the batch endpoint requires. Skipping it on resume causes 400s
-      // because the DB state may have drifted from the React Query cache.
+      // Init is destructive: it blanks `tables` and sets generation_status=TABLES_PARTIAL,
+      // which the batch endpoint requires. Anything that should keep the generated
+      // tables must go through `finishGeneration` instead.
       const init = await semanticApi.generateInit(connectionId!, providerParam);
       const { batch_count: batchCount, tables_total: tablesTotal, batch_size: batchSize } = init;
 
-      setGenProgress({ tables_done: 0, tables_total: tablesTotal, batch_size: batchSize });
+      setGenProgress({
+        tables_done: 0,
+        tables_total: tablesTotal,
+        batch_size: batchSize,
+        phase: 'tables',
+      });
 
       const CONCURRENCY = 2;
-      const MAX_RETRIES = 4;
       const queue = Array.from({ length: batchCount }, (_, i) => i);
-      let cancelled = false;
-
-      const runBatchWithRetry = async (i: number) => {
-        for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-          if (cancelled) throw new Error('cancelled');
-          try {
-            return await semanticApi.generateBatch(connectionId!, i, providerParam);
-          } catch (err: unknown) {
-            const status = axios.isAxiosError(err) ? err.response?.status : undefined;
-            const isNetworkError = axios.isAxiosError(err) && !err.response;
-            const isRetryable = status === 429 || isNetworkError;
-            if (!isRetryable || attempt === MAX_RETRIES - 1) {
-              cancelled = true;
-              throw err;
-            }
-            await new Promise((r) => setTimeout(r, 2000 * 2 ** attempt));
-          }
-        }
-        return undefined;
-      };
-
+      const token: RetryToken = { cancelled: false };
+      const runBatchWithRetry = (i: number) =>
+        withRetry(() => semanticApi.generateBatch(connectionId!, i, providerParam), token);
       const runWorker = async () => {
-        while (queue.length > 0 && !cancelled) {
+        while (queue.length > 0 && !token.cancelled) {
           const i = queue.shift()!;
+          if (token.cancelled) return;
           const updated = await runBatchWithRetry(i);
           const done = updated?.generation_progress?.tables_done;
           if (done !== undefined) {
@@ -467,18 +509,56 @@ export default function SemanticModelPageV2() {
       };
       await Promise.all(Array.from({ length: Math.min(CONCURRENCY, batchCount) }, runWorker));
 
-      return semanticApi.generateGlobals(connectionId!, providerParam);
+      setGenProgress((p) => (p ? { ...p, phase: 'globals' } : null));
+      // Globals runs once every batch has already been paid for, so a throttle here is the
+      // most expensive point in the run to give up at.
+      const globals = await withRetry(
+        () => semanticApi.generateGlobals(connectionId!, providerParam),
+        token,
+      );
+      // withRetry yields undefined only when another worker cancelled the run — impossible
+      // for this single trailing call, which throws on its own failure. Narrowing regardless.
+      if (!globals) throw new Error('Generation was cancelled');
+      return globals;
     },
-    onSuccess: (m) => {
-      queryClient.setQueryData(['semantic', connectionId], m);
-      setDraft(m);
-      setShowConfirm(false);
-      setGenProgress(null);
+    // A re-run must clear the *sibling* mutation's error before the new result can land.
+    // The error banner reads both, and TanStack holds an error until that mutation
+    // re-runs or is reset, so a failed Finish's red banner would otherwise survive a
+    // successful full run.
+    onMutate: () => {
+      finishGeneration.reset();
     },
-    onError: () => {
-      setGenProgress(null);
-      queryClient.invalidateQueries({ queryKey: ['semantic', connectionId] });
+    onSuccess: handleGenerationSuccess,
+    onError: handleGenerationError,
+  });
+
+  // Finish an interrupted run without discarding the tables it already produced.
+  // `/generate/globals` accepts a `tables_partial` model and finalises over whatever is
+  // there, so this needs no init and no batch calls — which is the whole point: Restart
+  // routes through `/generate/init`, and that blanks `tables`.
+  const finishGeneration = useMutation({
+    mutationFn: async () => {
+      const done = model?.generation_progress?.tables_done ?? 0;
+      setGenProgress({
+        tables_done: done,
+        tables_total: model?.generation_progress?.tables_total ?? done,
+        batch_size: 0,
+        // Skips straight to the globals label; there is no batch queue on this path.
+        phase: 'globals',
+      });
+      const globals = await withRetry(
+        () => semanticApi.generateGlobals(connectionId!, selectedProvider || undefined),
+        { cancelled: false },
+      );
+      if (!globals) throw new Error('Generation was cancelled');
+      return globals;
     },
+    // Mirrors `generate.onMutate` — see the note there.
+    onMutate: () => {
+      generate.reset();
+    },
+    onSuccess: handleGenerationSuccess,
+    onError: handleGenerationError,
   });
 
   const save = useMutation({
@@ -553,7 +633,7 @@ export default function SemanticModelPageV2() {
         <GenerateConfirmDialog
           onConfirm={() => {
             setShowConfirm(false);
-            generate.mutate({});
+            generate.mutate();
           }}
           onCancel={() => setShowConfirm(false)}
         />
@@ -673,9 +753,16 @@ export default function SemanticModelPageV2() {
               </select>
             )}
 
+            {/* Also held while a Finish run is in flight: Regenerate routes through
+                /generate/init, which blanks the tables that Finish is finalising. */}
             <button
-              onClick={() => hasModel ? setShowConfirm(true) : generate.mutate({})}
-              disabled={!canGenerate || generate.isPending || !selectedProvider}
+              onClick={() => hasModel ? setShowConfirm(true) : generate.mutate()}
+              disabled={
+                !canGenerate ||
+                generate.isPending ||
+                finishGeneration.isPending ||
+                !selectedProvider
+              }
               title={
                 !canGenerate
                   ? 'Only admins can generate the semantic model'
@@ -720,7 +807,11 @@ export default function SemanticModelPageV2() {
           {genProgress && (
             <div className="space-y-1.5">
               <div className="flex justify-between text-xs text-muted-foreground">
-                <span>Analysing tables…</span>
+                <span>
+                  {genProgress.phase === 'globals'
+                    ? 'Building metrics and joins…'
+                    : 'Analysing tables…'}
+                </span>
                 <span>{genProgress.tables_done} / {genProgress.tables_total}</span>
               </div>
               <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
@@ -735,31 +826,56 @@ export default function SemanticModelPageV2() {
           )}
 
           {/* Resume banner — interrupted generation */}
-          {model?.generation_status === 'tables_partial' && !generate.isPending && (
-            <div className="flex items-center gap-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-400">
-              <AlertTriangle className="h-4 w-4 shrink-0" />
-              <span>
-                Generation was interrupted at table{' '}
-                {model.generation_progress?.tables_done ?? 0} of{' '}
-                {model.generation_progress?.tables_total ?? '?'}.
-              </span>
-              <button
-                onClick={() =>
-                  generate.mutate({
-                    resumeFromBatch: model.generation_progress?.tables_done ?? 0,
-                  })
-                }
-                className="ml-auto shrink-0 rounded bg-amber-500/20 px-2.5 py-1 text-xs font-medium hover:bg-amber-500/30"
-              >
-                Resume
-              </button>
-            </div>
-          )}
+          {/* Gated on both pending flags, or it stays live through the globals call and
+              the user can double-fire it. */}
+          {model?.generation_status === 'tables_partial' &&
+            !generate.isPending &&
+            !finishGeneration.isPending && (
+              <div className="flex items-center gap-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-400">
+                <AlertTriangle className="h-4 w-4 shrink-0" />
+                <span>
+                  Generation was interrupted at table{' '}
+                  {model.generation_progress?.tables_done ?? 0} of{' '}
+                  {model.generation_progress?.tables_total ?? '?'}.
+                </span>
+                <div className="ml-auto flex shrink-0 items-center gap-2">
+                  {/* Keeps the tables already paid for and runs only the globals phase.
+                      Disabled with no tables, where globals would have nothing to work
+                      from — a first-batch failure leaves `tables` empty. */}
+                  <button
+                    onClick={() => finishGeneration.mutate()}
+                    disabled={
+                      !canGenerate ||
+                      !selectedProvider ||
+                      Object.keys(model.tables ?? {}).length === 0
+                    }
+                    title={
+                      Object.keys(model.tables ?? {}).length === 0
+                        ? 'No tables were generated — restart instead'
+                        : 'Generate metrics and joins from the tables already generated'
+                    }
+                    className="rounded bg-amber-500/20 px-2.5 py-1 text-xs font-medium hover:bg-amber-500/30 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Finish with what's generated
+                  </button>
+                  {/* Discards every generated table and starts from scratch. */}
+                  <button
+                    onClick={() => generate.mutate()}
+                    disabled={!canGenerate || !selectedProvider}
+                    title="Discard the partial model and generate again from scratch"
+                    className="rounded bg-amber-500/20 px-2.5 py-1 text-xs font-medium hover:bg-amber-500/30 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Restart
+                  </button>
+                </div>
+              </div>
+            )}
 
           {/* Generation error */}
-          {generate.error && (
+          {(generate.error || finishGeneration.error) && (
             <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-              Generation failed: {apiErrorMessage(generate.error, 'Unknown error')}
+              Generation failed:{' '}
+              {apiErrorMessage(generate.error ?? finishGeneration.error, 'Unknown error')}
             </div>
           )}
 
@@ -811,8 +927,8 @@ export default function SemanticModelPageV2() {
               <p className="mb-3 text-sm text-muted-foreground">No semantic model yet.</p>
               {canGenerate ? (
                 <button
-                  onClick={() => generate.mutate({})}
-                  disabled={generate.isPending || !selectedProvider}
+                  onClick={() => generate.mutate()}
+                  disabled={generate.isPending || finishGeneration.isPending || !selectedProvider}
                   className="rounded-md bg-brand-gradient px-6 py-2 text-sm font-medium text-white shadow-gradient-btn transition-opacity hover:opacity-90 disabled:opacity-50"
                 >
                   {generate.isPending ? 'Generating…' : 'Generate Semantic Model'}

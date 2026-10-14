@@ -417,6 +417,13 @@ async def generate_semantic_init(
     partial_model = existing_model.model_copy(
         update={
             "tables": {},
+            # Stamp the hash of the schema this run is planned against. ``model_copy``
+            # carries every unlisted field forward, so without this a re-generate kept
+            # the *previous* run's hash — worse than the ``None`` a fresh connection
+            # gets, because a resume would read it as authoritative. Computed from the
+            # cached, family-collapsed schema (init does not force_refresh), which is
+            # the right basis for comparing against a later resume.
+            "schema_hash": gen.compute_schema_hash(schema),
             "generation_status": GenerationStatus.TABLES_PARTIAL,
             "generation_progress": GenerationProgress(
                 tables_done=0,

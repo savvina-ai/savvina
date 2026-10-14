@@ -110,7 +110,9 @@ All three phases begin the same way: load the schema JSON from `UserSchemaCache`
 - `_build_relationship_graph(schema)` reads `DataSourceSchema.relationships` (already populated by `introspect()` from `information_schema`) to produce `list[RelationshipEdge]`. Zero DB queries.
 - Batch count = `ceil(len(schema.tables) / _BATCH_SIZE)` where `_BATCH_SIZE = 4`
 
-The router writes an initial partial `SemanticModel` to DB with `generation_status = "tables_partial"` and `generation_progress = {tables_done: 0, tables_total: N, batch_size: 4}`. Returns `GenerateInitResponse` with the batch count.
+The router writes an initial partial `SemanticModel` to DB with `tables = {}`, `generation_status = "tables_partial"`, `generation_progress = {tables_done: 0, tables_total: N, batch_size: 4}` and `schema_hash` stamped from the cached schema. Returns `GenerateInitResponse` with the batch count.
+
+Init is the destructive step: it blanks every generated table. An interrupted run (a provider rate limit, a timeout, a closed tab) is therefore offered two actions on the page banner — **Finish with what's generated**, which calls Phase 3 alone over the tables already stored, and **Restart**, which goes back through init. Finish is disabled when no tables were generated, since the globals call would have nothing to work from.
 
 ### Phase 2 — Batch: Table Annotation
 

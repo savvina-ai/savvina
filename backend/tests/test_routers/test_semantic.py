@@ -233,3 +233,80 @@ class TestCheckDrift:
 
 
 # ── Admin guard (403 for non-admin) ─────────────────────────────────────────────
+
+
+# ── POST /api/v1/connections/{id}/semantic/generate/init ────────────────────────
+
+
+class TestPhasedGenerationInit:
+    async def test_generate_init_persists_the_partial_model_it_plans(self, http_client) -> None:
+        """The response only echoes the batch plan; the *write* is the contract.
+
+        ``/generate/init`` is the one destructive endpoint in this router — it blanks
+        ``tables`` — and nothing asserted what it stored, so a change to the persisted
+        payload was invisible to this suite.
+        """
+        conn = _make_conn(semantic_model=None)
+        schema = MagicMock()
+        schema.tables = []
+
+        with (
+            patch("app.routers.semantic._load_schema_for_connection") as mock_load,
+            patch("app.routers.semantic.SemanticModelGenerator") as mock_gen,
+        ):
+            mock_load.return_value = (schema, conn)
+            gen = mock_gen.return_value
+            gen.prepare_generation.return_value = {
+                "tables_total": 7,
+                "batch_count": 2,
+                "batch_size": 4,
+            }
+            gen.compute_schema_hash.return_value = "hash-abc"
+            db = _mock_db(MockResult())  # update Connection
+            app.dependency_overrides[get_db] = lambda: db
+            resp = await http_client.post("/api/v1/connections/conn-123/semantic/generate/init")
+
+        assert resp.status_code == 200
+        stored = db.execute.await_args.args[0].compile().params["semantic_model"]
+        assert stored["tables"] == {}
+        assert stored["generation_status"] == "tables_partial"
+        assert stored["generation_progress"] == {
+            "tables_done": 0,
+            "tables_total": 7,
+            # _BATCH_SIZE, not prepare_generation's batch_size — the route passes its own.
+            "batch_size": 4,
+        }
+        # 12.5b: the resume precondition. Without it a resume cannot tell that the
+        # cached schema was refreshed and reordered underneath it.
+        assert stored["schema_hash"] == "hash-abc"
+
+    async def test_generate_init_restamps_a_stale_schema_hash(self, http_client) -> None:
+        """Re-initialising must not carry the previous run's hash forward.
+
+        ``model_copy(update=…)`` copies every unlisted field, so before 12.5b a
+        regenerate kept the old ``schema_hash`` — worse than the ``None`` a fresh
+        connection gets, because a resume would read it as authoritative.
+        """
+        conn = _make_conn(semantic_model={**_EMPTY_MODEL, "schema_hash": "stale-hash"})
+        schema = MagicMock()
+        schema.tables = []
+
+        with (
+            patch("app.routers.semantic._load_schema_for_connection") as mock_load,
+            patch("app.routers.semantic.SemanticModelGenerator") as mock_gen,
+        ):
+            mock_load.return_value = (schema, conn)
+            gen = mock_gen.return_value
+            gen.prepare_generation.return_value = {
+                "tables_total": 1,
+                "batch_count": 1,
+                "batch_size": 4,
+            }
+            gen.compute_schema_hash.return_value = "fresh-hash"
+            db = _mock_db(MockResult())  # update Connection
+            app.dependency_overrides[get_db] = lambda: db
+            resp = await http_client.post("/api/v1/connections/conn-123/semantic/generate/init")
+
+        assert resp.status_code == 200
+        stored = db.execute.await_args.args[0].compile().params["semantic_model"]
+        assert stored["schema_hash"] == "fresh-hash"
