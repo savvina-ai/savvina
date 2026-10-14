@@ -21,6 +21,7 @@ from app.semantic.models import (
     ColumnSemantic,
     Hierarchy,
     RelationshipEdge,
+    SemanticModel,
     TablesBatchResponse,
     TableSemantic,
 )
@@ -527,3 +528,39 @@ class TestEdgesInSchema:
         edges = [to_hidden_table, from_hidden_column, gone]
         assert edges_in_schema(edges, schema, privacy) == [to_hidden_table, from_hidden_column]
         assert edges_in_schema(edges, schema) == []
+
+
+class TestDetectDriftPrivacy:
+    """The store keeps what the policy hides; Check Drift must not call it removed."""
+
+    _PRIVACY = PrivacySettings(
+        excluded_tables=["public.payroll"], excluded_columns=["public.orders.ssn"]
+    )
+
+    def _stored(self) -> SemanticModel:
+        return SemanticModel(
+            tables={
+                "public.orders": _tbl("id", "ssn", "gone_col", name="Orders"),
+                "public.payroll": _tbl("id", name="Payroll"),
+                "public.ghosts": _tbl("id", name="Ghosts"),
+            }
+        )
+
+    def test_hidden_table_and_column_are_not_drift(self) -> None:
+        # The policy-applied schema: payroll removed, orders.ssn never introspected.
+        schema = _schema_with_tables(["orders"])
+        warnings = SemanticModelGenerator().detect_drift(schema, self._stored(), self._PRIVACY)
+        assert not any("payroll" in w for w in warnings)
+        assert not any("ssn" in w for w in warnings)
+
+    def test_genuinely_missing_table_and_column_are_still_drift(self) -> None:
+        schema = _schema_with_tables(["orders"])
+        warnings = SemanticModelGenerator().detect_drift(schema, self._stored(), self._PRIVACY)
+        assert any('"public.ghosts"' in w and "no longer exists" in w for w in warnings)
+        assert any('"public.orders.gone_col"' in w for w in warnings)
+
+    def test_without_privacy_a_hidden_item_reads_as_removed(self) -> None:
+        schema = _schema_with_tables(["orders"])
+        warnings = SemanticModelGenerator().detect_drift(schema, self._stored())
+        assert any('"public.payroll"' in w for w in warnings)
+        assert any('"public.orders.ssn"' in w for w in warnings)

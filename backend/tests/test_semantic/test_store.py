@@ -510,6 +510,14 @@ class TestFitsPostgresLimits:
         long_name = "n" * 5000
         assert store._fit_values(SemanticGlobalItemRow, {"name": long_name})["name"] == long_name
 
+    def test_column_references_are_as_wide_as_column_names(self) -> None:
+        # A truncated reference would name a column that does not exist.
+        name_length = SemanticColumnRow.__table__.c.column_name.type.length
+        long_ref = "c" * name_length
+        for field in ("primary_timestamp_column", "primary_date_column"):
+            assert SemanticTableRow.__table__.c[field].type.length == name_length
+            assert store._fit_values(SemanticTableRow, {field: long_ref})[field] == long_ref
+
 
 async def _begin(db, cid, *, tables_total: int = 2, resume: bool = False) -> None:
     await store.begin_generation(

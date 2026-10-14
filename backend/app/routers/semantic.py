@@ -172,7 +172,8 @@ async def check_drift(
     if privacy:
         schema = _apply_privacy_to_schema(schema, privacy)
 
-    warnings = SemanticModelGenerator().detect_drift(schema, stored_model)
+    # The store keeps what the policy hides; that absence from ``schema`` is not drift.
+    warnings = SemanticModelGenerator().detect_drift(schema, stored_model, privacy)
 
     return DriftReport(
         connection_id=connection_id,
@@ -469,7 +470,10 @@ async def generate_semantic_init(
             await db.rollback()  # release the row lock
             raise HTTPException(
                 status_code=409,
-                detail="Schema changed since the interrupted run — restart generation",
+                detail=(
+                    "Schema changed since the interrupted run — regenerate (keeps your "
+                    "edits); Restart from scratch discards them"
+                ),
             )
         pending = await semantic_store.pending_table_keys(db, connection_id, all_keys)
         resumed = True
@@ -533,7 +537,10 @@ async def generate_semantic_batch(
     if header.schema_hash != gen.compute_schema_hash(schema):
         raise HTTPException(
             status_code=409,
-            detail="Schema changed during generation — restart or resume generation",
+            detail=(
+                "Schema changed during generation — regenerate (keeps your edits); "
+                "Restart from scratch discards them"
+            ),
         )
     known = {f"{t.schema_name}.{t.name}" for t in schema.tables}
     unknown = [k for k in body.table_keys if k not in known]
@@ -541,7 +548,9 @@ async def generate_semantic_batch(
         raise HTTPException(status_code=400, detail=f"Unknown table keys: {unknown}")
 
     llm_provider, configured_model, _ = await _resolve_provider(provider, db)
-    relationship_edges = gen._build_relationship_graph(schema)
+    # Strict (no ``privacy``): adapter FKs are filtered by table only, so an FK on an
+    # excluded column would otherwise name that column in the prompt.
+    relationship_edges = edges_in_schema(gen._build_relationship_graph(schema), schema)
 
     try:
         generated = await asyncio.wait_for(
@@ -681,7 +690,9 @@ async def generate_semantic_globals(
     llm_provider, configured_model, provider_name = await _resolve_provider(provider, db)
 
     gen = SemanticModelGenerator()
-    relationship_edges = gen._build_relationship_graph(schema)
+    # Strict (no ``privacy``): adapter FKs are filtered by table only, so an FK on an
+    # excluded column would otherwise reach the prompt and be saved as a fresh edge.
+    relationship_edges = edges_in_schema(gen._build_relationship_graph(schema), schema)
     # ``schema`` has the policy applied (excluded schemas/tables removed, excluded
     # columns never introspected); pruning must not read that absence as drift.
     privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None

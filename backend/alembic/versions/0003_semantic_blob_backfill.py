@@ -457,11 +457,16 @@ def backfill_connection(
 
 
 def backfill_all(conn: sa.engine.Connection) -> None:
-    """Backfill every connection that carries a semantic blob."""
+    """Backfill every active connection that carries a semantic blob.
+
+    A soft-deleted connection (``is_active = false``) is skipped: no route reads or
+    deletes its semantic rows, so backfilling it would only leave orphans.
+    """
     connections = sa.Table("connections", sa.MetaData(), autoload_with=conn)
     rows = conn.execute(
         sa.select(connections.c.id, connections.c.semantic_model).where(
-            connections.c.semantic_model.isnot(None)
+            connections.c.semantic_model.isnot(None),
+            connections.c.is_active.is_(True),
         )
     ).all()
     if not rows:

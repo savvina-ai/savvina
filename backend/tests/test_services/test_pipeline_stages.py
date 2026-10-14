@@ -241,6 +241,36 @@ class TestStagePruneAndFilter:
         assert semantic_model is None
         assert any("conn-1" in r.getMessage() and r.exc_info for r in caplog.records)
 
+    async def test_store_failure_is_confined_to_a_savepoint(self, stored_semantic_model):
+        """On PostgreSQL a failed statement aborts the transaction; the read must run
+        in a SAVEPOINT so only it is rolled back and the turn's next query works."""
+        events: list[str] = []
+
+        class _Savepoint:
+            async def __aenter__(self):
+                events.append("savepoint")
+
+            async def __aexit__(self, exc_type, exc, tb):
+                events.append(f"rollback:{exc_type.__name__}" if exc_type else "release")
+                return False  # like SQLAlchemy: roll back and re-raise
+
+        async def failing_load(*_a):
+            events.append("load")
+            raise RuntimeError("relation does not exist")
+
+        stored_semantic_model.side_effect = failing_load
+        db = MagicMock()
+        db.begin_nested = MagicMock(side_effect=lambda: _Savepoint())
+        schema = MagicMock()
+        sr = _make_schema_result(schema=schema, embeddings_available=False)
+
+        result = await _stage_prune_and_filter(
+            sr, _make_conn_row(), "q", _make_settings(), MagicMock(), db, "conn-1", "u", None
+        )
+
+        assert result == (schema, None)
+        assert events == ["savepoint", "load", "rollback:RuntimeError"]
+
     async def test_privacy_reaches_the_semantic_filter(self, stored_semantic_model):
         """A stale schema still listing an excluded column must not leak it."""
         schema = DataSourceSchema(

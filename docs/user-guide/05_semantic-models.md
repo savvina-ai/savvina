@@ -51,7 +51,7 @@ A provider rate limit, a timeout or a closed tab can stop a run part-way. The ta
 | **Finish with what's generated** | Skips the missing tables and builds the metrics and joins from the tables already generated. Disabled when no tables were generated. |
 | **Restart from scratch** | Deletes the model, including your edits, and generates it again. The only action that discards work; it asks for confirmation first. |
 
-Resume is refused if the database schema changed since the interrupted run; use **Restart from scratch** in that case.
+Resume is refused if the database schema changed since the interrupted run. Use **Regenerate** in that case: it generates against the current schema and keeps your edits. **Restart from scratch** also works but discards them.
 
 ### Via the API
 

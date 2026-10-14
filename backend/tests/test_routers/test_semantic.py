@@ -235,6 +235,43 @@ class TestCheckDrift:
         assert resp.status_code == 200
         assert resp.json()["warnings"] == []
 
+    async def test_what_the_policy_hides_is_not_reported_as_removed(self, http_client):
+        """The store keeps hidden annotations; drift must read the policy, not the absence."""
+        usc = MagicMock()
+        usc.schema_cache = {"tables": {}}
+        conn = _make_conn(
+            privacy_settings={
+                "excluded_tables": ["public.payroll"],
+                "excluded_columns": ["public.orders.ssn"],
+            }
+        )
+        db = _mock_db(MockResult(single=conn), MockResult(single=usc))
+        app.dependency_overrides[get_db] = lambda: db
+        stored = SemanticModel(
+            tables={
+                "public.orders": TableSemantic(
+                    display_name="Orders",
+                    columns={"id": {"display_name": "Id"}, "ssn": {"display_name": "SSN"}},
+                ),
+                "public.payroll": TableSemantic(display_name="Payroll"),
+                "public.ghosts": TableSemantic(display_name="Ghosts"),
+            }
+        )
+        # The cache as introspected: orders.ssn excluded at introspection, payroll present.
+        with (
+            patch(f"{_STORE}.load_model", new=AsyncMock(return_value=stored)),
+            patch(
+                "app.routers.semantic._schema_from_dict",
+                return_value=_schema(["orders", "payroll"]),
+            ),
+        ):
+            resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
+        assert resp.status_code == 200
+        warnings = resp.json()["warnings"]
+        assert not any("payroll" in w or "ssn" in w for w in warnings)
+        # A table that is genuinely gone is still reported.
+        assert any('"public.ghosts"' in w for w in warnings)
+
     async def test_returns_404_no_semantic_model(self, http_client):
         db = _mock_db(MockResult(single=_make_conn()))
         app.dependency_overrides[get_db] = lambda: db
@@ -276,6 +313,29 @@ def _schema(names: list[str], columns: dict[str, list[str]] | None = None) -> Da
             for n in names
         ],
     )
+
+
+def _fk_schema() -> DataSourceSchema:
+    """``orders.ssn_ref`` is excluded, so the adapter never introspected it."""
+    return _schema(
+        ["orders", "customers"],
+        columns={"orders": ["id", "customer_id"], "customers": ["id"]},
+    )
+
+
+def _fk_edges() -> tuple[RelationshipEdge, RelationshipEdge]:
+    """A live FK edge and one on the excluded ``orders.ssn_ref`` (adapter FKs keep it)."""
+
+    def edge(column: str) -> RelationshipEdge:
+        return RelationshipEdge(
+            from_table="public.orders",
+            from_column=column,
+            to_table="public.customers",
+            to_column="id",
+            join_sql=f"public.orders.{column} = public.customers.id",
+        )
+
+    return edge("customer_id"), edge("ssn_ref")
 
 
 def _header(
@@ -460,7 +520,11 @@ class TestGenerateInit:
         assert resp.status_code == 409
         db.rollback.assert_awaited()  # the row lock is released
         db.commit.assert_not_awaited()
-        assert "schema changed" in resp.json()["detail"].lower()
+        detail = resp.json()["detail"]
+        assert "schema changed" in detail.lower()
+        # Points at the non-destructive fix first, and says what Restart costs.
+        assert "regenerate (keeps your edits)" in detail
+        assert "Restart from scratch discards them" in detail
         begin.assert_not_awaited()
 
     async def test_takes_the_row_lock_before_reading_run_state(self, http_client) -> None:
@@ -616,6 +680,22 @@ class TestGenerateBatch:
         assert resp.status_code == 200
         assert set(reconcile.await_args.args[2]) == {"public.orders"}
 
+    async def test_an_fk_on_an_excluded_column_does_not_reach_the_generator(
+        self, http_client
+    ) -> None:
+        """Adapter FKs are filtered by table only; the adapter never introspects an
+        excluded column, so an FK edge on one must not name it in the prompt."""
+        live, hidden = _fk_edges()
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches()
+        with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:
+            gen = self._wire(mock_load, mock_gen, {}, schema=_fk_schema())
+            gen._build_relationship_graph.return_value = [live, hidden]
+            app.dependency_overrides[get_db] = lambda: _mock_db(MockResult(single=_make_conn()))
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+
+        assert resp.status_code == 200
+        assert gen.generate_tables.await_args.kwargs["relationship_edges"] == [live]
+
     async def test_omitted_tables_are_logged_and_left_pending(self, http_client, caplog) -> None:
         generated = {"public.orders": TableSemantic(display_name="Orders")}
         reconcile = AsyncMock()
@@ -666,6 +746,9 @@ class TestGenerateBatch:
             app.dependency_overrides[get_db] = lambda: _mock_db()
             resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
         assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert "regenerate (keeps your edits)" in detail
+        assert "Restart from scratch discards them" in detail
 
     async def test_unknown_key_is_400(self, http_client) -> None:
         with (
@@ -1056,6 +1139,28 @@ class TestGenerateGlobals:
         assert set(saved.tables) == {"public.orders", "public.customers"}
         assert live_edge in saved.relationships
         assert stale_edge not in saved.relationships
+
+    async def test_an_fk_on_an_excluded_column_is_neither_prompted_nor_saved(
+        self, http_client
+    ) -> None:
+        live, hidden = _fk_edges()
+        partial = self._partial(
+            tables={
+                "public.orders": {"display_name": "Orders", "columns": {}},
+                "public.customers": {"display_name": "Customers", "columns": {}},
+            }
+        )
+        resp, save, gen = await self._run(
+            http_client,
+            model=partial,
+            schema=_fk_schema(),
+            fresh_edges=[live, hidden],
+            conn=_make_conn(privacy_settings={"excluded_columns": ["public.orders.ssn_ref"]}),
+        )
+
+        assert resp.status_code == 200
+        assert gen.generate_globals.await_args.kwargs["relationship_edges"] == [live]
+        assert save.await_args.args[2].relationships == [live]
 
     async def test_what_the_privacy_policy_hides_survives_globals(self, http_client) -> None:
         """The schema the route sees has excluded tables removed and excluded columns

@@ -392,7 +392,7 @@ Phase 1 of semantic model generation. Loads the schema (live introspection if it
 `pending_table_keys` is the exact list of tables still to send to `/generate/batch`: every table on a fresh run, only the tables the interrupted run had not reached on a resume. The client splits it into batches of `batch_size`; `batch_count` is how many that makes (at least 1).
 
 **Response `400`:** Schema load failed, or `resume=true` and there is no interrupted (`tables_partial`) generation to resume
-**Response `409`:** `resume=true` and the schema changed since the interrupted run — restart generation, or the connection was deleted during init
+**Response `409`:** `resume=true` and the schema changed since the interrupted run — regenerate with a fresh init (`resume=false`, keeps hand edits), or delete the model first (`DELETE …/semantic`, as the UI's Restart from scratch does) to discard them; or the connection was deleted during init
 
 ---
 
@@ -419,7 +419,7 @@ Phase 2 — call once per batch. Sends one batch of tables to the LLM, reconcile
 }
 ```
 **Response `400`:** `/generate/init` not called first, a key that is not a table of the schema, or an over-long table key or column name
-**Response `409`:** The schema changed since init; or the state moved on while the batch was running (generation finalised or the model deleted); or a newer `/generate/init` restarted the run — the batch's results are discarded
+**Response `409`:** The schema changed since init — regenerate with a fresh `/generate/init` (`resume=false`, keeps hand edits); or the state moved on while the batch was running (generation finalised or the model deleted); or a newer `/generate/init` restarted the run — the batch's results are discarded
 **Response `422`:** The LLM response could not be used, or the request body failed validation (`table_keys` empty or more than 4 entries)
 **Response `504`:** The batch timed out (180 s)
 

@@ -1567,6 +1567,7 @@ class SemanticModelGenerator:
         self,
         current_schema: DataSourceSchema,
         stored_model: SemanticModel,
+        privacy: PrivacySettings | None = None,
     ) -> list[str]:
         """
         Compare current schema structure against stored semantic model.
@@ -1575,6 +1576,11 @@ class SemanticModelGenerator:
         IMPORTANT: This method ONLY compares structural changes
         (tables/columns added, removed, renamed). It NEVER re-runs
         statistical queries.
+
+        With ``privacy``, a stored table or column the policy hides is not reported
+        as removed: the store keeps hidden annotations, and ``current_schema`` (with
+        the policy applied) lacks them because they are hidden, not gone — the same
+        rule as ``prune_to_schema``.
         """
         warnings: list[str] = []
 
@@ -1592,6 +1598,8 @@ class SemanticModelGenerator:
 
         for table_key in stored_model.tables:
             if table_key not in current_tables:
+                if policy_hides_table(table_key, privacy):
+                    continue
                 warnings.append(
                     f'Table "{table_key}" referenced in semantic model '
                     f"no longer exists in the database"
@@ -1600,6 +1608,8 @@ class SemanticModelGenerator:
                 stored_cols = {_norm(c) for c in stored_model.tables[table_key].columns}
                 live_cols = current_columns.get(table_key, set())
                 for col in stored_cols - live_cols:
+                    if policy_hides_column(table_key, col, privacy):
+                        continue
                     warnings.append(
                         f'Column "{table_key}.{col}" referenced in semantic model no longer exists'
                     )
@@ -1616,7 +1626,11 @@ class SemanticModelGenerator:
             for t in metric.related_tables:
                 norm_t = _norm(t)
                 # Accept both "public.orders" (qualified) and "orders" (bare)
-                if norm_t not in current_tables and norm_t not in current_tables_bare:
+                if (
+                    norm_t not in current_tables
+                    and norm_t not in current_tables_bare
+                    and not policy_hides_table(norm_t, privacy)
+                ):
                     warnings.append(
                         f'Business metric "{metric.name}" references '
                         f'table "{t}" which no longer exists'

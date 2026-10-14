@@ -203,6 +203,20 @@ class TestBackfill:
         await _run_backfill(semantic_db)
         assert (await semantic_db.scalars(select(SemanticModelRow))).all() == []
 
+    async def test_inactive_connection_is_not_backfilled(self, semantic_db, connection_id) -> None:
+        """A soft-deleted connection's semantic rows would be orphans no route deletes."""
+        await _add_connection(semantic_db, _SECOND_ID)
+        await semantic_db.execute(
+            text("UPDATE connections SET is_active = :f WHERE id = :id"),
+            {"f": False, "id": _SECOND_ID},
+        )
+        await _seed_blob(semantic_db, connection_id, _BLOB)
+        await _seed_blob(semantic_db, _SECOND_ID, _BLOB)
+        await _run_backfill(semantic_db)
+
+        assert set((await _counts(semantic_db, _SECOND_ID)).values()) == {0}
+        assert (await _counts(semantic_db, connection_id))["semantic_models"] == 1
+
 
 _SECOND_ID = "22222222-2222-2222-2222-222222222222"
 _MIG = "0003_semantic_blob_backfill.py"
