@@ -9,10 +9,25 @@ import type {
   SemanticSuggestionResponse,
 } from '../types';
 
-interface GenerateInitResult {
+export interface GenerateInitResult {
   connection_id: string;
   tables_total: number;
   batch_count: number;
+  batch_size: number;
+  pending_table_keys: string[];
+  resumed: boolean;
+}
+
+/**
+ * What `/generate/batch` answers with: the run's progress, never the model. The page
+ * drives its own progress bar from the keys it dispatched and reads the finished model
+ * from `/generate/globals`.
+ */
+export interface GenerateBatchResult {
+  connection_id: string;
+  table_keys: string[];
+  tables_done: number;
+  tables_total: number;
   batch_size: number;
 }
 
@@ -20,21 +35,21 @@ export const semanticApi = {
   get: (connectionId: string) =>
     apiClient.get<SemanticModel>(`/api/v1/connections/${connectionId}/semantic`).then(r => r.data),
 
-  generateInit: (connectionId: string, provider?: string) =>
+  generateInit: (connectionId: string, provider?: string, resume = false) =>
     apiClient
       .post<GenerateInitResult>(
         `/api/v1/connections/${connectionId}/semantic/generate/init`,
         undefined,
-        provider ? { params: { provider } } : undefined,
+        { params: { ...(provider ? { provider } : {}), ...(resume ? { resume: true } : {}) } },
       )
       .then(r => r.data),
 
-  generateBatch: (connectionId: string, batchIdx: number, provider?: string) =>
+  generateBatch: (connectionId: string, tableKeys: string[], provider?: string) =>
     apiClient
-      .post<SemanticModel>(
+      .post<GenerateBatchResult>(
         `/api/v1/connections/${connectionId}/semantic/generate/batch`,
-        undefined,
-        { params: { batch_idx: batchIdx, ...(provider ? { provider } : {}) } },
+        { table_keys: tableKeys },
+        provider ? { params: { provider } } : undefined,
       )
       .then(r => r.data),
 
