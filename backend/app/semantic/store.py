@@ -20,13 +20,14 @@ from the blob era's generator order.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import logging
 from typing import TYPE_CHECKING, Any
 import uuid
 
-from sqlalchemy import String, delete, select
+from sqlalchemy import String, delete, func, select
 
 from ..models.semantic_store import (
     SemanticColumnRow,
@@ -37,7 +38,13 @@ from ..models.semantic_store import (
     SemanticRelationshipRow,
     SemanticTableRow,
 )
-from .models import GenerationStatus, RelationshipEdge, SemanticModel
+from .models import (
+    GenerationProgress,
+    GenerationStatus,
+    RelationshipEdge,
+    SemanticModel,
+    TableSemantic,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -464,6 +471,9 @@ async def save_model(
     if header.generation_status != str(GenerationStatus.TABLES_PARTIAL):
         # The run is over; the rows rebuilt below carry no run id either.
         header.generation_run_id = None
+    # Saving with status ``tables_partial`` keeps the header's run id but rebuilds
+    # every table row without a stamp, which resets resume state: callers must
+    # not full-save mid-run (use ``reconcile_tables``).
     header.updated_at = _now()
     header.updated_by = updated_by
     header.version = header.version + 1 if action == "update" else 1
@@ -676,6 +686,338 @@ async def load_model(db: AsyncSession, connection_id: str) -> SemanticModel | No
     # a malformed value can still raise pydantic's ValidationError (a
     # ValueError), exactly as reading the blob did.
     return SemanticModel.model_validate(data)
+
+
+# ── Generation run state ──────────────────────────────────────────────────────
+
+
+async def begin_generation(
+    db: AsyncSession,
+    connection_id: str,
+    *,
+    schema_hash: str,
+    tables_total: int,
+    tables_done: int,
+    batch_size: int,
+    source_dialect: str,
+    resume: bool = False,
+) -> None:
+    """Mark a generation run as started. Touches the header only — never the rows.
+
+    The old init wrote ``"tables": {}``. Nothing is blanked any more: a
+    regenerate is a reconcile, and the rows that exist are the resume state.
+
+    A fresh run mints a new ``generation_run_id``; ``resume=True`` keeps the
+    stored one so the tables the interrupted run already stamped stay done.
+    That marker — not row existence — is what ``pending_table_keys`` and
+    ``count_tables_in_run`` compare against: every table has a row before the
+    first batch of a regenerate lands, so "has a row" would report the whole
+    model done from the start. ``tables_done`` is supplied by the caller for the
+    same reason: 0 for a fresh run, the stamped count for a resume.
+    """
+    # Fit first: the strings come from the datasource, and PostgreSQL rejects NULs
+    # and over-long values the blob accepted.
+    fitted = _fit_values(
+        SemanticModelRow, {"schema_hash": schema_hash, "source_dialect": source_dialect}
+    )
+    header = await db.scalar(
+        select(SemanticModelRow).where(SemanticModelRow.connection_id == connection_id)
+    )
+    if header is None:
+        header = SemanticModelRow(connection_id=connection_id)
+        db.add(header)
+        await db.flush()
+    old_value = _header_to_dict(header)
+    if not resume or header.generation_run_id is None:
+        header.generation_run_id = str(uuid.uuid4())
+    header.schema_hash = fitted["schema_hash"]
+    header.source_dialect = fitted["source_dialect"]
+    header.generation_status = str(GenerationStatus.TABLES_PARTIAL)
+    header.generation_progress = {
+        "tables_done": tables_done,
+        "tables_total": tables_total,
+        "batch_size": batch_size,
+    }
+    header.version += 1
+    header.updated_at = _now()
+    _write_history(
+        db,
+        connection_id=connection_id,
+        entity_type="model",
+        entity_id=header.id,
+        entity_key="",
+        action="update",
+        source="generation",
+        old_value=old_value,
+        new_value=_header_to_dict(header),
+        changed_by=None,
+    )
+    await db.flush()
+
+
+@dataclass(frozen=True)
+class SemanticHeader:
+    """The header row's run-state fields, without assembling the model."""
+
+    generation_status: str
+    schema_hash: str | None
+    generation_progress: GenerationProgress | None
+    generation_run_id: str | None
+
+
+async def load_header(db: AsyncSession, connection_id: str) -> SemanticHeader | None:
+    """Read the header row fresh, or ``None`` when the connection has no model.
+
+    ``populate_existing`` bypasses the identity map: the batch route's post-lock
+    re-read exists to see a status another request changed while this one
+    awaited the LLM.
+    """
+    header = await db.scalar(
+        select(SemanticModelRow)
+        .where(SemanticModelRow.connection_id == connection_id)
+        .execution_options(populate_existing=True)
+    )
+    if header is None:
+        return None
+    progress = header.generation_progress
+    return SemanticHeader(
+        generation_status=header.generation_status,
+        schema_hash=header.schema_hash,
+        generation_progress=GenerationProgress.model_validate(progress) if progress else None,
+        generation_run_id=header.generation_run_id,
+    )
+
+
+async def count_tables_in_run(db: AsyncSession, connection_id: str) -> int:
+    """How many table rows the run in flight has stamped — the progress figure."""
+    header = await db.scalar(
+        select(SemanticModelRow)
+        .where(SemanticModelRow.connection_id == connection_id)
+        .execution_options(populate_existing=True)
+    )
+    if header is None or header.generation_run_id is None:
+        return 0
+    return int(
+        await db.scalar(
+            select(func.count())
+            .select_from(SemanticTableRow)
+            .where(
+                SemanticTableRow.connection_id == connection_id,
+                SemanticTableRow.generation_run_id == header.generation_run_id,
+            )
+        )
+        or 0
+    )
+
+
+async def advance_progress(db: AsyncSession, connection_id: str) -> GenerationProgress | None:
+    """Recompute ``tables_done`` from this run's stamped rows; return the new progress.
+
+    The recount is only correct when the caller serialises batches: the batch
+    route holds the connection row lock, so no other batch stamps rows between
+    the count and the write.
+    """
+    header = await db.scalar(
+        select(SemanticModelRow).where(SemanticModelRow.connection_id == connection_id)
+    )
+    if header is None or not header.generation_progress:
+        return None
+    # Count first: the count re-reads the header (populate_existing), so the
+    # progress dict below is built from the freshly loaded value, not a stale one.
+    done = await count_tables_in_run(db, connection_id)
+    header.generation_progress = {**header.generation_progress, "tables_done": done}
+    await db.flush()
+    return GenerationProgress.model_validate(header.generation_progress)
+
+
+async def pending_table_keys(
+    db: AsyncSession, connection_id: str, all_keys: Sequence[str]
+) -> list[str]:
+    """The keys in ``all_keys`` the run in flight has not stamped, in order.
+
+    With no run in flight (no header, or no run id) every key is pending.
+    Chunked so a wide schema cannot exceed the per-statement bind limit.
+    """
+    header = await db.scalar(
+        select(SemanticModelRow)
+        .where(SemanticModelRow.connection_id == connection_id)
+        .execution_options(populate_existing=True)
+    )
+    if header is None or header.generation_run_id is None:
+        return list(all_keys)
+    done: set[str] = set()
+    for chunk in _chunks(list(all_keys)):
+        rows = await db.execute(
+            select(SemanticTableRow.table_key).where(
+                SemanticTableRow.connection_id == connection_id,
+                SemanticTableRow.generation_run_id == header.generation_run_id,
+                SemanticTableRow.table_key.in_(list(chunk)),
+            )
+        )
+        done |= {key for (key,) in rows.all()}
+    return [key for key in all_keys if key not in done]
+
+
+async def reconcile_tables(
+    db: AsyncSession,
+    connection_id: str,
+    generated: Mapping[str, TableSemantic],
+    *,
+    updated_by: str | None,
+) -> None:
+    """Upsert the generator's output, skipping every field a human wrote.
+
+    For each generated table: an existing row takes the new value on every
+    field **not** in its ``user_edited_fields``; a missing row is inserted with
+    empty provenance. Columns likewise. Tables the batch does not name are not
+    touched. ``is_sensitive`` is additionally never cleared by generation.
+
+    A regenerate identical to what is stored writes no history row and bumps
+    no version, but every table the batch names is stamped with the header's
+    ``generation_run_id`` — that stamp is what tells a resume and the progress
+    figure that this run has reached the table.
+
+    Every generated key and value is fitted (``_fit_values``) *before* it is
+    compared with the stored row, because the stored row holds the fitted value:
+    comparing the raw one would see an over-long or NUL-bearing value as changed
+    on every regenerate. Raises ``ValueError`` (before touching the session) for
+    an over-long table key or column name.
+    """
+    # Fit everything first: a ValueError must leave the session untouched. A
+    # later key that fits to the same string as an earlier one replaces it.
+    fitted_tables: dict[str, tuple[dict[str, Any], dict[str, dict[str, Any]]]] = {}
+    for raw_key, table in generated.items():
+        table_values = _fit_values(
+            SemanticTableRow,
+            {"table_key": raw_key, **_table_row_values(table.model_dump(mode="json"))},
+        )
+        columns: dict[str, dict[str, Any]] = {}
+        for raw_name, column in table.columns.items():
+            col_values = _fit_values(
+                SemanticColumnRow,
+                {"column_name": raw_name, **_column_row_values(column.model_dump(mode="json"))},
+            )
+            columns[col_values["column_name"]] = col_values
+        fitted_tables[table_values["table_key"]] = (table_values, columns)
+
+    header = await db.scalar(
+        select(SemanticModelRow).where(SemanticModelRow.connection_id == connection_id)
+    )
+    if header is None:
+        header = SemanticModelRow(connection_id=connection_id)
+        db.add(header)
+        await db.flush()
+    run_id = header.generation_run_id
+
+    existing_tables: dict[str, SemanticTableRow] = {}
+    for chunk in _chunks(list(fitted_tables)):
+        rows = await db.scalars(
+            select(SemanticTableRow).where(
+                SemanticTableRow.model_id == header.id,
+                SemanticTableRow.table_key.in_(list(chunk)),
+            )
+        )
+        existing_tables.update({row.table_key: row for row in rows})
+
+    new_table_rows: list[SemanticTableRow] = []
+    for table_key, (generated_values, _columns) in fitted_tables.items():
+        row = existing_tables.get(table_key)
+        if row is None:
+            row = SemanticTableRow(
+                id=str(uuid.uuid4()),
+                model_id=header.id,
+                connection_id=connection_id,
+                generation_run_id=run_id,
+                updated_at=_now(),
+                updated_by=updated_by,
+                **generated_values,
+            )
+            new_table_rows.append(row)
+            existing_tables[table_key] = row
+            continue
+        row.generation_run_id = run_id
+        protected = set(row.user_edited_fields)
+        old_value = {field: getattr(row, field) for field in _TABLE_FIELDS}
+        new_value = {**old_value}
+        for field in _TABLE_FIELDS:
+            if field not in protected:
+                new_value[field] = generated_values[field]
+        if new_value == old_value:
+            continue
+        for field, value in new_value.items():
+            setattr(row, field, value)
+        row.version += 1
+        row.updated_at = _now()
+        row.updated_by = updated_by
+        _write_history(
+            db,
+            connection_id=connection_id,
+            entity_type="table",
+            entity_id=row.id,
+            entity_key=table_key,
+            action="update",
+            source="generation",
+            old_value=old_value,
+            new_value=new_value,
+            changed_by=updated_by,
+        )
+    for chunk in _chunks(new_table_rows):
+        db.add_all(chunk)
+    await db.flush()
+
+    table_ids = [row.id for row in existing_tables.values()]
+    existing_columns: dict[tuple[str, str], SemanticColumnRow] = {}
+    for chunk in _chunks(table_ids):
+        cols = await db.scalars(
+            select(SemanticColumnRow).where(SemanticColumnRow.table_id.in_(list(chunk)))
+        )
+        existing_columns.update({(c.table_id, c.column_name): c for c in cols})
+
+    new_column_rows: list[SemanticColumnRow] = []
+    for table_key, (_table_values, columns) in fitted_tables.items():
+        table_row = existing_tables[table_key]
+        for column_name, generated_col_values in columns.items():
+            col = existing_columns.get((table_row.id, column_name))
+            if col is None:
+                new_column_rows.append(
+                    SemanticColumnRow(
+                        table_id=table_row.id,
+                        updated_at=_now(),
+                        updated_by=updated_by,
+                        **generated_col_values,
+                    )
+                )
+                continue
+            protected = set(col.user_edited_fields)
+            old_value = {field: getattr(col, field) for field in _COLUMN_FIELDS}
+            new_value = {**old_value}
+            for field in _COLUMN_FIELDS:
+                if field not in protected:
+                    new_value[field] = generated_col_values[field]
+            # Generation never clears a flag, whoever set it.
+            new_value["is_sensitive"] = old_value["is_sensitive"] or new_value["is_sensitive"]
+            if new_value == old_value:
+                continue
+            for field, value in new_value.items():
+                setattr(col, field, value)
+            col.version += 1
+            col.updated_at = _now()
+            col.updated_by = updated_by
+            _write_history(
+                db,
+                connection_id=connection_id,
+                entity_type="column",
+                entity_id=col.id,
+                entity_key=f"{table_key}.{column_name}",
+                action="update",
+                source="generation",
+                old_value=old_value,
+                new_value=new_value,
+                changed_by=updated_by,
+            )
+    for chunk in _chunks(new_column_rows):
+        db.add_all(chunk)
+    await db.flush()
 
 
 async def _protected_values(

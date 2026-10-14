@@ -508,3 +508,392 @@ class TestFitsPostgresLimits:
         # Global-item names are unbounded Text: only NULs go.
         long_name = "n" * 5000
         assert store._fit_values(SemanticGlobalItemRow, {"name": long_name})["name"] == long_name
+
+
+async def _begin(db, cid, *, tables_total: int = 2, resume: bool = False) -> None:
+    await store.begin_generation(
+        db,
+        cid,
+        schema_hash="h",
+        tables_total=tables_total,
+        tables_done=0,
+        batch_size=4,
+        source_dialect="postgresql",
+        resume=resume,
+    )
+
+
+class TestGenerationRun:
+    async def test_begin_generation_creates_a_header_with_a_run_id(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.begin_generation(
+            semantic_db,
+            connection_id,
+            schema_hash="h1",
+            tables_total=3,
+            tables_done=0,
+            batch_size=4,
+            source_dialect="postgresql",
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        header = await store.load_header(semantic_db, connection_id)
+        assert header is not None
+        assert header.generation_status == "tables_partial"
+        assert header.schema_hash == "h1"
+        assert header.generation_run_id is not None
+        assert header.generation_progress is not None
+        assert header.generation_progress.tables_total == 3
+
+    async def test_begin_generation_never_blanks_existing_rows(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        await _begin(semantic_db, connection_id)
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        loaded = await store.load_model(semantic_db, connection_id)
+        assert set(loaded.tables) == {"public.orders", "public.customers"}
+        assert loaded.generation_status == GenerationStatus.TABLES_PARTIAL
+
+    async def test_begin_generation_fits_the_header_strings(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.begin_generation(
+            semantic_db,
+            connection_id,
+            schema_hash="ab\x00cd",
+            tables_total=1,
+            tables_done=0,
+            batch_size=4,
+            source_dialect="d" * 80,
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        header = await semantic_db.scalar(select(SemanticModelRow))
+        assert header.schema_hash == "abcd"
+        assert header.source_dialect == "d" * 50
+
+    async def test_fresh_run_mints_a_new_run_id_and_resume_keeps_it(
+        self, semantic_db, connection_id
+    ) -> None:
+        await _begin(semantic_db, connection_id, tables_total=1)
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        first = (await store.load_header(semantic_db, connection_id)).generation_run_id
+        await _begin(semantic_db, connection_id, tables_total=1, resume=True)
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert (await store.load_header(semantic_db, connection_id)).generation_run_id == first
+        await _begin(semantic_db, connection_id, tables_total=1)
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert (await store.load_header(semantic_db, connection_id)).generation_run_id != first
+
+    async def test_load_header_is_none_without_a_model(self, semantic_db, connection_id) -> None:
+        assert await store.load_header(semantic_db, connection_id) is None
+
+
+class TestReconcile:
+    async def test_inserts_tables_that_have_no_row(self, semantic_db, connection_id) -> None:
+        await _begin(semantic_db, connection_id)
+        await store.reconcile_tables(
+            semantic_db, connection_id, _rich_model().tables, updated_by="u1"
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        loaded = await store.load_model(semantic_db, connection_id)
+        assert set(loaded.tables) == {"public.orders", "public.customers"}
+        assert loaded.tables["public.orders"].columns["status"].display_name == "Status"
+
+    async def test_overwrites_unedited_fields_and_keeps_edited_ones(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        # Mark the table description and the status column's display_name as hand-edited.
+        table_row = await semantic_db.scalar(
+            select(SemanticTableRow).where(SemanticTableRow.table_key == "public.orders")
+        )
+        table_row.user_edited_fields = ["description"]
+        col_row = await semantic_db.scalar(
+            select(SemanticColumnRow).where(
+                SemanticColumnRow.table_id == table_row.id,
+                SemanticColumnRow.column_name == "status",
+            )
+        )
+        col_row.user_edited_fields = ["display_name"]
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        regenerated = _rich_model().tables
+        regenerated["public.orders"].description = "LLM rewrote this"
+        regenerated["public.orders"].grain = "LLM rewrote the grain"
+        regenerated["public.orders"].columns["status"].display_name = "LLM Status"
+        regenerated["public.orders"].columns["status"].description = "LLM column description"
+        await _begin(semantic_db, connection_id)
+        await store.reconcile_tables(semantic_db, connection_id, regenerated, updated_by="gen")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        loaded = await store.load_model(semantic_db, connection_id)
+        orders = loaded.tables["public.orders"]
+        assert orders.description == "One row per order"  # protected
+        assert orders.grain == "LLM rewrote the grain"  # not protected
+        assert orders.columns["status"].display_name == "Status"  # protected
+        assert orders.columns["status"].description == "LLM column description"
+
+    async def test_a_changing_reconcile_bumps_versions_and_writes_history(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        regenerated = _rich_model().tables
+        regenerated["public.orders"].grain = "LLM rewrote the grain"
+        regenerated["public.orders"].columns["status"].description = "LLM column description"
+        await _begin(semantic_db, connection_id)
+        await store.reconcile_tables(semantic_db, connection_id, regenerated, updated_by="gen")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        orders = await semantic_db.scalar(
+            select(SemanticTableRow).where(SemanticTableRow.table_key == "public.orders")
+        )
+        assert orders.version == 2
+        assert orders.updated_by == "gen"
+        assert orders.grain == "LLM rewrote the grain"
+        status = await semantic_db.scalar(
+            select(SemanticColumnRow).where(
+                SemanticColumnRow.table_id == orders.id,
+                SemanticColumnRow.column_name == "status",
+            )
+        )
+        assert status.version == 2
+        assert status.updated_by == "gen"
+        customers = await semantic_db.scalar(
+            select(SemanticTableRow).where(SemanticTableRow.table_key == "public.customers")
+        )
+        assert customers.version == 1
+
+        history = (
+            await semantic_db.scalars(
+                select(SemanticHistoryRow).where(SemanticHistoryRow.source == "generation")
+            )
+        ).all()
+        table_entries = [h for h in history if h.entity_type == "table"]
+        column_entries = [h for h in history if h.entity_type == "column"]
+        assert [(h.entity_key, h.action, h.changed_by) for h in table_entries] == [
+            ("public.orders", "update", "gen")
+        ]
+        assert [h.entity_key for h in column_entries] == ["public.orders.status"]
+        assert table_entries[0].old_value["grain"] == "one row per order"
+        assert table_entries[0].new_value["grain"] == "LLM rewrote the grain"
+
+    async def test_a_new_column_on_an_existing_table_is_inserted_unprotected(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        regenerated = _rich_model().tables
+        regenerated["public.customers"].columns["segment"] = ColumnSemantic(display_name="Segment")
+        await _begin(semantic_db, connection_id)
+        await store.reconcile_tables(semantic_db, connection_id, regenerated, updated_by="gen")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        loaded = await store.load_model(semantic_db, connection_id)
+        assert set(loaded.tables["public.customers"].columns) == {"id", "segment"}
+        assert loaded.tables["public.customers"].columns["segment"].display_name == "Segment"
+        segment = await semantic_db.scalar(
+            select(SemanticColumnRow).where(SemanticColumnRow.column_name == "segment")
+        )
+        assert segment.user_edited_fields == []
+        assert segment.version == 1
+
+    async def test_never_clears_is_sensitive(self, semantic_db, connection_id) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        regenerated = _rich_model().tables
+        regenerated["public.orders"].columns["email"].is_sensitive = False
+        await _begin(semantic_db, connection_id)
+        await store.reconcile_tables(semantic_db, connection_id, regenerated, updated_by="gen")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        loaded = await store.load_model(semantic_db, connection_id)
+        assert loaded.tables["public.orders"].columns["email"].is_sensitive is True
+
+    async def test_untouched_tables_are_left_alone(self, semantic_db, connection_id) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        only_customers = {"public.customers": TableSemantic(display_name="Clients", columns={})}
+        await _begin(semantic_db, connection_id)
+        await store.reconcile_tables(semantic_db, connection_id, only_customers, updated_by="gen")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        loaded = await store.load_model(semantic_db, connection_id)
+        assert loaded.tables["public.customers"].display_name == "Clients"
+        assert loaded.tables["public.orders"].display_name == "Orders"
+        assert "status" in loaded.tables["public.orders"].columns
+
+    async def test_identical_regenerate_writes_no_history_but_stamps_the_run(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        before = len((await semantic_db.scalars(select(SemanticHistoryRow))).all())
+        await _begin(semantic_db, connection_id)
+        await store.reconcile_tables(
+            semantic_db, connection_id, _rich_model().tables, updated_by="gen"
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        after = (await semantic_db.scalars(select(SemanticHistoryRow))).all()
+        # begin_generation writes one header row; the reconcile itself writes none.
+        assert len(after) == before + 1
+        header = await store.load_header(semantic_db, connection_id)
+        rows = (await semantic_db.scalars(select(SemanticTableRow))).all()
+        assert {r.generation_run_id for r in rows} == {header.generation_run_id}
+        assert all(r.version == 1 for r in rows)
+        columns = (await semantic_db.scalars(select(SemanticColumnRow))).all()
+        assert all(c.version == 1 for c in columns)
+
+    async def test_regenerating_values_that_need_fitting_is_still_a_no_op(
+        self, semantic_db, connection_id
+    ) -> None:
+        def generated() -> dict[str, TableSemantic]:
+            return {
+                "public.orders": TableSemantic(
+                    display_name="Orders",
+                    description="bad\x00desc",
+                    domain="d" * 200,
+                    columns={
+                        "total": ColumnSemantic(
+                            display_name="x" * 600,
+                            description="a\x00b",
+                            currency="US Dollars",
+                        )
+                    },
+                ),
+                "public.customers": TableSemantic(display_name="Customers", columns={}),
+            }
+
+        await _begin(semantic_db, connection_id)
+        await store.reconcile_tables(semantic_db, connection_id, generated(), updated_by="gen")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        stored = await semantic_db.scalar(
+            select(SemanticTableRow).where(SemanticTableRow.table_key == "public.orders")
+        )
+        assert stored.domain == "d" * 128
+        assert stored.description == "baddesc"
+        semantic_db.expunge_all()
+
+        await _begin(semantic_db, connection_id)
+        await store.reconcile_tables(semantic_db, connection_id, generated(), updated_by="gen")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        entity_history = (
+            await semantic_db.scalars(
+                select(SemanticHistoryRow).where(
+                    SemanticHistoryRow.entity_type.in_(["table", "column"])
+                )
+            )
+        ).all()
+        assert entity_history == []
+        assert all(r.version == 1 for r in (await semantic_db.scalars(select(SemanticTableRow))))
+        assert all(r.version == 1 for r in (await semantic_db.scalars(select(SemanticColumnRow))))
+        header = await store.load_header(semantic_db, connection_id)
+        rows = (await semantic_db.scalars(select(SemanticTableRow))).all()
+        assert {r.generation_run_id for r in rows} == {header.generation_run_id}
+
+    async def test_over_long_identity_raises_and_writes_nothing(
+        self, semantic_db, connection_id
+    ) -> None:
+        with pytest.raises(ValueError, match="table_key"):
+            await store.reconcile_tables(
+                semantic_db,
+                connection_id,
+                {"t" * 600: TableSemantic(display_name="T")},
+                updated_by="gen",
+            )
+        assert await semantic_db.scalar(select(SemanticModelRow)) is None
+
+
+class TestPendingKeysAndProgress:
+    async def test_every_key_is_pending_without_a_run(self, semantic_db, connection_id) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        keys = ["public.orders", "public.customers", "public.ghost"]
+        assert await store.pending_table_keys(semantic_db, connection_id, keys) == keys
+
+    async def test_a_regenerate_starts_with_every_key_pending_even_though_rows_exist(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await _begin(semantic_db, connection_id)
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        keys = ["public.orders", "public.customers"]
+        assert await store.pending_table_keys(semantic_db, connection_id, keys) == keys
+        assert await store.count_tables_in_run(semantic_db, connection_id) == 0
+
+    async def test_reconciled_keys_leave_the_pending_list_in_order(
+        self, semantic_db, connection_id
+    ) -> None:
+        await _begin(semantic_db, connection_id, tables_total=3)
+        await store.reconcile_tables(
+            semantic_db,
+            connection_id,
+            {"public.customers": TableSemantic(display_name="Customers")},
+            updated_by="gen",
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        keys = ["public.orders", "public.customers", "public.items"]
+        assert await store.pending_table_keys(semantic_db, connection_id, keys) == [
+            "public.orders",
+            "public.items",
+        ]
+        progress = await store.advance_progress(semantic_db, connection_id)
+        assert progress is not None
+        assert progress.tables_done == 1
+        assert progress.tables_total == 3
+
+    async def test_resume_keeps_the_stamped_tables_and_a_fresh_run_clears_them(
+        self, semantic_db, connection_id
+    ) -> None:
+        await _begin(semantic_db, connection_id)
+        await store.reconcile_tables(
+            semantic_db,
+            connection_id,
+            {"public.customers": TableSemantic(display_name="Customers")},
+            updated_by="gen",
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        await _begin(semantic_db, connection_id, resume=True)
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert await store.count_tables_in_run(semantic_db, connection_id) == 1
+        await _begin(semantic_db, connection_id)
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert await store.count_tables_in_run(semantic_db, connection_id) == 0
+        assert await store.pending_table_keys(semantic_db, connection_id, ["public.customers"]) == [
+            "public.customers"
+        ]
+
+    async def test_advance_progress_is_none_without_a_run(self, semantic_db, connection_id) -> None:
+        assert await store.advance_progress(semantic_db, connection_id) is None
