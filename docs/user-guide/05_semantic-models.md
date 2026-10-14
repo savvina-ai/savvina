@@ -16,8 +16,8 @@ prd_ctg_id → FK to Product Category ID
 
 When a user asks a question in chat, the backend:
 
-1. Loads the connection's `semantic_model` JSON from the database.
-2. Filters it to tables actually visible in the user's schema (privacy + permissions).
+1. Loads the connection's semantic model rows from the database.
+2. Filters it to the tables and columns actually visible in the user's schema (privacy + permissions). Columns your privacy settings hide are left out of the prompt, along with relationships that use them.
 3. Formats it into a `## Business Context` block injected into the LLM system prompt, after the raw schema DDL.
 4. The LLM generates SQL using both the raw schema **and** this business context.
 
@@ -37,16 +37,34 @@ If the prompt exceeds the provider's context window, a compression cascade drops
 6. Review the output carefully — especially **Business Metrics** and their filters.
 7. Click **Save Changes**.
 
+Once a model exists the button reads **Regenerate**. Regenerating asks the LLM to re-annotate the model from your current schema. Fields you edited by hand are kept, and tables and columns that are no longer in the database are removed.
+
+While a run is in progress, **Save Changes** is disabled and so are the other generation controls.
+
+#### If generation is interrupted
+
+A provider rate limit, a timeout or a closed tab can stop a run part-way. The tables generated so far are kept, and the page shows a banner ("Generation was interrupted at table N of M") with three actions:
+
+| Action | What it does |
+|--------|--------------|
+| **Resume** | Generates only the tables that are still missing, then the metrics and joins. |
+| **Finish with what's generated** | Skips the missing tables and builds the metrics and joins from the tables already generated. Disabled when no tables were generated. |
+| **Restart from scratch** | Deletes the model, including your edits, and generates it again. The only action that discards work; it asks for confirmation first. |
+
+Resume is refused if the database schema changed since the interrupted run; use **Restart from scratch** in that case.
+
 ### Via the API
 
 Generation is a three-phase process. All endpoints accept a `provider` query parameter (type name or config UUID; default: `claude`).
 
 ```bash
-# Phase 1 — initialise: introspects schema and returns batch count
+# Phase 1 — initialise: returns pending_table_keys, the tables still to generate.
+# Nothing is deleted. Add resume=true to continue an interrupted run.
 POST /api/v1/connections/{id}/semantic/generate/init?provider=claude
 
-# Phase 2 — repeat for each batch (batch_idx 0 … batch_count-1)
-POST /api/v1/connections/{id}/semantic/generate/batch?batch_idx=0&provider=claude
+# Phase 2 — one call per batch of 1–4 table keys taken from pending_table_keys
+POST /api/v1/connections/{id}/semantic/generate/batch?provider=claude
+{"table_keys": ["public.customers", "public.orders"]}
 
 # Phase 3 — generate cross-table metrics, joins, and derived columns
 POST /api/v1/connections/{id}/semantic/generate/globals?provider=claude
@@ -58,11 +76,13 @@ POST /api/v1/connections/{id}/semantic/generate/globals?provider=claude
 
 | Action | When to use |
 |--------|-------------|
-| **Generate** | First setup, or after a major schema change when you want the LLM to start fresh. **Replaces the entire model — manual edits will be lost.** |
+| **Generate / Regenerate** | First setup, or after a schema change. Regenerating refreshes the LLM-written parts of the model and keeps the fields you edited by hand, including metrics, segments, derived columns and joins you wrote. Tables and columns that no longer exist in the database are removed. |
 | **Save Changes** | Persist in-progress edits. All edits live in a local draft until saved. |
-| **Check Drift** | Compare saved model against the live schema; warns if referenced tables or columns no longer exist. |
-| **Delete** | Remove the semantic layer entirely. Queries still work but without business context. |
-| **Marked as reviewed** | Tracking flag only — has no effect on prompt generation. Use it to indicate the model has been human-verified. |
+| **Check Drift** | Compare the saved model against your cached schema (privacy settings applied); warns if referenced tables or columns no longer exist. Refresh the schema first to compare against the live database. |
+| **Delete** | Remove the semantic layer entirely, including your edits. Queries still work but without business context. |
+| **Marked as reviewed** | Tracking flag only — has no effect on prompt generation. Use it to indicate the model has been human-verified. Regenerating clears it. |
+
+Fields you edit by hand are remembered as yours: a later regenerate refreshes the rest of the model but leaves them alone. A column marked **Sensitive** stays sensitive after a regenerate. **Delete** and **Restart from scratch** discard your edits, and a regenerate also removes hand-edited tables and columns that no longer exist in the database.
 
 > **Schema refresh** does not regenerate the semantic model. After refreshing the schema to pick up new tables/columns, regenerate the model manually if needed.
 

@@ -73,7 +73,9 @@ backend/tests/
 ├── test_semantic/
 │   ├── test_generator.py          ← SemanticModelGenerator with mocked LLM
 │   ├── test_formatter.py          ← SemanticFormatter prompt rendering
-│   └── test_models.py             ← Semantic Pydantic models and discriminated unions
+│   ├── test_models.py             ← Semantic Pydantic models and discriminated unions
+│   ├── test_store.py              ← Normalised store: reconcile, provenance, optimistic lock, history, value fitting
+│   └── test_blob_is_unread.py     ← AST check that nothing in `app/` reads `Connection.semantic_model`
 ├── test_services/                 ← the pipeline, stage by stage (~20 files)
 │   ├── test_chat_service.py       ← Full pipeline scenarios end-to-end
 │   ├── test_pipeline_stages.py    ← Individual stage behaviour
@@ -98,6 +100,7 @@ backend/tests/
     ├── test_connections.py        ← All /api/v1/connections/* endpoints
     ├── test_semantic.py           ← All /api/v1/connections/{id}/semantic/* endpoints
     ├── test_semantic_v2.py        ← Three-phase generation + suggestions endpoints
+    ├── test_semantic_generation_flow.py ← Init / resume / batch / globals against the store
     ├── test_providers.py          ← All /api/v1/providers/* endpoints
     ├── test_chat.py               ← All /api/v1/chat/* endpoints
     └── test_settings.py           ← GET/PUT /api/v1/settings

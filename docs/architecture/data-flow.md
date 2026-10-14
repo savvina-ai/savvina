@@ -21,7 +21,7 @@ routers/chat.py: process_message()
        ├─ schema_pruning._select_relevant_tables()   # schema pruning (cosine similarity + domain boost)
        │    ├─ QueryCache.compute_embedding_async()
        │    └─ QueryCache.cosine_similarity()
-       ├─ schema_pruning._filter_semantic_to_schema()  # drop pruned tables from semantic model
+       ├─ schema_pruning._filter_semantic_to_schema()  # drop pruned tables and privacy-hidden columns from the semantic model
        ├─ schema_pruning._filter_semantic_by_relevance() # token-score narrowing + domain token boost
        ├─ pipeline._generate_query()                 # cache → LLM → validate → store
        │    ├─ QueryCache.lookup()                   # exact + semantic similarity lookup
@@ -322,9 +322,9 @@ When `schema_pruning_enabled` is true (default), the full schema is narrowed:
 **File:** `services/schema_pruning.py` → `_filter_semantic_to_schema()`, `_filter_semantic_by_relevance()`  
 **Model:** `semantic/models.py` → `SemanticModel`
 
-Two-pass filtering of the stored `Connection.semantic_model`:
+Two-pass filtering of the model assembled by `semantic/store.load_model`:
 
-1. `_filter_semantic_to_schema()` — drops any table keys not present in the privacy-filtered schema (removes excluded tables/schemas)
+1. `_filter_semantic_to_schema()` — narrows the model to the privacy-filtered schema: drops table keys not present in it (excluded tables/schemas) and, within each kept table, columns not present in it, with references to them (primary timestamp/date column, partition/cluster columns, hierarchy levels) and the relationships that use them. Common joins are filtered by table only: one is dropped only when it references a pruned table. The store keeps annotations for privacy-hidden columns, so this is what keeps them out of the prompt
 2. `_filter_semantic_by_relevance()` — token-score narrowing: scores each table by name overlap + display name + column name tokens against the question; tables whose `domain` tag has tokens overlapping the question receive a +2 score bonus; keeps top-10 plus one-hop FK neighbours
 
 ### Step 8: Query Cache Lookup

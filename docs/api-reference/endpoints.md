@@ -242,7 +242,7 @@ Get a single connection with full detail including schema cache and privacy sett
 
 ### `DELETE /api/v1/connections/{id}`
 
-Delete a connection and cascade-delete all associated sessions, messages, cache entries, examples, and semantic model.
+Delete a connection and cascade-delete all associated sessions, messages, cache entries, examples, and semantic model (the semantic rows are deleted; their audit history is kept).
 
 **Response `204`:** No content
 **Response `404`:** Connection not found
@@ -363,52 +363,91 @@ Changing the config clears that connection's cached schema and its query cache, 
 
 ### `GET /api/v1/connections/{id}/semantic`
 
-Get the saved semantic model for a connection.
+Get the saved semantic model for a connection, assembled from the semantic store tables. Tables and columns are returned in alphabetical key order.
 
-**Response `200`:** `SemanticModelResponse`
+**Response `200`:** `SemanticModel`
 **Response `404`:** No semantic model saved
 
 ---
 
 ### `POST /api/v1/connections/{id}/semantic/generate/init`
 
-Phase 1 of semantic model generation. Introspects the schema and returns the number of table batches to process.
+Phase 1 of semantic model generation. Loads the schema (live introspection if it is not cached), takes the connection row lock, marks the run as started (`generation_status = "tables_partial"`, a fresh run id, the schema hash) and returns the work list. Makes no LLM call. Rate limited to 10/minute. Never destructive: no table or column row is touched; a run reconciles onto whatever rows already exist.
 
-**Query parameter:** `provider` (string, default: `claude`) — provider type name or config UUID
+**Query parameters:**
+- `provider` (string, default: `claude`) — provider type name or config UUID
+- `resume` (bool, default: `false`) — continue an interrupted run instead of starting a new one. Requires a `tables_partial` model whose schema hash still matches; keeps the stored run id so the tables that run already generated stay done
 
-**Response `200`:** `GenerateInitResponse` — `{"batch_count": N, "table_count": M}`
-**Response `400`:** Schema introspection failed or no API key configured
+**Response `200`:** `GenerateInitResponse`
+```json
+{
+  "connection_id": "…",
+  "tables_total": 12,
+  "batch_count": 3,
+  "batch_size": 4,
+  "pending_table_keys": ["public.customers", "public.orders", "…"],
+  "resumed": false
+}
+```
+`pending_table_keys` is the exact list of tables still to send to `/generate/batch`: every table on a fresh run, only the tables the interrupted run had not reached on a resume. The client splits it into batches of `batch_size`; `batch_count` is how many that makes (at least 1).
+
+**Response `400`:** Schema load failed, or `resume=true` and there is no interrupted (`tables_partial`) generation to resume
+**Response `409`:** `resume=true` and the schema changed since the interrupted run — restart generation, or the connection was deleted during init
 
 ---
 
 ### `POST /api/v1/connections/{id}/semantic/generate/batch`
 
-Phase 2 — call once per batch. Sends one batch of tables to the LLM and merges the result into the partial model.
+Phase 2 — call once per batch. Sends one batch of tables to the LLM, reconciles the result onto the stored rows and returns the run's progress. Fields a person has edited by hand are skipped. Rate limited to 20/minute. The generator keeps the output grounded in the batch's real tables: a near-miss table or column key (different case, quoting) is mapped to the real one and an invented one is dropped; a column the LLM leaves out is not touched, so its earlier annotation survives.
 
-**Query parameters:**
-- `batch_idx` (int, required) — zero-based batch index (0 … batch_count-1)
-- `provider` (string, default: `claude`)
+**Query parameter:** `provider` (string, default: `claude`)
 
-**Response `200`:** `SemanticModel` (partial, updated after this batch)
-**Response `400`:** `/generate/init` not called first, or batch_idx out of range
+**Request body:**
+```json
+{"table_keys": ["public.customers", "public.orders"]}
+```
+`table_keys` is 1 to 4 `schema.table` keys, taken from `pending_table_keys`. Batches are identified by their keys, never by position.
+
+**Response `200`:** `GenerateBatchResponse` — progress only, not the model
+```json
+{
+  "connection_id": "…",
+  "table_keys": ["public.customers", "public.orders"],
+  "tables_done": 6,
+  "tables_total": 12,
+  "batch_size": 4
+}
+```
+**Response `400`:** `/generate/init` not called first, a key that is not a table of the schema, or an over-long table key or column name
+**Response `409`:** The schema changed since init; or the state moved on while the batch was running (generation finalised or the model deleted); or a newer `/generate/init` restarted the run — the batch's results are discarded
+**Response `422`:** The LLM response could not be used, or the request body failed validation (`table_keys` empty or more than 4 entries)
+**Response `504`:** The batch timed out (180 s)
 
 ---
 
 ### `POST /api/v1/connections/{id}/semantic/generate/globals`
 
-Phase 3 — generate cross-table business metrics, common joins, and derived columns. Call after all batches are complete.
+Phase 3 — generate cross-table business metrics, common joins, derived columns and segments, and finalise the model (`generation_status = "complete"`). Rate limited to 10/minute. Call after all batches are complete, or on its own to finish an interrupted run over the tables already generated.
+
+Tables and columns that are no longer in the database are removed here, together with relationships and other references to them. What the connection's privacy settings hide is kept, not removed, and never reaches the LLM. Hand-edited metrics, segments, derived columns, joins and relationships are carried through; over-long generated names are dropped.
 
 **Query parameter:** `provider` (string, default: `claude`)
 
-**Response `200`:** `SemanticModel` (final, saved to the connection)
-**Response `400`:** Init or batch phases not completed
-**Response `500`:** LLM generation failed
+**Response `200`:** `SemanticModel` (final, as stored)
+**Response `400`:** Init or batch phases not completed, or a value the store cannot hold
+**Response `409`:** The model was deleted or its state changed while globals was generating
+**Response `500`:** An unexpected error
+
+An LLM failure does not fail this call: the generator logs it and returns no generated metrics, joins, derived columns or segments, so the response is `200` with a model that has none of those from this run (hand-edited ones are still carried through). Check the model's contents rather than relying on the status code.
+**Response `504`:** Timed out (180 s)
 
 ---
 
 ### `PUT /api/v1/connections/{id}/semantic`
 
-Partially update the semantic model. Only the fields you provide are updated — unmentioned tables/metrics/joins are preserved.
+Partially update the semantic model. Only the fields you provide are updated — unmentioned tables/metrics/joins are preserved. A top-level section that is `null` or omitted is not supplied and is left untouched; an empty list (`[]`) clears it. Inside a table, `null` also means "not supplied" for `display_name` and `default_filters`, and inside a column for `display_name`, `value_mappings`, `is_sensitive`, `is_non_additive` and `semantic_type`; for the other nullable fields (`description`, `grain`, `currency`, …) `null` clears the value.
+
+Every field you change is recorded as hand-edited, so a later regenerate refreshes the rest of the model but leaves it alone. A value identical to what is stored is not recorded as an edit. Changes are written to the model's audit history.
 
 **Request body (all fields optional):**
 ```json
@@ -451,13 +490,15 @@ Partially update the semantic model. Only the fields you provide are updated —
 }
 ```
 
-**Response `200`:** `SemanticModelResponse`
+**Response `200`:** `SemanticModel`
+**Response `400`:** A value the store cannot hold (for example an over-long table key, column name or metric name)
+**Response `409`:** A concurrent edit changed a table row (optimistic lock) — reload and retry
 
 ---
 
 ### `DELETE /api/v1/connections/{id}/semantic`
 
-Remove the semantic model from a connection. Future queries will not have business context.
+Remove the semantic model from a connection: every semantic row is deleted, hand edits included. Future queries will not have business context.
 
 **Response `204`:** No content
 
@@ -486,10 +527,11 @@ List pending semantic-model suggestions raised from user feedback on generated q
 
 ### `POST /api/v1/connections/{id}/semantic/suggestions/{suggestion_id}/apply`
 
-Apply one suggestion to the stored semantic model and return the updated model.
+Apply one suggestion to the stored semantic model and return the updated model. The change is recorded as a hand edit, so a later regenerate leaves it alone.
 
-**Response `200`:** `SemanticModelResponse`
-**Response `404`:** Connection or suggestion not found
+**Response `200`:** `SemanticModel`
+**Response `404`:** Connection or suggestion not found, no semantic model, or the suggestion's table or column is not in the model
+**Response `409`:** A concurrent edit changed the row
 
 ---
 
