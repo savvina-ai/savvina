@@ -830,6 +830,57 @@ class TestReconcile:
             )
         assert await semantic_db.scalar(select(SemanticModelRow)) is None
 
+    async def test_expected_run_id_that_matches_reconciles(
+        self, semantic_db, connection_id
+    ) -> None:
+        await _begin(semantic_db, connection_id)
+        run_id = (await store.load_header(semantic_db, connection_id)).generation_run_id
+        await store.reconcile_tables(
+            semantic_db,
+            connection_id,
+            {"public.orders": TableSemantic(display_name="Orders")},
+            updated_by="gen",
+            expected_run_id=run_id,
+        )
+        rows = (await semantic_db.scalars(select(SemanticTableRow))).all()
+        assert [(r.table_key, r.generation_run_id) for r in rows] == [("public.orders", run_id)]
+
+    async def test_superseded_expected_run_id_conflicts_and_writes_nothing(
+        self, semantic_db, connection_id
+    ) -> None:
+        await _begin(semantic_db, connection_id)
+        old_run = (await store.load_header(semantic_db, connection_id)).generation_run_id
+        await semantic_db.commit()
+        # A fresh init in another transaction: a Core UPDATE leaves the identity-mapped
+        # header stale, so this also proves the check reads the row fresh.
+        await semantic_db.execute(
+            update(SemanticModelRow)
+            .where(SemanticModelRow.connection_id == connection_id)
+            .values(generation_run_id="new-run")
+        )
+        with pytest.raises(store.SemanticStoreConflict, match="superseded"):
+            await store.reconcile_tables(
+                semantic_db,
+                connection_id,
+                {"public.orders": TableSemantic(display_name="Orders")},
+                updated_by="gen",
+                expected_run_id=old_run,
+            )
+        assert (await semantic_db.scalars(select(SemanticTableRow))).all() == []
+
+    async def test_expected_run_id_without_a_header_conflicts(
+        self, semantic_db, connection_id
+    ) -> None:
+        with pytest.raises(store.SemanticStoreConflict):
+            await store.reconcile_tables(
+                semantic_db,
+                connection_id,
+                {"public.orders": TableSemantic(display_name="Orders")},
+                updated_by="gen",
+                expected_run_id="run-1",
+            )
+        assert await semantic_db.scalar(select(SemanticModelRow)) is None
+
 
 class TestPendingKeysAndProgress:
     async def test_every_key_is_pending_without_a_run(self, semantic_db, connection_id) -> None:

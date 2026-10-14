@@ -13,7 +13,7 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
-from ..datasources.models import ColumnInfo, DataSourceSchema
+from ..datasources.models import ColumnInfo, DataSourceSchema, PrivacySettings
 from .models import (
     GENERATION_BATCH_SIZE,
     AggregationType,
@@ -38,10 +38,6 @@ if TYPE_CHECKING:
     from ..providers.base import BaseLLMProvider
 
 logger = logging.getLogger(__name__)
-
-# Tables per LLM call in batched generation. Schemas with up to _BATCH_SIZE tables
-# generate in a single batch; larger schemas are split into multiple batches.
-_BATCH_SIZE = GENERATION_BATCH_SIZE  # kept for existing imports
 
 # Prompt for a single batch of tables (tables section only, no global metrics/joins).
 _BATCH_TABLES_PROMPT = """\
@@ -254,6 +250,171 @@ _FISCAL_DIMENSION_SUFFIXES: tuple[str, ...] = ("_year", "_quarter", "_period")
 _FISCAL_DIMENSION_PREFIXES: tuple[str, ...] = ("fiscal_", "budget_", "calendar_", "tax_")
 
 
+def policy_hides_table(key: str, privacy: PrivacySettings | None) -> bool:
+    """Whether ``privacy`` explains why table ``key`` (``schema.table``) is absent.
+
+    ``_apply_privacy_to_schema`` removes excluded schemas and tables from the
+    schema the generation routes see, so an absent table can be hidden rather
+    than gone. A key is ``f"{schema_name}.{name}"`` and either part may itself
+    contain a dot, so every split is tried rather than one guessed.
+    """
+    if privacy is None:
+        return False
+    return any(
+        privacy.is_table_excluded(key[:i], key[i + 1 :]) for i, ch in enumerate(key) if ch == "."
+    )
+
+
+def policy_hides_column(table_key: str, column: str, privacy: PrivacySettings | None) -> bool:
+    """Whether ``privacy`` explains why ``column`` is absent from ``table_key``.
+
+    Exact ``schema.table.column`` membership in ``excluded_columns``, which is what
+    the adapters skip at introspection. Deliberately not
+    ``PrivacySettings.is_column_excluded``: that also matches the sensitive-name
+    patterns, and the adapters still introspect those columns.
+    """
+    return privacy is not None and f"{table_key}.{column}" in privacy.excluded_columns
+
+
+def _warn_near_miss(kind: str, name: str, target: str | None, where: str) -> None:
+    """Warn that a dropped stored ``name`` was a near-miss spelling of live ``target``.
+
+    No remap: a migrated row's user-edit marks are keyed by the old spelling, so a
+    remap would keep the value but silently lose the marks, and the next regenerate
+    would overwrite the edit anyway.
+    """
+    if target is None:
+        return
+    logger.warning(
+        "prune_to_schema: near-miss %s key %r%s dropped; its annotations, incl. any hand "
+        "edits, are not carried to %r",
+        kind,
+        name,
+        where,
+        target,
+    )
+
+
+def _prune_table(
+    key: str,
+    table: TableSemantic,
+    real_columns: list[str],
+    privacy: PrivacySettings | None,
+    *,
+    log: bool,
+) -> TableSemantic:
+    """``table`` bounded to ``real_columns`` (plus the ones ``privacy`` hides)."""
+    live = set(real_columns)
+
+    def kept(name: str) -> bool:
+        # A column the policy hides is not gone: keep it, and references to it, as is.
+        return name in live or policy_hides_column(key, name, privacy)
+
+    columns = {name: col for name, col in table.columns.items() if kept(name)}
+    if log:
+        for name in table.columns:
+            if not kept(name):
+                target = SemanticModelGenerator._resolve_real_key(name, real_columns, bare_ok=False)
+                _warn_near_miss("column", name, target, f" on {key}")
+
+    # References are checked against the live columns, not the annotated ones: the
+    # generator never backfills a column the LLM omitted, and a reference to a real
+    # but unannotated column is not dangling.
+    hierarchies = []
+    for hierarchy in table.hierarchies:
+        levels = [level for level in hierarchy.levels if kept(level)]
+        if levels:
+            hierarchies.append(hierarchy.model_copy(update={"levels": levels}))
+    timestamp, date = table.primary_timestamp_column, table.primary_date_column
+    return table.model_copy(
+        update={
+            "columns": columns,
+            "primary_timestamp_column": timestamp if timestamp and kept(timestamp) else None,
+            "primary_date_column": date if date and kept(date) else None,
+            "partition_columns": [c for c in table.partition_columns if kept(c)],
+            "cluster_columns": [c for c in table.cluster_columns if kept(c)],
+            "hierarchies": hierarchies,
+        }
+    )
+
+
+def prune_to_schema(
+    tables: dict[str, TableSemantic],
+    schema: DataSourceSchema,
+    privacy: PrivacySettings | None = None,
+    *,
+    log: bool = True,
+) -> dict[str, TableSemantic]:
+    """Bound a model's tables to what ``schema`` still has. Pure; never mutates ``tables``.
+
+    A regenerate reconciles onto the stored rows and never blanks them, and the
+    CE has no apply-drift, so ``/generate/globals`` calls this to stop tables and
+    columns that left the database from living in the model forever:
+
+    - a table whose key (``schema.name``) is not in ``schema`` is dropped, and
+      within a kept table every column that is not a real column of it;
+    - references to a column the table no longer has are cleared:
+      ``primary_timestamp_column`` / ``primary_date_column`` become ``None``,
+      ``partition_columns`` / ``cluster_columns`` and each hierarchy's ``levels``
+      are filtered, and a hierarchy left with no levels is dropped.
+
+    **An absence the policy explains is not drift.** With ``privacy``, a table
+    whose schema or table is excluded, and a column whose ``schema.table.column``
+    is in ``excluded_columns``, is absent from ``schema`` because it is hidden,
+    not because it is gone: it is carried through unchanged, references to it
+    included.
+
+    **Near-miss spellings are dropped, not remapped.** Rows backfilled from an old
+    blob can carry an LLM spelling (``public.Orders``, ``"OrderID"``) that the
+    generator later grounds to the real key. Such a row is dropped like any other
+    absent key — a remap would keep its value but lose its user-edit marks, which
+    are keyed by the old spelling — and, when ``log``, a warning names the key it
+    would have matched (``_resolve_real_key``'s rules). ``log=False`` is for a
+    second call over the same model, so the warnings are not duplicated.
+
+    ``default_filters`` are free SQL and are NOT rewritten: a filter naming a
+    dropped column stays as written.
+
+    Membership is by schema, not by generation-run stamp, so finishing a partial
+    run keeps every real table it annotated.
+    """
+    real_columns = {f"{t.schema_name}.{t.name}": [c.name for c in t.columns] for t in schema.tables}
+    real_keys = list(real_columns)
+    out: dict[str, TableSemantic] = {}
+    for key, table in tables.items():
+        if key in real_columns:
+            out[key] = _prune_table(key, table, real_columns[key], privacy, log=log)
+        elif policy_hides_table(key, privacy):
+            out[key] = table.model_copy()
+        elif log:
+            target = SemanticModelGenerator._resolve_real_key(key, real_keys, bare_ok=True)
+            _warn_near_miss("table", key, target, "")
+    return out
+
+
+def edges_in_schema(
+    edges: Sequence[RelationshipEdge],
+    schema: DataSourceSchema,
+    privacy: PrivacySettings | None = None,
+) -> list[RelationshipEdge]:
+    """The edges whose both endpoints are real columns of real tables in ``schema``.
+
+    Bounded by the live schema, not by the annotated tables: a user-authored edge
+    to a real but unannotated table must survive "Finish with what's generated".
+    An endpoint ``privacy`` hides (its table, or its column) counts as live.
+    """
+    live = {f"{t.schema_name}.{t.name}": {c.name for c in t.columns} for t in schema.tables}
+
+    def alive(table: str, column: str) -> bool:
+        if table in live:
+            return column in live[table] or policy_hides_column(table, column, privacy)
+        return policy_hides_table(table, privacy)
+
+    return [
+        e for e in edges if alive(e.from_table, e.from_column) and alive(e.to_table, e.to_column)
+    ]
+
+
 class SemanticModelGenerator:
     """Generates an initial SemanticModel by asking an LLM to analyse the schema."""
 
@@ -310,7 +471,7 @@ class SemanticModelGenerator:
                         pass
 
         # Always batch — the single-shot path was deleted in favour of a single
-        # uniform code path. Even small schemas now batch (one batch when ≤ _BATCH_SIZE).
+        # uniform code path. Even small schemas now batch (one batch when ≤ GENERATION_BATCH_SIZE).
         parsed = await self._generate_batched(
             schema=schema,
             provider=provider,
@@ -398,7 +559,7 @@ class SemanticModelGenerator:
         the full JSON in one shot (max_output_tokens < _BATCH_TOKEN_THRESHOLD).
 
         Strategy:
-        1. Split schema.tables into batches of _BATCH_SIZE.
+        1. Split schema.tables into batches of GENERATION_BATCH_SIZE.
         2. Call the LLM once per batch, returning only {"tables": {...}}.
         3. Merge all table results.
         4. Call the LLM once more for {"business_metrics", "derived_columns", "common_joins"}.
@@ -412,7 +573,10 @@ class SemanticModelGenerator:
         # ── Step 1-3: one call per batch of tables ────────────────────────────
         all_tables: dict[str, TableSemantic] = {}
         tables = schema.tables
-        batches = [tables[i : i + _BATCH_SIZE] for i in range(0, len(tables), _BATCH_SIZE)]
+        batches = [
+            tables[i : i + GENERATION_BATCH_SIZE]
+            for i in range(0, len(tables), GENERATION_BATCH_SIZE)
+        ]
         logger.debug(
             "SemanticModelGenerator batched: %d tables → %d batches",
             len(tables),
@@ -578,40 +742,13 @@ class SemanticModelGenerator:
         """
         relationship_edges = self._build_relationship_graph(schema)
         tables_total = len(schema.tables)
-        batch_count = max(1, -(-tables_total // _BATCH_SIZE))  # ceil division
+        batch_count = max(1, -(-tables_total // GENERATION_BATCH_SIZE))  # ceil division
         return {
             "tables_total": tables_total,
             "batch_count": batch_count,
-            "batch_size": _BATCH_SIZE,
+            "batch_size": GENERATION_BATCH_SIZE,
             "relationship_edges": relationship_edges,
         }
-
-    async def generate_table_batch(
-        self,
-        schema: DataSourceSchema,
-        provider: BaseLLMProvider,
-        model: str | None,
-        batch_idx: int,
-        relationship_edges: list[RelationshipEdge],
-    ) -> dict[str, TableSemantic]:
-        """Positional wrapper around ``generate_tables``.
-
-        Kept only for the current router, which still slices by batch index; the
-        routes task switches it to ``generate_tables`` and this can then go.
-        ``generate()`` does not use it.
-        """
-        start = batch_idx * GENERATION_BATCH_SIZE
-        keys = [
-            f"{t.schema_name}.{t.name}"
-            for t in schema.tables[start : start + GENERATION_BATCH_SIZE]
-        ]
-        return await self.generate_tables(
-            schema=schema,
-            provider=provider,
-            model=model,
-            table_keys=keys,
-            relationship_edges=relationship_edges,
-        )
 
     async def generate_tables(
         self,

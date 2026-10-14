@@ -876,6 +876,7 @@ async def reconcile_tables(
     generated: Mapping[str, TableSemantic],
     *,
     updated_by: str | None,
+    expected_run_id: str | None = None,
 ) -> None:
     """Upsert the generator's output, skipping every field a human wrote.
 
@@ -883,6 +884,11 @@ async def reconcile_tables(
     field **not** in its ``user_edited_fields``; a missing row is inserted with
     empty provenance. Columns likewise. Tables the batch does not name are not
     touched. ``is_sensitive`` is additionally never cleared by generation.
+
+    Nothing is ever deleted here: a table or column that left the schema keeps
+    its row through every batch. Removing those is ``/generate/globals``'s job,
+    via ``generator.prune_to_schema`` before its full save (the CE has no
+    apply-drift).
 
     A regenerate identical to what is stored writes no history row and bumps
     no version, but every table the batch names is stamped with the header's
@@ -894,6 +900,12 @@ async def reconcile_tables(
     comparing the raw one would see an over-long or NUL-bearing value as changed
     on every regenerate. Raises ``ValueError`` (before touching the session) for
     an over-long table key or column name.
+
+    ``expected_run_id`` is the run the caller generated for. When given and the
+    header's ``generation_run_id`` differs (a fresh ``/generate/init`` restarted
+    the run), raises ``SemanticStoreConflict`` before writing anything: stamping
+    this output with the new run id would make a resume of that run skip tables
+    it never generated.
     """
     # Fit everything first: a ValueError must leave the session untouched. A
     # later key that fits to the same string as an earlier one replaces it.
@@ -913,8 +925,17 @@ async def reconcile_tables(
         fitted_tables[table_values["table_key"]] = (table_values, columns)
 
     header = await db.scalar(
-        select(SemanticModelRow).where(SemanticModelRow.connection_id == connection_id)
+        select(SemanticModelRow)
+        .where(SemanticModelRow.connection_id == connection_id)
+        .execution_options(populate_existing=True)
     )
+    if expected_run_id is not None and (
+        header is None or header.generation_run_id != expected_run_id
+    ):
+        raise SemanticStoreConflict(
+            f"generation run {expected_run_id!r} was superseded "
+            f"(now {header.generation_run_id if header else None!r})"
+        )
     if header is None:
         header = SemanticModelRow(connection_id=connection_id)
         db.add(header)

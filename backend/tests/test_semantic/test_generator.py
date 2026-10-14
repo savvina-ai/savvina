@@ -3,15 +3,23 @@
 
 """Tests for SemanticModelGenerator — focused on build_time_expressions()."""
 
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.datasources.models import ColumnInfo, DataSourceSchema, SchemaInfo, TableInfo
-from app.semantic.generator import SemanticModelGenerator
+from app.datasources.models import (
+    ColumnInfo,
+    DataSourceSchema,
+    PrivacySettings,
+    SchemaInfo,
+    TableInfo,
+)
+from app.semantic.generator import SemanticModelGenerator, edges_in_schema, prune_to_schema
 from app.semantic.models import (
     GENERATION_BATCH_SIZE,
     ColumnSemantic,
+    Hierarchy,
     RelationshipEdge,
     TablesBatchResponse,
     TableSemantic,
@@ -218,36 +226,10 @@ class TestGenerateTablesByKey:
         description = out["public.Facts"].columns["created_at"].description
         assert description is not None and "NOT a business period date" in description
 
-    def test_batch_size_constant_is_shared(self) -> None:
-        from app.semantic.generator import _BATCH_SIZE
-
-        assert _BATCH_SIZE == GENERATION_BATCH_SIZE == 4
-
-
-class TestGenerateTableBatchWrapper:
-    async def test_batch_idx_delegates_by_key(self) -> None:
-        schema = _schema_with_tables(["a", "b", "c", "d", "e"])
-        provider = _provider_returning({"public.e": _tbl("id")})
-        out = await SemanticModelGenerator().generate_table_batch(
-            schema=schema, provider=provider, model=None, batch_idx=1, relationship_edges=[]
-        )
-        assert set(out) == {"public.e"}
-        ddl = provider.generate_structured.call_args.kwargs["user_message"]
-        assert "CREATE TABLE public.e (" in ddl
-        assert "CREATE TABLE public.a (" not in ddl
-
-    async def test_batch_idx_past_the_end_makes_no_llm_call(self) -> None:
-        provider = MagicMock()
-        provider.generate_structured = AsyncMock()
-        out = await SemanticModelGenerator().generate_table_batch(
-            schema=_schema_with_tables(["a", "b"]),
-            provider=provider,
-            model=None,
-            batch_idx=5,
-            relationship_edges=[],
-        )
-        assert out == {}
-        provider.generate_structured.assert_not_called()
+    def test_prepare_generation_reports_the_shared_batch_size(self) -> None:
+        prep = SemanticModelGenerator().prepare_generation(_schema_with_tables(["a"] * 5))
+        assert prep["batch_size"] == GENERATION_BATCH_SIZE == 4
+        assert prep["batch_count"] == 2
 
 
 class TestGroundTablesToSchema:
@@ -339,3 +321,209 @@ class TestGroundTablesToSchema:
         tables = {"public.orders": _tbl("status", "id", "ID")}
         assert self._ground(tables, schema) == (0, 2)
         assert set(tables["public.orders"].columns) == {"id"}
+
+
+class TestPruneToSchema:
+    def test_drops_tables_the_schema_no_longer_has(self) -> None:
+        schema = _schema_with_tables(["orders"])
+        out = prune_to_schema({"public.orders": _tbl("id"), "public.gone": _tbl("id")}, schema)
+        assert set(out) == {"public.orders"}
+
+    def test_drops_columns_the_table_no_longer_has(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["total"])
+        out = prune_to_schema({"public.orders": _tbl("id", "total", "dropped_col")}, schema)
+        assert set(out["public.orders"].columns) == {"id", "total"}
+
+    def test_clears_time_columns_that_left_the_table(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["order_date"])
+        table = _tbl("id", "order_date").model_copy(
+            update={"primary_timestamp_column": "created_at", "primary_date_column": "order_date"}
+        )
+        out = prune_to_schema({"public.orders": table}, schema)["public.orders"]
+        assert out.primary_timestamp_column is None
+        assert out.primary_date_column == "order_date"
+
+    def test_a_reference_to_a_real_unannotated_column_is_kept(self) -> None:
+        # The generator never backfills a column the LLM omitted; that column is
+        # still real, so a reference to it is not dangling.
+        schema = _schema_with_tables(["orders"], extra_columns=["created_at"])
+        table = _tbl("id").model_copy(
+            update={"primary_timestamp_column": "created_at", "partition_columns": ["created_at"]}
+        )
+        out = prune_to_schema({"public.orders": table}, schema)["public.orders"]
+        assert out.primary_timestamp_column == "created_at"
+        assert out.partition_columns == ["created_at"]
+
+    def test_filters_partition_and_cluster_columns(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["region", "day"])
+        table = _tbl("id").model_copy(
+            update={"partition_columns": ["day", "gone"], "cluster_columns": ["gone", "region"]}
+        )
+        out = prune_to_schema({"public.orders": table}, schema)["public.orders"]
+        assert out.partition_columns == ["day"]
+        assert out.cluster_columns == ["region"]
+
+    def test_filters_hierarchy_levels_and_drops_empty_hierarchies(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["year", "month"])
+        table = _tbl("id").model_copy(
+            update={
+                "hierarchies": [
+                    Hierarchy(name="Date", levels=["year", "quarter", "month"]),
+                    Hierarchy(name="Geo", levels=["country", "city"]),
+                ]
+            }
+        )
+        out = prune_to_schema({"public.orders": table}, schema)["public.orders"]
+        assert [(h.name, h.levels) for h in out.hierarchies] == [("Date", ["year", "month"])]
+
+    def test_default_filters_are_not_rewritten(self) -> None:
+        schema = _schema_with_tables(["orders"])
+        table = _tbl("id").model_copy(update={"default_filters": ["gone_col IS NULL"]})
+        out = prune_to_schema({"public.orders": table}, schema)["public.orders"]
+        assert out.default_filters == ["gone_col IS NULL"]
+
+    def test_does_not_mutate_its_input(self) -> None:
+        schema = _schema_with_tables(["orders"])
+        table = _tbl("id", "gone").model_copy(
+            update={
+                "primary_date_column": "gone",
+                "partition_columns": ["gone"],
+                "hierarchies": [Hierarchy(name="H", levels=["gone"])],
+            }
+        )
+        tables = {"public.orders": table, "public.ghost": _tbl("id")}
+        before = {k: v.model_dump() for k, v in tables.items()}
+        out = prune_to_schema(tables, schema)
+        assert {k: v.model_dump() for k, v in tables.items()} == before
+        assert out["public.orders"] is not table
+
+    # ── An absence the privacy policy explains is not drift ──────────────────
+
+    def test_a_table_the_policy_hides_is_kept_unchanged(self) -> None:
+        schema = _schema_with_tables(["orders"])  # public.secret was filtered out
+        secret = _tbl("id", "x", name="Secret").model_copy(
+            update={"primary_timestamp_column": "x", "description": "hand written"}
+        )
+        privacy = PrivacySettings(excluded_tables=["public.secret"])
+        out = prune_to_schema(
+            {"public.orders": _tbl("id"), "public.secret": secret}, schema, privacy
+        )
+        assert set(out) == {"public.orders", "public.secret"}
+        assert out["public.secret"].model_dump() == secret.model_dump()
+
+    def test_a_table_in_an_excluded_schema_is_kept(self) -> None:
+        schema = _schema_with_tables(["orders"])
+        privacy = PrivacySettings(excluded_schemas=["hr"])
+        out = prune_to_schema({"hr.people": _tbl("id"), "public.gone": _tbl("id")}, schema, privacy)
+        assert set(out) == {"hr.people"}
+
+    def test_a_column_the_policy_hides_is_kept(self) -> None:
+        schema = _schema_with_tables(["orders"])  # ssn skipped at introspection
+        privacy = PrivacySettings(excluded_columns=["public.orders.ssn"])
+        out = prune_to_schema({"public.orders": _tbl("id", "ssn", "gone")}, schema, privacy)
+        assert set(out["public.orders"].columns) == {"id", "ssn"}
+
+    def test_references_to_a_hidden_column_are_kept(self) -> None:
+        schema = _schema_with_tables(["orders"])
+        privacy = PrivacySettings(excluded_columns=["public.orders.signed_up_at"])
+        table = _tbl("id").model_copy(
+            update={
+                "primary_timestamp_column": "signed_up_at",
+                "partition_columns": ["signed_up_at", "gone"],
+                "hierarchies": [Hierarchy(name="H", levels=["signed_up_at"])],
+            }
+        )
+        out = prune_to_schema({"public.orders": table}, schema, privacy)["public.orders"]
+        assert out.primary_timestamp_column == "signed_up_at"
+        assert out.partition_columns == ["signed_up_at"]
+        assert [h.levels for h in out.hierarchies] == [["signed_up_at"]]
+
+    def test_a_sensitive_name_alone_does_not_hide_a_column(self) -> None:
+        # The adapters still introspect sensitive-pattern columns, so an absent
+        # ``email`` really is gone: only exact excluded_columns membership hides.
+        schema = _schema_with_tables(["orders"])
+        out = prune_to_schema({"public.orders": _tbl("id", "email")}, schema, PrivacySettings())
+        assert set(out["public.orders"].columns) == {"id"}
+
+    # ── Near-miss stored spellings are dropped, with a warning ──────────────
+
+    @staticmethod
+    def _near_miss_warnings(caplog) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "near-miss" in r.getMessage()
+        ]
+
+    def test_a_near_miss_table_key_is_dropped_with_a_warning(self, caplog) -> None:
+        schema = _schema_with_tables(["orders"])
+        with caplog.at_level(logging.WARNING, logger="app.semantic.generator"):
+            out = prune_to_schema({"public.Orders": _tbl("id", name="Hand-edited")}, schema)
+        assert out == {}
+        [message] = self._near_miss_warnings(caplog)
+        assert "'public.Orders'" in message and "'public.orders'" in message
+        assert "hand edits" in message
+
+    def test_a_near_miss_column_is_dropped_and_its_references_cleared(self, caplog) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["OrderID", "OrderDate"])
+        table = _tbl("id", '"OrderID"', "orderdate").model_copy(
+            update={"primary_date_column": "orderdate", "cluster_columns": ['"OrderID"']}
+        )
+        with caplog.at_level(logging.WARNING, logger="app.semantic.generator"):
+            out = prune_to_schema({"public.orders": table}, schema)["public.orders"]
+        assert set(out.columns) == {"id"}
+        assert out.primary_date_column is None
+        assert out.cluster_columns == []
+        messages = self._near_miss_warnings(caplog)
+        assert len(messages) == 2
+        assert any("'orderdate'" in m and "'OrderDate'" in m for m in messages)
+        assert any("'\"OrderID\"'" in m and "'OrderID'" in m for m in messages)
+
+    def test_a_key_that_is_simply_gone_is_dropped_without_a_warning(self, caplog) -> None:
+        schema = _schema_with_tables(["orders"])
+        with caplog.at_level(logging.WARNING, logger="app.semantic.generator"):
+            out = prune_to_schema(
+                {"public.ghost": _tbl("id"), "public.orders": _tbl("id", "gone")}, schema
+            )
+        assert set(out) == {"public.orders"}
+        assert self._near_miss_warnings(caplog) == []
+
+    def test_log_false_silences_the_near_miss_warnings(self, caplog) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["OrderID"])
+        tables = {"public.Orders": _tbl("id"), "public.orders": _tbl("id", "orderid")}
+        with caplog.at_level(logging.WARNING, logger="app.semantic.generator"):
+            out = prune_to_schema(tables, schema, log=False)
+        assert set(out) == {"public.orders"}
+        assert set(out["public.orders"].columns) == {"id"}
+        assert self._near_miss_warnings(caplog) == []
+
+
+def _edge(from_table: str, from_column: str, to_table: str, to_column: str) -> RelationshipEdge:
+    return RelationshipEdge(
+        from_table=from_table,
+        from_column=from_column,
+        to_table=to_table,
+        to_column=to_column,
+        join_sql=f"{from_table}.{from_column} = {to_table}.{to_column}",
+    )
+
+
+class TestEdgesInSchema:
+    def test_keeps_live_edges_and_drops_gone_ones(self) -> None:
+        schema = _schema_with_tables(["orders", "customers"], extra_columns=["customer_id"])
+        live = _edge("public.orders", "customer_id", "public.customers", "id")
+        gone_table = _edge("public.orders", "customer_id", "public.ghosts", "id")
+        gone_column = _edge("public.orders", "region_id", "public.customers", "id")
+        assert edges_in_schema([live, gone_table, gone_column], schema) == [live]
+
+    def test_an_endpoint_the_policy_hides_counts_as_live(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["customer_id"])
+        privacy = PrivacySettings(
+            excluded_tables=["public.customers"], excluded_columns=["public.orders.ssn"]
+        )
+        to_hidden_table = _edge("public.orders", "customer_id", "public.customers", "id")
+        from_hidden_column = _edge("public.orders", "ssn", "public.orders", "id")
+        gone = _edge("public.orders", "customer_id", "public.ghosts", "id")
+        edges = [to_hidden_table, from_hidden_column, gone]
+        assert edges_in_schema(edges, schema, privacy) == [to_hidden_table, from_hidden_column]
+        assert edges_in_schema(edges, schema) == []
