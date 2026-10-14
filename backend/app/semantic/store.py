@@ -96,6 +96,9 @@ _CHUNK = 500
 # "global_item": {"kind:name": [...]}, "relationship": {"a.x->b.y": [...]}}.
 # What a full save has to carry across so a user's edits survive a globals
 # finalisation that rebuilds every row.
+# Column keys are ``"table_key.column_name"``: only ever looked up, never parsed,
+# but a quoted identifier containing a dot can in principle make two columns
+# share a key (the same encoding as prod).
 ProvenanceMap = dict[str, dict[str, list[str]]]
 _HEADER_KEY = ""
 # Review state rather than content: ``/generate/globals`` resets it on purpose.
@@ -1020,7 +1023,151 @@ async def reconcile_tables(
     await db.flush()
 
 
+# ── Provenance ────────────────────────────────────────────────────────────────
+
+
+async def provenance_map(db: AsyncSession, connection_id: str) -> ProvenanceMap:
+    """Every row's ``user_edited_fields``, keyed by entity so a full save can restore it.
+
+    Reads fresh (``populate_existing``): it runs right before a full rebuild and
+    must see committed state, not stale identity-mapped rows.
+    """
+    out: ProvenanceMap = {
+        "model": {},
+        "table": {},
+        "column": {},
+        "metric": {},
+        "global_item": {},
+        "relationship": {},
+    }
+    header = await db.scalar(
+        select(SemanticModelRow)
+        .where(SemanticModelRow.connection_id == connection_id)
+        .execution_options(populate_existing=True)
+    )
+    if header is None:
+        return out
+    if header.user_edited_fields:
+        out["model"][_HEADER_KEY] = list(header.user_edited_fields)
+    tables = list(
+        (
+            await db.scalars(
+                select(SemanticTableRow)
+                .where(SemanticTableRow.model_id == header.id)
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+    )
+    key_by_table_id = {row.id: row.table_key for row in tables}
+    for row in tables:
+        if row.user_edited_fields:
+            out["table"][row.table_key] = list(row.user_edited_fields)
+    for chunk in _chunks(list(key_by_table_id)):
+        cols = await db.scalars(
+            select(SemanticColumnRow)
+            .where(SemanticColumnRow.table_id.in_(list(chunk)))
+            .execution_options(populate_existing=True)
+        )
+        for col in cols:
+            if col.user_edited_fields:
+                key = f"{key_by_table_id[col.table_id]}.{col.column_name}"
+                out["column"][key] = list(col.user_edited_fields)
+    metrics = await db.scalars(
+        select(SemanticMetricRow)
+        .where(SemanticMetricRow.model_id == header.id)
+        .execution_options(populate_existing=True)
+    )
+    for m in metrics:
+        if m.user_edited_fields:
+            out["metric"][m.name] = list(m.user_edited_fields)
+    items = await db.scalars(
+        select(SemanticGlobalItemRow)
+        .where(SemanticGlobalItemRow.model_id == header.id)
+        .execution_options(populate_existing=True)
+    )
+    for item in items:
+        if item.user_edited_fields:
+            out["global_item"][f"{item.kind}:{item.name}"] = list(item.user_edited_fields)
+    rels = await db.scalars(
+        select(SemanticRelationshipRow)
+        .where(SemanticRelationshipRow.model_id == header.id)
+        .execution_options(populate_existing=True)
+    )
+    for rel in rels:
+        if rel.user_edited_fields:
+            out["relationship"][relationship_key(_relationship_row_to_dict(rel))] = list(
+                rel.user_edited_fields
+            )
+    return out
+
+
 async def _protected_values(
     db: AsyncSession, model_id: str, provenance: ProvenanceMap
 ) -> dict[str, dict[str, dict[str, Any]]]:
-    return {"table": {}, "column": {}}
+    """``{"table": {key: {field: stored_value}}, "column": {...}}`` for edited fields.
+
+    Read before ``save_model`` deletes the rows, and fresh (``populate_existing``)
+    so the values are the committed ones.
+    """
+    out: dict[str, dict[str, dict[str, Any]]] = {"table": {}, "column": {}}
+    if not provenance.get("table") and not provenance.get("column"):
+        return out
+    tables = list(
+        (
+            await db.scalars(
+                select(SemanticTableRow)
+                .where(SemanticTableRow.model_id == model_id)
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+    )
+    key_by_id = {row.id: row.table_key for row in tables}
+    for row in tables:
+        fields = provenance.get("table", {}).get(row.table_key)
+        if fields:
+            out["table"][row.table_key] = {f: getattr(row, f) for f in fields if f in _TABLE_FIELDS}
+    wanted = provenance.get("column", {})
+    if wanted:
+        for chunk in _chunks(list(key_by_id)):
+            cols = await db.scalars(
+                select(SemanticColumnRow)
+                .where(SemanticColumnRow.table_id.in_(list(chunk)))
+                .execution_options(populate_existing=True)
+            )
+            for col in cols:
+                key = f"{key_by_id[col.table_id]}.{col.column_name}"
+                fields = wanted.get(key)
+                if fields:
+                    out["column"][key] = {f: getattr(col, f) for f in fields if f in _COLUMN_FIELDS}
+    return out
+
+
+def carry_edited_relationships(
+    current: Sequence[RelationshipEdge],
+    fresh: Sequence[RelationshipEdge],
+    provenance: ProvenanceMap,
+    *,
+    render_tables: set[str],
+) -> list[RelationshipEdge]:
+    """The relationship list a rebuild saves: ``fresh`` bounded to
+    ``render_tables``, with every marked edge of ``current`` carried forward in
+    place of its rebuilt twin.
+
+    A marked edge — a user-authored join the catalog has no row for, or an FK
+    edge whose description a user rewrote — is kept as stored. Globals passes
+    the set of *annotated* tables as ``render_tables``, and under
+    ``tables_partial`` ("finish with what's generated") a user-authored edge to
+    a real but unannotated table is not evidence of anything wrong, so kept
+    edges are not bounded by it.
+    """
+    marked = provenance.get("relationship", {})
+    kept = [r for r in current if relationship_key(r) in marked]
+    kept_keys = {relationship_key(r) for r in kept}
+    rebuilt = [
+        e
+        for e in fresh
+        if e.from_table in render_tables
+        and e.to_table in render_tables
+        and relationship_key(e) not in kept_keys
+    ]
+    return rebuilt + kept

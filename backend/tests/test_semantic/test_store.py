@@ -897,3 +897,218 @@ class TestPendingKeysAndProgress:
 
     async def test_advance_progress_is_none_without_a_run(self, semantic_db, connection_id) -> None:
         assert await store.advance_progress(semantic_db, connection_id) is None
+
+
+class TestProvenanceSurvivesFullSave:
+    async def _mark(self, db, *, table_fields=(), column_fields=(), header_fields=()) -> None:
+        table_row = await db.scalar(
+            select(SemanticTableRow).where(SemanticTableRow.table_key == "public.orders")
+        )
+        table_row.user_edited_fields = list(table_fields)
+        col_row = await db.scalar(
+            select(SemanticColumnRow).where(
+                SemanticColumnRow.table_id == table_row.id,
+                SemanticColumnRow.column_name == "status",
+            )
+        )
+        col_row.user_edited_fields = list(column_fields)
+        header = await db.scalar(select(SemanticModelRow))
+        header.user_edited_fields = list(header_fields)
+        await db.commit()
+        db.expunge_all()
+
+    async def test_provenance_map_reports_every_marked_row(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        await self._mark(
+            semantic_db,
+            table_fields=["description"],
+            column_fields=["display_name"],
+            header_fields=["notes"],
+        )
+        prov = await store.provenance_map(semantic_db, connection_id)
+        assert prov["model"] == {"": ["notes"]}
+        assert prov["table"] == {"public.orders": ["description"]}
+        assert prov["column"] == {"public.orders.status": ["display_name"]}
+        assert prov["metric"] == {} and prov["global_item"] == {} and prov["relationship"] == {}
+
+    async def test_full_save_restores_marks_and_stored_values(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        await self._mark(
+            semantic_db,
+            table_fields=["description"],
+            column_fields=["display_name"],
+            header_fields=["notes"],
+        )
+        prov = await store.provenance_map(semantic_db, connection_id)
+
+        rebuilt = _rich_model()
+        rebuilt.tables["public.orders"].description = "generator"
+        rebuilt.tables["public.orders"].grain = "generator grain"
+        rebuilt.tables["public.orders"].columns["status"].display_name = "generator"
+        rebuilt.notes = ["generator notes"]
+        rebuilt.is_user_reviewed = False
+        await store.save_model(
+            semantic_db,
+            connection_id,
+            rebuilt,
+            updated_by="gen",
+            source="generation",
+            provenance=prov,
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        loaded = await store.load_model(semantic_db, connection_id)
+        assert loaded.tables["public.orders"].description == "One row per order"
+        assert loaded.tables["public.orders"].grain == "generator grain"
+        assert loaded.tables["public.orders"].columns["status"].display_name == "Status"
+        assert loaded.notes == ["budgets are quarterly"]
+        again = await store.provenance_map(semantic_db, connection_id)
+        assert again["table"] == {"public.orders": ["description"]}
+        assert again["column"] == {"public.orders.status": ["display_name"]}
+
+    async def test_marks_are_not_carried_onto_keys_absent_from_the_model(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        await self._mark(semantic_db, table_fields=["description"])
+        prov = await store.provenance_map(semantic_db, connection_id)
+        smaller = SemanticModel(tables={"public.customers": TableSemantic(display_name="C")})
+        await store.save_model(
+            semantic_db, connection_id, smaller, updated_by="gen", provenance=prov
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert (await store.provenance_map(semantic_db, connection_id))["table"] == {}
+
+    async def test_marks_are_not_carried_onto_columns_absent_from_the_model(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        await self._mark(semantic_db, column_fields=["display_name"])
+        prov = await store.provenance_map(semantic_db, connection_id)
+        assert prov["column"] == {"public.orders.status": ["display_name"]}
+        pruned = _rich_model()
+        del pruned.tables["public.orders"].columns["status"]
+        await store.save_model(
+            semantic_db, connection_id, pruned, updated_by="gen", provenance=prov
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        loaded = await store.load_model(semantic_db, connection_id)
+        assert "status" not in loaded.tables["public.orders"].columns
+        assert (await store.provenance_map(semantic_db, connection_id))["column"] == {}
+
+    async def test_relationship_metric_and_global_item_marks_round_trip(
+        self, semantic_db, connection_id
+    ) -> None:
+        model = _rich_model()
+        model.relationships[0].description = "hand written"
+        await store.save_model(semantic_db, connection_id, model, updated_by="u1")
+        await semantic_db.commit()
+        for row in (await semantic_db.scalars(select(SemanticRelationshipRow))).all():
+            row.user_edited_fields = ["description"]
+        for metric_row in (
+            await semantic_db.scalars(
+                select(SemanticMetricRow).where(SemanticMetricRow.name == "Revenue")
+            )
+        ).all():
+            metric_row.user_edited_fields = ["payload"]
+        for item_row in (
+            await semantic_db.scalars(
+                select(SemanticGlobalItemRow).where(SemanticGlobalItemRow.kind == "common_join")
+            )
+        ).all():
+            item_row.user_edited_fields = ["payload"]
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        prov = await store.provenance_map(semantic_db, connection_id)
+        rel_key = "public.orders.customer_id->public.customers.id"
+        assert prov["relationship"] == {rel_key: ["description"]}
+        assert prov["metric"] == {"Revenue": ["payload"]}
+        assert prov["global_item"] == {
+            "common_join:public.orders.customer_id = public.customers.id": ["payload"]
+        }
+
+        current = await store.load_model(semantic_db, connection_id)
+        fresh = [current.relationships[0].model_copy(update={"description": "generator"})]
+        carried = store.carry_edited_relationships(
+            current.relationships,
+            fresh,
+            prov,
+            render_tables={"public.orders", "public.customers"},
+        )
+        rebuilt = current.model_copy(update={"relationships": carried})
+        await store.save_model(
+            semantic_db,
+            connection_id,
+            rebuilt,
+            updated_by="gen",
+            source="generation",
+            provenance=prov,
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        assert await store.provenance_map(semantic_db, connection_id) == prov
+        loaded = await store.load_model(semantic_db, connection_id)
+        assert [r.description for r in loaded.relationships] == ["hand written"]
+
+
+class TestCarryEditedRelationships:
+    def _edge(self, frm="public.orders", to="public.customers", col="customer_id", desc=None):
+        return RelationshipEdge(
+            from_table=frm,
+            from_column=col,
+            to_table=to,
+            to_column="id",
+            relationship_type="many_to_one",
+            join_sql=f"{frm}.{col} = {to}.id",
+            is_required=False,
+            description=desc,
+        )
+
+    def test_unmarked_edges_are_rebuilt_from_fresh(self) -> None:
+        current = [self._edge(desc="stale")]
+        fresh = [self._edge(desc="fresh")]
+        out = store.carry_edited_relationships(
+            current,
+            fresh,
+            {"relationship": {}},
+            render_tables={"public.orders", "public.customers"},
+        )
+        assert [e.description for e in out] == ["fresh"]
+
+    def test_marked_edge_is_kept_and_its_twin_dropped(self) -> None:
+        current = [self._edge(desc="hand written")]
+        fresh = [self._edge(desc="fresh")]
+        prov = {"relationship": {store.relationship_key(current[0]): ["description"]}}
+        out = store.carry_edited_relationships(
+            current, fresh, prov, render_tables={"public.orders", "public.customers"}
+        )
+        assert [e.description for e in out] == ["hand written"]
+
+    def test_fresh_edges_outside_render_tables_are_not_emitted(self) -> None:
+        fresh = [self._edge(), self._edge(frm="public.items", col="order_id", to="public.orders")]
+        out = store.carry_edited_relationships(
+            [],
+            fresh,
+            {"relationship": {}},
+            render_tables={"public.orders", "public.customers"},
+        )
+        assert len(out) == 1
+
+    def test_marked_user_authored_edge_survives_a_partial_render_set(self) -> None:
+        manual = self._edge(frm="public.notes", col="order_id", to="public.orders", desc="manual")
+        prov = {"relationship": {store.relationship_key(manual): ["payload"]}}
+        out = store.carry_edited_relationships([manual], [], prov, render_tables={"public.orders"})
+        assert out == [manual]
