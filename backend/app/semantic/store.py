@@ -27,7 +27,8 @@ import logging
 from typing import TYPE_CHECKING, Any
 import uuid
 
-from sqlalchemy import String, delete, func, select
+from pydantic import TypeAdapter
+from sqlalchemy import String, delete, func, select, update
 
 from ..models.semantic_store import (
     SemanticColumnRow,
@@ -39,15 +40,23 @@ from ..models.semantic_store import (
     SemanticTableRow,
 )
 from .models import (
+    BusinessMetric,
+    ColumnSemantic,
+    CommonJoin,
+    DerivedColumn,
     GenerationProgress,
     GenerationStatus,
     RelationshipEdge,
+    Segment,
     SemanticModel,
     TableSemantic,
 )
 
 if TYPE_CHECKING:
+    from pydantic import BaseModel
     from sqlalchemy.ext.asyncio import AsyncSession
+
+    from ..schemas.semantic import SemanticModelUpdate
 
 logger = logging.getLogger(__name__)
 
@@ -1171,3 +1180,641 @@ def carry_edited_relationships(
         and relationship_key(e) not in kept_keys
     ]
     return rebuilt + kept
+
+
+# ── Member patch and optimistic locking ───────────────────────────────────────
+
+
+class SemanticStoreConflict(Exception):  # noqa: N818 — the router maps it to 409
+    """An optimistic-lock update matched no row — someone else wrote first."""
+
+
+# A ``None`` on these fields means "not supplied" and must preserve what is
+# stored; only ``[]`` is an explicit clear. ``display_name`` is here because it
+# is a non-nullable str on the Pydantic side, so a null cannot mean "clear".
+# The frontend PUTs the whole draft model, so an untouched section serialised
+# as null hits this on an ordinary save.
+_TABLE_NOT_SUPPLIED_ON_NULL: frozenset[str] = frozenset({"default_filters", "display_name"})
+_COLUMN_NOT_SUPPLIED_ON_NULL: frozenset[str] = frozenset(
+    {"value_mappings", "display_name", "is_non_additive", "is_sensitive", "semantic_type"}
+)
+_GLOBAL_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("segment", "segments"),
+    ("derived_column", "derived_columns"),
+    ("common_join", "common_joins"),
+)
+
+
+_METRIC_ADAPTER: TypeAdapter[Any] = TypeAdapter(BusinessMetric)
+_GLOBAL_ITEM_MODELS: dict[str, type[BaseModel]] = {
+    "segment": Segment,
+    "derived_column": DerivedColumn,
+    "common_join": CommonJoin,
+}
+
+
+# A stored value is diffed in the shape ``load_model`` would serve it, not raw:
+# migration 0003 copies legacy payloads verbatim, so the echo of a migrated row
+# can differ from the raw row only in shape (a missing defaulted key, a coerced
+# enum) and would otherwise be marked user-edited, freezing it against
+# regeneration. A value that fails validation falls back to raw — the diff path
+# never raises.
+def _canonical(validate: Callable[[Any], BaseModel], raw: Any) -> Any:
+    try:
+        return validate(raw).model_dump(mode="json")
+    except (ValueError, TypeError):
+        return raw
+
+
+def _canonical_metric(payload: dict[str, Any]) -> dict[str, Any]:
+    return _canonical(_METRIC_ADAPTER.validate_python, payload)
+
+
+def _canonical_global_item(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return _canonical(_GLOBAL_ITEM_MODELS[kind].model_validate, payload)
+
+
+def _canonical_relationship(row: SemanticRelationshipRow) -> dict[str, Any]:
+    return _canonical(RelationshipEdge.model_validate, _relationship_row_to_dict(row))
+
+
+def _canonical_table_row(row: SemanticTableRow) -> dict[str, Any]:
+    raw = {field: getattr(row, field) for field in _TABLE_FIELDS}
+    canon = _canonical(TableSemantic.model_validate, raw)
+    return {field: canon.get(field) for field in _TABLE_FIELDS}
+
+
+def _canonical_column_row(row: SemanticColumnRow) -> dict[str, Any]:
+    canon = _canonical(ColumnSemantic.model_validate, _column_row_to_dict(row))
+    return {field: canon.get(field) for field in _COLUMN_FIELDS}
+
+
+# What a row inserted with nothing sent would hold. A new row is marked only on
+# the fields whose sent value differs: a stale draft re-creating a pruned column
+# echoes ``is_sensitive=False`` and friends, and marking those would stop
+# ``reconcile_tables`` from ever flagging the column sensitive.
+_TABLE_DEFAULTS: dict[str, Any] = TableSemantic(display_name="").model_dump(
+    mode="json", exclude={"columns"}
+)
+_COLUMN_DEFAULTS: dict[str, Any] = ColumnSemantic(display_name="").model_dump(mode="json")
+
+
+def _insert_marks(values: Mapping[str, Any], defaults: Mapping[str, Any]) -> list[str]:
+    """Provenance for a newly inserted row: the sent fields that differ from the default."""
+    return sorted(field for field, value in values.items() if value != defaults.get(field))
+
+
+async def update_table_fields(
+    db: AsyncSession,
+    table_id: str,
+    expected_version: int,
+    values: dict[str, Any],
+    *,
+    updated_by: str | None,
+    mark_user_edited: bool,
+) -> None:
+    """Apply ``values`` to one table row under an optimistic lock.
+
+    ``values`` is fitted (``_fit_values``) before the diff, because the stored
+    row holds fitted values, and is compared with the stored row in its
+    canonical shape (``_canonical_table_row``). Only fields that then differ are
+    written — an echoed field bumps neither ``version`` nor
+    ``user_edited_fields`` nor the history log.
+
+    The write is ``UPDATE … WHERE id = :id AND version = :version`` issued as a
+    Core statement so the predicate is part of the SQL: under READ COMMITTED two
+    overlapping transactions can both read the same version, and only the
+    predicate in the UPDATE tells them apart. A zero rowcount means a concurrent
+    writer moved the row on, and raises ``SemanticStoreConflict``.
+    """
+    values = _fit_values(SemanticTableRow, values)
+    row = await db.scalar(
+        select(SemanticTableRow)
+        .where(SemanticTableRow.id == table_id)
+        .execution_options(populate_existing=True)
+    )
+    if row is None:
+        raise SemanticStoreConflict(f"semantic_tables row {table_id!r} changed under this edit")
+
+    old_value = {field: getattr(row, field) for field in _TABLE_FIELDS}
+    canonical = _canonical_table_row(row)
+    diff = {field: value for field, value in values.items() if canonical.get(field) != value}
+    if not diff:
+        return
+
+    connection_id = row.connection_id
+    table_key = row.table_key
+    update_values: dict[str, Any] = {
+        **diff,
+        "version": expected_version + 1,
+        "updated_at": _now(),
+        "updated_by": updated_by,
+    }
+    if mark_user_edited:
+        update_values["user_edited_fields"] = sorted(set(row.user_edited_fields) | set(diff))
+
+    result = await db.execute(
+        update(SemanticTableRow)
+        .where(SemanticTableRow.id == table_id, SemanticTableRow.version == expected_version)
+        .values(**update_values)
+    )
+    if result.rowcount == 0:  # type: ignore[attr-defined]
+        raise SemanticStoreConflict(f"semantic_tables row {table_id!r} changed under this edit")
+    # The session's default ``synchronize_session`` already updates the
+    # identity-mapped ``row`` in memory; do not ``expire`` it (a sync read of
+    # ``row.version`` straight after would raise MissingGreenlet).
+
+    _write_history(
+        db,
+        connection_id=connection_id,
+        entity_type="table",
+        entity_id=table_id,
+        entity_key=table_key,
+        action="update",
+        source="user" if mark_user_edited else "generation",
+        old_value=old_value,
+        new_value={**old_value, **diff},
+        changed_by=updated_by,
+    )
+    await db.flush()
+
+
+def _sent(patch: BaseModel, *, exclude: frozenset[str] = frozenset()) -> dict[str, Any]:
+    """The fields the client sent, each dumped in full.
+
+    ``model_dump(exclude_unset=True)`` would also drop unset keys *inside* each
+    nested item (a metric, a value mapping), storing it partial; ``load_model``
+    then fills the defaults and the next echo of it reads as a change. So
+    ``model_fields_set`` decides which fields were sent, and their contents are
+    dumped whole.
+    """
+    dumped = patch.model_dump(mode="json", exclude=set(exclude))
+    return {key: dumped[key] for key in patch.model_fields_set if key not in exclude}
+
+
+def _supplied(patch: dict[str, Any], not_supplied_on_null: frozenset[str]) -> dict[str, Any]:
+    """Drop keys whose null means "not supplied" rather than "clear"."""
+    return {
+        key: value
+        for key, value in patch.items()
+        if not (value is None and key in not_supplied_on_null)
+    }
+
+
+def _write_section_history(
+    db: AsyncSession,
+    header: SemanticModelRow,
+    *,
+    entity_type: str,
+    section: str,
+    old_items: list[dict[str, Any]],
+    new_items: list[dict[str, Any]],
+    changed_by: str | None,
+) -> None:
+    """One history row for a wholesale-rewritten list section, keyed by its field
+    name; ``items`` are the payloads in ordinal order."""
+    _write_history(
+        db,
+        connection_id=header.connection_id,
+        entity_type=entity_type,
+        entity_id=header.id,
+        entity_key=section,
+        action="update",
+        source="user",
+        old_value={"items": old_items},
+        new_value={"items": new_items},
+        changed_by=changed_by,
+    )
+
+
+# {table_key: (table values, {column_name: column values} or None)}, all fitted.
+_FittedTables = dict[str, tuple[dict[str, Any], dict[str, dict[str, Any]] | None]]
+
+
+def _fit_table_patches(patch: SemanticModelUpdate) -> _FittedTables:
+    """Fit every table and column patch, keyed by fitted key; a later key that
+    fits to the same string as an earlier one replaces it."""
+    out: _FittedTables = {}
+    for raw_key, table_patch in (patch.tables or {}).items():
+        values = _fit_values(
+            SemanticTableRow,
+            {
+                "table_key": raw_key,
+                **_supplied(
+                    _sent(table_patch, exclude=frozenset({"columns"})),
+                    _TABLE_NOT_SUPPLIED_ON_NULL,
+                ),
+            },
+        )
+        table_key = values.pop("table_key")
+        columns: dict[str, dict[str, Any]] | None = None
+        if table_patch.columns is not None:
+            columns = {}
+            for raw_name, column_patch in table_patch.columns.items():
+                col_values = _fit_values(
+                    SemanticColumnRow,
+                    {
+                        "column_name": raw_name,
+                        **_supplied(_sent(column_patch), _COLUMN_NOT_SUPPLIED_ON_NULL),
+                    },
+                )
+                columns[col_values.pop("column_name")] = col_values
+        out[table_key] = (values, columns)
+    return out
+
+
+async def apply_user_patch(
+    db: AsyncSession,
+    connection_id: str,
+    patch: SemanticModelUpdate,
+    *,
+    updated_by: str,
+) -> SemanticModel:
+    """Apply a user's partial update, recording per-field provenance.
+
+    Touching a field marks it in that row's ``user_edited_fields``, which is
+    what makes the next regenerate skip it. Global sections stay wholesale
+    replacements when supplied (the existing API contract), but their
+    provenance is per item: only an item that is new or whose payload changed
+    is marked. Every comparison is against what is *stored*, because the
+    frontend PUTs the whole draft on every save — and every incoming value is
+    fitted (``_fit_values``) first, because what is stored is fitted.
+
+    Every change is audited: table and column edits per row, a changed
+    ``notes``/``is_user_reviewed`` as one ``model`` history row holding just the
+    changed fields, and each rewritten list section as one row keyed by its
+    field name. An echoed section or field writes no history.
+
+    Stored values are compared in their canonical shape (``_canonical_*``), so a
+    migrated row whose raw payload differs from an echo only in shape is not
+    marked user-edited.
+
+    The caller must hold the connection row lock (``lock_and_reread_connection``)
+    for the whole call: table rows carry an optimistic version check
+    (``update_table_fields``), but column rows and the rewritten list sections
+    do not.
+
+    Raises ``ValueError`` (before touching the session) for an over-long table
+    key, column name, metric name or relationship endpoint.
+    """
+    # Fit everything first: a ValueError must leave the session untouched.
+    fitted_tables = _fit_table_patches(patch)
+    section_dump = {
+        key: value
+        for key, value in _sent(patch, exclude=frozenset({"tables"})).items()
+        if value is not None
+    }
+
+    fitted_globals: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for kind, field in _GLOBAL_SECTIONS:
+        if field in section_dump:
+            fitted_globals[kind, field] = _dedupe_last_wins(
+                [
+                    _fit_values(
+                        SemanticGlobalItemRow,
+                        {"name": _global_item_name(kind, payload), "payload": payload},
+                    )
+                    for payload in section_dump[field]
+                ],
+                key=lambda values: values["name"],
+            )
+    fitted_metrics: list[dict[str, Any]] | None = None
+    if "business_metrics" in section_dump:
+        fitted_metrics = _dedupe_last_wins(
+            [
+                _fit_values(
+                    SemanticMetricRow,
+                    {
+                        "name": str(payload.get("name", "")),
+                        "metric_type": str(payload.get("metric_type", "simple")),
+                        "payload": payload,
+                    },
+                )
+                for payload in section_dump["business_metrics"]
+            ],
+            key=lambda values: values["name"],
+        )
+    fitted_rels: list[dict[str, Any]] | None = None
+    if "relationships" in section_dump:
+        fitted_rels = [
+            _fit_values(SemanticRelationshipRow, _relationship_patch_to_dict(payload))
+            for payload in section_dump["relationships"]
+        ]
+    fitted_header = _fit_values(
+        SemanticModelRow,
+        {f: section_dump[f] for f in ("notes", "is_user_reviewed") if f in section_dump},
+    )
+
+    header = await db.scalar(
+        select(SemanticModelRow)
+        .where(SemanticModelRow.connection_id == connection_id)
+        .execution_options(populate_existing=True)
+    )
+    if header is None:
+        await save_model(db, connection_id, SemanticModel(), updated_by=updated_by)
+        header = await db.scalar(
+            select(SemanticModelRow).where(SemanticModelRow.connection_id == connection_id)
+        )
+        assert header is not None
+
+    for table_key, (table_values, column_values) in fitted_tables.items():
+        await _apply_table_patch(
+            db,
+            header,
+            connection_id,
+            table_key,
+            table_values,
+            column_values,
+            updated_by=updated_by,
+        )
+
+    for (kind, field), items in fitted_globals.items():
+        existing_rows = list(
+            (
+                await db.scalars(
+                    select(SemanticGlobalItemRow)
+                    .where(
+                        SemanticGlobalItemRow.model_id == header.id,
+                        SemanticGlobalItemRow.kind == kind,
+                    )
+                    .order_by(SemanticGlobalItemRow.ordinal)
+                    .execution_options(populate_existing=True)
+                )
+            ).all()
+        )
+        canonical_items = [_canonical_global_item(kind, row.payload) for row in existing_rows]
+        if _payload_lists_equal(canonical_items, (item["payload"] for item in items)):
+            continue
+        marks = _stored_marks(
+            (row.name, canonical, row.user_edited_fields)
+            for row, canonical in zip(existing_rows, canonical_items, strict=True)
+        )
+        _write_section_history(
+            db,
+            header,
+            entity_type="global_item",
+            section=field,
+            old_items=[row.payload for row in existing_rows],
+            new_items=[item["payload"] for item in items],
+            changed_by=updated_by,
+        )
+        await db.execute(
+            delete(SemanticGlobalItemRow).where(
+                SemanticGlobalItemRow.model_id == header.id,
+                SemanticGlobalItemRow.kind == kind,
+            )
+        )
+        for ordinal, item in enumerate(items):
+            db.add(
+                SemanticGlobalItemRow(
+                    model_id=header.id,
+                    connection_id=connection_id,
+                    kind=kind,
+                    name=item["name"],
+                    payload=item["payload"],
+                    ordinal=ordinal,
+                    user_edited_fields=_item_marks(marks, item["name"], item["payload"]),
+                    updated_at=_now(),
+                    updated_by=updated_by,
+                )
+            )
+
+    if fitted_metrics is not None:
+        existing_metric_rows = list(
+            (
+                await db.scalars(
+                    select(SemanticMetricRow)
+                    .where(SemanticMetricRow.model_id == header.id)
+                    .order_by(SemanticMetricRow.ordinal)
+                    .execution_options(populate_existing=True)
+                )
+            ).all()
+        )
+        canonical_metrics = [_canonical_metric(row.payload) for row in existing_metric_rows]
+        if not _payload_lists_equal(
+            canonical_metrics, (metric["payload"] for metric in fitted_metrics)
+        ):
+            marks = _stored_marks(
+                (row.name, canonical, row.user_edited_fields)
+                for row, canonical in zip(existing_metric_rows, canonical_metrics, strict=True)
+            )
+            _write_section_history(
+                db,
+                header,
+                entity_type="metric",
+                section="business_metrics",
+                old_items=[row.payload for row in existing_metric_rows],
+                new_items=[metric["payload"] for metric in fitted_metrics],
+                changed_by=updated_by,
+            )
+            await db.execute(
+                delete(SemanticMetricRow).where(SemanticMetricRow.model_id == header.id)
+            )
+            for ordinal, metric in enumerate(fitted_metrics):
+                db.add(
+                    SemanticMetricRow(
+                        model_id=header.id,
+                        connection_id=connection_id,
+                        ordinal=ordinal,
+                        user_edited_fields=_item_marks(marks, metric["name"], metric["payload"]),
+                        updated_at=_now(),
+                        updated_by=updated_by,
+                        **metric,
+                    )
+                )
+
+    if fitted_rels is not None:
+        existing_rel_rows = list(
+            (
+                await db.scalars(
+                    select(SemanticRelationshipRow)
+                    .where(SemanticRelationshipRow.model_id == header.id)
+                    .order_by(SemanticRelationshipRow.ordinal)
+                    .execution_options(populate_existing=True)
+                )
+            ).all()
+        )
+        existing_rel = [_canonical_relationship(row) for row in existing_rel_rows]
+        if not _payload_lists_equal(existing_rel, fitted_rels):
+            marks = _stored_marks(
+                (_relationship_identity(edge), edge, row.user_edited_fields)
+                for row, edge in zip(existing_rel_rows, existing_rel, strict=True)
+            )
+            _write_section_history(
+                db,
+                header,
+                entity_type="relationship",
+                section="relationships",
+                old_items=[_relationship_row_to_dict(row) for row in existing_rel_rows],
+                new_items=fitted_rels,
+                changed_by=updated_by,
+            )
+            await db.execute(
+                delete(SemanticRelationshipRow).where(SemanticRelationshipRow.model_id == header.id)
+            )
+            for ordinal, edge in enumerate(fitted_rels):
+                db.add(
+                    SemanticRelationshipRow(
+                        model_id=header.id,
+                        connection_id=connection_id,
+                        ordinal=ordinal,
+                        user_edited_fields=_item_marks(marks, _relationship_identity(edge), edge),
+                        updated_at=_now(),
+                        updated_by=updated_by,
+                        **edge,
+                    )
+                )
+
+    touched_header = {
+        field: value for field, value in fitted_header.items() if getattr(header, field) != value
+    }
+    if touched_header:
+        old_header = {field: getattr(header, field) for field in touched_header}
+        for field, value in touched_header.items():
+            setattr(header, field, value)
+        _write_history(
+            db,
+            connection_id=connection_id,
+            entity_type="model",
+            entity_id=header.id,
+            entity_key=_HEADER_KEY,
+            action="update",
+            source="user",
+            old_value=old_header,
+            new_value=touched_header,
+            changed_by=updated_by,
+        )
+        header.user_edited_fields = sorted(set(header.user_edited_fields) | set(touched_header))
+        header.version += 1
+        header.updated_at = _now()
+        header.updated_by = updated_by
+    await db.flush()
+
+    loaded = await load_model(db, connection_id)
+    assert loaded is not None
+    return loaded
+
+
+async def _apply_table_patch(
+    db: AsyncSession,
+    header: SemanticModelRow,
+    connection_id: str,
+    table_key: str,
+    values: dict[str, Any],
+    columns: dict[str, dict[str, Any]] | None,
+    *,
+    updated_by: str,
+) -> None:
+    """Apply one table's fitted ``values`` and its fitted column patches."""
+    row = await db.scalar(
+        select(SemanticTableRow)
+        .where(
+            SemanticTableRow.model_id == header.id,
+            SemanticTableRow.table_key == table_key,
+        )
+        .execution_options(populate_existing=True)
+    )
+    if row is None:
+        row = SemanticTableRow(
+            id=str(uuid.uuid4()),
+            model_id=header.id,
+            connection_id=connection_id,
+            table_key=table_key,
+            updated_at=_now(),
+            updated_by=updated_by,
+            user_edited_fields=_insert_marks(values, _TABLE_DEFAULTS),
+        )
+        for field, value in values.items():
+            setattr(row, field, value)
+        db.add(row)
+        await db.flush()
+        _write_history(
+            db,
+            connection_id=connection_id,
+            entity_type="table",
+            entity_id=row.id,
+            entity_key=table_key,
+            action="insert",
+            source="user",
+            old_value=None,
+            new_value=values,
+            changed_by=updated_by,
+        )
+    elif values:
+        await update_table_fields(
+            db, row.id, row.version, values, updated_by=updated_by, mark_user_edited=True
+        )
+
+    for column_name, column_values in (columns or {}).items():
+        await _apply_column_patch(db, row, column_name, column_values, updated_by=updated_by)
+
+
+async def _apply_column_patch(
+    db: AsyncSession,
+    table_row: SemanticTableRow,
+    column_name: str,
+    values: dict[str, Any],
+    *,
+    updated_by: str,
+) -> None:
+    """Apply one column's fitted ``values``, writing only what differs from storage."""
+    row = await db.scalar(
+        select(SemanticColumnRow)
+        .where(
+            SemanticColumnRow.table_id == table_row.id,
+            SemanticColumnRow.column_name == column_name,
+        )
+        .execution_options(populate_existing=True)
+    )
+    if row is None:
+        row = SemanticColumnRow(
+            table_id=table_row.id,
+            column_name=column_name,
+            updated_at=_now(),
+            updated_by=updated_by,
+            user_edited_fields=_insert_marks(values, _COLUMN_DEFAULTS),
+        )
+        for field, value in values.items():
+            setattr(row, field, value)
+        db.add(row)
+        await db.flush()
+        _write_history(
+            db,
+            connection_id=table_row.connection_id,
+            entity_type="column",
+            entity_id=row.id,
+            entity_key=f"{table_row.table_key}.{column_name}",
+            action="insert",
+            source="user",
+            old_value=None,
+            new_value=values,
+            changed_by=updated_by,
+        )
+        return
+
+    old_value = {field: getattr(row, field) for field in _COLUMN_FIELDS}
+    canonical = _canonical_column_row(row)
+    diff_values = {field: value for field, value in values.items() if canonical.get(field) != value}
+    if not diff_values:
+        # An echo, not an edit: no setattr, no version bump, no history row, and
+        # ``user_edited_fields`` is left exactly as it was.
+        return
+    for field, value in diff_values.items():
+        setattr(row, field, value)
+    row.user_edited_fields = sorted(set(row.user_edited_fields) | set(diff_values))
+    row.version += 1
+    row.updated_at = _now()
+    row.updated_by = updated_by
+    _write_history(
+        db,
+        connection_id=table_row.connection_id,
+        entity_type="column",
+        entity_id=row.id,
+        entity_key=f"{table_row.table_key}.{column_name}",
+        action="update",
+        source="user",
+        old_value=old_value,
+        new_value={**old_value, **diff_values},
+        changed_by=updated_by,
+    )
+    await db.flush()

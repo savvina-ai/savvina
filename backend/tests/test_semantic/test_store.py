@@ -6,7 +6,7 @@
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects import postgresql
 
 from app.database import Base
@@ -19,6 +19,7 @@ from app.models.semantic_store import (
     SemanticRelationshipRow,
     SemanticTableRow,
 )
+from app.schemas.semantic import ColumnSemanticUpdate, SemanticModelUpdate, TableSemanticUpdate
 from app.semantic import store
 from app.semantic.models import (
     AggregationType,
@@ -1112,3 +1113,581 @@ class TestCarryEditedRelationships:
         prov = {"relationship": {store.relationship_key(manual): ["payload"]}}
         out = store.carry_edited_relationships([manual], [], prov, render_tables={"public.orders"})
         assert out == [manual]
+
+
+class TestUserPatch:
+    async def _seed(self, db, cid) -> None:
+        await store.save_model(db, cid, _rich_model(), updated_by="u1")
+        await db.commit()
+        db.expunge_all()
+
+    async def test_patch_touches_only_the_addressed_fields_and_marks_them(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._seed(semantic_db, connection_id)
+        patch = SemanticModelUpdate(
+            tables={
+                "public.orders": TableSemanticUpdate(
+                    description="hand written",
+                    columns={"status": ColumnSemanticUpdate(display_name="State")},
+                )
+            }
+        )
+        model = await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        orders = model.tables["public.orders"]
+        assert orders.description == "hand written"
+        assert orders.grain == "one row per order"  # untouched
+        assert orders.columns["status"].display_name == "State"
+        assert orders.columns["status"].semantic_type == SemanticType.CATEGORICAL  # untouched
+        assert orders.columns["email"].is_sensitive is True  # untouched
+        prov = await store.provenance_map(semantic_db, connection_id)
+        assert prov["table"] == {"public.orders": ["description"]}
+        assert prov["column"] == {"public.orders.status": ["display_name"]}
+
+    async def test_echoing_stored_values_marks_nothing_and_bumps_nothing(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._seed(semantic_db, connection_id)
+        history_before = await semantic_db.scalar(
+            select(func.count()).select_from(SemanticHistoryRow)
+        )
+        full = _rich_model().model_dump(mode="json")
+        patch = SemanticModelUpdate.model_validate(full)
+        await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        prov = await store.provenance_map(semantic_db, connection_id)
+        assert prov == {
+            "model": {},
+            "table": {},
+            "column": {},
+            "metric": {},
+            "global_item": {},
+            "relationship": {},
+        }
+        rows = (await semantic_db.scalars(select(SemanticTableRow))).all()
+        assert all(r.version == 1 for r in rows)
+        columns = (await semantic_db.scalars(select(SemanticColumnRow))).all()
+        assert all(c.version == 1 for c in columns)
+        metrics = (await semantic_db.scalars(select(SemanticMetricRow))).all()
+        assert all(m.version == 1 for m in metrics)
+        header = await semantic_db.scalar(select(SemanticModelRow))
+        assert header.version == 1
+        history_after = await semantic_db.scalar(
+            select(func.count()).select_from(SemanticHistoryRow)
+        )
+        assert history_after == history_before
+
+    async def test_null_on_a_not_supplied_field_preserves_the_stored_value(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._seed(semantic_db, connection_id)
+        patch = SemanticModelUpdate(
+            tables={
+                "public.orders": TableSemanticUpdate(
+                    default_filters=None,
+                    columns={
+                        "status": ColumnSemanticUpdate(value_mappings=None, is_sensitive=None)
+                    },
+                )
+            }
+        )
+        model = await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
+        await semantic_db.commit()
+        assert model.tables["public.orders"].default_filters == ["deleted_at IS NULL"]
+        assert len(model.tables["public.orders"].columns["status"].value_mappings) == 1
+
+    async def test_explicit_empty_list_clears(self, semantic_db, connection_id) -> None:
+        await self._seed(semantic_db, connection_id)
+        patch = SemanticModelUpdate(
+            tables={"public.orders": TableSemanticUpdate(default_filters=[])}
+        )
+        model = await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
+        await semantic_db.commit()
+        assert model.tables["public.orders"].default_filters == []
+
+    async def test_new_table_and_column_are_inserted_with_marks(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._seed(semantic_db, connection_id)
+        patch = SemanticModelUpdate(
+            tables={
+                "public.items": TableSemanticUpdate(
+                    display_name="Items",
+                    columns={"sku": ColumnSemanticUpdate(display_name="SKU")},
+                )
+            }
+        )
+        model = await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert model.tables["public.items"].columns["sku"].display_name == "SKU"
+        prov = await store.provenance_map(semantic_db, connection_id)
+        assert prov["table"]["public.items"] == ["display_name"]
+        assert prov["column"]["public.items.sku"] == ["display_name"]
+
+    async def test_global_sections_replace_wholesale_with_per_item_marks(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._seed(semantic_db, connection_id)
+        metrics = [m.model_dump(mode="json") for m in _rich_model().business_metrics]
+        metrics[1]["description"] = "edited by hand"
+        patch = SemanticModelUpdate.model_validate({"business_metrics": metrics})
+        model = await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert [m.name for m in model.business_metrics] == ["Revenue", "Orders"]
+        prov = await store.provenance_map(semantic_db, connection_id)
+        assert prov["metric"] == {"Orders": ["payload"]}  # only the changed item is marked
+
+    async def test_reorder_is_a_real_edit(self, semantic_db, connection_id) -> None:
+        await self._seed(semantic_db, connection_id)
+        metrics = [m.model_dump(mode="json") for m in reversed(_rich_model().business_metrics)]
+        patch = SemanticModelUpdate.model_validate({"business_metrics": metrics})
+        model = await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert [m.name for m in model.business_metrics] == ["Orders", "Revenue"]
+        loaded = await store.load_model(semantic_db, connection_id)
+        assert [m.name for m in loaded.business_metrics] == ["Orders", "Revenue"]
+
+    async def test_notes_and_review_flag_are_diff_gated(self, semantic_db, connection_id) -> None:
+        await self._seed(semantic_db, connection_id)
+        same = SemanticModelUpdate(notes=["budgets are quarterly"], is_user_reviewed=False)
+        await store.apply_user_patch(semantic_db, connection_id, same, updated_by="u2")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert (await store.provenance_map(semantic_db, connection_id))["model"] == {}
+        changed = SemanticModelUpdate(notes=["new note"])
+        await store.apply_user_patch(semantic_db, connection_id, changed, updated_by="u2")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert (await store.provenance_map(semantic_db, connection_id))["model"] == {"": ["notes"]}
+
+    async def test_header_and_section_edits_are_audited(self, semantic_db, connection_id) -> None:
+        await self._seed(semantic_db, connection_id)
+        seeded = {h.id for h in (await semantic_db.scalars(select(SemanticHistoryRow))).all()}
+        header_id = await semantic_db.scalar(select(SemanticModelRow.id))
+        full = _rich_model().model_dump(mode="json")
+        full["notes"] = ["new note"]
+        full["business_metrics"][1]["description"] = "edited by hand"
+        full["segments"][0]["sql_expression"] = "status = 'paid'"
+        await store.apply_user_patch(
+            semantic_db,
+            connection_id,
+            SemanticModelUpdate.model_validate(full),
+            updated_by="u2",
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        rows = [
+            h
+            for h in (await semantic_db.scalars(select(SemanticHistoryRow))).all()
+            if h.id not in seeded
+        ]
+        by_type = {h.entity_type: h for h in rows}
+        assert sorted(h.entity_type for h in rows) == ["global_item", "metric", "model"]
+        assert all(
+            (h.action, h.source, h.entity_id, h.changed_by) == ("update", "user", header_id, "u2")
+            for h in rows
+        )
+
+        model_row = by_type["model"]
+        assert model_row.entity_key == ""
+        assert model_row.old_value == {"notes": ["budgets are quarterly"]}
+        assert model_row.new_value == {"notes": ["new note"]}
+
+        metric_row = by_type["metric"]
+        stored_metrics = [m.model_dump(mode="json") for m in _rich_model().business_metrics]
+        assert metric_row.entity_key == "business_metrics"
+        assert metric_row.old_value == {"items": stored_metrics}
+        assert metric_row.new_value == {"items": full["business_metrics"]}
+
+        segment_row = by_type["global_item"]
+        assert segment_row.entity_key == "segments"
+        assert segment_row.old_value["items"][0]["sql_expression"] == "status = 'p'"
+        assert segment_row.new_value == {"items": full["segments"]}
+
+    async def test_a_relationship_edit_writes_one_relationship_history_row(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._seed(semantic_db, connection_id)
+        rels = [r.model_dump(mode="json") for r in _rich_model().relationships]
+        rels[0]["description"] = "each order has a customer"
+        await store.apply_user_patch(
+            semantic_db,
+            connection_id,
+            SemanticModelUpdate.model_validate({"relationships": rels}),
+            updated_by="u2",
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        rows = (
+            await semantic_db.scalars(
+                select(SemanticHistoryRow).where(SemanticHistoryRow.entity_type == "relationship")
+            )
+        ).all()
+        assert len(rows) == 1
+        assert rows[0].entity_key == "relationships"
+        assert rows[0].old_value["items"][0]["description"] is None
+        assert rows[0].new_value["items"][0]["description"] == "each order has a customer"
+
+    async def _rows_and_history(self, db, cid) -> tuple:
+        rows = []
+        for row_cls in (
+            SemanticModelRow,
+            SemanticTableRow,
+            SemanticColumnRow,
+            SemanticMetricRow,
+            SemanticGlobalItemRow,
+            SemanticRelationshipRow,
+        ):
+            rows.extend((r.id, r.version) for r in (await db.scalars(select(row_cls))).all())
+        history = await db.scalar(select(func.count()).select_from(SemanticHistoryRow))
+        return sorted(rows), history, await store.provenance_map(db, cid)
+
+    async def _echo_reloaded_model(self, db, cid) -> None:
+        loaded = await store.load_model(db, cid)
+        echo = SemanticModelUpdate.model_validate(loaded.model_dump(mode="json"))
+        await store.apply_user_patch(db, cid, echo, updated_by="u2")
+        await db.commit()
+        db.expunge_all()
+
+    async def test_items_sent_without_defaulted_keys_are_stored_whole(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._seed(semantic_db, connection_id)
+        metrics = [m.model_dump(mode="json") for m in _rich_model().business_metrics]
+        metrics.append({"name": "Margin", "metric_type": "derived", "definition": "a - b"})
+        patch = SemanticModelUpdate.model_validate(
+            {
+                "business_metrics": metrics,
+                "tables": {
+                    "public.orders": {
+                        "columns": {
+                            "status": {
+                                "value_mappings": [{"raw_value": "r", "display_value": "Refunded"}]
+                            }
+                        }
+                    }
+                },
+            }
+        )
+        await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        margin = await semantic_db.scalar(
+            select(SemanticMetricRow).where(SemanticMetricRow.name == "Margin")
+        )
+        assert margin.payload["filters"] == []
+        assert margin.payload["description"] == ""
+        status = await semantic_db.scalar(
+            select(SemanticColumnRow).where(SemanticColumnRow.column_name == "status")
+        )
+        assert status.value_mappings == [
+            {"raw_value": "r", "display_value": "Refunded", "description": None}
+        ]
+        before = await self._rows_and_history(semantic_db, connection_id)
+        semantic_db.expunge_all()
+
+        await self._echo_reloaded_model(semantic_db, connection_id)
+        assert await self._rows_and_history(semantic_db, connection_id) == before
+
+    async def test_echo_of_a_migrated_shape_row_marks_nothing(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._seed(semantic_db, connection_id)
+        # Shapes migration 0003 copies verbatim: defaulted keys missing, a value
+        # mapping as a bare string, an unknown semantic type.
+        revenue = await semantic_db.scalar(
+            select(SemanticMetricRow).where(SemanticMetricRow.name == "Revenue")
+        )
+        revenue.payload = {
+            key: value
+            for key, value in revenue.payload.items()
+            if key not in ("filters", "measure_filters", "format_hint", "is_non_additive")
+        }
+        segment = await semantic_db.scalar(
+            select(SemanticGlobalItemRow).where(SemanticGlobalItemRow.kind == "segment")
+        )
+        segment.payload = {k: v for k, v in segment.payload.items() if k != "applicable_tables"}
+        status = await semantic_db.scalar(
+            select(SemanticColumnRow).where(SemanticColumnRow.column_name == "status")
+        )
+        status.value_mappings = ["p"]
+        status.semantic_type = "legacy_type"
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        before = await self._rows_and_history(semantic_db, connection_id)
+        semantic_db.expunge_all()
+
+        await self._echo_reloaded_model(semantic_db, connection_id)
+        after = await self._rows_and_history(semantic_db, connection_id)
+        assert after == before
+        assert after[2]["metric"] == {}
+        assert after[2]["column"] == {}
+
+    async def test_null_semantic_type_preserves_the_stored_value(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._seed(semantic_db, connection_id)
+        patch = SemanticModelUpdate(
+            tables={
+                "public.orders": TableSemanticUpdate(
+                    columns={
+                        "status": ColumnSemanticUpdate(semantic_type=None),
+                        "new_col": ColumnSemanticUpdate(display_name="New", semantic_type=None),
+                    }
+                )
+            }
+        )
+        model = await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
+        await semantic_db.commit()
+        columns = model.tables["public.orders"].columns
+        assert columns["status"].semantic_type == SemanticType.CATEGORICAL
+        assert columns["new_col"].semantic_type == SemanticType.UNKNOWN
+
+    async def test_a_new_row_marks_only_the_non_null_fields_sent(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._seed(semantic_db, connection_id)
+        patch = SemanticModelUpdate(
+            tables={
+                "public.items": TableSemanticUpdate(
+                    display_name="Items",
+                    description=None,
+                    grain=None,
+                    columns={
+                        "sku": ColumnSemanticUpdate(
+                            display_name="SKU", description=None, currency=None
+                        )
+                    },
+                )
+            }
+        )
+        await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        prov = await store.provenance_map(semantic_db, connection_id)
+        assert prov["table"]["public.items"] == ["display_name"]
+        assert prov["column"]["public.items.sku"] == ["display_name"]
+
+    async def test_a_new_column_sent_with_defaults_stays_open_to_generation(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._seed(semantic_db, connection_id)
+        # A stale draft re-creating a pruned column echoes the defaults.
+        patch = SemanticModelUpdate(
+            tables={
+                "public.orders": TableSemanticUpdate(
+                    columns={
+                        "sku": ColumnSemanticUpdate(
+                            display_name="SKU",
+                            is_sensitive=False,
+                            semantic_type=SemanticType.UNKNOWN,
+                            value_mappings=[],
+                        )
+                    }
+                )
+            }
+        )
+        await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        prov = await store.provenance_map(semantic_db, connection_id)
+        assert prov["column"]["public.orders.sku"] == ["display_name"]
+
+        generated = _rich_model().tables["public.orders"].model_copy(deep=True)
+        generated.columns["sku"] = ColumnSemantic(display_name="Sku", is_sensitive=True)
+        await store.reconcile_tables(
+            semantic_db, connection_id, {"public.orders": generated}, updated_by="gen"
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        sku = (
+            (await store.load_model(semantic_db, connection_id))
+            .tables["public.orders"]
+            .columns["sku"]
+        )
+        assert sku.is_sensitive is True
+        assert sku.display_name == "SKU"  # the user's marked field survives
+
+    async def test_patch_without_a_model_creates_one(self, semantic_db, connection_id) -> None:
+        patch = SemanticModelUpdate(tables={"public.x": TableSemanticUpdate(display_name="X")})
+        model = await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
+        await semantic_db.commit()
+        assert set(model.tables) == {"public.x"}
+
+    async def test_values_that_need_fitting_are_an_echo_on_the_second_apply(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._seed(semantic_db, connection_id)
+
+        def patch() -> SemanticModelUpdate:
+            full = _rich_model().model_dump(mode="json")
+            full["tables"]["public.orders"]["domain"] = "d" * 200
+            full["tables"]["public.orders"]["columns"]["total"]["currency"] = "US Dollars"
+            full["notes"] = ["a\x00b"]
+            full["business_metrics"][0]["description"] = "gross\x00 revenue"
+            full["segments"][0]["description"] = "paid\x00 orders"
+            full["relationships"][0]["description"] = "x\x00y"
+            return SemanticModelUpdate.model_validate(full)
+
+        async def snapshot() -> tuple:
+            rows = []
+            for row_cls in (
+                SemanticModelRow,
+                SemanticTableRow,
+                SemanticColumnRow,
+                SemanticMetricRow,
+                SemanticGlobalItemRow,
+                SemanticRelationshipRow,
+            ):
+                rows.extend(
+                    (r.id, r.version) for r in (await semantic_db.scalars(select(row_cls))).all()
+                )
+            history = await semantic_db.scalar(select(func.count()).select_from(SemanticHistoryRow))
+            return sorted(rows), history, await store.provenance_map(semantic_db, connection_id)
+
+        model = await store.apply_user_patch(semantic_db, connection_id, patch(), updated_by="u2")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert model.tables["public.orders"].domain == "d" * 128
+        assert model.tables["public.orders"].columns["total"].currency == "US Dolla"
+        assert model.notes == ["ab"]
+        # SQLite keeps NULs, so check that what was inserted is the fitted value.
+        assert model.business_metrics[0].description == "gross revenue"
+        assert model.segments[0].description == "paid orders"
+        assert model.relationships[0].description == "xy"
+        first = await snapshot()
+        assert first[2] == {
+            "model": {"": ["notes"]},
+            "table": {"public.orders": ["domain"]},
+            "column": {"public.orders.total": ["currency"]},
+            "metric": {"Revenue": ["payload"]},
+            "global_item": {"segment:Paid": ["payload"]},
+            "relationship": {"public.orders.customer_id->public.customers.id": ["payload"]},
+        }
+        semantic_db.expunge_all()
+
+        await store.apply_user_patch(semantic_db, connection_id, patch(), updated_by="u2")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert await snapshot() == first
+
+    async def test_over_long_identity_raises_and_writes_nothing(
+        self, semantic_db, connection_id
+    ) -> None:
+        patch = SemanticModelUpdate(tables={"t" * 600: TableSemanticUpdate(display_name="T")})
+        with pytest.raises(ValueError, match="table_key"):
+            await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
+        assert await semantic_db.scalar(select(SemanticModelRow)) is None
+        assert await semantic_db.scalar(select(SemanticHistoryRow)) is None
+
+
+class TestOptimisticLock:
+    async def _seed_and_read(self, db, cid) -> SemanticTableRow:
+        await store.save_model(db, cid, _rich_model(), updated_by="u1")
+        await db.commit()
+        db.expunge_all()
+        return await db.scalar(
+            select(SemanticTableRow).where(SemanticTableRow.table_key == "public.orders")
+        )
+
+    async def test_stale_version_raises_instead_of_clobbering(
+        self, semantic_db, connection_id
+    ) -> None:
+        row = await self._seed_and_read(semantic_db, connection_id)
+        with pytest.raises(store.SemanticStoreConflict):
+            await store.update_table_fields(
+                semantic_db,
+                row.id,
+                expected_version=row.version + 1,
+                values={"description": "late writer"},
+                updated_by="u2",
+                mark_user_edited=True,
+            )
+
+    async def test_a_writer_that_committed_first_is_not_overwritten(
+        self, semantic_db, connection_id
+    ) -> None:
+        row = await self._seed_and_read(semantic_db, connection_id)
+        table_id, stale_version = row.id, row.version
+        # Another transaction commits a write. synchronize_session=False leaves this
+        # session's identity-mapped ``row`` as stale as a separate transaction would.
+        await semantic_db.execute(
+            update(SemanticTableRow)
+            .where(SemanticTableRow.id == table_id)
+            .values(description="other writer", version=stale_version + 1)
+            .execution_options(synchronize_session=False)
+        )
+        await semantic_db.commit()
+        assert row.version == stale_version
+
+        with pytest.raises(store.SemanticStoreConflict):
+            await store.update_table_fields(
+                semantic_db,
+                table_id,
+                expected_version=stale_version,
+                values={"description": "late writer"},
+                updated_by="u2",
+                mark_user_edited=True,
+            )
+        await semantic_db.rollback()
+        semantic_db.expunge_all()
+        stored = await semantic_db.scalar(
+            select(SemanticTableRow).where(SemanticTableRow.id == table_id)
+        )
+        assert stored.description == "other writer"
+        assert stored.version == stale_version + 1
+        assert stored.user_edited_fields == []
+        table_history = await semantic_db.scalar(
+            select(func.count())
+            .select_from(SemanticHistoryRow)
+            .where(SemanticHistoryRow.entity_type == "table")
+        )
+        assert table_history == 0
+
+    async def test_matching_version_writes_and_bumps(self, semantic_db, connection_id) -> None:
+        row = await self._seed_and_read(semantic_db, connection_id)
+        await store.update_table_fields(
+            semantic_db,
+            row.id,
+            expected_version=row.version,
+            values={"description": "fresh"},
+            updated_by="u2",
+            mark_user_edited=True,
+        )
+        # The in-session object reflects the Core UPDATE without a refresh.
+        assert row.version == 2
+        assert row.description == "fresh"
+        assert row.user_edited_fields == ["description"]
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        again = await semantic_db.scalar(
+            select(SemanticTableRow).where(SemanticTableRow.id == row.id)
+        )
+        assert again.version == 2
+        assert again.description == "fresh"
+        assert again.user_edited_fields == ["description"]
+
+    async def test_an_echo_writes_nothing(self, semantic_db, connection_id) -> None:
+        row = await self._seed_and_read(semantic_db, connection_id)
+        await store.update_table_fields(
+            semantic_db,
+            row.id,
+            expected_version=row.version,
+            values={"description": "One row per order", "domain": "sales"},
+            updated_by="u2",
+            mark_user_edited=True,
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        again = await semantic_db.scalar(
+            select(SemanticTableRow).where(SemanticTableRow.id == row.id)
+        )
+        assert again.version == 1
+        assert again.user_edited_fields == []
