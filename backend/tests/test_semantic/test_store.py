@@ -1266,6 +1266,23 @@ class TestUserPatch:
         semantic_db.expunge_all()
         assert (await store.provenance_map(semantic_db, connection_id))["model"] == {"": ["notes"]}
 
+    async def test_review_flag_flips_and_an_echo_afterwards_marks_nothing_new(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._seed(semantic_db, connection_id)
+        flip = SemanticModelUpdate(is_user_reviewed=True)
+        model = await store.apply_user_patch(semantic_db, connection_id, flip, updated_by="u2")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert model.is_user_reviewed is True
+        loaded = await store.load_model(semantic_db, connection_id)
+        assert loaded.is_user_reviewed is True
+        semantic_db.expunge_all()
+
+        before = await self._rows_and_history(semantic_db, connection_id)
+        await self._echo_reloaded_model(semantic_db, connection_id)
+        assert await self._rows_and_history(semantic_db, connection_id) == before
+
     async def test_header_and_section_edits_are_audited(self, semantic_db, connection_id) -> None:
         await self._seed(semantic_db, connection_id)
         seeded = {h.id for h in (await semantic_db.scalars(select(SemanticHistoryRow))).all()}

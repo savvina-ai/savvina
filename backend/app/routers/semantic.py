@@ -33,8 +33,14 @@ from ..schemas.semantic import (
     SemanticModelUpdate,
     SemanticSuggestionResponse,
 )
+from ..semantic import store as semantic_store
 from ..semantic.generator import _BATCH_SIZE, SemanticModelGenerator
-from ..semantic.models import GenerationProgress, GenerationStatus, SemanticModel
+from ..semantic.models import (
+    GenerationProgress,
+    GenerationStatus,
+    SemanticModel,
+    ValueMapping,
+)
 from ..services.schema_utils import (
     _apply_privacy_to_schema,
     _schema_from_dict,
@@ -72,13 +78,15 @@ async def get_semantic_model(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    conn = await get_connection_or_404(connection_id, db)
-    if not conn.semantic_model:
+    await get_connection_or_404(connection_id, db)
+    model = await semantic_store.load_model(db, connection_id)
+    if model is None:
+        # Deliberately 404, not an empty model: SemanticModelPage derives
+        # "has a model" from whether this call errors.
         raise HTTPException(
             status_code=404,
-            detail="No semantic model — call /generate to auto-generate one",
+            detail="No semantic model — call /generate/init, /generate/batch, /generate/globals",
         )
-    model = SemanticModel.model_validate(conn.semantic_model)
     return cached_json_response(model.model_dump(mode="json"), request)
 
 
@@ -89,63 +97,26 @@ async def update_semantic_model(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> SemanticModel:
-    """Partially update the semantic model — applies user refinements on top of
-    the existing model without overwriting unmentioned keys.
+    """Partially update the semantic model.
 
-    Top-level lists (``business_metrics``, ``common_joins`` …) are wholesale
-    replacements when supplied. ``tables`` is the only section that deep-merges
-    per-column, preserving v2 metadata (``semantic_type``, ``cardinality`` …)
-    that the frontend doesn't always echo back.
+    All merge semantics (null = not supplied, [] = explicit clear, per-field
+    provenance) live in ``semantic/store.apply_user_patch``; this route only
+    maps the store's exceptions onto HTTP status codes.
     """
-    conn = await lock_and_reread_connection(connection_id, db)
-    existing_dict: dict = dict(conn.semantic_model) if conn.semantic_model else {}
-    existing_model = (
-        SemanticModel.model_validate(existing_dict) if existing_dict else SemanticModel()
-    )
-
-    # ── Per-column deep merge (Pydantic's model_copy(update=…) is shallow) ────
-    merged_tables = dict(existing_model.tables)
-    if body.tables is not None:
-        for tbl_key, tbl_update in body.tables.items():
-            existing_tbl = merged_tables.get(tbl_key)
-            tbl_patch = tbl_update.model_dump(exclude_unset=True, exclude={"columns"})
-            if existing_tbl is None:
-                # New table: require display_name from the patch (Pydantic
-                # validation will catch its absence).
-                base_tbl_data = tbl_patch
-            else:
-                base_tbl_data = {**existing_tbl.model_dump(mode="json"), **tbl_patch}
-
-            # Per-column deep merge
-            existing_cols = existing_tbl.columns if existing_tbl else {}
-            merged_cols = {k: v.model_dump(mode="json") for k, v in existing_cols.items()}
-            if tbl_update.columns is not None:
-                for col_name, col_update in tbl_update.columns.items():
-                    col_patch = col_update.model_dump(exclude_unset=True)
-                    merged_cols[col_name] = {**merged_cols.get(col_name, {}), **col_patch}
-            base_tbl_data["columns"] = merged_cols
-            merged_tables[tbl_key] = base_tbl_data
-
-    # ── Shallow updates for the remaining sections ───────────────────────────
-    update_data: dict = body.model_dump(exclude_unset=True, exclude={"tables"})
-    # ``model_copy(update=…)`` accepts already-validated values; tables go in as
-    # raw dicts because we just deep-merged them. Round-trip through
-    # ``model_validate`` to surface any shape errors before persisting.
-    merged_dict = {
-        **existing_model.model_dump(mode="json"),
-        **{k: v for k, v in update_data.items()},
-        "tables": merged_tables,
-    }
-    new_model = SemanticModel.model_validate(merged_dict)
-
-    await db.execute(
-        update(Connection)
-        .where(Connection.id == connection_id)
-        .values(
-            semantic_model=new_model.model_dump(mode="json"),
-            semantic_model_updated_at=datetime.now(UTC),
+    # Hold the connection row lock for the whole write: column rows carry no
+    # optimistic version predicate, so the lock is what serialises concurrent writers.
+    await lock_and_reread_connection(connection_id, db)
+    try:
+        new_model = await semantic_store.apply_user_patch(
+            db, connection_id, body, updated_by=current_user.id
         )
-    )
+    except semantic_store.SemanticStoreConflict as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except ValueError as exc:
+        # pydantic's ValidationError is a ValueError; the routers map it to 400.
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     await _invalidate_connection_caches(connection_id, db)
     await db.commit()
     return new_model
@@ -154,15 +125,13 @@ async def update_semantic_model(
 @router.delete("/{connection_id}/semantic", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_semantic_model(
     connection_id: str,
-    _current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    await get_connection_or_404(connection_id, db)
-    await db.execute(
-        update(Connection)
-        .where(Connection.id == connection_id)
-        .values(semantic_model=None, semantic_model_updated_at=None)
-    )
+    # Take the connection row lock (it also covers the 404) so a delete serialises
+    # with locked PUT / suggestion-apply writers instead of racing their rows.
+    await lock_and_reread_connection(connection_id, db)
+    await semantic_store.delete_model(db, connection_id, changed_by=current_user.id)
     await _invalidate_connection_caches(connection_id, db)
     await db.commit()
 
@@ -182,11 +151,9 @@ async def check_drift(
     then diffs structure against stored semantic model. No statistical re-queries.
     """
     conn = await get_connection_or_404(connection_id, db)
-    if not conn.semantic_model:
-        raise HTTPException(
-            status_code=404,
-            detail="No semantic model — generate one first",
-        )
+    stored_model = await semantic_store.load_model(db, connection_id)
+    if stored_model is None:
+        raise HTTPException(status_code=404, detail="No semantic model — generate one first")
 
     usc_result = await db.execute(
         select(UserSchemaCache).where(
@@ -205,7 +172,6 @@ async def check_drift(
     schema = _schema_from_dict(user_schema_cache.schema_cache)
     if privacy:
         schema = _apply_privacy_to_schema(schema, privacy)
-    stored_model = SemanticModel.model_validate(conn.semantic_model)
 
     warnings = SemanticModelGenerator().detect_drift(schema, stored_model)
 
@@ -280,7 +246,7 @@ async def apply_suggestion(
 
     OVERHEAD: app-only — reads/writes PostgreSQL app DB only.
     """
-    conn = await get_connection_or_404(connection_id, db)
+    await get_connection_or_404(connection_id, db)
 
     sug_result = await db.execute(
         select(SemanticSuggestion).where(
@@ -292,57 +258,78 @@ async def apply_suggestion(
     if suggestion is None:
         raise HTTPException(status_code=404, detail="Suggestion not found")
 
-    # Re-read under a row lock right before merging so this doesn't clobber a
-    # concurrent write (e.g. a batch-generation call) made since the read above.
-    conn = await lock_and_reread_connection(connection_id, db)
-    if not conn.semantic_model:
+    # Hold the connection row lock for the whole write: column rows carry no
+    # optimistic version predicate, so the lock is what serialises concurrent writers.
+    await lock_and_reread_connection(connection_id, db)
+    current = await semantic_store.load_model(db, connection_id)
+    if current is None:
         raise HTTPException(status_code=404, detail="No semantic model to update")
+    table = current.tables.get(suggestion.table_key)
+    if table is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Table {suggestion.table_key!r} not found in semantic model",
+        )
 
-    model_dict: dict = dict(conn.semantic_model)
-    tables: dict = dict(model_dict.get("tables", {}))
-
-    table_data: dict = dict(tables.get(suggestion.table_key, {}))
     correction_type = suggestion.correction_type
-    value = suggestion.value
+    value = suggestion.value if isinstance(suggestion.value, dict) else {}
+    table_patch: dict
+
+    # ``field`` comes from chat feedback (arbitrary text). Refuse a column the model
+    # doesn't have rather than let the store create a nameless column row.
+    column_targeted = correction_type == "add_value_mapping" or (
+        correction_type == "update_description" and value.get("target", "table") == "column"
+    )
+    col = table.columns.get(suggestion.field) if column_targeted else None
+    if column_targeted and col is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Column {suggestion.field!r} not found on {suggestion.table_key!r} "
+                "in semantic model"
+            ),
+        )
 
     if correction_type == "add_value_mapping":
-        columns: dict = dict(table_data.get("columns", {}))
-        field_data: dict = dict(columns.get(suggestion.field, {}))
-        mappings: list = list(field_data.get("value_mappings", []))
-        mappings.append(value)
-        field_data["value_mappings"] = mappings
-        columns[suggestion.field] = field_data
-        table_data["columns"] = columns
-
+        existing = [m.model_dump(mode="json") for m in col.value_mappings]
+        try:
+            # Full mapping dict (raw_value, display_value, description) so the
+            # store persists whole items, never a partial suggestion payload.
+            new_mapping = ValueMapping.model_validate(value).model_dump(mode="json")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if new_mapping["raw_value"] not in {m["raw_value"] for m in existing}:
+            existing.append(new_mapping)
+        table_patch = {"columns": {suggestion.field: {"value_mappings": existing}}}
     elif correction_type == "update_filter":
-        filters: list = list(table_data.get("default_filters", []))
+        filters = list(table.default_filters)
         new_filter = value.get("filter", "")
         if new_filter and new_filter not in filters:
             filters.append(new_filter)
-        table_data["default_filters"] = filters
-
+        table_patch = {"default_filters": filters}
     elif correction_type == "update_description":
-        target = value.get("target", "table")
-        if target == "column":
-            columns = dict(table_data.get("columns", {}))
-            field_data = dict(columns.get(suggestion.field, {}))
-            field_data["description"] = value.get("description", "")
-            columns[suggestion.field] = field_data
-            table_data["columns"] = columns
+        if value.get("target", "table") == "column":
+            table_patch = {
+                "columns": {suggestion.field: {"description": value.get("description", "")}}
+            }
         else:
-            table_data["description"] = value.get("description", "")
+            table_patch = {"description": value.get("description", "")}
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown correction_type: {correction_type!r}")
 
-    tables[suggestion.table_key] = table_data
-    model_dict["tables"] = tables
-
-    await db.execute(
-        update(Connection)
-        .where(Connection.id == connection_id)
-        .values(
-            semantic_model=model_dict,
-            semantic_model_updated_at=datetime.now(UTC),
+    try:
+        patch = SemanticModelUpdate.model_validate({"tables": {suggestion.table_key: table_patch}})
+        new_model = await semantic_store.apply_user_patch(
+            db, connection_id, patch, updated_by=current_user.id
         )
-    )
+    except semantic_store.SemanticStoreConflict as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except ValueError as exc:
+        # pydantic's ValidationError is a ValueError; the routers map it to 400.
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     await db.execute(
         update(SemanticSuggestion)
         .where(SemanticSuggestion.id == suggestion_id)
@@ -350,7 +337,7 @@ async def apply_suggestion(
     )
     await _invalidate_connection_caches(connection_id, db)
     await db.commit()
-    return SemanticModel.model_validate(model_dict)
+    return new_model
 
 
 # ── Phased generation helpers + endpoints ──────────────────────────────────────

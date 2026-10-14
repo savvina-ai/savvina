@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.database import get_db
 from app.main import app
+from app.semantic import store as semantic_store
+from app.semantic.models import SemanticModel
 
 from .conftest import MockResult, _make_conn, _mock_db
 
@@ -20,30 +22,40 @@ _EMPTY_MODEL = {
     "is_user_reviewed": False,
 }
 
+_STORE = "app.routers.semantic.semantic_store"
+
+
+def _populated() -> SemanticModel:
+    return SemanticModel.model_validate(
+        {
+            **_EMPTY_MODEL,
+            "tables": {
+                "public.orders": {
+                    "display_name": "Orders",
+                    "columns": {"status": {"display_name": "Status"}},
+                }
+            },
+        }
+    )
+
 
 # ── GET /api/v1/connections/{id}/semantic ───────────────────────────────────────
 
 
 class TestGetSemanticModel:
     async def test_returns_200_when_model_exists(self, http_client):
-        conn = _make_conn(semantic_model=_EMPTY_MODEL)
-        db = _mock_db(MockResult(single=conn))
+        db = _mock_db(MockResult(single=_make_conn()))
         app.dependency_overrides[get_db] = lambda: db
-        resp = await http_client.get("/api/v1/connections/conn-123/semantic")
+        with patch(f"{_STORE}.load_model", new=AsyncMock(return_value=_populated())):
+            resp = await http_client.get("/api/v1/connections/conn-123/semantic")
         assert resp.status_code == 200
-
-    async def test_response_has_tables_key(self, http_client):
-        conn = _make_conn(semantic_model=_EMPTY_MODEL)
-        db = _mock_db(MockResult(single=conn))
-        app.dependency_overrides[get_db] = lambda: db
-        resp = await http_client.get("/api/v1/connections/conn-123/semantic")
-        assert "tables" in resp.json()
+        assert "public.orders" in resp.json()["tables"]
 
     async def test_returns_404_when_no_model(self, http_client):
-        conn = _make_conn(semantic_model=None)
-        db = _mock_db(MockResult(single=conn))
+        db = _mock_db(MockResult(single=_make_conn()))
         app.dependency_overrides[get_db] = lambda: db
-        resp = await http_client.get("/api/v1/connections/conn-123/semantic")
+        with patch(f"{_STORE}.load_model", new=AsyncMock(return_value=None)):
+            resp = await http_client.get("/api/v1/connections/conn-123/semantic")
         assert resp.status_code == 404
 
     async def test_returns_404_when_connection_missing(self, http_client):
@@ -57,139 +69,115 @@ class TestGetSemanticModel:
 
 
 class TestUpdateSemanticModel:
-    async def test_returns_200_with_merged_model(self, http_client):
-        existing = dict(_EMPTY_MODEL)
-        conn = _make_conn(semantic_model=existing)
+    async def test_patch_goes_through_the_store_and_returns_its_model(self, http_client):
         db = _mock_db(
-            MockResult(single=conn),  # _get_or_404
-            MockResult(),  # update Connection
+            MockResult(single=_make_conn()),  # lock_and_reread_connection
             MockResult(),  # delete QueryCacheEntry
             MockResult(),  # delete UserSchemaCache
             MockResult(),  # delete TableEmbeddingCache
         )
         app.dependency_overrides[get_db] = lambda: db
-        resp = await http_client.put(
-            "/api/v1/connections/conn-123/semantic",
-            json={
-                "tables": {
-                    "public.users": {
-                        "display_name": "Users",
-                        "description": "User accounts",
-                    }
-                }
-            },
-        )
+        apply = AsyncMock(return_value=_populated())
+        with patch(f"{_STORE}.apply_user_patch", new=apply):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/semantic",
+                json={"tables": {"public.orders": {"description": "hand written"}}},
+            )
         assert resp.status_code == 200
-
-    async def test_response_tables_include_update(self, http_client):
-        conn = _make_conn(semantic_model=dict(_EMPTY_MODEL))
-        db = _mock_db(
-            MockResult(single=conn),
-            MockResult(),  # update Connection
-            MockResult(),  # delete QueryCacheEntry
-            MockResult(),  # delete UserSchemaCache
-            MockResult(),  # delete TableEmbeddingCache
-        )
-        app.dependency_overrides[get_db] = lambda: db
-        resp = await http_client.put(
-            "/api/v1/connections/conn-123/semantic",
-            json={"tables": {"public.orders": {"display_name": "Orders"}}},
-        )
-        body = resp.json()
-        assert "public.orders" in body["tables"]
-
-    async def test_sets_is_user_reviewed(self, http_client):
-        conn = _make_conn(semantic_model=dict(_EMPTY_MODEL))
-        db = _mock_db(
-            MockResult(single=conn),
-            MockResult(),  # update Connection
-            MockResult(),  # delete QueryCacheEntry
-            MockResult(),  # delete UserSchemaCache
-            MockResult(),  # delete TableEmbeddingCache
-        )
-        app.dependency_overrides[get_db] = lambda: db
-        resp = await http_client.put(
-            "/api/v1/connections/conn-123/semantic",
-            json={"is_user_reviewed": True},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["is_user_reviewed"] is True
-
-    async def test_not_found_returns_404(self, http_client):
-        db = _mock_db(MockResult(single=None))
-        app.dependency_overrides[get_db] = lambda: db
-        resp = await http_client.put(
-            "/api/v1/connections/missing/semantic",
-            json={},
-        )
-        assert resp.status_code == 404
+        assert "public.orders" in resp.json()["tables"]
+        patch_arg = apply.await_args.args[2]
+        assert patch_arg.tables["public.orders"].description == "hand written"
+        assert apply.await_args.kwargs["updated_by"]
+        db.commit.assert_awaited_once()
 
     async def test_invalidates_caches(self, http_client):
         """PUT semantic must invalidate all three cache tables before commit."""
-        conn = _make_conn(semantic_model=dict(_EMPTY_MODEL))
         db = _mock_db(
-            MockResult(single=conn),  # get_connection_or_404
-            MockResult(),  # update Connection
+            MockResult(single=_make_conn()),  # lock_and_reread_connection
             MockResult(),  # delete QueryCacheEntry
             MockResult(),  # delete UserSchemaCache
             MockResult(),  # delete TableEmbeddingCache
         )
         app.dependency_overrides[get_db] = lambda: db
-        await http_client.put("/api/v1/connections/conn-123/semantic", json={})
-        # 1 select (get_or_404) + 1 update + 3 deletes = 5
-        assert db.execute.await_count == 5
+        with patch(f"{_STORE}.apply_user_patch", new=AsyncMock(return_value=_populated())):
+            await http_client.put("/api/v1/connections/conn-123/semantic", json={})
+        # 1 select (lock_and_reread) + 3 deletes; the store write is patched out.
+        assert db.execute.await_count == 4
+
+    async def test_store_conflict_is_409(self, http_client):
+        db = _mock_db(MockResult(single=_make_conn()))
+        app.dependency_overrides[get_db] = lambda: db
+        with patch(
+            f"{_STORE}.apply_user_patch",
+            new=AsyncMock(side_effect=semantic_store.SemanticStoreConflict("moved on")),
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/semantic", json={"notes": ["x"]}
+            )
+        assert resp.status_code == 409
+        db.rollback.assert_awaited()
+        db.commit.assert_not_awaited()
+
+    async def test_validation_error_is_400(self, http_client):
+        db = _mock_db(MockResult(single=_make_conn()))
+        app.dependency_overrides[get_db] = lambda: db
+        with patch(
+            f"{_STORE}.apply_user_patch", new=AsyncMock(side_effect=ValueError("bad shape"))
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/semantic", json={"notes": ["x"]}
+            )
+        assert resp.status_code == 400
+        db.rollback.assert_awaited()
+        db.commit.assert_not_awaited()
+
+    async def test_returns_404_when_connection_missing(self, http_client):
+        db = _mock_db(MockResult(single=None))
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put("/api/v1/connections/missing/semantic", json={})
+        assert resp.status_code == 404
 
 
 # ── DELETE /api/v1/connections/{id}/semantic ────────────────────────────────────
 
 
 class TestDeleteSemanticModel:
-    async def test_returns_204(self, http_client):
-        conn = _make_conn(semantic_model=_EMPTY_MODEL)
+    async def test_deletes_through_the_store(self, http_client):
         db = _mock_db(
-            MockResult(single=conn),  # _get_or_404
-            MockResult(),  # update Connection (set model to None)
-            MockResult(),  # delete QueryCacheEntry
-            MockResult(),  # delete UserSchemaCache
-            MockResult(),  # delete TableEmbeddingCache
+            MockResult(single=_make_conn()),  # lock_and_reread_connection
+            MockResult(),
+            MockResult(),
+            MockResult(),  # cache deletes
         )
         app.dependency_overrides[get_db] = lambda: db
-        resp = await http_client.delete("/api/v1/connections/conn-123/semantic")
+        delete = AsyncMock()
+        with patch(f"{_STORE}.delete_model", new=delete):
+            resp = await http_client.delete("/api/v1/connections/conn-123/semantic")
         assert resp.status_code == 204
+        delete.assert_awaited_once()
+        assert delete.await_args.args[1] == "conn-123"
+        assert delete.await_args.kwargs["changed_by"]
+        db.commit.assert_awaited_once()
 
-    async def test_not_found_returns_404(self, http_client):
+    async def test_invalidates_caches(self, http_client):
+        """DELETE semantic must invalidate all three cache tables before commit."""
+        db = _mock_db(
+            MockResult(single=_make_conn()),  # lock_and_reread_connection
+            MockResult(),
+            MockResult(),
+            MockResult(),  # cache deletes
+        )
+        app.dependency_overrides[get_db] = lambda: db
+        with patch(f"{_STORE}.delete_model", new=AsyncMock()):
+            await http_client.delete("/api/v1/connections/conn-123/semantic")
+        # 1 select (lock_and_reread) + 3 deletes; the store delete is patched out.
+        assert db.execute.await_count == 4
+
+    async def test_returns_404_when_connection_missing(self, http_client):
         db = _mock_db(MockResult(single=None))
         app.dependency_overrides[get_db] = lambda: db
         resp = await http_client.delete("/api/v1/connections/missing/semantic")
         assert resp.status_code == 404
-
-    async def test_commit_called(self, http_client):
-        conn = _make_conn(semantic_model=_EMPTY_MODEL)
-        db = _mock_db(
-            MockResult(single=conn),
-            MockResult(),  # update Connection
-            MockResult(),  # delete QueryCacheEntry
-            MockResult(),  # delete UserSchemaCache
-            MockResult(),  # delete TableEmbeddingCache
-        )
-        app.dependency_overrides[get_db] = lambda: db
-        await http_client.delete("/api/v1/connections/conn-123/semantic")
-        db.commit.assert_called_once()
-
-    async def test_invalidates_caches(self, http_client):
-        """DELETE semantic must invalidate all three cache tables before commit."""
-        conn = _make_conn(semantic_model=_EMPTY_MODEL)
-        db = _mock_db(
-            MockResult(single=conn),  # get_connection_or_404
-            MockResult(),  # update Connection
-            MockResult(),  # delete QueryCacheEntry
-            MockResult(),  # delete UserSchemaCache
-            MockResult(),  # delete TableEmbeddingCache
-        )
-        app.dependency_overrides[get_db] = lambda: db
-        await http_client.delete("/api/v1/connections/conn-123/semantic")
-        # 1 select (get_or_404) + 1 update + 3 deletes = 5
-        assert db.execute.await_count == 5
 
 
 # ── GET /api/v1/connections/{id}/semantic/drift ─────────────────────────────────
@@ -197,15 +185,15 @@ class TestDeleteSemanticModel:
 
 class TestCheckDrift:
     async def test_returns_200_no_warnings(self, http_client):
-        conn = _make_conn(semantic_model=_EMPTY_MODEL)
         usc = MagicMock()
         usc.schema_cache = {"tables": {}}
         db = _mock_db(
-            MockResult(single=conn),  # get_connection_or_404
+            MockResult(single=_make_conn()),  # get_connection_or_404
             MockResult(single=usc),  # user schema cache lookup
         )
         app.dependency_overrides[get_db] = lambda: db
         with (
+            patch(f"{_STORE}.load_model", new=AsyncMock(return_value=_populated())),
             patch("app.routers.semantic._schema_from_dict", return_value=MagicMock()),
             patch("app.routers.semantic.SemanticModelGenerator") as mock_gen,
         ):
@@ -215,20 +203,20 @@ class TestCheckDrift:
         assert resp.json()["warnings"] == []
 
     async def test_returns_404_no_semantic_model(self, http_client):
-        conn = _make_conn(semantic_model=None)
-        db = _mock_db(MockResult(single=conn))
+        db = _mock_db(MockResult(single=_make_conn()))
         app.dependency_overrides[get_db] = lambda: db
-        resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
+        with patch(f"{_STORE}.load_model", new=AsyncMock(return_value=None)):
+            resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
         assert resp.status_code == 404
 
     async def test_returns_404_no_schema_cache(self, http_client):
-        conn = _make_conn(semantic_model=_EMPTY_MODEL)
         db = _mock_db(
-            MockResult(single=conn),  # get_connection_or_404
+            MockResult(single=_make_conn()),  # get_connection_or_404
             MockResult(single=None),  # no user schema cache for this user
         )
         app.dependency_overrides[get_db] = lambda: db
-        resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
+        with patch(f"{_STORE}.load_model", new=AsyncMock(return_value=_populated())):
+            resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
         assert resp.status_code == 404
 
 

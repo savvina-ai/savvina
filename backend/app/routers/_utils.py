@@ -40,10 +40,10 @@ async def get_connection_or_404(
 async def lock_and_reread_connection(conn_id: str, db: AsyncSession) -> Connection:
     """Re-fetch *conn_id* under ``FOR UPDATE``, bypassing the identity-map cache.
 
-    Call immediately before composing a write to ``Connection.semantic_model``
-    in any handler that read the connection earlier in the same request, so
-    the write merges into the latest committed state rather than a stale
-    snapshot from a concurrent request.
+    Call immediately before composing a write to the semantic store
+    (``semantic/store.py``) in any handler that read the connection earlier in
+    the same request, so the write merges into the latest committed state
+    rather than a stale snapshot from a concurrent request.
     """
     stmt = (
         select(Connection)
