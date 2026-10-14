@@ -17,6 +17,11 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+# Tables per LLM call during phased generation. Lives here rather than in the
+# generator so the HTTP schema (``GenerateBatchRequest``) can cap its body on it
+# without importing the generator.
+GENERATION_BATCH_SIZE: int = 4
+
 
 class _Base(BaseModel):
     """Shared Pydantic config for every semantic-model class.

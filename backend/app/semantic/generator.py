@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from ..datasources.models import ColumnInfo, DataSourceSchema
 from .models import (
+    GENERATION_BATCH_SIZE,
     AggregationType,
     BusinessMetric,
     CardinalityClass,
@@ -39,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 # Tables per LLM call in batched generation. Schemas with up to _BATCH_SIZE tables
 # generate in a single batch; larger schemas are split into multiple batches.
-_BATCH_SIZE: int = 4
+_BATCH_SIZE = GENERATION_BATCH_SIZE  # kept for existing imports
 
 # Prompt for a single batch of tables (tables section only, no global metrics/joins).
 _BATCH_TABLES_PROMPT = """\
@@ -592,15 +594,44 @@ class SemanticModelGenerator:
         batch_idx: int,
         relationship_edges: list[RelationshipEdge],
     ) -> dict[str, TableSemantic]:
-        """
-        Generate semantic annotations for one batch of tables (no adapter required).
+        """Positional wrapper around ``generate_tables``.
 
-        Returns a dict of ``schema.table → TableSemantic`` for the batch tables only.
-        Raises ``ValueError`` on LLM failure so the router can return HTTP 500.
+        Kept only for the current router, which still slices by batch index; the
+        routes task switches it to ``generate_tables`` and this can then go.
+        ``generate()`` does not use it.
         """
-        tables = schema.tables
-        start = batch_idx * _BATCH_SIZE
-        batch = tables[start : start + _BATCH_SIZE]
+        start = batch_idx * GENERATION_BATCH_SIZE
+        keys = [
+            f"{t.schema_name}.{t.name}"
+            for t in schema.tables[start : start + GENERATION_BATCH_SIZE]
+        ]
+        return await self.generate_tables(
+            schema=schema,
+            provider=provider,
+            model=model,
+            table_keys=keys,
+            relationship_edges=relationship_edges,
+        )
+
+    async def generate_tables(
+        self,
+        schema: DataSourceSchema,
+        provider: BaseLLMProvider,
+        model: str | None,
+        table_keys: Sequence[str],
+        relationship_edges: list[RelationshipEdge],
+    ) -> dict[str, TableSemantic]:
+        """Generate semantic annotations for the named tables (no adapter required).
+
+        Keys not present in ``schema`` are ignored; an empty resolved set makes no
+        LLM call. Returns ``schema.table → TableSemantic`` for the resolved tables.
+        Near-miss table/column names are remapped to the batch's real keys and invented
+        ones are dropped; columns the LLM omits are left absent (so the store keeps any
+        earlier annotation for them). Raises ``ValueError`` on LLM failure so the router
+        can map it to HTTP.
+        """
+        wanted = set(table_keys)
+        batch = [t for t in schema.tables if f"{t.schema_name}.{t.name}" in wanted]
         if not batch:
             return {}
 
@@ -635,16 +666,119 @@ class SemanticModelGenerator:
                 + prompt
             )
 
-        result = await provider.generate_structured(
-            system_prompt=sys_prompt,
-            user_message=prompt,
-            schema_type=TablesBatchResponse,
-            model=model,
-            temperature=0.0,
-            max_tokens=min(65536, provider.max_output_tokens),
-        )
+        try:
+            result = await provider.generate_structured(
+                system_prompt=sys_prompt,
+                user_message=prompt,
+                schema_type=TablesBatchResponse,
+                model=model,
+                temperature=0.0,
+                max_tokens=min(65536, provider.max_output_tokens),
+            )
+        except Exception as e:
+            raise ValueError(f"LLM call failed in generate_tables: {e}") from e
+        # Ground first so fiscal enrichment sees the remapped (real) table keys.
+        self._ground_tables_to_schema(result.tables, batch_schema_obj)
         self._enrich_fiscal_table_annotations(result.tables, schema)
         return result.tables
+
+    @staticmethod
+    def _strip_quotes(name: str) -> str:
+        """``"public"."Orders"`` / ```sales`.`orders``` → ``public.Orders`` / ``sales.orders``.
+
+        Strips surrounding whitespace on the whole key, then double quotes, MySQL
+        backticks and whitespace around each dotted part.
+        """
+        return ".".join(part.strip().strip('"`') for part in name.strip().split("."))
+
+    @classmethod
+    def _resolve_real_key(cls, name: str, real_keys: list[str], *, bare_ok: bool) -> str | None:
+        """Map a near-miss ``name`` onto exactly one entry of ``real_keys``, else ``None``.
+
+        Tried in order, the first rule that matches anything decides (ambiguity at that
+        rule means ``None``): quote-stripped exact match, case-insensitive match, and —
+        when ``bare_ok`` and the name has no dot — a case-insensitive match against the
+        part after the last dot of each real key (a bare table name).
+        """
+        stripped = cls._strip_quotes(name)
+        if stripped in real_keys:
+            return stripped
+        lowered = stripped.lower()
+        matches = [k for k in real_keys if k.lower() == lowered]
+        if not matches and bare_ok and "." not in stripped:
+            matches = [k for k in real_keys if k.rsplit(".", 1)[-1].lower() == lowered]
+        return matches[0] if len(matches) == 1 else None
+
+    def _ground_tables_to_schema(
+        self,
+        tables: dict[str, TableSemantic],
+        schema: DataSourceSchema,
+    ) -> tuple[int, int]:
+        """Keep the generated model grounded in the introspected schema, in place.
+
+        The store persists whatever it is given, so an invented table or column would
+        be stored permanently. Near-miss names are mapped back before anything is
+        dropped (a dropped table is never stamped, so every resume would re-pay for it):
+
+        - a table key not in ``schema`` is remapped to the one real key it matches by
+          quote-stripping, then case-insensitively, then as a bare table name (see
+          ``_resolve_real_key``) — provided the match is unique and that real key is not
+          already in the output; otherwise it is dropped as invented;
+        - within each real table, a column key not in the real column set is remapped the
+          same way (quote-strip, then case-insensitive), else dropped.
+
+        Real columns the LLM omitted are deliberately NOT backfilled. The store's
+        ``reconcile_tables`` overwrites every unedited field of each column a batch
+        names, so a bare-default column for one the LLM merely skipped would wipe the
+        description, semantic type and value mappings from the previous run (plus bump
+        the version and write a history row). An absent column is left untouched.
+
+        Returns ``(dropped_tables, dropped_columns)``.
+        """
+        real_cols_by_key = {
+            f"{t.schema_name}.{t.name}": [c.name for c in t.columns] for t in schema.tables
+        }
+        real_keys = list(real_cols_by_key)
+        dropped_tables = 0
+        dropped_columns = 0
+
+        # Real keys already present win over any near-miss that resolves to them.
+        for tkey in [k for k in tables if k not in real_cols_by_key]:
+            entry = tables.pop(tkey)
+            target = self._resolve_real_key(tkey, real_keys, bare_ok=True)
+            if target is None or target in tables:
+                dropped_tables += 1
+                continue
+            tables[target] = entry
+            logger.info("SemanticModelGenerator: remapped table key %r to %r", tkey, target)
+
+        for tkey, real_cols in real_cols_by_key.items():
+            sem_table = tables.get(tkey)
+            if sem_table is None:
+                continue
+            columns = sem_table.columns
+            for col_name in [c for c in columns if c not in real_cols]:
+                col = columns.pop(col_name)
+                target = self._resolve_real_key(col_name, real_cols, bare_ok=False)
+                if target is None or target in columns:
+                    dropped_columns += 1
+                    continue
+                columns[target] = col
+                logger.info(
+                    "SemanticModelGenerator: remapped column %r to %r on %s",
+                    col_name,
+                    target,
+                    tkey,
+                )
+
+        if dropped_tables or dropped_columns:
+            logger.info(
+                "SemanticModelGenerator: grounded to schema — dropped %d invented "
+                "table(s), %d invented column(s)",
+                dropped_tables,
+                dropped_columns,
+            )
+        return dropped_tables, dropped_columns
 
     async def generate_globals(
         self,

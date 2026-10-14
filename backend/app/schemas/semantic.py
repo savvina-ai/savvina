@@ -20,9 +20,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..semantic.models import (
+    GENERATION_BATCH_SIZE,
     AggregationType,
     BusinessMetric,
     CardinalityClass,
@@ -49,11 +50,41 @@ class DriftReport(BaseModel):
 
 
 class GenerateInitResponse(BaseModel):
-    """Returned by ``POST /connections/{id}/semantic/generate/init``."""
+    """Returned by ``POST /connections/{id}/semantic/generate/init``.
+
+    ``pending_table_keys`` is the work list: a fresh run lists every table, a
+    ``resume=true`` run lists only the ones the interrupted run had not reached.
+    The frontend slices it into batches itself — nothing positional survives on
+    the server.
+    """
 
     connection_id: str
     tables_total: int
     batch_count: int
+    batch_size: int
+    pending_table_keys: list[str] = []
+    resumed: bool = False
+
+
+class GenerateBatchRequest(BaseModel):
+    """Body of ``POST /connections/{id}/semantic/generate/batch`` — one batch of
+    tables to annotate, named by key rather than by position."""
+
+    table_keys: list[str] = Field(min_length=1, max_length=GENERATION_BATCH_SIZE)
+
+
+class GenerateBatchResponse(BaseModel):
+    """Returned by ``POST /connections/{id}/semantic/generate/batch``.
+
+    Progress only, never the model: the client drives its own progress bar from
+    the keys it dispatched and reads the finished model from ``/generate/globals``.
+    ``tables_done`` counts the tables this run has reconciled so far.
+    """
+
+    connection_id: str
+    table_keys: list[str]
+    tables_done: int
+    tables_total: int
     batch_size: int
 
 
