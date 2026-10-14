@@ -10,7 +10,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.datasources.models import ColumnInfo, DataSourceSchema, PrivacySettings, TableInfo
+from app.semantic.formatter import SemanticFormatter
 from app.semantic.models import (
+    ColumnSemantic,
     CommonJoin,
     DerivedMetric,
     RelationshipEdge,
@@ -299,8 +301,8 @@ class TestFilterSemanticToSchema:
         """Relationships referencing pruned tables are dropped."""
         semantic = self._make_semantic()
         schema = _make_schema(
-            _make_table("store", "orders", ["id"]),
-            _make_table("store", "customers", ["id"]),
+            _make_table("store", "orders", ["id", "customer_id"]),
+            _make_table("store", "customers", ["id", "customer_id"]),
             # products pruned
         )
         result = _filter_semantic_to_schema(semantic, schema)
@@ -332,6 +334,154 @@ class TestFilterSemanticToSchema:
         schema = _make_schema(_make_table("store", "orders", ["id"]))
         result = _filter_semantic_to_schema(semantic, schema)
         assert len(result.business_metrics) == 2
+
+
+class TestFilterSemanticToSchemaPrivacy:
+    """The stored model may annotate columns the privacy settings hide.
+
+    ``/generate/globals`` keeps those annotations so un-hiding loses no work, so the
+    chat path must narrow columns, not only tables, to the privacy-filtered schema.
+    """
+
+    def _model(self) -> SemanticModel:
+        return SemanticModel(
+            tables={
+                "store.orders": TableSemantic(
+                    display_name="Orders",
+                    primary_timestamp_column="secret_ts",
+                    partition_columns=["secret_ts"],
+                    columns={
+                        "id": ColumnSemantic(display_name="Order ID", description="Order key"),
+                        "amount": ColumnSemantic(
+                            display_name="Amount", description="Order value in euros"
+                        ),
+                        "secret_ts": ColumnSemantic(
+                            display_name="Hidden Stamp",
+                            description="Zorblax confidential moment",
+                        ),
+                    },
+                ),
+                "store.customers": TableSemantic(
+                    display_name="Customers",
+                    columns={"id": ColumnSemantic(display_name="Customer ID")},
+                ),
+            },
+            relationships=[
+                RelationshipEdge(
+                    from_table="store.orders",
+                    from_column="secret_ts",
+                    to_table="store.customers",
+                    to_column="id",
+                    join_sql="store.orders.secret_ts = store.customers.id",
+                ),
+                RelationshipEdge(
+                    from_table="store.orders",
+                    from_column="id",
+                    to_table="store.customers",
+                    to_column="id",
+                    join_sql="store.orders.id = store.customers.id",
+                ),
+            ],
+        )
+
+    def _schema_without_secret(self) -> DataSourceSchema:
+        return _make_schema(
+            _make_table("store", "orders", ["id", "amount"]),
+            _make_table("store", "customers", ["id"]),
+        )
+
+    def test_excluded_column_never_reaches_the_prompt(self) -> None:
+        result = _filter_semantic_to_schema(self._model(), self._schema_without_secret())
+
+        prompt = SemanticFormatter().format_for_prompt(result)
+
+        # Sanity: the visible parts of the same table are rendered.
+        assert "Order value in euros" in prompt
+        for leaked in ("secret_ts", "Hidden Stamp", "Zorblax"):
+            assert leaked not in prompt
+
+    def test_excluded_column_is_dropped_with_its_references_and_edges(self) -> None:
+        result = _filter_semantic_to_schema(self._model(), self._schema_without_secret())
+
+        orders = result.tables["store.orders"]
+        assert set(orders.columns) == {"id", "amount"}
+        assert orders.primary_timestamp_column is None
+        assert orders.partition_columns == []
+        assert [(r.from_column, r.to_column) for r in result.relationships] == [("id", "id")]
+
+    def test_column_present_in_schema_is_kept(self) -> None:
+        schema = _make_schema(
+            _make_table("store", "orders", ["id", "amount", "secret_ts"]),
+            _make_table("store", "customers", ["id"]),
+        )
+
+        result = _filter_semantic_to_schema(self._model(), schema)
+
+        orders = result.tables["store.orders"]
+        assert set(orders.columns) == {"id", "amount", "secret_ts"}
+        assert orders.primary_timestamp_column == "secret_ts"
+        assert len(result.relationships) == 2
+        prompt = SemanticFormatter().format_for_prompt(result)
+        assert "Zorblax confidential moment" in prompt
+
+    def test_privacy_excluded_column_is_dropped_even_from_a_stale_schema(self) -> None:
+        """A stale schema cache can still hold a newly excluded column."""
+        stale_schema = _make_schema(
+            _make_table("store", "orders", ["id", "amount", "secret_ts"]),
+            _make_table("store", "customers", ["id"]),
+        )
+        privacy = PrivacySettings(excluded_columns=["store.orders.secret_ts"])
+
+        result = _filter_semantic_to_schema(self._model(), stale_schema, privacy)
+
+        orders = result.tables["store.orders"]
+        assert set(orders.columns) == {"id", "amount"}
+        assert orders.primary_timestamp_column is None
+        assert orders.partition_columns == []
+        assert [(r.from_column, r.to_column) for r in result.relationships] == [("id", "id")]
+        prompt = SemanticFormatter().format_for_prompt(result)
+        assert "Order value in euros" in prompt
+        for leaked in ("secret_ts", "Hidden Stamp", "Zorblax"):
+            assert leaked not in prompt
+        # The caller's schema is not narrowed in place.
+        assert [c.name for c in stale_schema.tables[0].columns] == ["id", "amount", "secret_ts"]
+
+    def test_exclusion_is_exact_not_a_sensitive_name_pattern(self) -> None:
+        """Same rule as ``policy_hides_column``: only exact ``schema.table.column``."""
+        schema = _make_schema(
+            _make_table("store", "orders", ["id", "amount", "secret_ts"]),
+            _make_table("store", "customers", ["id"]),
+        )
+        # "secret" is a default sensitive pattern, but the column is not excluded.
+        result = _filter_semantic_to_schema(self._model(), schema, PrivacySettings())
+
+        assert "secret_ts" in result.tables["store.orders"].columns
+
+    def test_edge_dropped_on_a_column_mismatch_is_logged(self, caplog) -> None:
+        with caplog.at_level("WARNING", logger="app.services.schema_pruning"):
+            _filter_semantic_to_schema(self._model(), self._schema_without_secret())
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert len(messages) == 1
+        assert "store.orders.secret_ts -> store.customers.id" in messages[0]
+
+    def test_edge_dropped_for_an_invisible_table_is_not_logged(self, caplog) -> None:
+        schema = _make_schema(_make_table("store", "orders", ["id", "amount", "secret_ts"]))
+
+        with caplog.at_level("WARNING", logger="app.services.schema_pruning"):
+            result = _filter_semantic_to_schema(self._model(), schema)
+
+        assert result.relationships == []
+        assert caplog.records == []
+
+    def test_input_model_is_not_mutated(self) -> None:
+        model = self._model()
+
+        _filter_semantic_to_schema(model, self._schema_without_secret())
+
+        assert "secret_ts" in model.tables["store.orders"].columns
+        assert model.tables["store.orders"].primary_timestamp_column == "secret_ts"
+        assert len(model.relationships) == 2
 
 
 # ── Domain-aware schema pruning ────────────────────────────────────────────────

@@ -161,6 +161,7 @@ class TestDeleteSemanticModel:
     async def test_deletes_through_the_store(self, http_client):
         db = _mock_db(
             MockResult(single=_make_conn()),  # lock_and_reread_connection
+            MockResult(),  # clear the legacy blob
             MockResult(),
             MockResult(),
             MockResult(),  # cache deletes
@@ -175,10 +176,10 @@ class TestDeleteSemanticModel:
         assert delete.await_args.kwargs["changed_by"]
         db.commit.assert_awaited_once()
 
-    async def test_invalidates_caches(self, http_client):
-        """DELETE semantic must invalidate all three cache tables before commit."""
+    async def test_clears_the_legacy_blob_with_sql_null(self, http_client):
         db = _mock_db(
             MockResult(single=_make_conn()),  # lock_and_reread_connection
+            MockResult(),  # clear the legacy blob
             MockResult(),
             MockResult(),
             MockResult(),  # cache deletes
@@ -186,8 +187,24 @@ class TestDeleteSemanticModel:
         app.dependency_overrides[get_db] = lambda: db
         with patch(f"{_STORE}.delete_model", new=AsyncMock()):
             await http_client.delete("/api/v1/connections/conn-123/semantic")
-        # 1 select (lock_and_reread) + 3 deletes; the store delete is patched out.
-        assert db.execute.await_count == 4
+        sql = [str(c.args[0].compile()) for c in db.execute.await_args_list]
+        # SQL NULL, not a bound None (which a JSON column stores as the text 'null').
+        assert any(q.startswith("UPDATE connections SET semantic_model=NULL") for q in sql), sql
+
+    async def test_invalidates_caches(self, http_client):
+        """DELETE semantic must invalidate all three cache tables before commit."""
+        db = _mock_db(
+            MockResult(single=_make_conn()),  # lock_and_reread_connection
+            MockResult(),  # clear the legacy blob
+            MockResult(),
+            MockResult(),
+            MockResult(),  # cache deletes
+        )
+        app.dependency_overrides[get_db] = lambda: db
+        with patch(f"{_STORE}.delete_model", new=AsyncMock()):
+            await http_client.delete("/api/v1/connections/conn-123/semantic")
+        # 1 select (lock_and_reread) + 1 blob update + 3 deletes; the store delete is patched out.
+        assert db.execute.await_count == 5
 
     async def test_returns_404_when_connection_missing(self, http_client):
         db = _mock_db(MockResult(single=None))
@@ -828,6 +845,7 @@ class TestGenerateGlobals:
         save = save or AsyncMock()
         db = db or _mock_db(
             MockResult(single=_make_conn()),  # lock_and_reread_connection
+            MockResult(),  # clear the legacy blob
             MockResult(),
             MockResult(),
             MockResult(),  # cache deletes

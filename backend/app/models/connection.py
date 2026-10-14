@@ -29,7 +29,8 @@ class Connection(Base):
     # 'auto_execute' | 'review_first' | 'generate_only'
     execution_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="auto_execute")
     # Cached SemanticModel as a dict
-    semantic_model: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Unread since the semantic store; kept for one release, hence deferred.
+    semantic_model: Mapped[dict | None] = mapped_column(JSON, nullable=True, deferred=True)
     semantic_model_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

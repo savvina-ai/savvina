@@ -42,6 +42,7 @@ from ..schemas.sse import (
     SseEvent,
     StatusEvent,
 )
+from ..semantic import store as semantic_store
 from ..semantic.models import SemanticModel
 from ..utils.encryption import decrypt_value
 from .execution import (
@@ -265,9 +266,18 @@ async def _stage_prune_and_filter(
 ) -> tuple[DataSourceSchema, Any]:  # (DataSourceSchema, SemanticModel | None)
     """Stage 3b-4: apply schema pruning and semantic model filtering."""
     schema = sr.schema
-    _raw_semantic: SemanticModel | None = (
-        SemanticModel.model_validate(conn.semantic_model) if conn.semantic_model else None
-    )
+    # The store is the only reader of semantic data; the blob column on ``conn``
+    # is unread (tests/test_semantic/test_blob_is_unread.py).
+    # A failed read costs the turn its business context, not the turn itself.
+    _raw_semantic: SemanticModel | None
+    try:
+        _raw_semantic = await semantic_store.load_model(db, connection_id)
+    except Exception:
+        logger.exception(
+            "Could not load the semantic model for connection %s; continuing without it",
+            connection_id,
+        )
+        _raw_semantic = None
     if sr.embeddings_available and getattr(settings, "schema_pruning_enabled", True):
         schema = await _select_relevant_tables(
             schema=schema,
@@ -282,7 +292,7 @@ async def _stage_prune_and_filter(
         )
     semantic_model: SemanticModel | None = _raw_semantic
     if semantic_model:
-        semantic_model = _filter_semantic_to_schema(semantic_model, schema)
+        semantic_model = _filter_semantic_to_schema(semantic_model, schema, privacy)
         semantic_model = _filter_semantic_by_relevance(semantic_model, message)
     return schema, semantic_model
 

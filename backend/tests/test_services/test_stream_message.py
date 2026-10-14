@@ -9,9 +9,13 @@ import contextlib
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from app.datasources.models import QueryResult, ValidationResult
 from app.providers.base import LLMResponse
 from app.services.chat_service import ChatService
+
+pytestmark = pytest.mark.usefixtures("stored_semantic_model")
 
 # ── Test module ───────────────────────────────────────────────────────────────
 
@@ -62,7 +66,6 @@ def _make_connection(
     *,
     execution_mode: str = "auto_execute",
     privacy_settings: dict | None = None,
-    semantic_model: dict | None = None,
 ) -> MagicMock:
     conn = MagicMock()
     conn.id = "conn-1"
@@ -70,7 +73,6 @@ def _make_connection(
     conn.config_encrypted = b"encrypted-bytes"
     conn.privacy_settings = privacy_settings
     conn.execution_mode = execution_mode
-    conn.semantic_model = semantic_model
     return conn
 
 

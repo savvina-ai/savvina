@@ -15,8 +15,12 @@ from contextlib import ExitStack, contextmanager
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from app.schemas.chat import ChatResponse
 from app.services.chat_service import ChatService
+
+pytestmark = pytest.mark.usefixtures("stored_semantic_model")
 
 # ── Reuse the same helpers as test_chat_service ──────────────────────────────
 
@@ -89,7 +93,6 @@ def _make_connection(*, execution_mode: str = "auto_execute") -> MagicMock:
     conn.privacy_settings = None
     conn.execution_mode = execution_mode
     conn.schema_cache = _SCHEMA_CACHE_DICT
-    conn.semantic_model = None
     return conn
 
 

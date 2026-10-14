@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import logging
 import re
@@ -21,6 +21,7 @@ from ..datasources.models import DataSourceSchema, PrivacySettings, TableInfo
 from ..models.connection import Connection
 from ..models.table_embedding_cache import TableEmbeddingCache
 from ..models.user_schema_cache import UserSchemaCache
+from ..semantic.generator import edges_in_schema, policy_hides_column, prune_to_schema
 from ..semantic.models import SemanticModel
 from .schema_utils import (
     _apply_privacy_to_schema,
@@ -47,17 +48,71 @@ class _SchemaResult:
     embeddings_available: bool = False
 
 
-def _filter_semantic_to_schema(semantic: SemanticModel, schema: DataSourceSchema) -> SemanticModel:
-    """Return a copy of semantic model narrowed to tables visible in schema.
+def _schema_without_excluded_columns(
+    schema: DataSourceSchema, privacy: PrivacySettings | None
+) -> DataSourceSchema:
+    """``schema`` minus the columns ``privacy`` excludes (exact ``schema.table.column``)."""
+    if privacy is None or not privacy.excluded_columns:
+        return schema
+    tables = [
+        replace(
+            t,
+            columns=[
+                c
+                for c in t.columns
+                if not policy_hides_column(f"{t.schema_name}.{t.name}", c.name, privacy)
+            ],
+        )
+        for t in schema.tables
+    ]
+    return replace(schema, tables=tables)
 
-    Also drops relationships and common_joins that reference pruned tables.
+
+def _filter_semantic_to_schema(
+    semantic: SemanticModel,
+    schema: DataSourceSchema,
+    privacy: PrivacySettings | None = None,
+) -> SemanticModel:
+    """Return a copy of semantic model narrowed to the tables AND columns in schema.
+
+    ``schema`` is the privacy-filtered schema the LLM will see. The stored model can
+    hold annotations for tables and columns the privacy settings hide (generation
+    keeps them so un-hiding loses no work), so narrowing by table alone would leak a
+    hidden column's name, description, timestamp role or join to the prompt. Hence:
+
+    - tables are narrowed to the schema and each table's columns to the schema's
+      columns, with references to a dropped column (primary timestamp/date column,
+      partition/cluster columns, hierarchy levels) cleared. This is the strict
+      ``prune_to_schema`` (no ``privacy`` argument), so hidden columns are dropped
+      rather than carried through;
+    - relationships are kept only when both endpoints are real columns of the
+      schema (strict ``edges_in_schema``), so edges on hidden columns go too. An edge
+      dropped although both its tables are visible is a column mismatch (a user edit
+      gone stale, or a hidden column) and is logged;
+    - common_joins that reference pruned tables are dropped.
+
+    Defence in depth: introspection already omits ``privacy.excluded_columns``, but a
+    stale schema cache (a request racing a privacy change) can still carry one, so
+    when ``privacy`` is given those columns are removed from the schema first and
+    everything above is computed against the narrowed copy.
+
     Business metrics are kept as-is — they remain useful signal regardless of table scope.
     """
+    schema = _schema_without_excluded_columns(schema, privacy)
     visible = {f"{t.schema_name}.{t.name}" for t in schema.tables}
-    filtered_tables = {k: v for k, v in semantic.tables.items() if k in visible}
-    filtered_rels = [
-        r for r in semantic.relationships if r.from_table in visible and r.to_table in visible
-    ]
+    filtered_tables = prune_to_schema(semantic.tables, schema, log=False)
+    filtered_rels = edges_in_schema(semantic.relationships, schema)
+    kept_ids = {id(r) for r in filtered_rels}
+    for r in semantic.relationships:
+        if id(r) not in kept_ids and r.from_table in visible and r.to_table in visible:
+            logger.warning(
+                "Dropped relationship %s.%s -> %s.%s from the chat prompt: "
+                "a column is not in the schema the LLM may see",
+                r.from_table,
+                r.from_column,
+                r.to_table,
+                r.to_column,
+            )
     filtered_joins = [
         j for j in semantic.common_joins if all(t.strip() in visible for t in j.tables)
     ]
