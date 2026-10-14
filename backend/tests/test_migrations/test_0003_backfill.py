@@ -174,7 +174,6 @@ class TestBackfill:
             ("common_join", "o.customer_id = c.id"),
         }
 
-    @pytest.mark.xfail(strict=True, reason="store lands in Task 5")
     async def test_backfilled_rows_validate_as_a_semantic_model(
         self, semantic_db, connection_id
     ) -> None:
