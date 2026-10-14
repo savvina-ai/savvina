@@ -472,6 +472,9 @@ describe('SemanticModelPage — confirming a restart', () => {
     const dialog = await screen.findByRole('dialog');
     expect(dialog).not.toHaveTextContent(/overwritten/i);
     expect(dialog).toHaveTextContent(/edited by hand are kept/);
+    // The phased path batches tables and does no column fingerprinting.
+    expect(dialog).toHaveTextContent(/batches of up to 4, one LLM call per batch/);
+    expect(dialog).not.toHaveTextContent(/fingerprint|invoked once/i);
   });
 
   it('never inits when the DELETE fails', async () => {

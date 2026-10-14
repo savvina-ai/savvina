@@ -177,20 +177,27 @@ function GenerateConfirmDialog({ action, onConfirm, onCancel }: ConfirmDialogPro
             removed.
           </p>
         )}
+        {/* Mirrors the phased backend: GENERATION_BATCH_SIZE tables per /generate/batch
+            call, one /generate/globals call, edges from `_build_relationship_graph`. */}
         <ul className="mb-4 space-y-1 text-xs text-muted-foreground">
           <li className="flex items-start gap-2">
             <span className="mt-0.5 shrink-0 text-primary">•</span>
-            Column fingerprinting reads catalog statistics from your database (no user
-            data rows).
+            Tables are annotated in batches of up to 4, one LLM call per batch.
           </li>
           <li className="flex items-start gap-2">
             <span className="mt-0.5 shrink-0 text-primary">•</span>
-            LLM is invoked once to generate display names, descriptions, and derived
-            columns.
+            One final LLM call builds business metrics, common joins, derived columns and
+            segments from the annotated tables.
           </li>
           <li className="flex items-start gap-2">
             <span className="mt-0.5 shrink-0 text-primary">•</span>
-            Relationship edges are built from FK catalog only — no extra queries.
+            Relationship edges are built from your database&apos;s foreign keys only — no
+            extra queries.
+          </li>
+          <li className="flex items-start gap-2">
+            <span className="mt-0.5 shrink-0 text-primary">•</span>
+            The LLM sees only the schema — table and column names, types, keys and
+            comments — never row data.
           </li>
         </ul>
         <div className="flex justify-end gap-3">
