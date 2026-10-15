@@ -368,8 +368,17 @@ def _write_history(
     ``entity_key`` is fitted like any other value: a column key is
     ``"{table_key}.{column_name}"``, and two identity values that each fit their
     own column can together exceed the key's.
-    The key is best-effort audit context (a truncated key can collide); ``entity_id``
-    is the stable reference.
+
+    ``entity_id`` is the row the change was made to, as it existed then.
+    ``save_model`` is a full replace: it deletes every table, column, metric,
+    relationship and global-item row and inserts the rebuilt set with new ids (only
+    the header keeps its id). Keeping ids would need a per-row reconcile against the
+    stored rows, which this path deliberately does not do (``reconcile_tables`` is
+    the path that keeps rows). So across a globals finalisation the durable audit
+    key of a table or column change is ``(entity_type, entity_key)`` within a
+    connection, and ``entity_id`` identifies the row only until the next rebuild.
+    A truncated ``entity_key`` can collide; that is the accepted limit of the key,
+    not a reason to prefer the id.
     """
     fitted = _fit_values(SemanticHistoryRow, {"entity_key": entity_key})
     db.add(
@@ -407,7 +416,7 @@ async def save_model(
     source: str = "user",
     provenance: ProvenanceMap | None = None,
     protected: ProtectedValues | None = None,
-) -> None:
+) -> SemanticModel:
     """Replace every semantic row for ``connection_id`` with ``model``.
 
     A full replace, used where the caller holds the whole model (``/generate/
@@ -422,15 +431,22 @@ async def save_model(
 
     ``protected`` is the stored values for the marked table and column fields and
     must come from the same ``provenance_snapshot`` as ``provenance``
-    (``provenance_snapshot(...).protected``). Without it the values are read here
-    and restricted to the fields ``provenance`` names — a second pass over every
-    row, which the globals route avoids by passing the snapshot's.
+    (``provenance_snapshot(...).protected``). Every content field (one of
+    ``_TABLE_FIELDS`` / ``_COLUMN_FIELDS``) that ``provenance`` marks on a table
+    or column must have its stored value in ``protected[kind][key]``: without it
+    that edit would be written back as a mark over the incoming model's value,
+    which is the data loss the marks exist to prevent. Raises ``TypeError`` if
+    any such value is missing, or if ``protected`` is non-empty without
+    ``provenance``. ``is_user_reviewed`` is never carried as a mark: a globals run
+    resets it on purpose (``_HEADER_UNPROTECTED``).
+
+    Returns the model as stored — values fitted (``_fit_values``) and
+    name-keyed items deduped — so a caller need not re-read it.
 
     Raises ``ValueError`` (before touching the session) if an identity value — a
     table key, column name, metric name or relationship endpoint — is longer than
     its column, or a segment, derived-column or join name is over the unique
     index's byte limit; every other string is made to fit (``_fit_values``).
-    Raises ``TypeError`` if ``protected`` is non-empty without ``provenance``.
 
     The caller must hold the connection row lock (``lock_and_reread_connection``):
     the header's ``version`` is bumped in Python from the value read here, and
@@ -439,6 +455,16 @@ async def save_model(
     if protected and not provenance:
         raise TypeError("protected values need the provenance they were read with")
     prov = provenance or {}
+    stored = protected or {}
+    missing = [
+        f"{key}.{field}"
+        for kind, content in (("table", _TABLE_FIELDS), ("column", _COLUMN_FIELDS))
+        for key, fields in prov.get(kind, {}).items()
+        for field in fields
+        if field in content and field not in stored.get(kind, {}).get(key, {})
+    ]
+    if missing:
+        raise TypeError(f"provenance marks without their protected values: {missing[:5]}")
     dumped = model.model_dump(mode="json")
 
     # Fit every value first: a ValueError must leave the session untouched.
@@ -536,22 +562,6 @@ async def save_model(
     else:
         action = "update"
         old_value = _header_to_dict(header)
-        if (
-            protected is None
-            and provenance
-            and (provenance.get("table") or provenance.get("column"))
-        ):
-            # Not supplied by the caller: read the marked values before the rows go.
-            snap = (await provenance_snapshot(db, connection_id)).protected
-            # Only the fields ``provenance`` names, as the caller's marks define them.
-            protected = {
-                kind: {
-                    key: {f: v for f, v in values.items() if f in provenance[kind][key]}
-                    for key, values in snap[kind].items()
-                    if key in provenance.get(kind, {})
-                }
-                for kind in ("table", "column")
-            }
         stored_values = protected or {}
         # Cascades clear tables → columns.
         await db.execute(delete(SemanticTableRow).where(SemanticTableRow.model_id == header.id))
@@ -563,10 +573,10 @@ async def save_model(
             delete(SemanticGlobalItemRow).where(SemanticGlobalItemRow.model_id == header.id)
         )
 
-    header_edited = list(prov.get("model", {}).get(_HEADER_KEY, []))
-    protected_header = (
-        set(header_edited) - _HEADER_UNPROTECTED if action == "update" else set[str]()
-    )
+    header_edited = [
+        f for f in prov.get("model", {}).get(_HEADER_KEY, []) if f not in _HEADER_UNPROTECTED
+    ]
+    protected_header = set(header_edited) if action == "update" else set[str]()
     for field, value in header_values.items():
         if field in protected_header:
             continue
@@ -682,6 +692,19 @@ async def save_model(
         db.add_all(chunk)
 
     await db.flush()
+    columns_by_table: dict[str, list[SemanticColumnRow]] = {}
+    for col_row in column_rows:
+        columns_by_table.setdefault(col_row.table_id, []).append(col_row)
+    return _assemble_model(
+        _ModelRows(
+            header=header,
+            tables=table_rows,
+            columns_by_table=columns_by_table,
+            metrics=metric_rows,
+            relationships=rel_rows,
+            global_items=global_rows,
+        )
+    )
 
 
 async def delete_model(db: AsyncSession, connection_id: str, *, changed_by: str | None) -> None:
@@ -727,10 +750,29 @@ def _column_row_to_dict(col: SemanticColumnRow) -> dict[str, Any]:
     return {field: getattr(col, field) for field in _COLUMN_FIELDS}
 
 
-async def load_model(db: AsyncSession, connection_id: str) -> SemanticModel | None:
-    """Assemble the whole semantic model for a connection, or None if unset."""
-    # populate_existing: a re-read under a row lock must see other transactions'
-    # committed state, not an identity-mapped instance.
+@dataclass
+class _ModelRows:
+    """One connection's semantic rows, read fresh in one pass."""
+
+    header: SemanticModelRow
+    tables: list[SemanticTableRow]
+    columns_by_table: dict[str, list[SemanticColumnRow]]
+    metrics: list[SemanticMetricRow]
+    relationships: list[SemanticRelationshipRow]
+    global_items: list[SemanticGlobalItemRow]
+
+
+async def _fetch_rows(db: AsyncSession, connection_id: str) -> _ModelRows | None:
+    """Every row of a connection's model. Metrics, relationships and global items
+    come as ordinal-ordered lists; tables and columns in no particular order, as
+    ``_assemble_model`` orders them.
+
+    ``populate_existing`` on every select: a re-read under a row lock must see
+    other transactions' committed state, not an identity-mapped instance. This is
+    the one pass ``load_model``, ``provenance_snapshot`` and
+    ``load_model_with_provenance`` share, so a caller that needs both the model
+    and its marks under the connection row lock scans the rows once.
+    """
     header = await db.scalar(
         select(SemanticModelRow)
         .where(SemanticModelRow.connection_id == connection_id)
@@ -738,71 +780,112 @@ async def load_model(db: AsyncSession, connection_id: str) -> SemanticModel | No
     )
     if header is None:
         return None
-
-    table_rows = list(
+    tables = list(
         (
             await db.scalars(
                 select(SemanticTableRow)
                 .where(SemanticTableRow.model_id == header.id)
-                .order_by(SemanticTableRow.table_key)
                 .execution_options(populate_existing=True)
             )
         ).all()
     )
     columns_by_table: dict[str, list[SemanticColumnRow]] = {}
-    for chunk in _chunks([row.id for row in table_rows]):
+    for chunk in _chunks([row.id for row in tables]):
         rows = await db.scalars(
             select(SemanticColumnRow)
             .where(SemanticColumnRow.table_id.in_(list(chunk)))
-            .order_by(SemanticColumnRow.column_name)
             .execution_options(populate_existing=True)
         )
         for col in rows:
             columns_by_table.setdefault(col.table_id, []).append(col)
+    metrics = list(
+        (
+            await db.scalars(
+                select(SemanticMetricRow)
+                .where(SemanticMetricRow.model_id == header.id)
+                .order_by(SemanticMetricRow.ordinal)
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+    )
+    relationships = list(
+        (
+            await db.scalars(
+                select(SemanticRelationshipRow)
+                .where(SemanticRelationshipRow.model_id == header.id)
+                .order_by(SemanticRelationshipRow.ordinal)
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+    )
+    global_items = list(
+        (
+            await db.scalars(
+                select(SemanticGlobalItemRow)
+                .where(SemanticGlobalItemRow.model_id == header.id)
+                .order_by(SemanticGlobalItemRow.kind, SemanticGlobalItemRow.ordinal)
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+    )
+    return _ModelRows(header, tables, columns_by_table, metrics, relationships, global_items)
 
+
+def _assemble_model(rows: _ModelRows) -> SemanticModel:
+    """The ``SemanticModel`` the rows describe. Pure.
+
+    The model's own ``mode="before"`` validators coerce most stored shapes, but a
+    malformed value can still raise pydantic's ValidationError (a ValueError),
+    exactly as reading the blob did.
+
+    The one definition of table and column order: Python string order on
+    ``table_key`` and ``column_name``. The formatter renders tables in dict
+    order, so the order is prompt content, and SQL collation differs between
+    SQLite and PostgreSQL; sorting here keeps it the same on every backend and
+    on every path (``load_model`` and ``save_model``'s return alike).
+    """
+    header = rows.header
     tables: dict[str, Any] = {}
-    for row in table_rows:
+    for row in sorted(rows.tables, key=lambda r: r.table_key):
         table_data: dict[str, Any] = {field: getattr(row, field) for field in _TABLE_FIELDS}
         table_data["columns"] = {
-            col.column_name: _column_row_to_dict(col) for col in columns_by_table.get(row.id, [])
+            col.column_name: _column_row_to_dict(col)
+            for col in sorted(rows.columns_by_table.get(row.id, []), key=lambda c: c.column_name)
         }
         tables[row.table_key] = table_data
-
-    metrics = (
-        await db.scalars(
-            select(SemanticMetricRow)
-            .where(SemanticMetricRow.model_id == header.id)
-            .order_by(SemanticMetricRow.ordinal)
-        )
-    ).all()
-    relationships = (
-        await db.scalars(
-            select(SemanticRelationshipRow)
-            .where(SemanticRelationshipRow.model_id == header.id)
-            .order_by(SemanticRelationshipRow.ordinal)
-        )
-    ).all()
-    globals_ = (
-        await db.scalars(
-            select(SemanticGlobalItemRow)
-            .where(SemanticGlobalItemRow.model_id == header.id)
-            .order_by(SemanticGlobalItemRow.kind, SemanticGlobalItemRow.ordinal)
-        )
-    ).all()
-
     data: dict[str, Any] = {field: getattr(header, field) for field in _MODEL_FIELDS}
     data["generation_status"] = header.generation_status
     data["generation_progress"] = header.generation_progress
     data["tables"] = tables
-    data["business_metrics"] = [row.payload for row in metrics]
-    data["relationships"] = [_relationship_row_to_dict(row) for row in relationships]
-    data["segments"] = [row.payload for row in globals_ if row.kind == "segment"]
-    data["derived_columns"] = [row.payload for row in globals_ if row.kind == "derived_column"]
-    data["common_joins"] = [row.payload for row in globals_ if row.kind == "common_join"]
-    # The model's own ``mode="before"`` validators coerce most stored shapes, but
-    # a malformed value can still raise pydantic's ValidationError (a
-    # ValueError), exactly as reading the blob did.
+    data["business_metrics"] = [row.payload for row in rows.metrics]
+    data["relationships"] = [_relationship_row_to_dict(row) for row in rows.relationships]
+    data["segments"] = [row.payload for row in rows.global_items if row.kind == "segment"]
+    data["derived_columns"] = [
+        row.payload for row in rows.global_items if row.kind == "derived_column"
+    ]
+    data["common_joins"] = [row.payload for row in rows.global_items if row.kind == "common_join"]
     return SemanticModel.model_validate(data)
+
+
+async def load_model(db: AsyncSession, connection_id: str) -> SemanticModel | None:
+    """Assemble the whole semantic model for a connection, or None if unset."""
+    rows = await _fetch_rows(db, connection_id)
+    return None if rows is None else _assemble_model(rows)
+
+
+async def load_model_with_provenance(
+    db: AsyncSession, connection_id: str
+) -> tuple[SemanticModel | None, ProvenanceSnapshot]:
+    """``load_model`` and ``provenance_snapshot`` from one pass over the rows.
+
+    For the globals route, which needs both under the connection row lock and
+    must not scan every row twice while concurrent PUT and suggestion-apply
+    writers wait on that lock. With no model the snapshot is empty.
+    """
+    rows = await _fetch_rows(db, connection_id)
+    if rows is None:
+        return None, _empty_snapshot()
+    return _assemble_model(rows), _snapshot_from_rows(rows)
 
 
 # ── Read cache ────────────────────────────────────────────────────────────────
@@ -851,6 +934,16 @@ def _forget_writes(session: Any, transaction: Any) -> None:
         session.info.get(_WROTE_KEY, set()).clear()
 
 
+class SemanticModelUnavailable(Exception):  # noqa: N818 — names the state, not a fault
+    """The model could not be rebuilt on a cache miss; the caller may go on without it.
+
+    Raised by ``load_model_cached`` only for a failure inside its rebuild SAVEPOINT,
+    chained (``from``) to the original exception. The savepoint has been rolled back,
+    so the caller's transaction is still usable. Any other failure (the unwrapped
+    key read) propagates as itself.
+    """
+
+
 async def load_model_cached(db: AsyncSession, connection_id: str) -> SemanticModel | None:
     """``load_model``, served from a per-process cache while the header's version holds.
 
@@ -868,6 +961,10 @@ async def load_model_cached(db: AsyncSession, connection_id: str) -> SemanticMod
     cached under a version that a rollback would free for another writer to
     reuse with different content. Other pending ORM changes in the session are
     irrelevant to the model and do not bypass it.
+
+    A cache miss rebuilds the model inside a SAVEPOINT; a hit opens none. A failed
+    rebuild raises ``SemanticModelUnavailable`` from the original error, with the
+    caller's transaction intact; a failed key read raises the original error.
     """
     if connection_id in db.info.get(_WROTE_KEY, ()):
         return await load_model(db, connection_id)
@@ -886,7 +983,20 @@ async def load_model_cached(db: AsyncSession, connection_id: str) -> SemanticMod
     if cached is not None and cached[0] == header_id and cached[1] == version:
         _model_cache.move_to_end(connection_id)
         return cached[2]
-    model = await load_model(db, connection_id)
+    # The rebuild runs in a SAVEPOINT: on PostgreSQL a failed statement aborts the
+    # whole transaction, and the chat turn that called this must be able to go on
+    # without the model. Only this multi-statement rebuild is confined, and only its
+    # failure becomes ``SemanticModelUnavailable`` (the one error a caller may continue
+    # past). The single indexed key read above is not wrapped, so a cache hit costs
+    # exactly one statement; its failure propagates as itself, because on PostgreSQL
+    # it has already aborted the caller's transaction.
+    try:
+        async with db.begin_nested():
+            model = await load_model(db, connection_id)
+    except Exception as exc:
+        raise SemanticModelUnavailable(
+            f"could not rebuild the semantic model for connection {connection_id}"
+        ) from exc
     if model is None:
         _model_cache.pop(connection_id, None)
         return None
@@ -946,11 +1056,14 @@ async def begin_generation(
         .where(SemanticModelRow.connection_id == connection_id)
         .execution_options(populate_existing=True)
     )
+    old_value: dict[str, Any] | None
     if header is None:
         header = SemanticModelRow(connection_id=connection_id)
         db.add(header)
         await db.flush()
-    old_value = _header_to_dict(header)
+        action, old_value = "insert", None
+    else:
+        action, old_value = "update", _header_to_dict(header)
     if not resume or header.generation_run_id is None:
         header.generation_run_id = str(uuid.uuid4())
     header.schema_hash = fitted["schema_hash"]
@@ -969,7 +1082,7 @@ async def begin_generation(
         entity_type="model",
         entity_id=header.id,
         entity_key="",
-        action="update",
+        action=action,
         source="generation",
         old_value=old_value,
         new_value=_header_to_dict(header),
@@ -1093,8 +1206,9 @@ async def reconcile_tables(
 
     For each generated table: an existing row takes the new value on every
     field **not** in its ``user_edited_fields``; a missing row is inserted with
-    empty provenance. Columns likewise. Tables the batch does not name are not
-    touched. ``is_sensitive`` is additionally never cleared by generation.
+    empty provenance and an ``"insert"`` history row. Columns likewise. Tables
+    the batch does not name are not touched. ``is_sensitive`` is additionally
+    never cleared by generation.
 
     Nothing is ever deleted here: a table or column that left the schema keeps
     its row through every batch. Removing those is ``/generate/globals``'s job,
@@ -1162,13 +1276,18 @@ async def reconcile_tables(
     run_id = header.generation_run_id
     changed = False
 
+    # populate_existing on both row reads: the marks decide what generation may
+    # overwrite, so a stale identity-mapped row would overwrite a hand edit another
+    # transaction committed while this one awaited the LLM.
     existing_tables: dict[str, SemanticTableRow] = {}
     for chunk in _chunks(list(fitted_tables)):
         rows = await db.scalars(
-            select(SemanticTableRow).where(
+            select(SemanticTableRow)
+            .where(
                 SemanticTableRow.model_id == header.id,
                 SemanticTableRow.table_key.in_(list(chunk)),
             )
+            .execution_options(populate_existing=True)
         )
         existing_tables.update({row.table_key: row for row in rows})
 
@@ -1187,6 +1306,19 @@ async def reconcile_tables(
             )
             new_table_rows.append(row)
             existing_tables[table_key] = row
+            # The id is set above, so the history row can name it before any flush.
+            _write_history(
+                db,
+                connection_id=connection_id,
+                entity_type="table",
+                entity_id=row.id,
+                entity_key=table_key,
+                action="insert",
+                source="generation",
+                old_value=None,
+                new_value={field: generated_values[field] for field in _TABLE_FIELDS},
+                changed_by=updated_by,
+            )
             continue
         row.generation_run_id = run_id
         protected = set(row.user_edited_fields)
@@ -1223,7 +1355,9 @@ async def reconcile_tables(
     existing_columns: dict[tuple[str, str], SemanticColumnRow] = {}
     for chunk in _chunks(table_ids):
         cols = await db.scalars(
-            select(SemanticColumnRow).where(SemanticColumnRow.table_id.in_(list(chunk)))
+            select(SemanticColumnRow)
+            .where(SemanticColumnRow.table_id.in_(list(chunk)))
+            .execution_options(populate_existing=True)
         )
         existing_columns.update({(c.table_id, c.column_name): c for c in cols})
 
@@ -1235,11 +1369,25 @@ async def reconcile_tables(
             if col is None:
                 new_column_rows.append(
                     SemanticColumnRow(
+                        # Explicit id, so the history row can name it before any flush.
+                        id=str(uuid.uuid4()),
                         table_id=table_row.id,
                         updated_at=_now(),
                         updated_by=updated_by,
                         **generated_col_values,
                     )
+                )
+                _write_history(
+                    db,
+                    connection_id=connection_id,
+                    entity_type="column",
+                    entity_id=new_column_rows[-1].id,
+                    entity_key=f"{table_key}.{column_name}",
+                    action="insert",
+                    source="generation",
+                    old_value=None,
+                    new_value={field: generated_col_values[field] for field in _COLUMN_FIELDS},
+                    changed_by=updated_by,
                 )
                 continue
             protected = set(col.user_edited_fields)
@@ -1298,96 +1446,64 @@ class ProvenanceSnapshot:
     protected: ProtectedValues
 
 
-async def provenance_snapshot(db: AsyncSession, connection_id: str) -> ProvenanceSnapshot:
-    """Every row's ``user_edited_fields``, plus the stored values of the marked
-    table and column fields, keyed by entity — in one pass over the rows.
-
-    Reads fresh (``populate_existing``): it runs right before a full rebuild,
-    under the connection row lock, and must see committed state rather than
-    stale identity-mapped rows. One pass, because every scan made while that
-    lock is held blocks concurrent PUT and suggestion-apply writers.
-    """
-    marks: ProvenanceMap = {
-        "model": {},
-        "table": {},
-        "column": {},
-        "metric": {},
-        "global_item": {},
-        "relationship": {},
-    }
-    protected: ProtectedValues = {"table": {}, "column": {}}
-    header = await db.scalar(
-        select(SemanticModelRow)
-        .where(SemanticModelRow.connection_id == connection_id)
-        .execution_options(populate_existing=True)
+def _empty_snapshot() -> ProvenanceSnapshot:
+    return ProvenanceSnapshot(
+        marks={
+            "model": {},
+            "table": {},
+            "column": {},
+            "metric": {},
+            "global_item": {},
+            "relationship": {},
+        },
+        protected={"table": {}, "column": {}},
     )
-    if header is None:
-        return ProvenanceSnapshot(marks=marks, protected=protected)
+
+
+def _snapshot_from_rows(rows: _ModelRows) -> ProvenanceSnapshot:
+    """Every row's ``user_edited_fields``, plus the stored values of the marked
+    table and column fields, keyed by entity. Pure."""
+    snapshot = _empty_snapshot()
+    marks, protected = snapshot.marks, snapshot.protected
+    header = rows.header
     if header.user_edited_fields:
         marks["model"][_HEADER_KEY] = list(header.user_edited_fields)
-    tables = list(
-        (
-            await db.scalars(
-                select(SemanticTableRow)
-                .where(SemanticTableRow.model_id == header.id)
-                .execution_options(populate_existing=True)
-            )
-        ).all()
-    )
-    key_by_table_id = {row.id: row.table_key for row in tables}
-    for row in tables:
+    key_by_table_id = {row.id: row.table_key for row in rows.tables}
+    for row in rows.tables:
         if row.user_edited_fields:
             fields = list(row.user_edited_fields)
             marks["table"][row.table_key] = fields
             protected["table"][row.table_key] = {
                 f: getattr(row, f) for f in fields if f in _TABLE_FIELDS
             }
-    for chunk in _chunks(list(key_by_table_id)):
-        cols = await db.scalars(
-            select(SemanticColumnRow)
-            .where(SemanticColumnRow.table_id.in_(list(chunk)))
-            .execution_options(populate_existing=True)
-        )
+    for table_id, cols in rows.columns_by_table.items():
         for col in cols:
             if col.user_edited_fields:
-                key = f"{key_by_table_id[col.table_id]}.{col.column_name}"
+                key = f"{key_by_table_id[table_id]}.{col.column_name}"
                 fields = list(col.user_edited_fields)
                 marks["column"][key] = fields
                 protected["column"][key] = {
                     f: getattr(col, f) for f in fields if f in _COLUMN_FIELDS
                 }
-    metrics = await db.scalars(
-        select(SemanticMetricRow)
-        .where(SemanticMetricRow.model_id == header.id)
-        .execution_options(populate_existing=True)
-    )
-    for m in metrics:
+    for m in rows.metrics:
         if m.user_edited_fields:
             marks["metric"][m.name] = list(m.user_edited_fields)
-    items = await db.scalars(
-        select(SemanticGlobalItemRow)
-        .where(SemanticGlobalItemRow.model_id == header.id)
-        .execution_options(populate_existing=True)
-    )
-    for item in items:
+    for item in rows.global_items:
         if item.user_edited_fields:
             marks["global_item"][f"{item.kind}:{item.name}"] = list(item.user_edited_fields)
-    rels = await db.scalars(
-        select(SemanticRelationshipRow)
-        .where(SemanticRelationshipRow.model_id == header.id)
-        .execution_options(populate_existing=True)
-    )
-    for rel in rels:
+    for rel in rows.relationships:
         if rel.user_edited_fields:
             marks["relationship"][relationship_key(_relationship_row_to_dict(rel))] = list(
                 rel.user_edited_fields
             )
-    return ProvenanceSnapshot(marks=marks, protected=protected)
+    return snapshot
 
 
-async def provenance_map(db: AsyncSession, connection_id: str) -> ProvenanceMap:
-    """``provenance_snapshot(...).marks`` — for callers and tests that need only the marks."""
-    return (await provenance_snapshot(db, connection_id)).marks
+async def provenance_snapshot(db: AsyncSession, connection_id: str) -> ProvenanceSnapshot:
+    """Every row's marks and the stored values of the marked table and column
+    fields, read fresh (``populate_existing``) in one pass over the rows."""
+    rows = await _fetch_rows(db, connection_id)
+    return _empty_snapshot() if rows is None else _snapshot_from_rows(rows)
 
 
 def carry_edited_relationships(
@@ -1505,23 +1621,23 @@ def _insert_marks(values: Mapping[str, Any], defaults: Mapping[str, Any]) -> lis
 
 async def _update_table_fields(
     db: AsyncSession,
-    table_id: str,
-    expected_version: int,
+    row: SemanticTableRow,
     values: dict[str, Any],
     *,
     updated_by: str | None,
-    mark_user_edited: bool,
 ) -> bool:
-    """Apply ``values`` to one table row under an optimistic lock.
+    """Apply fitted ``values`` to ``row`` under an optimistic lock.
 
     Returns whether anything was written. Does not bump the header version: the
     caller (``apply_user_patch``) must, because ``load_model_cached`` is keyed on it.
 
-    ``values`` is fitted (``_fit_values``) before the diff, because the stored
-    row holds fitted values, and is compared with the stored row in its
-    canonical shape (``_canonical_table_row``). Only fields that then differ are
-    written — an echoed field bumps neither ``version`` nor
-    ``user_edited_fields`` nor the history log.
+    ``row`` is the instance the caller just read with ``populate_existing``, so no
+    second read is made here; ``values`` is already fitted
+    (``_fit_table_patches``), because the stored row holds fitted values and the
+    diff below is against the stored row in its canonical shape
+    (``_canonical_table_row``). Only fields that then differ are written — an
+    echoed field bumps neither ``version`` nor ``user_edited_fields`` nor the
+    history log.
 
     The write is ``UPDATE … WHERE id = :id AND version = :version`` issued as a
     Core statement so the predicate is part of the SQL: under READ COMMITTED two
@@ -1529,52 +1645,39 @@ async def _update_table_fields(
     predicate in the UPDATE tells them apart. A zero rowcount means a concurrent
     writer moved the row on, and raises ``SemanticStoreConflict``.
     """
-    values = _fit_values(SemanticTableRow, values)
-    row = await db.scalar(
-        select(SemanticTableRow)
-        .where(SemanticTableRow.id == table_id)
-        .execution_options(populate_existing=True)
-    )
-    if row is None:
-        raise SemanticStoreConflict(f"semantic_tables row {table_id!r} changed under this edit")
-
     old_value = {field: getattr(row, field) for field in _TABLE_FIELDS}
     canonical = _canonical_table_row(row)
     diff = {field: value for field, value in values.items() if canonical.get(field) != value}
     if not diff:
         return False
 
-    connection_id = row.connection_id
-    table_key = row.table_key
-    _note_write(db, connection_id)
-    update_values: dict[str, Any] = {
-        **diff,
-        "version": expected_version + 1,
-        "updated_at": _now(),
-        "updated_by": updated_by,
-    }
-    if mark_user_edited:
-        update_values["user_edited_fields"] = sorted(set(row.user_edited_fields) | set(diff))
-
+    _note_write(db, row.connection_id)
+    expected_version = row.version
     result = await db.execute(
         update(SemanticTableRow)
-        .where(SemanticTableRow.id == table_id, SemanticTableRow.version == expected_version)
-        .values(**update_values)
+        .where(SemanticTableRow.id == row.id, SemanticTableRow.version == expected_version)
+        .values(
+            **diff,
+            version=expected_version + 1,
+            updated_at=_now(),
+            updated_by=updated_by,
+            user_edited_fields=sorted(set(row.user_edited_fields) | set(diff)),
+        )
     )
     if result.rowcount == 0:  # type: ignore[attr-defined]
-        raise SemanticStoreConflict(f"semantic_tables row {table_id!r} changed under this edit")
+        raise SemanticStoreConflict(f"semantic_tables row {row.id!r} changed under this edit")
     # The session's default ``synchronize_session`` already updates the
     # identity-mapped ``row`` in memory; do not ``expire`` it (a sync read of
     # ``row.version`` straight after would raise MissingGreenlet).
 
     _write_history(
         db,
-        connection_id=connection_id,
+        connection_id=row.connection_id,
         entity_type="table",
-        entity_id=table_id,
-        entity_key=table_key,
+        entity_id=row.id,
+        entity_key=row.table_key,
         action="update",
-        source="user" if mark_user_edited else "generation",
+        source="user",
         old_value=old_value,
         new_value={**old_value, **diff},
         changed_by=updated_by,
@@ -1667,6 +1770,44 @@ def _fit_table_patches(patch: SemanticModelUpdate) -> _FittedTables:
     return out
 
 
+async def _rows_needing_display_name(
+    db: AsyncSession, header: SemanticModelRow | None, fitted_tables: _FittedTables
+) -> list[str]:
+    """Keys of patched tables and columns that would be inserted without a ``display_name``.
+
+    ``display_name`` is required on ``TableSemantic`` and ``ColumnSemantic``, so a
+    patch naming a table or column the model lacks must supply it — the rule the
+    whole-model validation applied before the store. With no ``header`` the model
+    has nothing, so every patched table and column is an insert. Otherwise one
+    statement per chunk of patched keys. Runs before any row is written, so the
+    ``ValueError`` it feeds leaves the session untouched.
+    """
+    existing_tables: set[str] = set()
+    existing_columns: set[tuple[str, str]] = set()
+    if header is not None:
+        for chunk in _chunks(list(fitted_tables)):
+            rows = await db.execute(
+                select(SemanticTableRow.table_key, SemanticColumnRow.column_name)
+                .outerjoin(SemanticColumnRow, SemanticColumnRow.table_id == SemanticTableRow.id)
+                .where(
+                    SemanticTableRow.model_id == header.id,
+                    SemanticTableRow.table_key.in_(list(chunk)),
+                )
+            )
+            for key, column_name in rows.all():
+                existing_tables.add(key)
+                if column_name is not None:
+                    existing_columns.add((key, column_name))
+    missing: list[str] = []
+    for key, (values, columns) in fitted_tables.items():
+        if key not in existing_tables and "display_name" not in values:
+            missing.append(key)
+        for column_name, col_values in (columns or {}).items():
+            if (key, column_name) not in existing_columns and "display_name" not in col_values:
+                missing.append(f"{key}.{column_name}")
+    return missing
+
+
 async def apply_user_patch(
     db: AsyncSession,
     connection_id: str,
@@ -1702,7 +1843,9 @@ async def apply_user_patch(
     keyed on it); an echo bumps nothing.
 
     Raises ``ValueError`` (before touching the session) for an over-long table
-    key, column name, metric name, global-item name or relationship endpoint.
+    key, column name, metric name, global-item name or relationship endpoint, and
+    for a table or column the model does not have unless the patch supplies its
+    ``display_name``.
     """
     # Fit everything first: a ValueError must leave the session untouched.
     fitted_tables = _fit_table_patches(patch)
@@ -1752,12 +1895,20 @@ async def apply_user_patch(
         {f: section_dump[f] for f in ("notes", "is_user_reviewed") if f in section_dump},
     )
 
-    _note_write(db, connection_id)
     header = await db.scalar(
         select(SemanticModelRow)
         .where(SemanticModelRow.connection_id == connection_id)
         .execution_options(populate_existing=True)
     )
+    # Before anything is written, including the header a first edit creates.
+    missing = await _rows_needing_display_name(db, header, fitted_tables)
+    if missing:
+        raise ValueError(
+            "A table or column the model does not have needs a display_name: "
+            + ", ".join(sorted(missing))
+        )
+
+    _note_write(db, connection_id)
     if header is None:
         await save_model(db, connection_id, SemanticModel(), updated_by=updated_by)
         header = await db.scalar(
@@ -2001,9 +2152,7 @@ async def _apply_table_patch(
             changed_by=updated_by,
         )
     elif values:
-        changed = await _update_table_fields(
-            db, row.id, row.version, values, updated_by=updated_by, mark_user_edited=True
-        )
+        changed = await _update_table_fields(db, row, values, updated_by=updated_by)
 
     for column_name, column_values in (columns or {}).items():
         if await _apply_column_patch(db, row, column_name, column_values, updated_by=updated_by):

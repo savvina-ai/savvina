@@ -220,9 +220,12 @@ secrets:
   hf_token:
     environment: HF_TOKEN
   # Optional CA bundle (PEM) for builds behind a TLS-inspecting proxy. Set
-  # CA_BUNDLE to its path; /dev/null (an empty file) leaves the default trust store.
+  # CA_BUNDLE to its path. The default is an empty file shipped in the repository
+  # (download_model.sh skips an empty bundle and keeps the image's trust store);
+  # a device path such as /dev/null does not exist on a Windows Docker Desktop host.
+  # The default file is deliberately extensionless because *.pem is git-ignored.
   ca_bundle:
-    file: ${CA_BUNDLE:-/dev/null}
+    file: ${CA_BUNDLE:-./docker/empty-ca-bundle}
 
 volumes:
   ollama_models:

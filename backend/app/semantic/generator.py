@@ -6,14 +6,14 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 import hashlib
 import json
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from ..datasources.models import ColumnInfo, DataSourceSchema, PrivacySettings
+from ..datasources.models import ColumnInfo, DataSourceSchema, PrivacySettings, table_key
 from .models import (
     GENERATION_BATCH_SIZE,
     AggregationType,
@@ -255,9 +255,9 @@ def policy_hides_table(key: str, privacy: PrivacySettings | None, *, bare_ok: bo
 
     ``_apply_privacy_to_schema`` removes excluded schemas, tables and
     ``excluded_columns`` from the schema the generation routes see, so an absent
-    table can be hidden rather than gone. A stored key is ``f"{schema_name}.{name}"``
-    and either part may itself contain a dot, so every split is tried rather than
-    one guessed.
+    table can be hidden rather than gone. A stored key is ``table_key(...)``
+    (``datasources.models.table_key``) and either part may itself contain a dot, so
+    every split is tried rather than one guessed.
 
     ``bare_ok=True`` is for a metric's ``related_tables`` entry, which
     ``detect_drift`` accepts unqualified: such a name is hidden when
@@ -266,6 +266,10 @@ def policy_hides_table(key: str, privacy: PrivacySettings | None, *, bare_ok: bo
     dot can make that match over-broad, which only suppresses a warning). Without
     ``bare_ok`` a bare key is never treated as hidden, so pruning still drops
     such anomalies.
+
+    A bare name carries no schema, so ``excluded_schemas`` cannot be applied to it
+    here; ``detect_drift`` resolves that case through the stored model's qualified
+    keys.
     """
     if privacy is None:
         return False
@@ -276,16 +280,12 @@ def policy_hides_table(key: str, privacy: PrivacySettings | None, *, bare_ok: bo
     )
 
 
-def policy_hides_column(table_key: str, column: str, privacy: PrivacySettings | None) -> bool:
-    """Whether ``privacy`` explains why ``column`` is absent from ``table_key``.
+def policy_hides_column(key: str, column: str, privacy: PrivacySettings | None) -> bool:
+    """Whether ``privacy`` explains why ``column`` is absent from table ``key``.
 
-    Exact ``schema.table.column`` membership in ``excluded_columns``, which is what
-    the adapters skip at introspection and ``_apply_privacy_to_schema`` strips
-    from the schema. Deliberately not
-    ``PrivacySettings.is_column_excluded``: that also matches the sensitive-name
-    patterns, and the adapters still introspect those columns.
+    Delegates to ``PrivacySettings.hides_column``.
     """
-    return privacy is not None and f"{table_key}.{column}" in privacy.excluded_columns
+    return privacy is not None and privacy.hides_column(key, column)
 
 
 def _warn_near_miss(kind: str, name: str, target: str | None, where: str) -> None:
@@ -390,7 +390,7 @@ def prune_to_schema(
     Membership is by schema, not by generation-run stamp, so finishing a partial
     run keeps every real table it annotated.
     """
-    real_columns = {f"{t.schema_name}.{t.name}": [c.name for c in t.columns] for t in schema.tables}
+    real_columns = {table_key(t): [c.name for c in t.columns] for t in schema.tables}
     real_keys = list(real_columns)
     out: dict[str, TableSemantic] = {}
     for key, table in tables.items():
@@ -415,7 +415,7 @@ def edges_in_schema(
     to a real but unannotated table must survive "Finish with what's generated".
     An endpoint ``privacy`` hides (its table, or its column) counts as live.
     """
-    live = {f"{t.schema_name}.{t.name}": {c.name for c in t.columns} for t in schema.tables}
+    live = {table_key(t): {c.name for c in t.columns} for t in schema.tables}
 
     def alive(table: str, column: str) -> bool:
         if table in live:
@@ -425,6 +425,111 @@ def edges_in_schema(
     return [
         e for e in edges if alive(e.from_table, e.from_column) and alive(e.to_table, e.to_column)
     ]
+
+
+_TABLE_REFERENCE_FIELDS = (
+    "primary_timestamp_column",
+    "primary_date_column",
+    "partition_columns",
+    "cluster_columns",
+    "hierarchies",
+)
+
+
+def _unique(names: Iterable[str]) -> list[str]:
+    """``names`` without repeats, in first-seen order."""
+    return list(dict.fromkeys(names))
+
+
+def drop_dangling_edits(
+    marks: dict[str, dict[str, list[str]]],
+    protected: dict[str, dict[str, dict[str, Any]]],
+    schema: DataSourceSchema,
+    privacy: PrivacySettings | None = None,
+) -> tuple[dict[str, dict[str, list[str]]], dict[str, dict[str, dict[str, Any]]], list[str]]:
+    """``marks`` and ``protected`` with each table edit's references to gone columns dropped.
+
+    A full save writes every protected value back over the rebuilt row — after
+    ``prune_to_schema`` cleared the same references in the incoming model. A
+    hand-set ``primary_timestamp_column`` on a column that left the database
+    would therefore come back as a dangling reference, and its mark would stop
+    every later regenerate from choosing another.
+
+    The rule is ``_prune_table``'s, applied to the protected values:
+
+    - ``primary_timestamp_column`` / ``primary_date_column`` naming a gone column
+      is voided: the field leaves the table's marks and its protected values, so
+      the pruned generated value wins.
+    - ``partition_columns`` / ``cluster_columns`` lose only their gone entries.
+      If any entry remains the mark stays and the filtered list is protected;
+      if none does, the field is voided.
+    - ``hierarchies``: each hierarchy keeps only its live levels, and one left
+      with no levels is dropped. If any hierarchy remains the mark stays with
+      the filtered list; if none does, the field is voided. A field is only
+      rewritten when one of its names is gone.
+
+    A column the policy hides is not gone (``policy_hides_column``, the rule
+    ``prune_to_schema`` applies), and a table absent from ``schema`` is left
+    alone: whether its row survives is ``prune_to_schema``'s decision. A table
+    left with no marks or no protected values loses that entry.
+
+    Also returns one human-readable note per table field changed. Pure: the
+    returned dicts and mark lists are new and every rewritten value is a new list
+    (of new hierarchy dicts); an unchanged protected value is the input's object.
+    """
+    real_columns = {table_key(t): {c.name for c in t.columns} for t in schema.tables}
+    out_marks = {kind: {k: list(v) for k, v in entries.items()} for kind, entries in marks.items()}
+    out_protected = {
+        kind: {k: dict(v) for k, v in entries.items()} for kind, entries in protected.items()
+    }
+    out_marks.setdefault("table", {})
+    notes: list[str] = []
+    for key, values in protected.get("table", {}).items():
+        live = real_columns.get(key)
+        if live is None:
+            continue
+
+        def kept(name: str, _key: str = key, _live: set[str] = live) -> bool:
+            return name in _live or policy_hides_column(_key, name, privacy)
+
+        for field in _TABLE_REFERENCE_FIELDS:
+            value = values.get(field)
+            if not value:
+                continue
+            remaining: list[Any]
+            if field == "hierarchies":
+                dropped = _unique(
+                    level for h in value for level in h.get("levels") or [] if not kept(level)
+                )
+                filtered = (
+                    {**h, "levels": [level for level in h.get("levels") or [] if kept(level)]}
+                    for h in value
+                )
+                remaining = [h for h in filtered if h["levels"]]
+            elif isinstance(value, list):
+                dropped = _unique(c for c in value if not kept(c))
+                remaining = [c for c in value if kept(c)]
+            else:
+                dropped = [] if kept(value) else [value]
+                remaining = []
+            if not dropped:
+                continue
+            names = ", ".join(dropped)
+            if remaining:
+                out_protected["table"][key][field] = remaining
+                note = f"{key}.{field}: dropped {names} (no longer in the table)"
+            else:
+                out_protected["table"][key].pop(field, None)
+                out_marks["table"][key] = [f for f in out_marks["table"].get(key, []) if f != field]
+                verb = "is" if len(dropped) == 1 else "are"
+                note = f"{key}.{field}: hand edit cleared — {names} {verb} no longer in the table"
+            logger.warning("Dangling hand edit: %s", note)
+            notes.append(note)
+        if not out_protected["table"][key]:
+            del out_protected["table"][key]
+        if key in out_marks["table"] and not out_marks["table"][key]:
+            del out_marks["table"][key]
+    return out_marks, out_protected, notes
 
 
 class SemanticModelGenerator:
@@ -515,29 +620,29 @@ class SemanticModelGenerator:
 
         # Auto-detect temporal columns per table (name/type matching — no DB calls)
         for table in schema.tables:
-            table_key = f"{table.schema_name}.{table.name}"
-            if table_key in parsed.tables:
-                temporal = self._infer_temporal_columns(table_key, table.columns)
+            tbl_key = table_key(table)
+            if tbl_key in parsed.tables:
+                temporal = self._infer_temporal_columns(tbl_key, table.columns)
                 if temporal["primary_timestamp_column"]:
-                    parsed.tables[table_key].primary_timestamp_column = temporal[
+                    parsed.tables[tbl_key].primary_timestamp_column = temporal[
                         "primary_timestamp_column"
                     ]
                 if temporal["primary_date_column"]:
-                    parsed.tables[table_key].primary_date_column = temporal["primary_date_column"]
+                    parsed.tables[tbl_key].primary_date_column = temporal["primary_date_column"]
 
         # Backfill fingerprint-derived cardinality onto ColumnSemantic objects.
         # column_stats keys are "table_name.col_name" (no schema prefix).
         if column_stats:
             for table in schema.tables:
-                table_key = f"{table.schema_name}.{table.name}"
-                if table_key not in parsed.tables:
+                tbl_key = table_key(table)
+                if tbl_key not in parsed.tables:
                     continue
                 for col in table.columns:
                     stat_key = f"{table.name}.{col.name}"
                     if stat_key not in column_stats:
                         continue
-                    if col.name in parsed.tables[table_key].columns:
-                        parsed.tables[table_key].columns[col.name].cardinality = column_stats[
+                    if col.name in parsed.tables[tbl_key].columns:
+                        parsed.tables[tbl_key].columns[col.name].cardinality = column_stats[
                             stat_key
                         ]["cardinality"]
 
@@ -737,31 +842,6 @@ class SemanticModelGenerator:
 
     # ── Phase methods (called independently by phased generation endpoints) ────
 
-    def prepare_generation(
-        self,
-        schema: DataSourceSchema,
-    ) -> dict:
-        """
-        Compute everything needed to orchestrate phased generation — no LLM, no adapter.
-
-        Returns a plain dict suitable for JSON serialisation:
-        {
-            "tables_total": int,
-            "batch_count": int,
-            "batch_size": int,
-            "relationship_edges": list[RelationshipEdge],  # kept as dataclasses
-        }
-        """
-        relationship_edges = self._build_relationship_graph(schema)
-        tables_total = len(schema.tables)
-        batch_count = max(1, -(-tables_total // GENERATION_BATCH_SIZE))  # ceil division
-        return {
-            "tables_total": tables_total,
-            "batch_count": batch_count,
-            "batch_size": GENERATION_BATCH_SIZE,
-            "relationship_edges": relationship_edges,
-        }
-
     async def generate_tables(
         self,
         schema: DataSourceSchema,
@@ -780,7 +860,7 @@ class SemanticModelGenerator:
         can map it to HTTP.
         """
         wanted = set(table_keys)
-        batch = [t for t in schema.tables if f"{t.schema_name}.{t.name}" in wanted]
+        batch = [t for t in schema.tables if table_key(t) in wanted]
         if not batch:
             return {}
 
@@ -794,7 +874,7 @@ class SemanticModelGenerator:
         batch_ddl = self._schema_to_ddl(batch_schema_obj)
 
         # Filter FK edges to only those relevant to this batch
-        batch_table_keys = {f"{t.schema_name}.{t.name}" for t in batch}
+        batch_table_keys = {table_key(t) for t in batch}
         batch_edges = [
             e
             for e in relationship_edges
@@ -884,9 +964,7 @@ class SemanticModelGenerator:
 
         Returns ``(dropped_tables, dropped_columns)``.
         """
-        real_cols_by_key = {
-            f"{t.schema_name}.{t.name}": [c.name for c in t.columns] for t in schema.tables
-        }
+        real_cols_by_key = {table_key(t): [c.name for c in t.columns] for t in schema.tables}
         real_keys = list(real_cols_by_key)
         dropped_tables = 0
         dropped_columns = 0
@@ -950,6 +1028,8 @@ class SemanticModelGenerator:
         Derived columns also get the auto-detected ratio-pair supplement from
         ``_detect_ratio_pairs``. ``generation_warnings`` contains any metric
         time-column validation issues detected post-generation.
+
+        Raises ``ValueError`` on LLM failure so the router can map it to HTTP.
         """
         tables_summary = self._build_tables_summary(schema, all_tables=all_tables)
 
@@ -970,10 +1050,6 @@ class SemanticModelGenerator:
             relationships_summary=relationships_summary or "(none detected)",
         )
 
-        metrics: list[BusinessMetric] = []
-        joins: list[CommonJoin] = []
-        derived_columns: list[DerivedColumn] = []
-        segments: list[Segment] = []
         try:
             global_result = await provider.generate_structured(
                 system_prompt=sys_prompt,
@@ -983,15 +1059,15 @@ class SemanticModelGenerator:
                 temperature=0.0,
                 max_tokens=min(65536, provider.max_output_tokens),
             )
-            metrics = global_result.business_metrics
-            joins = global_result.common_joins
-            derived_columns = global_result.derived_columns
-            segments = global_result.segments
+            metrics: list[BusinessMetric] = global_result.business_metrics
+            joins: list[CommonJoin] = global_result.common_joins
+            derived_columns: list[DerivedColumn] = global_result.derived_columns
+            segments: list[Segment] = global_result.segments
         except Exception as exc:
-            logger.warning(
-                "SemanticModelGenerator.generate_globals: call failed: %s — returning empty",
-                exc,
-            )
+            # Same contract as generate_tables: the route maps a throttle to 429 (so the
+            # page retries) and anything else to 422, and the run stays ``tables_partial``
+            # with Finish available — rather than completing with no metrics and no word.
+            raise ValueError(f"LLM call failed in generate_globals: {exc}") from exc
 
         # Supplement with auto-detected ratio pairs
         auto_pairs = self._detect_ratio_pairs(schema)
@@ -1024,8 +1100,7 @@ class SemanticModelGenerator:
         No additional database queries. Zero overhead.
         """
         nullable_map: dict[str, dict[str, bool]] = {
-            f"{t.schema_name}.{t.name}": {c.name: c.nullable for c in t.columns}
-            for t in schema.tables
+            table_key(t): {c.name: c.nullable for c in t.columns} for t in schema.tables
         }
         edges: list[RelationshipEdge] = []
         for rel in schema.relationships:
@@ -1241,7 +1316,7 @@ class SemanticModelGenerator:
     # OVERHEAD: app-only — pure name/type pattern matching
     def _infer_temporal_columns(
         self,
-        table_key: str,
+        tbl_key: str,
         columns: list[ColumnInfo],
     ) -> dict:
         """
@@ -1342,7 +1417,7 @@ class SemanticModelGenerator:
                 or n.startswith(_FISCAL_DIMENSION_PREFIXES)
             )
             if fiscal_col_count >= 2:
-                keys.add(f"{tbl.schema_name}.{tbl.name}")
+                keys.add(table_key(tbl))
         return keys
 
     def _enrich_fiscal_table_annotations(
@@ -1359,8 +1434,8 @@ class SemanticModelGenerator:
         """
         fiscal_keys = self._fiscal_table_keys(schema)
         for tbl in schema.tables:
-            table_key = f"{tbl.schema_name}.{tbl.name}"
-            if table_key not in fiscal_keys or table_key not in tables:
+            tbl_key = table_key(tbl)
+            if tbl_key not in fiscal_keys or tbl_key not in tables:
                 continue
             fiscal_cols = [
                 c.name
@@ -1368,7 +1443,7 @@ class SemanticModelGenerator:
                 if c.name.lower().endswith(_FISCAL_DIMENSION_SUFFIXES)
                 or c.name.lower().startswith(_FISCAL_DIMENSION_PREFIXES)
             ]
-            sem_table = tables[table_key]
+            sem_table = tables[tbl_key]
             for col_name, col_sem in sem_table.columns.items():
                 if col_name.lower() not in _AUDIT_TIMESTAMP_NAMES:
                     continue
@@ -1433,9 +1508,7 @@ class SemanticModelGenerator:
             return []
 
         # FK targets per table: table_key → set of target table_keys
-        fk_targets: dict[str, set[str]] = {
-            f"{t.schema_name}.{t.name}": set() for t in schema.tables
-        }
+        fk_targets: dict[str, set[str]] = {table_key(t): set() for t in schema.tables}
         for rel in schema.relationships:
             from_key = f"{rel.from_schema}.{rel.from_table}"
             to_key = f"{rel.to_schema}.{rel.to_table}"
@@ -1444,14 +1517,14 @@ class SemanticModelGenerator:
 
         # DATE columns per table (excludes TIMESTAMP — those are not period axes)
         date_col_map: dict[str, list[str]] = {
-            f"{t.schema_name}.{t.name}": [c.name for c in t.columns if c.data_type == "date"]
+            table_key(t): [c.name for c in t.columns if c.data_type == "date"]
             for t in schema.tables
         }
 
         notes: list[str] = []
         for tbl in schema.tables:
-            table_key = f"{tbl.schema_name}.{tbl.name}"
-            if table_key not in fiscal_keys:
+            tbl_key = table_key(tbl)
+            if tbl_key not in fiscal_keys:
                 continue
 
             fiscal_dims = [
@@ -1464,10 +1537,10 @@ class SemanticModelGenerator:
 
             # Find companion tables: share ≥1 FK target with this fiscal table
             # AND have at least one DATE column AND are not themselves fiscal tables
-            my_targets = fk_targets.get(table_key, set())
+            my_targets = fk_targets.get(tbl_key, set())
             companions: list[str] = []
             for other_key, other_date_cols in date_col_map.items():
-                if other_key == table_key or other_key in fiscal_keys:
+                if other_key == tbl_key or other_key in fiscal_keys:
                     continue
                 if not other_date_cols:
                     continue
@@ -1475,7 +1548,7 @@ class SemanticModelGenerator:
                     companions.append(f"{other_key} ({', '.join(other_date_cols[:2])})")
 
             note = (
-                f"{table_key} is a period table — filter by "
+                f"{tbl_key} is a period table — filter by "
                 f"{', '.join(fiscal_dims)}, not by timestamp columns"
             )
             if audit_cols:
@@ -1504,10 +1577,10 @@ class SemanticModelGenerator:
         _id_types = (SemanticType.IDENTIFIER, SemanticType.FOREIGN_KEY)
 
         for tbl in schema.tables:
-            table_key = f"{tbl.schema_name}.{tbl.name}"
-            if table_key not in tables:
+            tbl_key = table_key(tbl)
+            if tbl_key not in tables:
                 continue
-            sem = tables[table_key]
+            sem = tables[tbl_key]
 
             # Partition columns — sourced from adapter introspect() where supported.
             partition_cols = [c.name for c in tbl.columns if c.is_partition_key]
@@ -1540,7 +1613,7 @@ class SemanticModelGenerator:
         """Scan tables for (numerator, denominator) column pairs and return DerivedColumn hints."""
         results: list[DerivedColumn] = []
         for table in schema.tables:
-            table_key = f"{table.schema_name}.{table.name}"
+            tbl_key = table_key(table)
             col_names = [c.name for c in table.columns]
             num_cols = [
                 n for n in col_names if any(kw in n.lower() for kw in _RATIO_NUMERATOR_KEYWORDS)
@@ -1556,10 +1629,10 @@ class SemanticModelGenerator:
                         DerivedColumn(
                             name=f"{table.name} {num_col} utilization",
                             sql_expression=(
-                                f"ROUND({table_key}.{num_col}"
-                                f" / NULLIF({table_key}.{den_col}, 0) * 100, 2)"
+                                f"ROUND({tbl_key}.{num_col}"
+                                f" / NULLIF({tbl_key}.{den_col}, 0) * 100, 2)"
                             ),
-                            base_tables=[table_key],
+                            base_tables=[tbl_key],
                             description=f"Percentage of {den_col} consumed by {num_col}",
                             format_hint="percentage",
                         )
@@ -1600,30 +1673,37 @@ class SemanticModelGenerator:
             """Strip SQL quoting characters that LLMs may emit around identifiers."""
             return name.replace("`", "").replace('"', "").replace("'", "")
 
-        current_tables = {f"{t.schema_name}.{t.name}" for t in current_schema.tables}
+        current_tables = {table_key(t) for t in current_schema.tables}
         # Bare names (without schema prefix) for metrics generated by LLMs that omit schema
         current_tables_bare = {t.name for t in current_schema.tables}
+        # A bare metric table under an excluded schema: the policy cannot be asked
+        # about a bare name, but the stored model holds the qualified key it came from.
+        stored_hidden_bare = {
+            key.rpartition(".")[2]
+            for key in stored_model.tables
+            if key not in current_tables and policy_hides_table(key, privacy)
+        }
         current_columns: dict[str, set[str]] = {}
         for t in current_schema.tables:
-            key = f"{t.schema_name}.{t.name}"
+            key = table_key(t)
             current_columns[key] = {c.name for c in t.columns}
 
-        for table_key in stored_model.tables:
-            if table_key not in current_tables:
-                if policy_hides_table(table_key, privacy):
+        for tbl_key in stored_model.tables:
+            if tbl_key not in current_tables:
+                if policy_hides_table(tbl_key, privacy):
                     continue
                 warnings.append(
-                    f'Table "{table_key}" referenced in semantic model '
+                    f'Table "{tbl_key}" referenced in semantic model '
                     f"no longer exists in the database"
                 )
             else:
-                stored_cols = {_norm(c) for c in stored_model.tables[table_key].columns}
-                live_cols = current_columns.get(table_key, set())
+                stored_cols = {_norm(c) for c in stored_model.tables[tbl_key].columns}
+                live_cols = current_columns.get(tbl_key, set())
                 for col in stored_cols - live_cols:
-                    if policy_hides_column(table_key, col, privacy):
+                    if policy_hides_column(tbl_key, col, privacy):
                         continue
                     warnings.append(
-                        f'Column "{table_key}.{col}" referenced in semantic model no longer exists'
+                        f'Column "{tbl_key}.{col}" referenced in semantic model no longer exists'
                     )
 
         semantic_tables = set(stored_model.tables.keys())
@@ -1641,6 +1721,7 @@ class SemanticModelGenerator:
                 if (
                     norm_t not in current_tables
                     and norm_t not in current_tables_bare
+                    and norm_t not in stored_hidden_bare
                     and not policy_hides_table(norm_t, privacy, bare_ok=True)
                 ):
                     warnings.append(
@@ -1658,9 +1739,9 @@ class SemanticModelGenerator:
         Used for cheap drift detection without re-querying the database.
         """
         structure = []
-        for table in sorted(schema.tables, key=lambda t: f"{t.schema_name}.{t.name}"):
+        for table in sorted(schema.tables, key=table_key):
             table_entry = {
-                "key": f"{table.schema_name}.{table.name}",
+                "key": table_key(table),
                 "type": table.table_type,
                 "columns": [
                     {"name": c.name, "type": c.data_type, "pk": c.is_primary_key}
@@ -1728,11 +1809,11 @@ class SemanticModelGenerator:
         """
         lines: list[str] = []
         for tbl in schema.tables:
-            table_key = f"{tbl.schema_name}.{tbl.name}"
+            tbl_key = table_key(tbl)
             col_parts = [f"{c.name}:{c.data_type}" for c in tbl.columns[:max_cols]]
-            line = f"  {table_key} ({', '.join(col_parts)})"
-            if all_tables and table_key in all_tables:
-                sem = all_tables[table_key]
+            line = f"  {tbl_key} ({', '.join(col_parts)})"
+            if all_tables and tbl_key in all_tables:
+                sem = all_tables[tbl_key]
                 hints: list[str] = []
                 if sem.primary_date_column:
                     hints.append(f"primary_date={sem.primary_date_column}")
@@ -1758,7 +1839,7 @@ class SemanticModelGenerator:
         """
         table_blocks: list[str] = []
         for table in schema.tables:
-            fq = f"{table.schema_name}.{table.name}"
+            fq = table_key(table)
             block_lines: list[str] = [f"-- Table: {fq}"]
             if table.description:
                 block_lines.append(f"-- {table.description}")

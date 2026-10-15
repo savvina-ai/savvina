@@ -14,15 +14,21 @@ asserting the lock is taken).
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import event, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import select
 
 from app.database import get_db
-from app.datasources.models import ColumnInfo, DataSourceSchema, SchemaInfo, TableInfo
+from app.datasources.models import (
+    ColumnInfo,
+    DataSourceSchema,
+    RelationshipInfo,
+    SchemaInfo,
+    TableInfo,
+)
 from app.main import app
 from app.models.cache import QueryCacheEntry
 from app.models.connection import Connection
@@ -35,6 +41,7 @@ from app.models.semantic_store import (
     SemanticRelationshipRow,
     SemanticTableRow,
 )
+from app.models.semantic_suggestion import SemanticSuggestion
 from app.models.table_embedding_cache import TableEmbeddingCache
 from app.models.user import User
 from app.models.user_schema_cache import UserSchemaCache
@@ -47,6 +54,10 @@ from app.semantic.models import (
     SimpleMetric,
     TableSemantic,
 )
+from tests.test_semantic.conftest import semantic_db, semantic_tables  # noqa: F401
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 _CID = "22222222-2222-2222-2222-222222222222"
 _BASE = f"/api/v1/connections/{_CID}/semantic"
@@ -60,6 +71,7 @@ _TABLES = (
     SemanticRelationshipRow,
     SemanticGlobalItemRow,
     SemanticHistoryRow,
+    SemanticSuggestion,
     # Emptied by _invalidate_connection_caches on every finalising write.
     QueryCacheEntry,
     UserSchemaCache,
@@ -67,7 +79,9 @@ _TABLES = (
 )
 
 
-def _schema(tables: dict[str, list[str]]) -> DataSourceSchema:
+def _schema(
+    tables: dict[str, list[str]], fks: list[RelationshipInfo] | None = None
+) -> DataSourceSchema:
     return DataSourceSchema(
         source_type="postgresql",
         schemas=[SchemaInfo(name="public")],
@@ -83,35 +97,27 @@ def _schema(tables: dict[str, list[str]]) -> DataSourceSchema:
             )
             for name, columns in tables.items()
         ],
+        relationships=fks or [],
     )
 
 
+@pytest.fixture
+def semantic_tables() -> tuple[type, ...]:  # noqa: F811 - overrides the shared default
+    return _TABLES
+
+
 @pytest_asyncio.fixture
-async def db() -> AsyncIterator[AsyncSession]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+async def db(semantic_db: AsyncSession) -> AsyncIterator[AsyncSession]:  # noqa: F811
+    semantic_db.add(
+        Connection(id=_CID, name="flow", source_type="postgresql", config_encrypted=b"")
+    )
+    await semantic_db.commit()
 
-    @event.listens_for(engine.sync_engine, "connect")
-    def _fk_on(dbapi_conn, _record) -> None:
-        cursor = dbapi_conn.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+    async def _get_db() -> AsyncIterator[AsyncSession]:
+        yield semantic_db
 
-    async with engine.begin() as conn:
-        for model in _TABLES:
-            await conn.run_sync(model.__table__.create)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
-    async with maker() as session:
-        session.add(
-            Connection(id=_CID, name="flow", source_type="postgresql", config_encrypted=b"")
-        )
-        await session.commit()
-
-        async def _get_db() -> AsyncIterator[AsyncSession]:
-            yield session
-
-        app.dependency_overrides[get_db] = _get_db
-        yield session
-    await engine.dispose()
+    app.dependency_overrides[get_db] = _get_db
+    yield semantic_db
 
 
 class _Llm:
@@ -121,6 +127,7 @@ class _Llm:
         self.description = "generated"
         self.batches: list[list[str]] = []
         self.during_batch = None  # optional async hook, run inside the "LLM call"
+        self.during_globals = None  # likewise, inside the globals "LLM call"
         self.globals_tables: dict[str, TableSemantic] = {}
 
     async def generate_tables(self, *, schema, table_keys, **_kw) -> dict[str, TableSemantic]:
@@ -140,6 +147,8 @@ class _Llm:
 
     async def generate_globals(self, **kw):
         self.globals_tables = kw["all_tables"]
+        if self.during_globals is not None:
+            await self.during_globals()
         metric = SimpleMetric(
             name="Row count", definition="COUNT(*)", aggregation=AggregationType.COUNT
         )
@@ -158,8 +167,8 @@ def flow(db):
     async def load_schema(connection_id, _user, session):
         return current["schema"], await session.get(Connection, connection_id)
 
-    def set_schema(tables: dict[str, list[str]]) -> None:
-        current["schema"] = _schema(tables)
+    def set_schema(tables: dict[str, list[str]], fks: list[RelationshipInfo] | None = None) -> None:
+        current["schema"] = _schema(tables, fks)
 
     with (
         patch("app.routers.semantic._load_schema_for_connection", new=load_schema),
@@ -265,6 +274,128 @@ class TestGenerationFlow:
         assert body["generation_status"] == "complete"
         assert set(body["tables"]) == set(first)
 
+    async def test_a_table_the_llm_omits_stays_pending_and_is_reported(
+        self, http_client, db, flow
+    ) -> None:
+        llm, set_schema = flow
+        set_schema({"a": ["id"], "b": ["id"]})
+        original = llm.generate_tables
+
+        # Patched onto the class as a plain function, so it is bound: ``_self`` is the
+        # generator instance (the fixture's ``llm.generate_tables`` is a bound method
+        # and needs no such parameter).
+        async def omit_b(_self, *, schema, table_keys, **kw):
+            out = await original(schema=schema, table_keys=table_keys, **kw)
+            out.pop("public.b", None)
+            return out
+
+        with patch.object(SemanticModelGenerator, "generate_tables", new=omit_b):
+            plan = await _init(http_client)
+            resp = await http_client.post(
+                f"{_BASE}/generate/batch", json={"table_keys": plan["pending_table_keys"]}
+            )
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["omitted_table_keys"] == ["public.b"]
+            assert await store.pending_table_keys(db, _CID, ["public.a", "public.b"]) == [
+                "public.b"
+            ]
+            body = await _globals(http_client)
+        assert body["generation_status"] == "complete"
+        assert set(body["tables"]) == {"public.a"}
+        assert any("public.b" in w and "no annotation" in w for w in body["generation_warnings"])
+
+    async def test_the_globals_response_is_what_a_later_get_returns(
+        self, http_client, db, flow
+    ) -> None:
+        """/generate/globals answers with the model as stored, not the one it built:
+        a GET right after returns the same JSON, ordering included. The names are
+        deliberately not in sorted order, so a reorder by the store would show."""
+        llm, set_schema = flow
+        set_schema({"zeta": ["zz", "id", "amount"], "alpha": ["yy", "bb"], "mid": ["k"]})
+        await _generate(http_client)
+        resp = await http_client.put(
+            _BASE,
+            json={
+                "tables": {
+                    "public.zeta": {
+                        "description": "hand written",
+                        "columns": {"amount": {"description": "hand column"}},
+                    }
+                }
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        llm.description = "regenerated"
+        original = llm.generate_globals
+
+        # A NUL the store strips on write: answering with the built model instead of
+        # the stored one would show it.
+        async def nul_in_a_metric(_self, **kw):
+            metrics, *rest = await original(**kw)
+            metrics[0].description = "rows\x00 counted"
+            return (metrics, *rest)
+
+        with patch.object(SemanticModelGenerator, "generate_globals", new=nul_in_a_metric):
+            body = await _generate(http_client)
+        got = await http_client.get(_BASE)
+        assert got.status_code == 200, got.text
+        assert body == got.json()
+        assert body["business_metrics"][0]["description"] == "rows counted"
+        assert body["tables"]["public.zeta"]["description"] == "hand written"
+        assert body["tables"]["public.zeta"]["columns"]["amount"]["description"] == "hand column"
+        assert body["tables"]["public.alpha"]["description"] == "regenerated alpha"
+
+    async def test_an_unmarked_fk_edge_to_a_hidden_table_returns_once_unhidden(
+        self, http_client, db, flow
+    ) -> None:
+        """Documented rule (semantic-model-generation.md, Finalisation): while a table
+        is hidden, the generated FK edge to it is not regenerated and is not carried;
+        the hidden table's own row and hand edits are. Un-hiding brings the edge back
+        on the next globals run, from the FK it is built from. Nothing hand-written
+        is involved, so nothing is lost."""
+        _llm, set_schema = flow
+        fk = RelationshipInfo(
+            from_schema="public",
+            from_table="orders",
+            from_column="customer_id",
+            to_schema="public",
+            to_table="customers",
+            to_column="id",
+        )
+        both = {"orders": ["id", "customer_id"], "customers": ["id"]}
+
+        def edges_to_customers() -> list[str]:
+            return [r.from_column for r in stored.relationships if r.to_table == "public.customers"]
+
+        set_schema(both, fks=[fk])
+        await _generate(http_client)
+        resp = await http_client.put(
+            _BASE, json={"tables": {"public.customers": {"description": "hand table"}}}
+        )
+        assert resp.status_code == 200, resp.text
+        stored = await store.load_model(db, _CID)
+        assert edges_to_customers() == ["customer_id"]  # generated from the FK, unmarked
+
+        conn = await db.get(Connection, _CID)
+        conn.privacy_settings = {"excluded_tables": ["public.customers"]}
+        await db.commit()
+        # What the real loader returns under that policy: customers and its FK gone.
+        set_schema({"orders": ["id", "customer_id"]})
+        await _generate(http_client)
+        stored = await store.load_model(db, _CID)
+        assert stored.tables["public.customers"].description == "hand table"
+        assert edges_to_customers() == []
+
+        conn = await db.get(Connection, _CID)
+        conn.privacy_settings = {}
+        await db.commit()
+        set_schema(both, fks=[fk])
+        await _generate(http_client)
+        stored = await store.load_model(db, _CID)
+        assert stored.tables["public.customers"].description == "hand table"
+        assert edges_to_customers() == ["customer_id"]
+
     async def test_a_batch_from_a_restarted_run_is_409_and_stamps_nothing(
         self, http_client, db, flow
     ) -> None:
@@ -299,6 +430,86 @@ class TestGenerationFlow:
             "public.orders",
             "public.customers",
         ]
+
+    async def test_globals_from_a_restarted_run_is_409_and_the_new_run_finishes(
+        self, http_client, db, flow
+    ) -> None:
+        llm, _set_schema = flow
+        plan = await _init(http_client)
+        keys = plan["pending_table_keys"]
+        await _batches(http_client, keys, plan["batch_size"])
+        old_run = (await store.load_header(db, _CID)).generation_run_id
+
+        async def restart() -> None:
+            # A fresh /generate/init commits while globals awaits the LLM.
+            llm.during_globals = None
+            await store.begin_generation(
+                db,
+                _CID,
+                schema_hash=(await store.load_header(db, _CID)).schema_hash,
+                tables_total=plan["tables_total"],
+                tables_done=0,
+                batch_size=plan["batch_size"],
+                source_dialect="postgresql",
+            )
+            await db.commit()
+
+        llm.during_globals = restart
+        resp = await http_client.post(f"{_BASE}/generate/globals")
+
+        assert resp.status_code == 409
+        assert "restarted" in resp.json()["detail"]
+        header = await store.load_header(db, _CID)
+        assert header.generation_status == GenerationStatus.TABLES_PARTIAL
+        assert header.generation_run_id != old_run
+        # The new run is untouched: every key is still pending for it, and its
+        # batches and globals go through.
+        assert await store.pending_table_keys(db, _CID, keys) == keys
+        await _batches(http_client, keys, plan["batch_size"])
+        body = await _globals(http_client)
+        assert body["generation_status"] == "complete"
+        assert set(body["tables"]) == set(keys)
+
+    async def test_a_suggestion_applied_twice_is_409_and_writes_nothing(
+        self, http_client, db, flow
+    ) -> None:
+        await _generate(http_client)
+        db.add(
+            SemanticSuggestion(
+                id="sug-1",
+                connection_id=_CID,
+                table_key="public.orders",
+                field="total",
+                correction_type="update_description",
+                value={"target": "column", "description": "Order total"},
+            )
+        )
+        await db.commit()
+        url = f"{_BASE}/suggestions/sug-1/apply"
+
+        first = await http_client.post(url)
+        assert first.status_code == 200, first.text
+        assert first.json()["tables"]["public.orders"]["columns"]["total"]["description"] == (
+            "Order total"
+        )
+        # The user edits the description after applying the suggestion.
+        edited = await http_client.put(
+            _BASE,
+            json={"tables": {"public.orders": {"columns": {"total": {"description": "mine"}}}}},
+        )
+        assert edited.status_code == 200, edited.text
+        history_before = len((await db.scalars(select(SemanticHistoryRow))).all())
+        version_before = (await db.scalar(select(SemanticModelRow))).version
+
+        second = await http_client.post(url)
+
+        assert second.status_code == 409
+        assert second.json()["detail"] == "Suggestion already applied"
+        db.expunge_all()
+        assert len((await db.scalars(select(SemanticHistoryRow))).all()) == history_before
+        assert (await db.scalar(select(SemanticModelRow))).version == version_before
+        model = await store.load_model(db, _CID)
+        assert model.tables["public.orders"].columns["total"].description == "mine"
 
     async def test_what_the_privacy_policy_hides_survives_a_regenerate(
         self, http_client, db, flow
@@ -347,7 +558,7 @@ class TestGenerationFlow:
         assert [store.relationship_key(r) for r in stored.relationships] == [
             store.relationship_key(edge)
         ]
-        marks = await store.provenance_map(db, _CID)
+        marks = (await store.provenance_snapshot(db, _CID)).marks
         assert "description" in marks["table"]["public.customers"]
         assert "description" in marks["column"]["public.orders.ssn"]
         assert store.relationship_key(edge) in marks["relationship"]

@@ -363,7 +363,7 @@ Changing the config clears that connection's cached schema and its query cache, 
 
 ### `GET /api/v1/connections/{id}/semantic`
 
-Get the saved semantic model for a connection, assembled from the semantic store tables. Tables and columns are returned in alphabetical key order.
+Get the saved semantic model for a connection, assembled from the semantic store tables. Tables and columns are returned in code-point order of their keys (Python string order, the same on every database), not the order the generator produced them in.
 
 **Response `200`:** `SemanticModel`
 **Response `404`:** No semantic model saved
@@ -391,7 +391,10 @@ Phase 1 of semantic model generation. Loads the schema (live introspection if it
 ```
 `pending_table_keys` is the exact list of tables still to send to `/generate/batch`: every table on a fresh run, only the tables the interrupted run had not reached on a resume. The client splits it into batches of `batch_size`; `batch_count` is how many that makes (at least 1).
 
+On a `tables_partial` model that has no schema hash or run id (an interrupted run migrated from the blob era by migration 0003) there is no run to continue: `resume=true` runs a fresh, non-destructive run instead (every table pending, hand edits kept) and answers `resumed: false`.
+
 **Response `400`:** Schema load failed, or `resume=true` and there is no interrupted (`tables_partial`) generation to resume
+**Response `429`:** The per-IP limit was hit — retry with backoff
 **Response `409`:** `resume=true` and the schema changed since the interrupted run — regenerate with a fresh init (`resume=false`, keeps hand edits), or delete the model first (`DELETE …/semantic`, as the UI's Restart from scratch does) to discard them; or the connection was deleted during init
 
 ---
@@ -415,12 +418,17 @@ Phase 2 — call once per batch. Sends one batch of tables to the LLM, reconcile
   "table_keys": ["public.customers", "public.orders"],
   "tables_done": 6,
   "tables_total": 12,
-  "batch_size": 4
+  "batch_size": 4,
+  "omitted_table_keys": []
 }
 ```
-**Response `400`:** `/generate/init` not called first, a key that is not a table of the schema, or an over-long table key or column name
+`omitted_table_keys` are the tables of this batch the LLM returned nothing for. They are not marked done and stay pending; the web client sends them once more, as their own batch. `/generate/globals` names any table still without an annotation in the model's `generation_warnings`.
+
+**Response `400`:** `/generate/init` not called first (or the interrupted run has no run id — call `/generate/init` again), a key that is not a table of the schema, or an over-long table key or column name
 **Response `409`:** The schema changed since init — regenerate with a fresh `/generate/init` (`resume=false`, keeps hand edits); or the state moved on while the batch was running (generation finalised or the model deleted); or a newer `/generate/init` restarted the run — the batch's results are discarded
-**Response `422`:** The LLM response could not be used, or the request body failed validation (`table_keys` empty or more than 4 entries)
+**Response `422`:** The LLM call failed or its response could not be used (including an exhausted provider balance, `[QUOTA_EXCEEDED]`, which waiting does not fix), or the request body failed validation (`table_keys` empty or more than 4 entries)
+**Response `429`:** The provider throttled the call (the detail carries `[RATE_LIMIT]`), or the per-IP limit was hit — retry with backoff
+**Response `500`:** An unexpected error
 **Response `504`:** The batch timed out (180 s)
 
 ---
@@ -433,13 +441,17 @@ Tables and columns that are no longer in the database are removed here, together
 
 **Query parameter:** `provider` (string, default: `claude`)
 
-**Response `200`:** `SemanticModel` (final, as stored)
+**Response `200`:** `SemanticModel` (final, as stored — the same model a later `GET` returns)
 **Response `400`:** Init or batch phases not completed, or a value the store cannot hold
-**Response `409`:** The model was deleted or its state changed while globals was generating
+**Response `409`:** The model was deleted or its state changed while globals was generating, or a newer `/generate/init` restarted the run — the globals results are discarded and the new run is left to finish
+**Response `422`:** The LLM call failed or its response could not be used
+**Response `429`:** The provider throttled the call, or the per-IP limit was hit — retry with backoff
 **Response `500`:** An unexpected error
-
-An LLM failure does not fail this call: the generator logs it and returns no generated metrics, joins, derived columns or segments, so the response is `200` with a model that has none of those from this run (hand-edited ones are still carried through). Check the model's contents rather than relying on the status code.
 **Response `504`:** Timed out (180 s)
+
+An LLM failure fails this call like a batch (`422`, or `429` on a throttle): the model stays `tables_partial`, and the web client offers **Finish with what's generated** and **Resume**.
+
+A completed model can carry `generation_warnings` from this call: the generator's own warnings (for example a time-series pattern in a metric over a fiscal-period table); one note per hand edit that named a column the table no longer has (a primary timestamp or date column naming it, or a list left empty, is cleared and no longer counts as a hand edit; a list with live entries keeps them and stays a hand edit); and one warning naming every table of the schema that has no annotation (the LLM returned nothing for it, the run was finished before reaching it, or it is new since the run started).
 
 ---
 
@@ -491,7 +503,7 @@ Every field you change is recorded as hand-edited, so a later regenerate refresh
 ```
 
 **Response `200`:** `SemanticModel`
-**Response `400`:** A value the store cannot hold (for example an over-long table key, column name or metric name)
+**Response `400`:** A value the store cannot hold (for example an over-long table key, column name or metric name), or a table or column the model does not have, unless the patch supplies its `display_name`. Nothing is written for a rejected patch.
 **Response `409`:** A concurrent edit changed a table row (optimistic lock) — reload and retry
 
 ---
@@ -531,7 +543,7 @@ Apply one suggestion to the stored semantic model and return the updated model. 
 
 **Response `200`:** `SemanticModel`
 **Response `404`:** Connection or suggestion not found, no semantic model, or the suggestion's table or column is not in the model
-**Response `409`:** A concurrent edit changed the row
+**Response `409`:** The suggestion has already been applied (`Suggestion already applied`), or a concurrent edit changed the row
 
 ---
 

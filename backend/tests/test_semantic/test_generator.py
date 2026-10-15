@@ -4,6 +4,7 @@
 """Tests for SemanticModelGenerator — focused on build_time_expressions()."""
 
 import logging
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -17,12 +18,12 @@ from app.datasources.models import (
 )
 from app.semantic.generator import (
     SemanticModelGenerator,
+    drop_dangling_edits,
     edges_in_schema,
     policy_hides_table,
     prune_to_schema,
 )
 from app.semantic.models import (
-    GENERATION_BATCH_SIZE,
     AggregationType,
     ColumnSemantic,
     Hierarchy,
@@ -234,10 +235,20 @@ class TestGenerateTablesByKey:
         description = out["public.Facts"].columns["created_at"].description
         assert description is not None and "NOT a business period date" in description
 
-    def test_prepare_generation_reports_the_shared_batch_size(self) -> None:
-        prep = SemanticModelGenerator().prepare_generation(_schema_with_tables(["a"] * 5))
-        assert prep["batch_size"] == GENERATION_BATCH_SIZE == 4
-        assert prep["batch_count"] == 2
+    async def test_generate_globals_llm_failure_raises_value_error(self) -> None:
+        """Same contract as generate_tables: the router maps the error to HTTP."""
+        provider = MagicMock()
+        provider.max_output_tokens = 8000
+        provider.generate_structured = AsyncMock(side_effect=RuntimeError("[RATE_LIMIT] slow"))
+        with pytest.raises(ValueError, match="generate_globals") as excinfo:
+            await SemanticModelGenerator().generate_globals(
+                schema=_schema_with_tables(["orders"]),
+                provider=provider,
+                model=None,
+                all_tables={"public.orders": _tbl("id", name="Orders")},
+                relationship_edges=[],
+            )
+        assert "[RATE_LIMIT]" in str(excinfo.value)
 
 
 class TestGroundTablesToSchema:
@@ -617,3 +628,214 @@ class TestDetectDriftPrivacy:
         warnings = SemanticModelGenerator().detect_drift(schema, self._stored())
         assert any('"public.payroll"' in w for w in warnings)
         assert any('"public.orders.ssn"' in w for w in warnings)
+
+
+class TestTableKeyAndHidesColumn:
+    def test_table_key_is_schema_dot_name(self) -> None:
+        from app.datasources.models import ColumnInfo, TableInfo, table_key
+
+        t = TableInfo(
+            catalog=None,
+            schema_name="sales",
+            name="orders",
+            table_type="table",
+            columns=[ColumnInfo(name="id", data_type="integer", native_type="int4")],
+        )
+        assert table_key(t) == "sales.orders"
+
+    def test_hides_column_is_exact_membership_only(self) -> None:
+        privacy = PrivacySettings(excluded_columns=["public.orders.ssn"])
+        assert privacy.hides_column("public.orders", "ssn")
+        assert not privacy.hides_column("public.orders", "SSN")
+        assert not privacy.hides_column("public.customers", "ssn")
+        # Unlike is_column_excluded, a sensitive-name pattern does not hide a column here.
+        assert privacy.is_column_excluded("public", "orders", "email")
+        assert not privacy.hides_column("public.orders", "email")
+
+
+def _marks(table: dict[str, list[str]]) -> dict[str, dict[str, list[str]]]:
+    return {
+        "model": {},
+        "table": table,
+        "column": {"public.orders.status": ["display_name"]},
+        "metric": {},
+        "global_item": {},
+        "relationship": {},
+    }
+
+
+class TestDropDanglingEdits:
+    _MARKS: ClassVar[dict[str, dict[str, list[str]]]] = _marks(
+        {"public.orders": ["description", "primary_timestamp_column", "partition_columns"]}
+    )
+    _PROTECTED: ClassVar[dict[str, dict[str, dict[str, Any]]]] = {
+        "table": {
+            "public.orders": {
+                "description": "hand",
+                "primary_timestamp_column": "created_ts",
+                "partition_columns": ["created_ts"],
+            }
+        },
+        "column": {"public.orders.status": {"display_name": "Status"}},
+    }
+
+    def test_an_edit_naming_a_dropped_column_is_voided_mark_and_value(self) -> None:
+        schema = _schema_with_tables(["orders"])  # orders has only ``id``
+        marks, protected, notes = drop_dangling_edits(self._MARKS, self._PROTECTED, schema)
+        assert marks["table"]["public.orders"] == ["description"]
+        assert protected["table"]["public.orders"] == {"description": "hand"}
+        assert marks["column"] == self._MARKS["column"]  # column marks are not references
+        assert notes == [
+            "public.orders.primary_timestamp_column: hand edit cleared — created_ts is no "
+            "longer in the table",
+            "public.orders.partition_columns: hand edit cleared — created_ts is no longer "
+            "in the table",
+        ]
+        # Pure: the inputs are untouched.
+        assert self._PROTECTED["table"]["public.orders"]["primary_timestamp_column"] == "created_ts"
+        assert self._MARKS["table"]["public.orders"] == [
+            "description",
+            "primary_timestamp_column",
+            "partition_columns",
+        ]
+
+    def test_a_reference_to_a_hidden_column_is_kept(self) -> None:
+        schema = _schema_with_tables(["orders"])
+        privacy = PrivacySettings(excluded_columns=["public.orders.created_ts"])
+        marks, protected, notes = drop_dangling_edits(self._MARKS, self._PROTECTED, schema, privacy)
+        assert marks == self._MARKS and protected == self._PROTECTED
+        assert notes == []
+
+    def test_a_table_not_in_the_schema_is_left_to_prune_to_schema(self) -> None:
+        marks, protected, notes = drop_dangling_edits(
+            self._MARKS, self._PROTECTED, _schema_with_tables([])
+        )
+        assert marks == self._MARKS and protected == self._PROTECTED
+        assert notes == []
+
+    def test_a_list_field_loses_only_its_dangling_entries(self) -> None:
+        marks, protected, notes = drop_dangling_edits(
+            _marks({"public.orders": ["partition_columns"]}),
+            {"table": {"public.orders": {"partition_columns": ["id", "gone"]}}, "column": {}},
+            _schema_with_tables(["orders"]),
+        )
+        assert marks["table"]["public.orders"] == ["partition_columns"]
+        assert protected["table"]["public.orders"] == {"partition_columns": ["id"]}
+        assert notes == ["public.orders.partition_columns: dropped gone (no longer in the table)"]
+
+    def test_a_hierarchy_with_one_dangling_level_is_filtered_and_keeps_its_mark(self) -> None:
+        hierarchies = [
+            {"name": "Date", "levels": ["year", "gone", "day"]},
+            {"name": "Geo", "levels": ["country"]},
+        ]
+        given = {"table": {"public.orders": {"hierarchies": hierarchies}}, "column": {}}
+        marks, protected, notes = drop_dangling_edits(
+            _marks({"public.orders": ["hierarchies"]}),
+            given,
+            _schema_with_tables(["orders"], extra_columns=["year", "day", "country"]),
+        )
+        assert marks["table"]["public.orders"] == ["hierarchies"]
+        assert protected["table"]["public.orders"]["hierarchies"] == [
+            {"name": "Date", "levels": ["year", "day"]},
+            {"name": "Geo", "levels": ["country"]},
+        ]
+        assert notes == ["public.orders.hierarchies: dropped gone (no longer in the table)"]
+        assert hierarchies[0]["levels"] == ["year", "gone", "day"]  # input untouched
+
+    def test_a_hierarchy_whose_levels_all_dangle_is_dropped(self) -> None:
+        given = {
+            "table": {
+                "public.orders": {
+                    "hierarchies": [
+                        {"name": "Date", "levels": ["gone", "lost"]},
+                        {"name": "Ids", "levels": ["id"]},
+                    ]
+                }
+            },
+            "column": {},
+        }
+        marks, protected, notes = drop_dangling_edits(
+            _marks({"public.orders": ["hierarchies"]}), given, _schema_with_tables(["orders"])
+        )
+        assert marks["table"]["public.orders"] == ["hierarchies"]
+        assert protected["table"]["public.orders"]["hierarchies"] == [
+            {"name": "Ids", "levels": ["id"]}
+        ]
+        assert notes == ["public.orders.hierarchies: dropped gone, lost (no longer in the table)"]
+
+    def test_the_only_hierarchy_dropped_voids_the_field_and_the_table_entry(self) -> None:
+        """A table whose only marked field is voided leaves marks and protected."""
+        given = {
+            "table": {"public.orders": {"hierarchies": [{"name": "D", "levels": ["gone"]}]}},
+            "column": {},
+        }
+        marks, protected, notes = drop_dangling_edits(
+            _marks({"public.orders": ["hierarchies"]}), given, _schema_with_tables(["orders"])
+        )
+        assert "public.orders" not in marks["table"]
+        assert "public.orders" not in protected["table"]
+        assert notes == [
+            "public.orders.hierarchies: hand edit cleared — gone is no longer in the table"
+        ]
+
+    def test_one_note_per_changed_field(self) -> None:
+        fields = {
+            "primary_timestamp_column": "gone_ts",
+            "primary_date_column": "id",  # live: unchanged, no note
+            "partition_columns": ["id", "gone_p"],
+            "cluster_columns": ["gone_a", "gone_b"],
+            "hierarchies": [{"name": "H", "levels": ["id", "gone_h"]}],
+        }
+        marks, protected, notes = drop_dangling_edits(
+            _marks({"public.orders": list(fields)}),
+            {"table": {"public.orders": fields}, "column": {}},
+            _schema_with_tables(["orders"]),
+        )
+        assert marks["table"]["public.orders"] == [
+            "primary_date_column",
+            "partition_columns",
+            "hierarchies",
+        ]
+        assert protected["table"]["public.orders"] == {
+            "primary_date_column": "id",
+            "partition_columns": ["id"],
+            "hierarchies": [{"name": "H", "levels": ["id"]}],
+        }
+        assert len(notes) == 4
+        assert [n.split(":")[0] for n in notes] == [
+            "public.orders.primary_timestamp_column",
+            "public.orders.partition_columns",
+            "public.orders.cluster_columns",
+            "public.orders.hierarchies",
+        ]
+        assert "gone_a, gone_b are no longer in the table" in notes[2]
+
+
+class TestDetectDriftBareNamesUnderAnExcludedSchema:
+    def test_a_bare_metric_table_under_an_excluded_schema_is_not_drift(self) -> None:
+        privacy = PrivacySettings(excluded_schemas=["hr"])
+        schema = _schema_with_tables(["orders"])
+        stored = SemanticModel(
+            tables={
+                "public.orders": _tbl("id", name="Orders"),
+                "hr.salaries": _tbl("id", name="S"),
+            },
+            business_metrics=[
+                SimpleMetric(
+                    name="Payroll",
+                    definition="SUM(x)",
+                    aggregation=AggregationType.SUM,
+                    related_tables=["salaries"],
+                ),
+                SimpleMetric(
+                    name="Ghost",
+                    definition="SUM(x)",
+                    aggregation=AggregationType.SUM,
+                    related_tables=["ghosts"],
+                ),
+            ],
+        )
+        warnings = SemanticModelGenerator().detect_drift(schema, stored, privacy)
+        assert not any("Payroll" in w for w in warnings)
+        assert any("Ghost" in w for w in warnings)
+        assert not any("hr.salaries" in w for w in warnings)

@@ -224,9 +224,9 @@ RUN pip install --no-cache-dir fastembed
 ENV FASTEMBED_CACHE_PATH=/app/fastembed_cache
 # Optional HF_TOKEN arrives as a BuildKit secret (never a build arg), so it
 # is not recorded in this stage's config or history. An optional ca_bundle
-# secret (CA_BUNDLE) adds a proxy's root CA for the download. download_model.sh
-# retries three times and then fails the build rather than producing an
-# image without the embedding model.
+# secret (CA_BUNDLE) adds a proxy's root CA to the system CA bundle for the
+# model download. download_model.sh retries three times and then fails the build
+# rather than producing an image without the embedding model.
 COPY download_model.sh /download_model.sh
 RUN --mount=type=secret,id=hf_token --mount=type=secret,id=ca_bundle sh /download_model.sh
 
@@ -277,6 +277,8 @@ USER appuser
 EXPOSE 8000
 ENTRYPOINT ["./entrypoint.sh"]
 ```
+
+When `CA_BUNDLE` is unset the compose file mounts the empty `docker/empty-ca-bundle`, which the script ignores, so the default build needs no configuration on any host OS. When a bundle is supplied, the script appends it to a temporary copy of the system CA bundle (falling back to certifi's, then to the secret alone with a warning) and points `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` at that combined file, which is removed when the script exits; the image's own trust store is not modified. Those variables replace the default trust store rather than extend it, so a PEM holding only the proxy root still works for hosts the proxy does not intercept.
 
 Key decisions:
 - **Three-stage build** — `model-cache` downloads the HuggingFace model independently; `builder` installs Python deps and copies the model from that stage; `runtime` receives only the finished venv and model cache. No compiler or build tools in production.

@@ -219,7 +219,7 @@ python -c "import secrets; print(secrets.token_urlsafe(24))"
 | `LOCAL_UID` | `1000` | Backend container runs as this user ID. Leave unset unless your host UID differs from 1000; on Linux/WSL set both with `printf '\nLOCAL_UID=%s\nLOCAL_GID=%s\n' "$(id -u)" "$(id -g)" >> .env` to avoid volume permission issues. |
 | `LOCAL_GID` | `1000` | Backend container group ID. Set together with `LOCAL_UID` above. |
 | `HF_TOKEN` | *(unset)* | Hugging Face access token used **only during `docker compose build`**. Avoids anonymous rate-limiting when the `model-cache` stage downloads the fastembed ONNX model (`BAAI/bge-small-en-v1.5`) from HuggingFace. It is passed as a BuildKit secret mount, not a build arg, so it is never recorded in any image layer or config. Not used at runtime. A free read-only token is sufficient — get one at huggingface.co → Settings → Access Tokens. |
-| `CA_BUNDLE` | *(unset)* | Path to a PEM file with extra root CAs, used **only during `docker compose build`**. Needed only when a TLS-inspecting proxy re-signs the HuggingFace CDN certificate and the build fails downloading the embedding model with `self-signed certificate in certificate chain`. On a host that already trusts the proxy CA, `/etc/ssl/certs/ca-certificates.crt` works. It is passed as a BuildKit secret mount, so it is never recorded in any image layer. Not used at runtime. |
+| `CA_BUNDLE` | `docker/empty-ca-bundle` | Path to a PEM file with extra root CAs, used **only during `docker compose build`**. The CAs in it are added to the system CA bundle for the model download (combined into a bundle used only by that step; the image's own trust store is not changed), so a file holding just your proxy's root CA is enough. Needed only when a TLS-inspecting proxy re-signs the HuggingFace CDN certificate and the build fails downloading the embedding model with `self-signed certificate in certificate chain`. Pointing at a full bundle such as `/etc/ssl/certs/ca-certificates.crt` on a host that already trusts the proxy CA also works. It is passed as a BuildKit secret mount, so it is never recorded in any image layer. Not used at runtime. The default is an empty file in the repository, so the secret mount works unchanged on Windows Docker Desktop. |
 | `SAVVINA_IMAGE_TAG` | `latest` | Tag of the `savvinaai/savvina-backend` and `savvinaai/savvina-frontend` images that `docker compose pull` fetches. `latest` is the newest release; pin one with e.g. `SAVVINA_IMAGE_TAG=v2.0.0`. With `docker compose up --build`, Compose still builds from local source but stamps the result with this tag — it does not change what gets built. |
 | `PG_UID` | `70` | UID that `init-permissions` chowns the `sample-postgres` volume to. Only needed if the bundled sample-Postgres image (`test-dbs` profile) is swapped for one that runs as a different UID. |
 | `PG_GID` | `70` | GID for the same `sample-postgres` volume chown. Pairs with `PG_UID`. |
@@ -287,7 +287,10 @@ SAMPLE_MYSQL_PASSWORD=<strong-password>
 # Free read-only token: huggingface.co → Settings → Access Tokens
 HF_TOKEN=
 # Only if the build fails with "self-signed certificate in certificate chain" behind a
-# TLS-inspecting proxy: path to a PEM file that includes the proxy's root CA.
+# TLS-inspecting proxy: path to a PEM file with the proxy's root CA. Its CAs are
+# added to the system CA bundle for the model download (a PEM with just the proxy root
+# is fine).
+# Leave empty to use docker/empty-ca-bundle (no extra CAs).
 CA_BUNDLE=
 
 # ── Pre-built images (optional) ────────────────────────────────────────────

@@ -22,3 +22,14 @@ def stored_semantic_model() -> Iterator[AsyncMock]:
         new=AsyncMock(return_value=None),
     ) as load_model:
         yield load_model
+
+
+@pytest.fixture(autouse=True)
+def _clear_semantic_filter_caches() -> None:
+    """The chat path memoises the cleaned and the narrowed semantic model and the
+    edge-drop warnings per process; clear all three so no test sees another's entries."""
+    from app.services.schema_pruning import clear_semantic_filter_caches
+    from app.services.semantic_privacy import clear_hidden_identifier_cache
+
+    clear_semantic_filter_caches()
+    clear_hidden_identifier_cache()

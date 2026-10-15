@@ -242,9 +242,8 @@ class TestApplySuggestion:
     @staticmethod
     def _apply_db(conn, sug) -> MagicMock:
         return _mock_db(
-            MockResult(single=conn),  # get_connection_or_404
-            MockResult(single=sug),  # select suggestion by id
-            MockResult(single=conn),  # lock_and_reread_connection
+            MockResult(single=conn),  # lock_and_reread_connection (404s a missing one)
+            MockResult(single=sug),  # select suggestion by id, under the lock
             MockResult(),  # update SemanticSuggestion
             MockResult(),  # delete QueryCacheEntry
             MockResult(),  # delete UserSchemaCache
@@ -490,6 +489,26 @@ class TestApplySuggestion:
         sug = _make_suggestion(connection_id="conn-123")
         db = self._apply_db(_make_conn(), sug)
         await self._post_apply(http_client, db)
-        # 1 select (get_or_404) + 1 select (suggestion) + 1 select (lock_and_reread)
-        # + 1 update (suggestion) + 3 deletes = 7; the store write is patched out.
-        assert db.execute.await_count == 7
+        # 1 select (lock_and_reread) + 1 select (suggestion) + 1 update (suggestion)
+        # + 3 deletes = 6; the store write is patched out.
+        assert db.execute.await_count == 6
+
+    async def test_an_applied_suggestion_is_409_and_nothing_is_written(self, http_client) -> None:
+        sug = _make_suggestion(is_applied=True)
+        db = self._apply_db(_make_conn(), sug)
+        resp, apply = await self._post_apply(http_client, db)
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == "Suggestion already applied"
+        apply.assert_not_awaited()
+        db.commit.assert_not_awaited()
+        assert db.execute.await_count == 2  # the lock and the suggestion read only
+
+    async def test_the_suggestion_is_read_under_the_lock(self, http_client) -> None:
+        """Read before the lock, a concurrent apply that commits in between would go
+        unseen and the suggestion would be applied twice."""
+        sug = _make_suggestion()
+        db = self._apply_db(_make_conn(), sug)
+        await self._post_apply(http_client, db)
+        lock_stmt, sug_stmt = (c.args[0] for c in db.execute.await_args_list[:2])
+        assert lock_stmt._for_update_arg is not None
+        assert sug_stmt.get_execution_options().get("populate_existing") is True

@@ -86,6 +86,10 @@ class GenerateBatchResponse(BaseModel):
     tables_done: int
     tables_total: int
     batch_size: int
+    # Keys of this batch the LLM returned no annotation for. They are not stamped,
+    # so they stay pending; the client re-queues them once, and ``/generate/globals``
+    # warns about any table still without one.
+    omitted_table_keys: list[str] = []
 
 
 # ── Semantic suggestion (DB row → API) ────────────────────────────────────────

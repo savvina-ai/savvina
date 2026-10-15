@@ -19,12 +19,14 @@ from app.semantic.models import (
     SemanticModel,
     TableSemantic,
 )
+from app.services import schema_pruning
 from app.services.schema_pruning import (
     _build_table_text,
     _filter_semantic_by_relevance,
     _filter_semantic_to_schema,
     _resolve_schema,
     _select_relevant_tables,
+    clear_semantic_filter_caches,
 )
 from app.services.schema_utils import _apply_privacy_to_schema, _schema_to_dict
 
@@ -464,6 +466,7 @@ class TestFilterSemanticToSchemaPrivacy:
         assert "secret_ts" in result.tables["store.orders"].columns
 
     def test_edge_dropped_on_a_column_mismatch_is_logged(self, caplog) -> None:
+        clear_semantic_filter_caches()
         with caplog.at_level("WARNING", logger="app.services.schema_pruning"):
             _filter_semantic_to_schema(self._model(), self._schema_without_secret())
 
@@ -472,6 +475,7 @@ class TestFilterSemanticToSchemaPrivacy:
         assert "store.orders.secret_ts -> store.customers.id" in messages[0]
 
     def test_edge_dropped_for_an_invisible_table_is_not_logged(self, caplog) -> None:
+        clear_semantic_filter_caches()
         schema = _make_schema(_make_table("store", "orders", ["id", "amount", "secret_ts"]))
 
         with caplog.at_level("WARNING", logger="app.services.schema_pruning"):
@@ -488,6 +492,66 @@ class TestFilterSemanticToSchemaPrivacy:
         assert "secret_ts" in model.tables["store.orders"].columns
         assert model.tables["store.orders"].primary_timestamp_column == "secret_ts"
         assert len(model.relationships) == 2
+
+    def test_narrowing_is_memoised_on_the_model_instance_and_schema(self) -> None:
+        clear_semantic_filter_caches()
+        model = self._model()
+        schema = self._schema_without_secret()
+        first = _filter_semantic_to_schema(model, schema)
+        assert _filter_semantic_to_schema(model, self._schema_without_secret()) is first
+        other = _make_schema(_make_table("store", "orders", ["id"]))
+        assert _filter_semantic_to_schema(model, other) is not first
+        assert _filter_semantic_to_schema(self._model(), schema) is not first
+
+    def test_a_dropped_edge_is_warned_about_once(self, caplog) -> None:
+        clear_semantic_filter_caches()
+        with caplog.at_level("WARNING", logger="app.services.schema_pruning"):
+            _filter_semantic_to_schema(self._model(), self._schema_without_secret())
+            clear_semantic_filter_caches(narrowed_only=True)
+            _filter_semantic_to_schema(self._model(), self._schema_without_secret())
+        assert len([r for r in caplog.records if "Dropped relationship" in r.getMessage()]) == 1
+
+    def test_the_narrowed_cache_evicts_the_least_recently_used_entry(self, monkeypatch) -> None:
+        monkeypatch.setattr(schema_pruning, "_NARROWED_CACHE_SIZE", 2)
+        model = self._model()
+        one = _make_schema(_make_table("store", "orders", ["id"]))
+        two = _make_schema(_make_table("store", "orders", ["amount"]))
+        three = _make_schema(_make_table("store", "customers", ["id"]))
+        first = _filter_semantic_to_schema(model, one)
+        _filter_semantic_to_schema(model, two)
+        assert _filter_semantic_to_schema(model, one) is first  # now most recent
+        _filter_semantic_to_schema(model, three)  # evicts ``two``
+        assert len(schema_pruning._narrowed_cache) == 2
+        assert _filter_semantic_to_schema(model, one) is first
+        assert all(
+            key[1] != schema_pruning._schema_signature(two)
+            for key in schema_pruning._narrowed_cache
+        )
+
+    def test_the_warned_edge_set_resets_at_its_cap(self, monkeypatch, caplog) -> None:
+        """At the cap the set is cleared, so an edge warned about before is warned again."""
+        monkeypatch.setattr(schema_pruning, "_WARNED_EDGE_DROPS_CAP", 1)
+        model = self._model().model_copy(
+            update={
+                "relationships": [
+                    *self._model().relationships,
+                    RelationshipEdge(
+                        from_table="store.orders",
+                        from_column="gone",
+                        to_table="store.customers",
+                        to_column="id",
+                        join_sql="store.orders.gone = store.customers.id",
+                    ),
+                ]
+            }
+        )
+        with caplog.at_level("WARNING", logger="app.services.schema_pruning"):
+            _filter_semantic_to_schema(model, self._schema_without_secret())
+            clear_semantic_filter_caches(narrowed_only=True)
+            _filter_semantic_to_schema(model, self._schema_without_secret())
+        warned = [r for r in caplog.records if "Dropped relationship" in r.getMessage()]
+        assert len(warned) == 4
+        assert len(schema_pruning._WARNED_EDGE_DROPS) == 1
 
 
 class TestResolveSchemaNarrowsStaleCache:

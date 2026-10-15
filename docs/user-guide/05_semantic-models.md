@@ -17,7 +17,7 @@ prd_ctg_id → FK to Product Category ID
 When a user asks a question in chat, the backend:
 
 1. Loads the connection's semantic model rows from the database.
-2. Filters it to the tables and columns actually visible in the user's schema (privacy + permissions). Columns your privacy settings hide are left out of the prompt, along with relationships that use them.
+2. Filters it to the tables and columns actually visible in the user's schema (privacy + permissions). Columns your privacy settings hide are left out of the prompt, along with relationships that use them and any business metric, segment, derived column, note or default filter that names a hidden table or column. Only what your privacy settings hide counts: a metric or note that names a column dropped or renamed in the database is out of date, not secret, so it stays in the prompt until you edit or remove it (or a regenerate replaces a generated one). Descriptions you write for visible tables and columns are not checked: do not name a hidden table or column in one.
 3. Formats it into a `## Business Context` block injected into the LLM system prompt, after the raw schema DDL.
 4. The LLM generates SQL using both the raw schema **and** this business context.
 
@@ -37,13 +37,15 @@ If the prompt exceeds the provider's context window, a compression cascade drops
 6. Review the output carefully — especially **Business Metrics** and their filters.
 7. Click **Save Changes**.
 
-Once a model exists the button reads **Regenerate**. Regenerating asks the LLM to re-annotate the model from your current schema. Fields you edited by hand are kept, and tables and columns that are no longer in the database are removed.
+Once a model exists the button reads **Regenerate**. Regenerating asks the LLM to re-annotate the model from your current schema. Saved fields you edited by hand are kept, and tables and columns that are no longer in the database are removed. Deleting a generated item is not remembered: a metric, segment, derived column, join or relationship the LLM generated and you deleted (or renamed) may come back on the next regenerate, so delete it again after regenerating if you do not want it. A hand edit that names a column the table no longer has (for example a primary timestamp column) is cleared or trimmed, and the **Incomplete generation** box at the top of the page says so.
 
-While a run is in progress, **Save Changes** is disabled and so are the other generation controls.
+A run starts from the saved model, so generation is disabled while you have unsaved edits: save them first. While a run is in progress the editors are read-only ("Editing is paused while generation runs."), **Save Changes** and applying suggestions are disabled, and **Regenerate** shows *Generating…* until the run ends.
+
+If the LLM returns nothing for a table, the page asks once more for the tables it skipped. A table still without annotations at the end is listed in the **Incomplete generation** box; **Regenerate** to annotate it.
 
 #### If generation is interrupted
 
-A provider rate limit, a timeout or a closed tab can stop a run part-way. The tables generated so far are kept, and the page shows a banner ("Generation was interrupted at table N of M") with three actions:
+A provider rate limit, a timeout or a closed tab can stop a run part-way (a rate-limited call is first retried a few times, waiting longer each time; an exhausted provider balance or any other provider error stops the run at once). The tables generated so far are kept, and the page shows a banner ("Generation was interrupted at table N of M") with three actions:
 
 | Action | What it does |
 |--------|--------------|
@@ -76,13 +78,13 @@ POST /api/v1/connections/{id}/semantic/generate/globals?provider=claude
 
 | Action | When to use |
 |--------|-------------|
-| **Generate / Regenerate** | First setup, or after a schema change. Regenerating refreshes the LLM-written parts of the model and keeps the fields you edited by hand, including metrics, segments, derived columns and joins you wrote. Tables and columns that no longer exist in the database are removed. |
+| **Generate / Regenerate** | First setup, or after a schema change. Regenerating refreshes the LLM-written parts of the model and keeps the fields you edited by hand, including metrics, segments, derived columns and joins you wrote or edited. A generated item you deleted may come back. Tables and columns that no longer exist in the database are removed. |
 | **Save Changes** | Persist in-progress edits. All edits live in a local draft until saved. |
 | **Check Drift** | Compare the saved model against your cached schema (privacy settings applied); warns if referenced tables or columns no longer exist. Refresh the schema first to compare against the live database. |
 | **Delete** | Remove the semantic layer entirely, including your edits. Queries still work but without business context. |
 | **Marked as reviewed** | Tracking flag only — has no effect on prompt generation. Use it to indicate the model has been human-verified. Regenerating clears it. |
 
-Fields you edit by hand are remembered as yours: a later regenerate refreshes the rest of the model but leaves them alone. A column marked **Sensitive** stays sensitive after a regenerate. **Delete** and **Restart from scratch** discard your edits, and a regenerate also removes hand-edited tables and columns that no longer exist in the database.
+Fields you edit by hand are remembered as yours: a later regenerate refreshes the rest of the model but leaves them alone. Edits to an item are kept; deleting a generated item is not remembered, so a regenerate may add it back (renaming one keeps your renamed copy, and the original may come back beside it). A column marked **Sensitive** stays sensitive after a regenerate. **Delete** and **Restart from scratch** discard your edits, and a regenerate also removes hand-edited tables and columns that no longer exist in the database.
 
 > **Schema refresh** does not regenerate the semantic model. After refreshing the schema to pick up new tables/columns, regenerate the model manually if needed.
 

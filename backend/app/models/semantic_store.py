@@ -130,7 +130,7 @@ class SemanticColumnRow(_Provenanced, Base):
     __tablename__ = "semantic_columns"
     __table_args__ = (
         Index("uq_semantic_columns_name", "table_id", "column_name", unique=True),
-        Index("ix_semantic_columns_table", "table_id"),
+        # No separate table_id index: uq_semantic_columns_name(table_id, column_name) leads with it.
         Index(
             "ix_semantic_columns_sensitive",
             "table_id",
@@ -182,14 +182,10 @@ class SemanticMetricRow(_Provenanced, Base):
 
 
 class SemanticRelationshipRow(_Provenanced, Base):
-    """One row per relationship edge, indexed in both directions."""
+    """One row per relationship edge; read by model only."""
 
     __tablename__ = "semantic_relationships"
-    __table_args__ = (
-        Index("ix_semantic_rel_from", "connection_id", "from_table"),
-        Index("ix_semantic_rel_to", "connection_id", "to_table"),
-        Index("ix_semantic_rel_model", "model_id"),
-    )
+    __table_args__ = (Index("ix_semantic_rel_model", "model_id"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     model_id: Mapped[str] = mapped_column(

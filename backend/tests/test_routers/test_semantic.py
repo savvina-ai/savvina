@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import ExitStack
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -325,7 +326,7 @@ def _fk_edges() -> tuple[RelationshipEdge, RelationshipEdge]:
 
 def _header(
     status: GenerationStatus,
-    schema_hash: str,
+    schema_hash: str | None,
     done: int = 0,
     total: int = 2,
     run_id: str | None = "run-1",
@@ -379,11 +380,6 @@ class TestGenerateInit:
         ):
             mock_load.return_value = (_schema(["orders", "customers"]), conn)
             gen = mock_gen.return_value
-            gen.prepare_generation.return_value = {
-                "tables_total": 2,
-                "batch_count": 1,
-                "batch_size": 4,
-            }
             gen.compute_schema_hash.return_value = "hash-abc"
             app.dependency_overrides[get_db] = lambda: db
             resp = await http_client.post("/api/v1/connections/conn-123/semantic/generate/init")
@@ -421,11 +417,6 @@ class TestGenerateInit:
         ):
             mock_load.return_value = (_schema(["orders", "customers"]), conn)
             gen = mock_gen.return_value
-            gen.prepare_generation.return_value = {
-                "tables_total": 2,
-                "batch_count": 1,
-                "batch_size": 4,
-            }
             gen.compute_schema_hash.return_value = "h"
             app.dependency_overrides[get_db] = lambda: _mock_db(MockResult(single=_make_conn()))
             resp = await http_client.post(
@@ -449,11 +440,6 @@ class TestGenerateInit:
             patch(f"{_STORE}.begin_generation", new=begin),
         ):
             mock_load.return_value = (_schema(["orders"]), _make_conn())
-            mock_gen.return_value.prepare_generation.return_value = {
-                "tables_total": 1,
-                "batch_count": 1,
-                "batch_size": 4,
-            }
             mock_gen.return_value.compute_schema_hash.return_value = "h"
             db = _mock_db(MockResult(single=_make_conn()))
             app.dependency_overrides[get_db] = lambda: db
@@ -475,11 +461,6 @@ class TestGenerateInit:
             ),
         ):
             mock_load.return_value = (_schema(["orders"]), _make_conn())
-            mock_gen.return_value.prepare_generation.return_value = {
-                "tables_total": 1,
-                "batch_count": 1,
-                "batch_size": 4,
-            }
             mock_gen.return_value.compute_schema_hash.return_value = "h"
             app.dependency_overrides[get_db] = lambda: _mock_db(MockResult(single=_make_conn()))
             resp = await http_client.post(
@@ -499,11 +480,6 @@ class TestGenerateInit:
             patch(f"{_STORE}.begin_generation", new=begin),
         ):
             mock_load.return_value = (_schema(["orders"]), _make_conn())
-            mock_gen.return_value.prepare_generation.return_value = {
-                "tables_total": 1,
-                "batch_count": 1,
-                "batch_size": 4,
-            }
             mock_gen.return_value.compute_schema_hash.return_value = "new"
             db = _mock_db(MockResult(single=_make_conn()))
             app.dependency_overrides[get_db] = lambda: db
@@ -547,11 +523,6 @@ class TestGenerateInit:
             patch(f"{_STORE}.begin_generation", new=begin),
         ):
             mock_load.return_value = (_schema(["orders"]), _make_conn())
-            mock_gen.return_value.prepare_generation.return_value = {
-                "tables_total": 1,
-                "batch_count": 1,
-                "batch_size": 4,
-            }
             mock_gen.return_value.compute_schema_hash.return_value = "h"
             app.dependency_overrides[get_db] = lambda: _mock_db()
             resp = await http_client.post(
@@ -569,17 +540,45 @@ class TestGenerateInit:
             patch(f"{_STORE}.begin_generation", new=begin),
         ):
             mock_load.return_value = (_schema(["orders"]), _make_conn())
-            mock_gen.return_value.prepare_generation.return_value = {
-                "tables_total": 1,
-                "batch_count": 1,
-                "batch_size": 4,
-            }
             mock_gen.return_value.compute_schema_hash.return_value = "h"
             app.dependency_overrides[get_db] = lambda: db
             resp = await http_client.post("/api/v1/connections/conn-123/semantic/generate/init")
         assert resp.status_code == 409
         begin.assert_not_awaited()
         db.rollback.assert_awaited()
+
+    async def test_resume_of_a_migrated_run_without_hash_or_run_id_is_a_fresh_run(
+        self, http_client
+    ) -> None:
+        """Migration 0003 backfills a blob-era interrupted run with neither a schema
+        hash nor a run id. There is no run to resume: the user gets a fresh,
+        non-destructive run instead of a false 'schema changed'."""
+        begin = AsyncMock()
+        with (
+            patch("app.routers.semantic._load_schema_for_connection") as mock_load,
+            patch("app.routers.semantic.SemanticModelGenerator") as mock_gen,
+            patch(
+                f"{_STORE}.load_header",
+                new=AsyncMock(
+                    return_value=_header(GenerationStatus.TABLES_PARTIAL, None, run_id=None)
+                ),
+            ),
+            patch(f"{_STORE}.begin_generation", new=begin),
+        ):
+            mock_load.return_value = (_schema(["orders", "customers"]), _make_conn())
+            mock_gen.return_value.compute_schema_hash.return_value = "h"
+            db = _mock_db(MockResult(single=_make_conn()))
+            app.dependency_overrides[get_db] = lambda: db
+            resp = await http_client.post(
+                "/api/v1/connections/conn-123/semantic/generate/init?resume=true"
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["resumed"] is False
+        assert body["pending_table_keys"] == ["public.orders", "public.customers"]
+        assert begin.await_args.kwargs["resume"] is False
+        assert begin.await_args.kwargs["tables_done"] == 0
+        db.commit.assert_awaited_once()
 
 
 _BATCH_URL = "/api/v1/connections/conn-123/semantic/generate/batch"
@@ -648,6 +647,7 @@ class TestGenerateBatch:
             "tables_done": 1,
             "tables_total": 2,
             "batch_size": 4,
+            "omitted_table_keys": [],
         }
         assert gen.generate_tables.await_args.kwargs["table_keys"] == ["public.orders"]
         assert reconcile.await_args.args[2] == generated
@@ -672,6 +672,86 @@ class TestGenerateBatch:
 
         assert resp.status_code == 200
         assert set(reconcile.await_args.args[2]) == {"public.orders"}
+
+    async def test_omitted_tables_are_reported_and_not_reconciled(self, http_client) -> None:
+        generated = {"public.orders": TableSemantic(display_name="Orders")}
+        reconcile = AsyncMock()
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches(reconcile=reconcile)
+        with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:
+            self._wire(mock_load, mock_gen, generated)
+            app.dependency_overrides[get_db] = lambda: _mock_db(MockResult(single=_make_conn()))
+            resp = await http_client.post(
+                _BATCH_URL, json={"table_keys": ["public.orders", "public.customers"]}
+            )
+        assert resp.status_code == 200
+        assert resp.json()["omitted_table_keys"] == ["public.customers"]
+        assert set(reconcile.await_args.args[2]) == {"public.orders"}
+
+    async def test_a_provider_throttle_is_429_so_the_client_retries(
+        self, http_client, caplog
+    ) -> None:
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches()
+        with (
+            caplog.at_level(logging.WARNING, logger="app.routers.semantic"),
+            p_load as mock_load,
+            p_prov,
+            p_gen as mock_gen,
+            p_hdr,
+            p_rec,
+            p_adv,
+        ):
+            self._wire(
+                mock_load,
+                mock_gen,
+                ValueError("LLM call failed in generate_tables: [RATE_LIMIT] slow down"),
+            )
+            app.dependency_overrides[get_db] = lambda: _mock_db()
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+        assert resp.status_code == 429
+        assert "[RATE_LIMIT]" in resp.json()["detail"]
+        # Expected and retried: a warning naming the provider, no traceback.
+        [record] = [r for r in caplog.records if r.name == "app.routers.semantic"]
+        assert record.levelno == logging.WARNING
+        assert record.exc_info is None
+        assert "provider=claude" in record.getMessage()
+
+    async def test_an_exhausted_quota_is_422_not_a_retried_throttle(self, http_client) -> None:
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches()
+        with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:
+            self._wire(
+                mock_load,
+                mock_gen,
+                ValueError("LLM call failed in generate_tables: [QUOTA_EXCEEDED] no credit"),
+            )
+            app.dependency_overrides[get_db] = lambda: _mock_db()
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+        assert resp.status_code == 422
+        assert "[QUOTA_EXCEEDED]" in resp.json()["detail"]
+
+    async def test_a_timeout_is_504_and_logged_as_a_warning(self, http_client, caplog) -> None:
+        async def never_answers(**_kw):
+            await asyncio.sleep(10)
+
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches()
+        with (
+            caplog.at_level(logging.WARNING, logger="app.routers.semantic"),
+            patch("app.routers.semantic._GENERATION_TIMEOUT_SECONDS", 0.01),
+            p_load as mock_load,
+            p_prov,
+            p_gen as mock_gen,
+            p_hdr,
+            p_rec,
+            p_adv,
+        ):
+            gen = self._wire(mock_load, mock_gen, {})
+            gen.generate_tables = never_answers
+            app.dependency_overrides[get_db] = lambda: _mock_db()
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+        assert resp.status_code == 504
+        assert "timed out" in resp.json()["detail"]
+        [record] = [r for r in caplog.records if r.name == "app.routers.semantic"]
+        assert record.levelno == logging.WARNING
+        assert "provider=claude" in record.getMessage()
 
     async def test_an_fk_on_an_excluded_column_does_not_reach_the_generator(
         self, http_client
@@ -942,9 +1022,21 @@ class TestGenerateGlobals:
         extra_patches: tuple = (),
         fresh_edges: list[RelationshipEdge] | None = None,
         conn: MagicMock | None = None,
+        headers: tuple | None = None,
     ):
-        """POST /generate/globals with the store and LLM mocked; returns (resp, save, gen)."""
+        """POST /generate/globals with the store and LLM mocked; returns (resp, save, gen).
+
+        ``save`` echoes the model it is given unless the test configured what it
+        returns (or raises): the route answers with ``save_model``'s result.
+        ``headers`` is what ``load_header`` returns before the LLM call and after the
+        lock; by default the model's own status with run id ``run-1`` both times.
+        """
+        if headers is None:
+            same = _header(model.generation_status, "h")
+            headers = (same, same)
         save = save or AsyncMock()
+        if save.side_effect is None and not isinstance(save.return_value, SemanticModel):
+            save.side_effect = lambda _db, _cid, final, **_kw: final
         db = db or _mock_db(
             MockResult(single=_make_conn()),  # lock_and_reread_connection
             MockResult(),
@@ -958,16 +1050,11 @@ class TestGenerateGlobals:
                 new=AsyncMock(return_value=(MagicMock(), "model-x", "claude")),
             ),
             patch("app.routers.semantic.SemanticModelGenerator") as mock_gen,
-            # After the save, load_model returns what was saved (the route reloads).
+            patch(f"{_STORE}.load_header", new=AsyncMock(side_effect=list(headers))),
+            patch(f"{_STORE}.load_model", new=AsyncMock(return_value=model)),
             patch(
-                f"{_STORE}.load_model",
-                new=AsyncMock(
-                    side_effect=lambda *_: save.await_args.args[2] if save.await_args else model
-                ),
-            ),
-            patch(
-                f"{_STORE}.provenance_snapshot",
-                new=AsyncMock(return_value=_snapshot(provenance, protected)),
+                f"{_STORE}.load_model_with_provenance",
+                new=AsyncMock(return_value=(model, _snapshot(provenance, protected))),
             ),
             patch(f"{_STORE}.save_model", new=save),
             ExitStack() as stack,
@@ -1040,6 +1127,7 @@ class TestGenerateGlobals:
     async def test_without_a_partial_model_is_400(self, http_client) -> None:
         with (
             patch("app.routers.semantic._load_schema_for_connection") as mock_load,
+            patch(f"{_STORE}.load_header", new=AsyncMock(return_value=None)),
             patch(f"{_STORE}.load_model", new=AsyncMock(return_value=None)),
         ):
             mock_load.return_value = (_schema(["orders"]), _make_conn())
@@ -1337,7 +1425,7 @@ class TestGenerateGlobals:
 
         async def provenance(*_a, **_k):
             calls.append("provenance")
-            return _snapshot()
+            return self._partial(), _snapshot()
 
         resp, _, _ = await self._run(
             http_client,
@@ -1346,7 +1434,7 @@ class TestGenerateGlobals:
             db=_mock_db(MockResult(), MockResult(), MockResult()),  # cache deletes only
             extra_patches=(
                 patch("app.routers.semantic.lock_and_reread_connection", new=lock),
-                patch(f"{_STORE}.provenance_snapshot", new=provenance),
+                patch(f"{_STORE}.load_model_with_provenance", new=provenance),
             ),
         )
         assert resp.status_code == 200
@@ -1374,19 +1462,184 @@ class TestGenerateGlobals:
         save.assert_not_awaited()
         db.rollback.assert_awaited()
 
-    async def test_returns_the_model_as_stored(self, http_client) -> None:
-        stored = self._partial(notes=["as stored"])
+    async def test_a_run_restarted_during_the_llm_call_is_409(self, http_client) -> None:
+        """A fresh /generate/init during the globals call mints a new run id; finalising
+        would mark that new run complete before its batches ran."""
         save = AsyncMock()
-        loads = iter([self._partial(), self._partial(), stored])
+        db = _mock_db(MockResult(single=_make_conn()))
         resp, _, _ = await self._run(
             http_client,
             model=self._partial(),
             schema=_schema(["orders"]),
             save=save,
-            extra_patches=(
-                patch(f"{_STORE}.load_model", new=AsyncMock(side_effect=lambda *_: next(loads))),
+            db=db,
+            headers=(
+                _header(GenerationStatus.TABLES_PARTIAL, "h", run_id="run-1"),
+                _header(GenerationStatus.TABLES_PARTIAL, "h", run_id="run-2"),
             ),
+        )
+        assert resp.status_code == 409
+        assert "restarted" in resp.json()["detail"]
+        save.assert_not_awaited()
+        db.rollback.assert_awaited()
+        db.commit.assert_not_awaited()
+
+    async def test_a_run_started_over_a_complete_model_during_the_llm_call_is_409(
+        self, http_client
+    ) -> None:
+        save = AsyncMock()
+        complete = self._partial(generation_status="complete")
+        resp, _, _ = await self._run(
+            http_client,
+            model=complete,
+            schema=_schema(["orders"]),
+            save=save,
+            db=_mock_db(MockResult(single=_make_conn())),
+            headers=(
+                _header(GenerationStatus.COMPLETE, "h", run_id=None),
+                _header(GenerationStatus.TABLES_PARTIAL, "h", run_id="run-2"),
+            ),
+        )
+        assert resp.status_code == 409
+        save.assert_not_awaited()
+
+    async def test_re_finalising_a_complete_model_is_not_a_restart(self, http_client) -> None:
+        """A complete model has no run id before or after the LLM call."""
+        complete = self._partial(generation_status="complete")
+        none_run = _header(GenerationStatus.COMPLETE, "h", run_id=None)
+        resp, save, _ = await self._run(
+            http_client,
+            model=complete,
+            schema=_schema(["orders"]),
+            headers=(none_run, none_run),
+        )
+        assert resp.status_code == 200
+        save.assert_awaited_once()
+
+    async def test_returns_the_model_as_stored(self, http_client) -> None:
+        """The response is what ``save_model`` stored and returned, not ``final``."""
+        stored = self._partial(notes=["as stored"])
+        save = AsyncMock(return_value=stored)
+        load = AsyncMock(return_value=self._partial())
+        resp, _, _ = await self._run(
+            http_client,
+            model=self._partial(),
+            schema=_schema(["orders"]),
+            save=save,
+            extra_patches=(patch(f"{_STORE}.load_model", new=load),),
         )
         assert resp.status_code == 200
         assert resp.json()["notes"] == ["as stored"]
         save.assert_awaited_once()
+        load.assert_awaited_once()  # the pre-LLM read only; nothing re-read after the save
+
+    async def test_a_provider_throttle_in_globals_is_429(self, http_client) -> None:
+        resp, save, _ = await self._run(
+            http_client,
+            model=self._partial(),
+            schema=_schema(["orders"]),
+            llm=ValueError("LLM call failed in generate_globals: [RATE_LIMIT] slow down"),
+        )
+        assert resp.status_code == 429
+        save.assert_not_awaited()
+
+    async def test_tables_without_an_annotation_are_named_in_a_warning(self, http_client) -> None:
+        resp, _, _ = await self._run(
+            http_client,
+            model=self._partial(),  # only public.orders is annotated
+            schema=_schema(["orders", "customers", "invoices"]),
+        )
+        assert resp.status_code == 200
+        [warning] = resp.json()["generation_warnings"]
+        assert "2 table(s) have no annotation" in warning
+        assert "public.customers" in warning and "public.invoices" in warning
+        assert warning.endswith("Regenerate to annotate them.")
+
+    async def test_a_table_a_batch_stored_during_the_llm_call_is_finalised(
+        self, http_client
+    ) -> None:
+        """The post-lock read, not the pre-LLM one, is what is finalised: a table a
+        concurrent batch stored meanwhile is saved and is not called unannotated."""
+        pre_lock = self._partial()  # public.orders only
+        under_lock = self._partial(
+            tables={
+                "public.orders": {"display_name": "Orders", "columns": {}},
+                "public.customers": {"display_name": "Customers", "columns": {}},
+            }
+        )
+        resp, save, gen = await self._run(
+            http_client,
+            model=pre_lock,
+            schema=_schema(["orders", "customers", "invoices"]),
+            extra_patches=(
+                patch(
+                    f"{_STORE}.load_model_with_provenance",
+                    new=AsyncMock(return_value=(under_lock, _snapshot())),
+                ),
+            ),
+        )
+        assert resp.status_code == 200
+        assert set(gen.generate_globals.await_args.kwargs["all_tables"]) == {"public.orders"}
+        assert set(save.await_args.args[2].tables) == {"public.orders", "public.customers"}
+        [warning] = resp.json()["generation_warnings"]
+        assert "1 table(s) have no annotation (public.invoices)" in warning
+        assert "public.customers" not in warning
+
+    async def test_a_model_deleted_during_the_llm_call_is_409(self, http_client) -> None:
+        save = AsyncMock()
+        db = _mock_db(MockResult(single=_make_conn()))
+        resp, _, _ = await self._run(
+            http_client,
+            model=self._partial(),
+            schema=_schema(["orders"]),
+            save=save,
+            db=db,
+            extra_patches=(
+                patch(
+                    f"{_STORE}.load_model_with_provenance",
+                    new=AsyncMock(return_value=(None, semantic_store._empty_snapshot())),
+                ),
+            ),
+        )
+        assert resp.status_code == 409
+        assert "deleted" in resp.json()["detail"]
+        db.rollback.assert_awaited()
+        db.commit.assert_not_awaited()
+        save.assert_not_awaited()
+
+    async def test_a_hand_edit_naming_a_dropped_column_is_voided_before_the_save(
+        self, http_client
+    ) -> None:
+        partial = self._partial(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "primary_timestamp_column": "created_ts",
+                    "columns": {"id": {"display_name": "Id"}},
+                }
+            }
+        )
+        provenance = {
+            **_no_provenance(),
+            "table": {"public.orders": ["primary_timestamp_column", "description"]},
+        }
+        protected = {
+            "table": {
+                "public.orders": {"primary_timestamp_column": "created_ts", "description": "hand"}
+            },
+            "column": {},
+        }
+        resp, save, _ = await self._run(
+            http_client,
+            model=partial,
+            schema=_schema(["orders"]),  # orders has only ``id`` now
+            provenance=provenance,
+            protected=protected,
+        )
+        assert resp.status_code == 200
+        kwargs = save.await_args.kwargs
+        assert kwargs["provenance"]["table"] == {"public.orders": ["description"]}
+        assert kwargs["protected"]["table"] == {"public.orders": {"description": "hand"}}
+        assert save.await_args.args[2].tables["public.orders"].primary_timestamp_column is None
+        [note] = resp.json()["generation_warnings"]
+        assert "public.orders.primary_timestamp_column" in note

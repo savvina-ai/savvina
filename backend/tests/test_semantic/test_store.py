@@ -10,6 +10,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects import postgresql
 
 from app.database import Base
+from app.datasources.models import ColumnInfo, DataSourceSchema, SchemaInfo, TableInfo
 from app.models.connection import Connection
 from app.models.semantic_store import (
     SemanticColumnRow,
@@ -22,6 +23,7 @@ from app.models.semantic_store import (
 )
 from app.schemas.semantic import ColumnSemanticUpdate, SemanticModelUpdate, TableSemanticUpdate
 from app.semantic import store
+from app.semantic.generator import drop_dangling_edits, prune_to_schema
 from app.semantic.models import (
     AggregationType,
     ColumnSemantic,
@@ -785,6 +787,24 @@ class TestGenerationRun:
         semantic_db.expunge_all()
         assert (await store.load_header(semantic_db, connection_id)).generation_run_id != first
 
+    async def test_begin_generation_records_an_insert_when_it_creates_the_header(
+        self, semantic_db, connection_id
+    ) -> None:
+        await _begin(semantic_db, connection_id)
+        await _begin(semantic_db, connection_id)
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        history = (
+            await semantic_db.scalars(
+                select(SemanticHistoryRow).where(SemanticHistoryRow.entity_type == "model")
+            )
+        ).all()
+        # Only the first call created the header; the second updated it.
+        assert sorted((h.action, h.source, h.old_value is None) for h in history) == [
+            ("insert", "generation", True),
+            ("update", "generation", False),
+        ]
+
     async def test_load_header_is_none_without_a_model(self, semantic_db, connection_id) -> None:
         assert await store.load_header(semantic_db, connection_id) is None
 
@@ -886,6 +906,86 @@ class TestReconcile:
         assert [h.entity_key for h in column_entries] == ["public.orders.status"]
         assert table_entries[0].old_value["grain"] == "one row per order"
         assert table_entries[0].new_value["grain"] == "LLM rewrote the grain"
+
+    async def test_reads_marks_fresh_rather_than_from_stale_identity_mapped_rows(
+        self, semantic_db, connection_id
+    ) -> None:
+        """Another transaction commits a hand edit (value and mark) while this session
+        still holds the rows in its identity map (``expire_on_commit=False``). The
+        reconcile must read the rows fresh, or it sees no mark and overwrites the edit."""
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        # Load both rows into the identity map, then change them behind its back.
+        table_row = await semantic_db.scalar(
+            select(SemanticTableRow).where(SemanticTableRow.table_key == "public.orders")
+        )
+        col_row = await semantic_db.scalar(
+            select(SemanticColumnRow).where(
+                SemanticColumnRow.table_id == table_row.id,
+                SemanticColumnRow.column_name == "status",
+            )
+        )
+        await semantic_db.execute(
+            update(SemanticTableRow)
+            .where(SemanticTableRow.id == table_row.id)
+            .values(description="human table", user_edited_fields=["description"])
+            .execution_options(synchronize_session=False)
+        )
+        await semantic_db.execute(
+            update(SemanticColumnRow)
+            .where(SemanticColumnRow.id == col_row.id)
+            .values(description="human column", user_edited_fields=["description"])
+            .execution_options(synchronize_session=False)
+        )
+        await semantic_db.commit()
+        assert table_row.user_edited_fields == []  # still stale
+        assert col_row.user_edited_fields == []
+
+        regenerated = _rich_model().tables
+        regenerated["public.orders"].description = "LLM table"
+        regenerated["public.orders"].columns["status"].description = "LLM column"
+        await _begin(semantic_db, connection_id)
+        await store.reconcile_tables(semantic_db, connection_id, regenerated, updated_by="gen")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        loaded = await store.load_model(semantic_db, connection_id)
+        assert loaded.tables["public.orders"].description == "human table"
+        assert loaded.tables["public.orders"].columns["status"].description == "human column"
+
+    async def test_inserted_rows_write_insert_history(self, semantic_db, connection_id) -> None:
+        """A first generation records the header, every table and every column as
+        inserted, so the audit trail does not start at the first update."""
+        await _begin(semantic_db, connection_id)
+        await store.reconcile_tables(
+            semantic_db, connection_id, _rich_model().tables, updated_by="gen"
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        history = (await semantic_db.scalars(select(SemanticHistoryRow))).all()
+        assert all(h.source == "generation" for h in history)
+        assert [(h.entity_type, h.action) for h in history if h.entity_type == "model"] == [
+            ("model", "insert")
+        ]
+        tables = {r.table_key: r.id for r in await semantic_db.scalars(select(SemanticTableRow))}
+        columns = {
+            (r.table_id, r.column_name): r.id
+            for r in await semantic_db.scalars(select(SemanticColumnRow))
+        }
+        table_history = [h for h in history if h.entity_type == "table"]
+        column_history = [h for h in history if h.entity_type == "column"]
+        assert {(h.entity_key, h.entity_id) for h in table_history} == set(tables.items())
+        assert all(
+            h.action == "insert" and h.changed_by == "gen" and h.old_value is None
+            for h in table_history + column_history
+        )
+        assert table_history[0].new_value["display_name"] in {"Orders", "Customers"}
+        key_of = {table_id: key for key, table_id in tables.items()}
+        assert {(h.entity_key, h.entity_id) for h in column_history} == {
+            (f"{key_of[table_id]}.{name}", column_id)
+            for (table_id, name), column_id in columns.items()
+        }
 
     async def test_a_new_column_on_an_existing_table_is_inserted_unprotected(
         self, semantic_db, connection_id
@@ -991,19 +1091,20 @@ class TestReconcile:
         assert stored.description == "baddesc"
         semantic_db.expunge_all()
 
+        def entity_history_count():
+            return semantic_db.scalar(
+                select(func.count())
+                .select_from(SemanticHistoryRow)
+                .where(SemanticHistoryRow.entity_type.in_(["table", "column"]))
+            )
+
+        inserted = await entity_history_count()  # the first run's insert rows
         await _begin(semantic_db, connection_id)
         await store.reconcile_tables(semantic_db, connection_id, generated(), updated_by="gen")
         await semantic_db.commit()
         semantic_db.expunge_all()
 
-        entity_history = (
-            await semantic_db.scalars(
-                select(SemanticHistoryRow).where(
-                    SemanticHistoryRow.entity_type.in_(["table", "column"])
-                )
-            )
-        ).all()
-        assert entity_history == []
+        assert await entity_history_count() == inserted
         assert all(r.version == 1 for r in (await semantic_db.scalars(select(SemanticTableRow))))
         assert all(r.version == 1 for r in (await semantic_db.scalars(select(SemanticColumnRow))))
         header = await store.load_header(semantic_db, connection_id)
@@ -1161,23 +1262,6 @@ class TestProvenanceSurvivesFullSave:
         await db.commit()
         db.expunge_all()
 
-    async def test_provenance_map_reports_every_marked_row(
-        self, semantic_db, connection_id
-    ) -> None:
-        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
-        await semantic_db.commit()
-        await self._mark(
-            semantic_db,
-            table_fields=["description"],
-            column_fields=["display_name"],
-            header_fields=["notes"],
-        )
-        prov = await store.provenance_map(semantic_db, connection_id)
-        assert prov["model"] == {"": ["notes"]}
-        assert prov["table"] == {"public.orders": ["description"]}
-        assert prov["column"] == {"public.orders.status": ["display_name"]}
-        assert prov["metric"] == {} and prov["global_item"] == {} and prov["relationship"] == {}
-
     async def test_snapshot_reports_marks_and_stored_values_in_one_pass(
         self, semantic_db, connection_id
     ) -> None:
@@ -1190,7 +1274,14 @@ class TestProvenanceSurvivesFullSave:
             header_fields=["notes"],
         )
         snap = await store.provenance_snapshot(semantic_db, connection_id)
-        assert snap.marks == await store.provenance_map(semantic_db, connection_id)
+        assert snap.marks == {
+            "model": {"": ["notes"]},
+            "table": {"public.orders": ["description"]},
+            "column": {"public.orders.status": ["display_name"]},
+            "metric": {},
+            "global_item": {},
+            "relationship": {},
+        }
         assert snap.protected == {
             "table": {"public.orders": {"description": "One row per order"}},
             "column": {"public.orders.status": {"display_name": "Status"}},
@@ -1228,39 +1319,80 @@ class TestProvenanceSurvivesFullSave:
         orders = loaded.tables["public.orders"]
         assert orders.description == "from snapshot"
         assert orders.columns["status"].display_name == "Snap Status"
-        prov = await store.provenance_map(semantic_db, connection_id)
+        prov = (await store.provenance_snapshot(semantic_db, connection_id)).marks
         assert prov["table"] == {"public.orders": ["description"]}
         assert prov["column"] == {"public.orders.status": ["display_name"]}
 
-    async def test_full_save_reads_protected_values_only_when_not_given(
+    async def test_dangling_hand_edits_are_dropped_before_a_full_save(
         self, semantic_db, connection_id
     ) -> None:
-        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        """A marked reference to a column that left the database is not written back."""
+
+        def orders(**fields) -> SemanticModel:
+            cols = ("id", "status", "region", "created_at", "ordered_at")
+            return SemanticModel(
+                tables={
+                    "public.orders": TableSemantic(
+                        display_name="Orders",
+                        columns={c: ColumnSemantic(display_name=c.upper()) for c in cols},
+                        **fields,
+                    )
+                }
+            )
+
+        await store.save_model(
+            semantic_db,
+            connection_id,
+            orders(
+                primary_timestamp_column="created_at", partition_columns=["region", "created_at"]
+            ),
+            updated_by="u1",
+        )
         await semantic_db.commit()
-        await self._mark(semantic_db, table_fields=["description"], column_fields=["display_name"])
+        await self._mark(
+            semantic_db, table_fields=["primary_timestamp_column", "partition_columns"]
+        )
         snap = await store.provenance_snapshot(semantic_db, connection_id)
 
-        with patch.object(store, "provenance_snapshot", wraps=store.provenance_snapshot) as spy:
-            await store.save_model(
-                semantic_db,
-                connection_id,
-                _rich_model(),
-                updated_by="gen",
-                provenance=snap.marks,
-                protected=snap.protected,
-            )
-        spy.assert_not_called()
-        await semantic_db.commit()
+        # ``created_at`` has left the database.
+        schema = DataSourceSchema(
+            source_type="postgresql",
+            schemas=[SchemaInfo(name="public")],
+            tables=[
+                TableInfo(
+                    catalog=None,
+                    schema_name="public",
+                    name="orders",
+                    table_type="table",
+                    columns=[
+                        ColumnInfo(name=c, data_type="text", native_type="text")
+                        for c in ("id", "status", "region", "ordered_at")
+                    ],
+                )
+            ],
+        )
+        marks, protected, notes = drop_dangling_edits(snap.marks, snap.protected, schema)
+        assert len(notes) == 2
 
-        with patch.object(store, "provenance_snapshot", wraps=store.provenance_snapshot) as spy:
-            await store.save_model(
-                semantic_db,
-                connection_id,
-                _rich_model(),
-                updated_by="gen",
-                provenance=snap.marks,
-            )
-        spy.assert_called_once()
+        rebuilt = orders(primary_timestamp_column="ordered_at", partition_columns=[])
+        rebuilt.tables = prune_to_schema(rebuilt.tables, schema, log=False)
+        await store.save_model(
+            semantic_db,
+            connection_id,
+            rebuilt,
+            updated_by="gen",
+            source="generation",
+            provenance=marks,
+            protected=protected,
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        loaded = (await store.load_model(semantic_db, connection_id)).tables["public.orders"]
+        assert loaded.primary_timestamp_column == "ordered_at"  # the voided edit lost
+        assert loaded.partition_columns == ["region"]  # the hand edit, filtered
+        prov = (await store.provenance_snapshot(semantic_db, connection_id)).marks
+        assert prov["table"] == {"public.orders": ["partition_columns"]}
 
     async def test_full_save_rejects_protected_values_without_provenance(
         self, semantic_db, connection_id
@@ -1291,49 +1423,88 @@ class TestProvenanceSurvivesFullSave:
             protected={},
         )
 
-    async def test_full_save_self_read_restores_only_the_fields_provenance_names(
+    async def test_full_save_needs_protected_values_when_table_or_column_marks_exist(
         self, semantic_db, connection_id
     ) -> None:
         await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
         await semantic_db.commit()
-        await self._mark(semantic_db, table_fields=["description", "grain"])
-        marks = await store.provenance_map(semantic_db, connection_id)
-        assert marks["table"]["public.orders"] == ["description", "grain"]
-        stored_grain = _rich_model().tables["public.orders"].grain
-        marks["table"]["public.orders"] = ["description"]
-
-        rebuilt = _rich_model()
-        rebuilt.tables["public.orders"].description = "LLM rewrote this"
-        rebuilt.tables["public.orders"].grain = "LLM grain"
-        assert stored_grain != "LLM grain"
+        await self._mark(semantic_db, table_fields=["description"])
+        snap = await store.provenance_snapshot(semantic_db, connection_id)
+        with pytest.raises(TypeError, match="protected"):
+            await store.save_model(
+                semantic_db, connection_id, _rich_model(), updated_by="gen", provenance=snap.marks
+            )
+        # Present but empty is no better than absent: the marked value must be there.
+        with pytest.raises(TypeError, match="protected"):
+            await store.save_model(
+                semantic_db,
+                connection_id,
+                _rich_model(),
+                updated_by="gen",
+                provenance=snap.marks,
+                protected={"table": {}, "column": {}},
+            )
+        # Marks on metrics, items or relationships alone have no stored values to carry.
+        marks = {**snap.marks, "table": {}, "column": {}, "metric": {"Revenue": ["payload"]}}
         await store.save_model(
-            semantic_db, connection_id, rebuilt, updated_by="gen", provenance=marks
+            semantic_db, connection_id, _rich_model(), updated_by="gen", provenance=marks
         )
+
+    async def test_full_save_returns_the_stored_model(self, semantic_db, connection_id) -> None:
+        model = _rich_model()
+        model.tables["public.orders"].description = "x" * 5000 + "\x00tail"
+        model.business_metrics.append(
+            model.business_metrics[0].model_copy(update={"description": "the later one"})
+        )
+        returned = await store.save_model(semantic_db, connection_id, model, updated_by="u1")
         await semantic_db.commit()
         semantic_db.expunge_all()
+        loaded = await store.load_model(semantic_db, connection_id)
+        assert returned == loaded
+        assert list(returned.tables) == list(loaded.tables)
+        assert all(
+            list(returned.tables[k].columns) == list(loaded.tables[k].columns)
+            for k in returned.tables
+        )
+        assert "\x00" not in returned.tables["public.orders"].description
+        names = [m.name for m in returned.business_metrics]
+        assert names.count(model.business_metrics[0].name) == 1
+        assert returned.business_metrics[0].description == "the later one"
 
-        orders = (await store.load_model(semantic_db, connection_id)).tables["public.orders"]
-        assert orders.description == "One row per order"
-        assert orders.grain == "LLM grain"
-
-    async def test_full_save_skips_the_self_read_without_table_or_column_marks(
+    async def test_load_model_with_provenance_matches_the_separate_reads(
         self, semantic_db, connection_id
     ) -> None:
         await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
         await semantic_db.commit()
-        marks = {
-            "model": {},
-            "table": {},
-            "column": {},
-            "metric": {"Revenue": ["payload"]},
-            "global_item": {},
-            "relationship": {},
-        }
-        with patch.object(store, "provenance_snapshot", wraps=store.provenance_snapshot) as spy:
-            await store.save_model(
-                semantic_db, connection_id, _rich_model(), updated_by="gen", provenance=marks
-            )
-        spy.assert_not_called()
+        await self._mark(semantic_db, table_fields=["description"], column_fields=["display_name"])
+        model, snap = await store.load_model_with_provenance(semantic_db, connection_id)
+        assert model == await store.load_model(semantic_db, connection_id)
+        assert snap == await store.provenance_snapshot(semantic_db, connection_id)
+        none_model, empty = await store.load_model_with_provenance(semantic_db, "no-such")
+        assert none_model is None
+        assert empty.marks["table"] == {} and empty.protected == {"table": {}, "column": {}}
+
+    async def test_full_save_drops_the_is_user_reviewed_mark(
+        self, semantic_db, connection_id
+    ) -> None:
+        """Review state is reset by every globals run; carrying its mark would report
+        a hand edit that no longer exists."""
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        await self._mark(semantic_db, header_fields=["notes", "is_user_reviewed"])
+        snap = await store.provenance_snapshot(semantic_db, connection_id)
+        await store.save_model(
+            semantic_db,
+            connection_id,
+            _rich_model(),
+            updated_by="gen",
+            source="generation",
+            provenance=snap.marks,
+            protected=snap.protected,
+        )
+        await semantic_db.commit()
+        marks = (await store.provenance_snapshot(semantic_db, connection_id)).marks
+        assert marks["model"] == {"": ["notes"]}
 
     async def test_full_save_restores_marks_and_stored_values(
         self, semantic_db, connection_id
@@ -1346,7 +1517,7 @@ class TestProvenanceSurvivesFullSave:
             column_fields=["display_name"],
             header_fields=["notes"],
         )
-        prov = await store.provenance_map(semantic_db, connection_id)
+        snap = await store.provenance_snapshot(semantic_db, connection_id)
 
         rebuilt = _rich_model()
         rebuilt.tables["public.orders"].description = "generator"
@@ -1354,23 +1525,26 @@ class TestProvenanceSurvivesFullSave:
         rebuilt.tables["public.orders"].columns["status"].display_name = "generator"
         rebuilt.notes = ["generator notes"]
         rebuilt.is_user_reviewed = False
-        await store.save_model(
+        returned = await store.save_model(
             semantic_db,
             connection_id,
             rebuilt,
             updated_by="gen",
             source="generation",
-            provenance=prov,
+            provenance=snap.marks,
+            protected=snap.protected,
         )
         await semantic_db.commit()
         semantic_db.expunge_all()
 
         loaded = await store.load_model(semantic_db, connection_id)
+        assert returned == loaded
+        assert returned.tables["public.orders"].description == "One row per order"
         assert loaded.tables["public.orders"].description == "One row per order"
         assert loaded.tables["public.orders"].grain == "generator grain"
         assert loaded.tables["public.orders"].columns["status"].display_name == "Status"
         assert loaded.notes == ["budgets are quarterly"]
-        again = await store.provenance_map(semantic_db, connection_id)
+        again = (await store.provenance_snapshot(semantic_db, connection_id)).marks
         assert again["table"] == {"public.orders": ["description"]}
         assert again["column"] == {"public.orders.status": ["display_name"]}
 
@@ -1380,14 +1554,19 @@ class TestProvenanceSurvivesFullSave:
         await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
         await semantic_db.commit()
         await self._mark(semantic_db, table_fields=["description"])
-        prov = await store.provenance_map(semantic_db, connection_id)
+        snap = await store.provenance_snapshot(semantic_db, connection_id)
         smaller = SemanticModel(tables={"public.customers": TableSemantic(display_name="C")})
         await store.save_model(
-            semantic_db, connection_id, smaller, updated_by="gen", provenance=prov
+            semantic_db,
+            connection_id,
+            smaller,
+            updated_by="gen",
+            provenance=snap.marks,
+            protected=snap.protected,
         )
         await semantic_db.commit()
         semantic_db.expunge_all()
-        assert (await store.provenance_map(semantic_db, connection_id))["table"] == {}
+        assert (await store.provenance_snapshot(semantic_db, connection_id)).marks["table"] == {}
 
     async def test_marks_are_not_carried_onto_columns_absent_from_the_model(
         self, semantic_db, connection_id
@@ -1395,18 +1574,23 @@ class TestProvenanceSurvivesFullSave:
         await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
         await semantic_db.commit()
         await self._mark(semantic_db, column_fields=["display_name"])
-        prov = await store.provenance_map(semantic_db, connection_id)
-        assert prov["column"] == {"public.orders.status": ["display_name"]}
+        snap = await store.provenance_snapshot(semantic_db, connection_id)
+        assert snap.marks["column"] == {"public.orders.status": ["display_name"]}
         pruned = _rich_model()
         del pruned.tables["public.orders"].columns["status"]
         await store.save_model(
-            semantic_db, connection_id, pruned, updated_by="gen", provenance=prov
+            semantic_db,
+            connection_id,
+            pruned,
+            updated_by="gen",
+            provenance=snap.marks,
+            protected=snap.protected,
         )
         await semantic_db.commit()
         semantic_db.expunge_all()
         loaded = await store.load_model(semantic_db, connection_id)
         assert "status" not in loaded.tables["public.orders"].columns
-        assert (await store.provenance_map(semantic_db, connection_id))["column"] == {}
+        assert (await store.provenance_snapshot(semantic_db, connection_id)).marks["column"] == {}
 
     async def test_relationship_metric_and_global_item_marks_round_trip(
         self, semantic_db, connection_id
@@ -1432,7 +1616,7 @@ class TestProvenanceSurvivesFullSave:
         await semantic_db.commit()
         semantic_db.expunge_all()
 
-        prov = await store.provenance_map(semantic_db, connection_id)
+        prov = (await store.provenance_snapshot(semantic_db, connection_id)).marks
         rel_key = "public.orders.customer_id->public.customers.id"
         assert prov["relationship"] == {rel_key: ["description"]}
         assert prov["metric"] == {"Revenue": ["payload"]}
@@ -1460,7 +1644,7 @@ class TestProvenanceSurvivesFullSave:
         await semantic_db.commit()
         semantic_db.expunge_all()
 
-        assert await store.provenance_map(semantic_db, connection_id) == prov
+        assert (await store.provenance_snapshot(semantic_db, connection_id)).marks == prov
         loaded = await store.load_model(semantic_db, connection_id)
         assert [r.description for r in loaded.relationships] == ["hand written"]
 
@@ -1521,6 +1705,94 @@ class TestUserPatch:
         await db.commit()
         db.expunge_all()
 
+    async def test_a_patch_naming_a_table_the_model_lacks_needs_display_name(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        patch_ = SemanticModelUpdate.model_validate(
+            {"tables": {"public.ghost": {"description": "x"}}}
+        )
+        tables_before = await semantic_db.scalar(select(func.count(SemanticTableRow.id)))
+        history_before = await semantic_db.scalar(select(func.count(SemanticHistoryRow.id)))
+        with pytest.raises(ValueError, match=r"public\.ghost"):
+            await store.apply_user_patch(semantic_db, connection_id, patch_, updated_by="u1")
+        # Nothing was written before the check.
+        assert await semantic_db.scalar(select(func.count(SemanticTableRow.id))) == tables_before
+        assert await semantic_db.scalar(select(func.count(SemanticHistoryRow.id))) == (
+            history_before
+        )
+        keys = (await semantic_db.scalars(select(SemanticTableRow.table_key))).all()
+        assert "public.ghost" not in keys
+
+    async def test_a_patch_naming_a_column_the_model_lacks_needs_display_name(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        patch_ = SemanticModelUpdate.model_validate(
+            {"tables": {"public.orders": {"columns": {"ghost": {"description": "x"}}}}}
+        )
+        with pytest.raises(ValueError, match=r"public\.orders\.ghost"):
+            await store.apply_user_patch(semantic_db, connection_id, patch_, updated_by="u1")
+
+    async def test_a_null_display_name_does_not_count_as_supplied(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        table_patch = SemanticModelUpdate.model_validate(
+            {"tables": {"public.ghost": {"display_name": None, "description": "x"}}}
+        )
+        with pytest.raises(ValueError, match=r"public\.ghost"):
+            await store.apply_user_patch(semantic_db, connection_id, table_patch, updated_by="u1")
+        column_patch = SemanticModelUpdate.model_validate(
+            {"tables": {"public.orders": {"columns": {"ghost": {"display_name": None}}}}}
+        )
+        with pytest.raises(ValueError, match=r"public\.orders\.ghost"):
+            await store.apply_user_patch(semantic_db, connection_id, column_patch, updated_by="u1")
+
+    async def test_a_new_column_on_a_table_with_no_column_rows_needs_display_name(
+        self, semantic_db, connection_id
+    ) -> None:
+        bare = SemanticModel(tables={"public.bare": TableSemantic(display_name="Bare")})
+        await store.save_model(semantic_db, connection_id, bare, updated_by="u1")
+        await semantic_db.commit()
+        patch_ = SemanticModelUpdate.model_validate(
+            {"tables": {"public.bare": {"columns": {"ghost": {"description": "x"}}}}}
+        )
+        with pytest.raises(ValueError, match=r"public\.bare\.ghost"):
+            await store.apply_user_patch(semantic_db, connection_id, patch_, updated_by="u1")
+
+    async def test_a_patch_on_a_connection_with_no_model_leaves_no_header_behind(
+        self, semantic_db, connection_id
+    ) -> None:
+        patch_ = SemanticModelUpdate.model_validate(
+            {"tables": {"public.ghost": {"description": "x"}}}
+        )
+        with pytest.raises(ValueError, match=r"public\.ghost"):
+            await store.apply_user_patch(semantic_db, connection_id, patch_, updated_by="u1")
+        assert await semantic_db.scalar(select(func.count(SemanticModelRow.id))) == 0
+
+    async def test_a_new_table_with_display_name_is_inserted(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        patch_ = SemanticModelUpdate.model_validate(
+            {
+                "tables": {
+                    "public.ghost": {
+                        "display_name": "Ghost",
+                        "columns": {"id": {"display_name": "Id"}},
+                    }
+                }
+            }
+        )
+        model = await store.apply_user_patch(semantic_db, connection_id, patch_, updated_by="u1")
+        assert model.tables["public.ghost"].display_name == "Ghost"
+        assert model.tables["public.ghost"].columns["id"].display_name == "Id"
+
     async def test_patch_touches_only_the_addressed_fields_and_marks_them(
         self, semantic_db, connection_id
     ) -> None:
@@ -1542,7 +1814,7 @@ class TestUserPatch:
         assert orders.columns["status"].display_name == "State"
         assert orders.columns["status"].semantic_type == SemanticType.CATEGORICAL  # untouched
         assert orders.columns["email"].is_sensitive is True  # untouched
-        prov = await store.provenance_map(semantic_db, connection_id)
+        prov = (await store.provenance_snapshot(semantic_db, connection_id)).marks
         assert prov["table"] == {"public.orders": ["description"]}
         assert prov["column"] == {"public.orders.status": ["display_name"]}
 
@@ -1558,7 +1830,7 @@ class TestUserPatch:
         await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
         await semantic_db.commit()
         semantic_db.expunge_all()
-        prov = await store.provenance_map(semantic_db, connection_id)
+        prov = (await store.provenance_snapshot(semantic_db, connection_id)).marks
         assert prov == {
             "model": {},
             "table": {},
@@ -1624,7 +1896,7 @@ class TestUserPatch:
         await semantic_db.commit()
         semantic_db.expunge_all()
         assert model.tables["public.items"].columns["sku"].display_name == "SKU"
-        prov = await store.provenance_map(semantic_db, connection_id)
+        prov = (await store.provenance_snapshot(semantic_db, connection_id)).marks
         assert prov["table"]["public.items"] == ["display_name"]
         assert prov["column"]["public.items.sku"] == ["display_name"]
 
@@ -1639,7 +1911,7 @@ class TestUserPatch:
         await semantic_db.commit()
         semantic_db.expunge_all()
         assert [m.name for m in model.business_metrics] == ["Revenue", "Orders"]
-        prov = await store.provenance_map(semantic_db, connection_id)
+        prov = (await store.provenance_snapshot(semantic_db, connection_id)).marks
         assert prov["metric"] == {"Orders": ["payload"]}  # only the changed item is marked
 
     async def test_reorder_is_a_real_edit(self, semantic_db, connection_id) -> None:
@@ -1659,12 +1931,14 @@ class TestUserPatch:
         await store.apply_user_patch(semantic_db, connection_id, same, updated_by="u2")
         await semantic_db.commit()
         semantic_db.expunge_all()
-        assert (await store.provenance_map(semantic_db, connection_id))["model"] == {}
+        assert (await store.provenance_snapshot(semantic_db, connection_id)).marks["model"] == {}
         changed = SemanticModelUpdate(notes=["new note"])
         await store.apply_user_patch(semantic_db, connection_id, changed, updated_by="u2")
         await semantic_db.commit()
         semantic_db.expunge_all()
-        assert (await store.provenance_map(semantic_db, connection_id))["model"] == {"": ["notes"]}
+        assert (await store.provenance_snapshot(semantic_db, connection_id)).marks["model"] == {
+            "": ["notes"]
+        }
 
     async def test_review_flag_flips_and_an_echo_afterwards_marks_nothing_new(
         self, semantic_db, connection_id
@@ -1764,7 +2038,7 @@ class TestUserPatch:
         ):
             rows.extend((r.id, r.version) for r in (await db.scalars(select(row_cls))).all())
         history = await db.scalar(select(func.count()).select_from(SemanticHistoryRow))
-        return sorted(rows), history, await store.provenance_map(db, cid)
+        return sorted(rows), history, (await store.provenance_snapshot(db, cid)).marks
 
     async def _echo_reloaded_model(self, db, cid) -> None:
         loaded = await store.load_model(db, cid)
@@ -1888,7 +2162,7 @@ class TestUserPatch:
         await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
         await semantic_db.commit()
         semantic_db.expunge_all()
-        prov = await store.provenance_map(semantic_db, connection_id)
+        prov = (await store.provenance_snapshot(semantic_db, connection_id)).marks
         assert prov["table"]["public.items"] == ["display_name"]
         assert prov["column"]["public.items.sku"] == ["display_name"]
 
@@ -1914,7 +2188,7 @@ class TestUserPatch:
         await store.apply_user_patch(semantic_db, connection_id, patch, updated_by="u2")
         await semantic_db.commit()
         semantic_db.expunge_all()
-        prov = await store.provenance_map(semantic_db, connection_id)
+        prov = (await store.provenance_snapshot(semantic_db, connection_id)).marks
         assert prov["column"]["public.orders.sku"] == ["display_name"]
 
         generated = _rich_model().tables["public.orders"].model_copy(deep=True)
@@ -1967,7 +2241,11 @@ class TestUserPatch:
                     (r.id, r.version) for r in (await semantic_db.scalars(select(row_cls))).all()
                 )
             history = await semantic_db.scalar(select(func.count()).select_from(SemanticHistoryRow))
-            return sorted(rows), history, await store.provenance_map(semantic_db, connection_id)
+            return (
+                sorted(rows),
+                history,
+                (await store.provenance_snapshot(semantic_db, connection_id)).marks,
+            )
 
         model = await store.apply_user_patch(semantic_db, connection_id, patch(), updated_by="u2")
         await semantic_db.commit()
@@ -2357,12 +2635,7 @@ class TestModelCache:
             select(SemanticTableRow).where(SemanticTableRow.table_key == "public.orders")
         )
         await store._update_table_fields(
-            semantic_db,
-            row.id,
-            row.version,
-            {"description": "uncommitted"},
-            updated_by="u2",
-            mark_user_edited=True,
+            semantic_db, row, {"description": "uncommitted"}, updated_by="u2"
         )
 
         model = await store.load_model_cached(semantic_db, connection_id)
@@ -2381,11 +2654,66 @@ class TestModelCache:
         assert model.notes == ["budgets are quarterly"]
         assert connection_id in store._model_cache
 
+    async def test_cache_miss_rebuilds_inside_a_savepoint_and_a_hit_opens_none(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        store.clear_model_cache()
+        with patch.object(semantic_db, "begin_nested", wraps=semantic_db.begin_nested) as nested:
+            first = await store.load_model_cached(semantic_db, connection_id)
+        assert nested.call_count == 1
+        with patch.object(semantic_db, "begin_nested", wraps=semantic_db.begin_nested) as nested:
+            second = await store.load_model_cached(semantic_db, connection_id)
+        assert nested.call_count == 0
+        assert second is first
+
+    async def test_a_failed_rebuild_leaves_the_session_usable_and_nothing_cached(
+        self, semantic_db, connection_id
+    ) -> None:
+        """Why the rebuild has a savepoint: on PostgreSQL a failed statement aborts the
+        transaction, so the failure must be rolled back to the savepoint, leaving the
+        caller's transaction open and usable. It surfaces as ``SemanticModelUnavailable``
+        (chained to the real error), the one failure a caller may continue past."""
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        store.clear_model_cache()
+        with (
+            patch.object(store, "load_model", side_effect=RuntimeError("boom")),
+            pytest.raises(store.SemanticModelUnavailable) as raised,
+        ):
+            await store.load_model_cached(semantic_db, connection_id)
+        assert isinstance(raised.value.__cause__, RuntimeError)
+        assert str(raised.value.__cause__) == "boom"
+        assert semantic_db.in_transaction()
+        assert not semantic_db.in_nested_transaction()
+        assert (await semantic_db.execute(select(func.count()).select_from(Connection))).scalar()
+        # Nothing was cached by the failed call: the next call must rebuild.
+        with patch.object(semantic_db, "begin_nested", wraps=semantic_db.begin_nested) as nested:
+            model = await store.load_model_cached(semantic_db, connection_id)
+        assert model is not None
+        assert nested.call_count == 1
+
+    async def test_a_failed_key_read_propagates_as_itself(self, semantic_db, connection_id) -> None:
+        """The key read is not confined by a savepoint: on PostgreSQL its failure has
+        already aborted the caller's transaction, so it must not be reported as the
+        recoverable ``SemanticModelUnavailable`` the chat turn continues past."""
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        store.clear_model_cache()
+        with (
+            patch.object(semantic_db, "execute", side_effect=RuntimeError("key read")),
+            pytest.raises(RuntimeError, match="key read") as raised,
+        ):
+            await store.load_model_cached(semantic_db, connection_id)
+        assert not isinstance(raised.value, store.SemanticModelUnavailable)
+
     async def test_a_savepoint_does_not_settle_an_outer_write(
         self, semantic_db, connection_id
     ) -> None:
-        """The chat path reads inside ``begin_nested``; releasing that SAVEPOINT must
-        not mark an outer, still-uncommitted write as settled."""
+        """Releasing a SAVEPOINT (a caller's own, or one opened for another connection's
+        rebuild) must not mark an outer, still-uncommitted write as settled. A session
+        that wrote this connection takes the bypass branch and never opens one here."""
         await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
         await semantic_db.commit()
         body = SemanticModelUpdate(notes=["outer, uncommitted"])
@@ -2409,7 +2737,11 @@ class TestModelCache:
         """With no header, ``apply_user_patch`` creates one via ``save_model`` (version
         1) and then applies the patch, which bumps it again."""
         body = SemanticModelUpdate(
-            tables={"public.orders": TableSemanticUpdate(description="first edit")},
+            tables={
+                "public.orders": TableSemanticUpdate(
+                    display_name="Orders", description="first edit"
+                )
+            },
             notes=["hand written"],
         )
         await store.apply_user_patch(semantic_db, connection_id, body, updated_by="u2")
@@ -2437,14 +2769,17 @@ class TestOptimisticLock:
         self, semantic_db, connection_id
     ) -> None:
         row = await self._seed_and_read(semantic_db, connection_id)
+        # A concurrent writer moves the stored version on; ``row`` stays as stale as a
+        # separate transaction's copy would.
+        await semantic_db.execute(
+            update(SemanticTableRow)
+            .where(SemanticTableRow.id == row.id)
+            .values(version=row.version + 1)
+            .execution_options(synchronize_session=False)
+        )
         with pytest.raises(store.SemanticStoreConflict):
             await store._update_table_fields(
-                semantic_db,
-                row.id,
-                expected_version=row.version + 1,
-                values={"description": "late writer"},
-                updated_by="u2",
-                mark_user_edited=True,
+                semantic_db, row, {"description": "late writer"}, updated_by="u2"
             )
 
     async def test_a_writer_that_committed_first_is_not_overwritten(
@@ -2465,12 +2800,7 @@ class TestOptimisticLock:
 
         with pytest.raises(store.SemanticStoreConflict):
             await store._update_table_fields(
-                semantic_db,
-                table_id,
-                expected_version=stale_version,
-                values={"description": "late writer"},
-                updated_by="u2",
-                mark_user_edited=True,
+                semantic_db, row, {"description": "late writer"}, updated_by="u2"
             )
         await semantic_db.rollback()
         semantic_db.expunge_all()
@@ -2490,12 +2820,7 @@ class TestOptimisticLock:
     async def test_matching_version_writes_and_bumps(self, semantic_db, connection_id) -> None:
         row = await self._seed_and_read(semantic_db, connection_id)
         await store._update_table_fields(
-            semantic_db,
-            row.id,
-            expected_version=row.version,
-            values={"description": "fresh"},
-            updated_by="u2",
-            mark_user_edited=True,
+            semantic_db, row, {"description": "fresh"}, updated_by="u2"
         )
         # The in-session object reflects the Core UPDATE without a refresh.
         assert row.version == 2
@@ -2514,11 +2839,9 @@ class TestOptimisticLock:
         row = await self._seed_and_read(semantic_db, connection_id)
         await store._update_table_fields(
             semantic_db,
-            row.id,
-            expected_version=row.version,
-            values={"description": "One row per order", "domain": "sales"},
+            row,
+            {"description": "One row per order", "domain": "sales"},
             updated_by="u2",
-            mark_user_edited=True,
         )
         await semantic_db.commit()
         semantic_db.expunge_all()

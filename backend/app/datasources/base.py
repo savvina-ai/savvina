@@ -15,6 +15,7 @@ from .models import (
     PrivacySettings,
     QueryResult,
     ValidationResult,
+    table_key,
 )
 
 
@@ -173,7 +174,7 @@ class BaseDataSource(ABC):
 
             col_lines: list[str] = []
             for col in table.columns:
-                if f"{table.schema_name}.{table.name}.{col.name}" in privacy.excluded_columns:
+                if privacy.hides_column(table_key(table), col.name):
                     continue
 
                 nullable_suffix = "" if col.nullable else " NOT NULL"

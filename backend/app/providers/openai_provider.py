@@ -139,6 +139,14 @@ class OpenAIProvider(BaseLLMProvider):
                 f" {api_msg} Try a provider with a larger context window"
                 f" (e.g. Claude, Gemini, OpenAI), or reduce the number of tables."
             )
+        # OpenAI answers an exhausted balance with 429 too, but waiting does not help:
+        # a distinct marker so callers that retry [RATE_LIMIT] do not retry this.
+        # (Gemini's daily and per-minute quotas share code 429, status
+        # RESOURCE_EXHAUSTED and the "exceeded your current quota" message, so they
+        # cannot be told apart here and stay [RATE_LIMIT].)
+        if exc.status_code == 429 and code == "insufficient_quota":
+            hint = api_msg or "The provider account has no remaining quota or credit."
+            return ValueError(f"[QUOTA_EXCEEDED] {hint}")
         if exc.status_code == 429:
             hint = api_msg or "You have exceeded the provider's rate limit or quota."
             return ValueError(f"[RATE_LIMIT] {hint}")

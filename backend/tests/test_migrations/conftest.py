@@ -3,4 +3,4 @@
 
 """Make the semantic store fixtures available to the migration tests."""
 
-from tests.test_semantic.conftest import connection_id, semantic_db  # noqa: F401
+from tests.test_semantic.conftest import connection_id, semantic_db, semantic_tables  # noqa: F401

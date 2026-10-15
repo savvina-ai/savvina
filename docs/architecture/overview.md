@@ -188,6 +188,7 @@ services/
 | `_compact_semantic_model()` | `pipeline` | Strips table DDL; keeps business metrics / time expressions |
 | `_resolve_schema()` | `schema_pruning` | Loads per-user schema from `UserSchemaCache` or introspects |
 | `_select_relevant_tables()` | `schema_pruning` | Schema pruning via cosine similarity + domain-aware score boost |
+| `without_hidden_identifiers()` | `semantic_privacy` | Drops free-text semantic items (metrics, segments, derived columns, notes, default filters, base SQL) that name a privacy-hidden identifier |
 | `_filter_semantic_to_schema()` | `schema_pruning` | Drops pruned tables, privacy-hidden columns and their references from the `SemanticModel` |
 | `_filter_semantic_by_relevance()` | `schema_pruning` | Token-score narrowing of semantic model to question |
 | `_validate_and_correct_query()` | `validation` | Orchestrates column check + self-correction attempts |

@@ -4,8 +4,9 @@
 """Tests for APIStatusError handling in OpenAIProvider.generate_response().
 
 Covers _normalize_api_error which converts provider HTTP errors into clean, user-readable
-ValueError messages: 413 (Groq TPM), 429 (Groq TPM, Gemini quota), 402 (HuggingFace),
-400+context_length_exceeded (Cerebras), 401/403 (bad key), and catch-all PROVIDER_ERROR.
+ValueError messages: 413 (Groq TPM), 429 (Groq TPM, Gemini quota, OpenAI
+insufficient_quota), 402 (HuggingFace), 400+context_length_exceeded (Cerebras),
+401/403 (bad key), and catch-all PROVIDER_ERROR.
 """
 
 from __future__ import annotations
@@ -165,6 +166,30 @@ class TestOpenAIProviderAPIStatusErrors:
             await provider.generate_response(
                 system_prompt="sys", user_message="q", conversation_history=[]
             )
+
+    async def test_429_insufficient_quota_raises_quota_exceeded_not_rate_limit(self) -> None:
+        """OpenAI's exhausted-balance 429 → [QUOTA_EXCEEDED], which nothing retries."""
+        provider = _make_provider()
+        body = {
+            "error": {
+                "message": "You exceeded your current quota, please check your plan.",
+                "type": "insufficient_quota",
+                "code": "insufficient_quota",
+            },
+        }
+        provider._client.chat.completions.create = AsyncMock(
+            side_effect=_make_api_status_error(429, body)
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            await provider.generate_response(
+                system_prompt="sys", user_message="q", conversation_history=[]
+            )
+
+        msg = str(exc_info.value)
+        assert msg.startswith("[QUOTA_EXCEEDED]")
+        assert "[RATE_LIMIT]" not in msg
+        assert "check your plan" in msg
 
     async def test_429_gemini_quota_raises_rate_limit_with_api_message(self) -> None:
         """Gemini free-tier quota 429 → [RATE_LIMIT] ValueError containing the quota message."""

@@ -24,6 +24,7 @@ from ..datasources.models import (
     RelationshipInfo,
     SchemaInfo,
     TableInfo,
+    table_key,
 )
 from ..datasources.registry import create_datasource
 from ..models.connection import Connection
@@ -195,8 +196,8 @@ def _apply_privacy_to_schema(
     not just format_schema_for_llm. Relationships are filtered so that
     FK annotations cannot reveal excluded table or column names to the LLM.
 
-    Columns in ``excluded_columns`` (exact ``schema.table.column``, the rule the
-    adapters apply at introspection) are removed as well: introspection already
+    Columns ``PrivacySettings.hides_column`` names (the adapters' rule at
+    introspection) are removed as well: introspection already
     omits them, but a schema cache written before a privacy change still carries
     them, and every consumer of this function — chat validation and pruning,
     drift, generation — must not see one. The sensitive-name patterns are
@@ -207,18 +208,13 @@ def _apply_privacy_to_schema(
         for t in schema.tables
         if not privacy.is_table_excluded(t.schema_name, t.name)
     }
-    excluded_columns = set(privacy.excluded_columns)
-
-    def _column_hidden(schema_name: str, table: str, column: str) -> bool:
-        return f"{schema_name}.{table}.{column}" in excluded_columns
-
     return DataSourceSchema(
         source_type=schema.source_type,
         schemas=[s for s in schema.schemas if s.name not in privacy.excluded_schemas],
         tables=[
             replace(
                 t,
-                columns=[c for c in t.columns if not _column_hidden(t.schema_name, t.name, c.name)],
+                columns=[c for c in t.columns if not privacy.hides_column(table_key(t), c.name)],
             )
             for t in schema.tables
             if (t.schema_name, t.name) in visible
@@ -228,8 +224,8 @@ def _apply_privacy_to_schema(
             for r in schema.relationships
             if (r.from_schema, r.from_table) in visible
             and (r.to_schema, r.to_table) in visible
-            and not _column_hidden(r.from_schema, r.from_table, r.from_column)
-            and not _column_hidden(r.to_schema, r.to_table, r.to_column)
+            and not privacy.hides_column(f"{r.from_schema}.{r.from_table}", r.from_column)
+            and not privacy.hides_column(f"{r.to_schema}.{r.to_table}", r.to_column)
         ],
         metadata=schema.metadata,
     )
@@ -400,12 +396,12 @@ def _check_column_references(
     for m in re.finditer(r"\b([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)\b", query, re.IGNORECASE):
         prefix = m.group(1).lower()
         column = m.group(2).lower()
-        table_key = alias_map.get(prefix)
-        if table_key and table_key in table_columns and column not in table_columns[table_key]:
-            available = ", ".join(sorted(table_columns[table_key]))
+        resolved = alias_map.get(prefix)
+        if resolved and resolved in table_columns and column not in table_columns[resolved]:
+            available = ", ".join(sorted(table_columns[resolved]))
             bad.append(
                 f'column "{m.group(2)}" does not exist in table'
-                f' "{table_key.rpartition(".")[2]}" (available: {available})'
+                f' "{resolved.rpartition(".")[2]}" (available: {available})'
             )
     if bad:
         return "Query references columns not found in schema: " + "; ".join(dict.fromkeys(bad))

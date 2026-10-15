@@ -122,7 +122,6 @@ def upgrade() -> None:
     op.create_index(
         "uq_semantic_columns_name", "semantic_columns", ["table_id", "column_name"], unique=True
     )
-    op.create_index("ix_semantic_columns_table", "semantic_columns", ["table_id"])
     # Partial on PostgreSQL (a flagged column is the rare case); ``postgresql_where``
     # is ignored by SQLite so this is a no-op there rather than an error.
     op.create_index(
@@ -175,10 +174,6 @@ def upgrade() -> None:
         sa.Column("ordinal", sa.Integer(), nullable=False, server_default="0"),
         *_provenance(),
     )
-    op.create_index(
-        "ix_semantic_rel_from", "semantic_relationships", ["connection_id", "from_table"]
-    )
-    op.create_index("ix_semantic_rel_to", "semantic_relationships", ["connection_id", "to_table"])
     op.create_index("ix_semantic_rel_model", "semantic_relationships", ["model_id"])
 
     op.create_table(

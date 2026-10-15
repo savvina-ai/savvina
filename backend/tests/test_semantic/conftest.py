@@ -13,6 +13,7 @@ back naive.
 
 from collections.abc import AsyncIterator
 
+import pytest
 import pytest_asyncio
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -42,8 +43,15 @@ _TABLES = (
 )
 
 
+@pytest.fixture
+def semantic_tables() -> tuple[type, ...]:
+    """The ORM models ``semantic_db`` creates. A module that needs more (the
+    generation flow test also exercises the cache tables) overrides this."""
+    return _TABLES
+
+
 @pytest_asyncio.fixture
-async def semantic_db() -> AsyncIterator[AsyncSession]:
+async def semantic_db(semantic_tables) -> AsyncIterator[AsyncSession]:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
 
     @event.listens_for(engine.sync_engine, "connect")
@@ -53,7 +61,7 @@ async def semantic_db() -> AsyncIterator[AsyncSession]:
         cursor.close()
 
     async with engine.begin() as conn:
-        for model in _TABLES:
+        for model in semantic_tables:
             await conn.run_sync(model.__table__.create)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with maker() as session:

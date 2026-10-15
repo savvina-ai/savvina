@@ -6,10 +6,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import func, select, update
@@ -21,7 +21,7 @@ from ..auth.dependencies import get_current_active_user
 from ..auth.limiter import limiter
 from ..config import get_settings
 from ..database import get_db
-from ..datasources.models import PrivacySettings
+from ..datasources.models import PrivacySettings, table_key
 from ..models.semantic_suggestion import SemanticSuggestion
 from ..models.user import User
 from ..models.user_schema_cache import UserSchemaCache
@@ -36,7 +36,12 @@ from ..schemas.semantic import (
     SemanticSuggestionResponse,
 )
 from ..semantic import store as semantic_store
-from ..semantic.generator import SemanticModelGenerator, edges_in_schema, prune_to_schema
+from ..semantic.generator import (
+    SemanticModelGenerator,
+    drop_dangling_edits,
+    edges_in_schema,
+    prune_to_schema,
+)
 from ..semantic.models import (
     GENERATION_BATCH_SIZE,
     GenerationStatus,
@@ -241,21 +246,30 @@ async def apply_suggestion(
 
     OVERHEAD: app-only — reads/writes PostgreSQL app DB only.
     """
-    await get_connection_or_404(connection_id, db)
+    # Take the connection row lock first (it also 404s a missing connection) and hold
+    # it for the whole write: column rows carry no optimistic version predicate, so the
+    # lock is what serialises concurrent writers. The suggestion is read under it, and
+    # fresh, so a concurrent apply of the same suggestion is seen as applied.
+    await lock_and_reread_connection(connection_id, db)
 
     sug_result = await db.execute(
-        select(SemanticSuggestion).where(
+        select(SemanticSuggestion)
+        .where(
             SemanticSuggestion.id == suggestion_id,
             SemanticSuggestion.connection_id == connection_id,
         )
+        .execution_options(populate_existing=True)
     )
     suggestion = sug_result.scalar_one_or_none()
     if suggestion is None:
         raise HTTPException(status_code=404, detail="Suggestion not found")
+    if suggestion.is_applied:
+        # Applying it again would overwrite whatever has been edited since, as a fresh
+        # hand edit; a double click or a second tab must not do that.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Suggestion already applied"
+        )
 
-    # Hold the connection row lock for the whole write: column rows carry no
-    # optimistic version predicate, so the lock is what serialises concurrent writers.
-    await lock_and_reread_connection(connection_id, db)
     current = await semantic_store.load_model(db, connection_id)
     if current is None:
         raise HTTPException(status_code=404, detail="No semantic model to update")
@@ -397,6 +411,53 @@ def _drop_unstorable[T](
     return kept
 
 
+_RATE_LIMIT_MARK = "[RATE_LIMIT]"
+
+
+async def _run_llm_phase[T](
+    call: Coroutine[Any, Any, T], *, what: str, connection_id: str, provider: str
+) -> T:
+    """Await one LLM phase under the generation timeout, mapping failures to HTTP.
+
+    ``generate_tables`` and ``generate_globals`` wrap provider errors in
+    ``ValueError``, keeping the providers' ``[RATE_LIMIT]`` marker in the message.
+
+    - Timeout: 504, logged as a warning.
+    - ``ValueError`` carrying ``[RATE_LIMIT]``: 429, so the page's retry-with-backoff
+      sees it. Logged as a warning without a traceback: throttles are expected and
+      retried. (A provider's exhausted quota carries ``[QUOTA_EXCEEDED]`` instead
+      and is a 422: waiting does not fix it.)
+    - Any other ``ValueError``: 422, logged with its traceback.
+    - Anything else: 500, logged with its traceback.
+
+    ``provider`` appears only in the log lines; ``what`` also reaches the 504 detail.
+    """
+    try:
+        return await asyncio.wait_for(call, timeout=_GENERATION_TIMEOUT_SECONDS)
+    except TimeoutError as exc:
+        logger.warning(
+            "%s timed out after %ss: connection=%s provider=%s",
+            what,
+            _GENERATION_TIMEOUT_SECONDS,
+            connection_id,
+            provider,
+        )
+        raise HTTPException(
+            status_code=504, detail=f"{what} timed out after {_GENERATION_TIMEOUT_SECONDS}s"
+        ) from exc
+    except ValueError as exc:
+        if _RATE_LIMIT_MARK in str(exc):
+            logger.warning(
+                "%s throttled: connection=%s provider=%s: %s", what, connection_id, provider, exc
+            )
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        logger.exception("%s failed: connection=%s provider=%s", what, connection_id, provider)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("%s failed: connection=%s provider=%s", what, connection_id, provider)
+        raise HTTPException(status_code=500, detail=str(exc) or f"{what} failed") from exc
+
+
 async def _lock_generation(connection_id: str, db: AsyncSession, during: str) -> None:
     """Take the connection row lock (``FOR UPDATE``) the generation routes serialise on.
 
@@ -435,12 +496,15 @@ async def generate_semantic_init(
     onto whatever rows exist. ``resume=true`` continues an interrupted run: it
     requires a ``tables_partial`` model whose ``schema_hash`` still matches the
     schema, and narrows the work list to the tables that run had not reached.
+    A ``tables_partial`` model that has no schema hash or run id (one migration
+    0003 backfilled) is not resumable; ``resume=true`` then runs a fresh
+    non-destructive run and answers ``resumed: false``.
     """
     schema, conn = await _load_schema_for_connection(connection_id, current_user, db)
 
     gen = SemanticModelGenerator()
-    prep = gen.prepare_generation(schema)
-    all_keys = [f"{t.schema_name}.{t.name}" for t in schema.tables]
+    all_keys = [table_key(t) for t in schema.tables]
+    tables_total = len(all_keys)
     schema_hash = gen.compute_schema_hash(schema)
 
     # Lock before reading or writing run state. Without it, a fresh init could commit
@@ -456,9 +520,17 @@ async def generate_semantic_init(
         if existing is None or existing.generation_status != GenerationStatus.TABLES_PARTIAL:
             await db.rollback()  # release the row lock
             raise HTTPException(status_code=400, detail="No interrupted generation to resume")
-        # The hash, not a table count: a schema that changed shape while keeping
-        # its cardinality would otherwise resume onto the wrong tables.
-        if existing.schema_hash != schema_hash:
+        if existing.schema_hash is None or existing.generation_run_id is None:
+            # Migration 0003 backfills a blob-era interrupted run with neither a hash
+            # (the old init hashed nothing) nor a run id (nothing was stamped). There
+            # is no run to narrow to: fall through to a fresh, non-resumed run, which
+            # reconciles onto the rows and keeps every hand edit — what the user
+            # asked for, minus a work list the server cannot shorten. ``resumed`` stays
+            # False, and that is what begin_generation is told.
+            pass
+        elif existing.schema_hash != schema_hash:
+            # The hash, not a table count: a schema that changed shape while keeping
+            # its cardinality would otherwise resume onto the wrong tables.
             await db.rollback()  # release the row lock
             raise HTTPException(
                 status_code=409,
@@ -467,26 +539,27 @@ async def generate_semantic_init(
                     "edits); Restart from scratch discards them"
                 ),
             )
-        pending = await semantic_store.pending_table_keys(db, connection_id, all_keys)
-        resumed = True
-        tables_done = len(all_keys) - len(pending)
+        else:
+            pending = await semantic_store.pending_table_keys(db, connection_id, all_keys)
+            resumed = True
+            tables_done = len(all_keys) - len(pending)
     batch_count = max(1, -(-len(pending) // GENERATION_BATCH_SIZE))
 
     await semantic_store.begin_generation(
         db,
         connection_id,
         schema_hash=schema_hash,
-        tables_total=prep["tables_total"],
+        tables_total=tables_total,
         tables_done=tables_done,
         batch_size=GENERATION_BATCH_SIZE,
         source_dialect=conn.source_type,
-        resume=resume,
+        resume=resumed,
     )
     await db.commit()
 
     return GenerateInitResponse(
         connection_id=connection_id,
-        tables_total=prep["tables_total"],
+        tables_total=tables_total,
         batch_count=batch_count,
         batch_size=GENERATION_BATCH_SIZE,
         pending_table_keys=pending,
@@ -544,50 +617,29 @@ async def generate_semantic_batch(
                 "Restart from scratch discards them"
             ),
         )
-    known = {f"{t.schema_name}.{t.name}" for t in schema.tables}
+    known = {table_key(t) for t in schema.tables}
     unknown = [k for k in body.table_keys if k not in known]
     if unknown:
         raise HTTPException(status_code=400, detail=f"Unknown table keys: {unknown}")
 
-    llm_provider, configured_model, _ = await _resolve_provider(provider, db)
+    llm_provider, configured_model, provider_name = await _resolve_provider(provider, db)
     # ``_apply_privacy_to_schema`` already strips ``excluded_columns`` and the FKs on
     # them (including from a stale schema cache), so the strict call (no ``privacy``)
     # is defence in depth: no edge on a column outside the schema reaches the prompt.
     relationship_edges = edges_in_schema(gen._build_relationship_graph(schema), schema)
 
-    try:
-        generated = await asyncio.wait_for(
-            gen.generate_tables(
-                schema=schema,
-                provider=llm_provider,
-                model=configured_model or None,
-                table_keys=body.table_keys,
-                relationship_edges=relationship_edges,
-            ),
-            timeout=_GENERATION_TIMEOUT_SECONDS,
-        )
-    except TimeoutError as exc:
-        raise HTTPException(
-            status_code=504,
-            detail=f"Batch {body.table_keys} generation timed out after "
-            f"{_GENERATION_TIMEOUT_SECONDS}s",
-        ) from exc
-    except ValueError as exc:
-        # generate_tables wraps provider errors in ValueError; keep the stack.
-        logger.exception(
-            "generate_semantic_batch: batch %s failed: connection=%s",
-            body.table_keys,
-            connection_id,
-        )
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.exception(
-            "generate_semantic_batch: batch %s failed: connection=%s",
-            body.table_keys,
-            connection_id,
-        )
-        detail = str(exc) if str(exc) else f"Batch {body.table_keys} generation failed"
-        raise HTTPException(status_code=500, detail=detail) from exc
+    generated = await _run_llm_phase(
+        gen.generate_tables(
+            schema=schema,
+            provider=llm_provider,
+            model=configured_model or None,
+            table_keys=body.table_keys,
+            relationship_edges=relationship_edges,
+        ),
+        what=f"Batch {body.table_keys} generation",
+        connection_id=connection_id,
+        provider=provider_name,
+    )
 
     # The generator already grounds its output to the batch; this guards against a
     # future generator change writing (and stamping) a table this batch never named.
@@ -595,7 +647,8 @@ async def generate_semantic_batch(
     batch_tables = {k: v for k, v in generated.items() if k in requested}
     omitted = [k for k in body.table_keys if k not in batch_tables]
     if omitted:
-        # Not stamped, so they stay pending and a resume retries them.
+        # Not stamped, so they stay pending: reported to the client (which re-queues
+        # them once) and named by /generate/globals if still unannotated.
         logger.warning(
             "generate_semantic_batch: the LLM returned no annotation for %s; they stay "
             "pending: connection=%s",
@@ -657,6 +710,7 @@ async def generate_semantic_batch(
         tables_done=progress.tables_done if progress else 0,
         tables_total=progress.tables_total if progress else 0,
         batch_size=progress.batch_size if progress else GENERATION_BATCH_SIZE,
+        omitted_table_keys=omitted,
     )
 
 
@@ -680,8 +734,10 @@ async def generate_semantic_globals(
     user_id: str = current_user.id
     schema, conn = await _load_schema_for_connection(connection_id, current_user, db)
 
-    partial_model = await semantic_store.load_model(db, connection_id)
-    if partial_model is None or partial_model.generation_status not in (
+    # The header first: the run id lives there, not on the model. It is what the
+    # post-lock check compares against to tell a restart from a plain re-finalise.
+    header = await semantic_store.load_header(db, connection_id)
+    if header is None or header.generation_status not in (
         GenerationStatus.TABLES_PARTIAL,
         GenerationStatus.COMPLETE,
     ):
@@ -689,6 +745,13 @@ async def generate_semantic_globals(
             status_code=400,
             detail="Call /generate/init and /generate/batch before /generate/globals",
         )
+    partial_model = await semantic_store.load_model(db, connection_id)
+    if partial_model is None:  # deleted between the two reads
+        raise HTTPException(
+            status_code=400,
+            detail="Call /generate/init and /generate/batch before /generate/globals",
+        )
+    run_id = header.generation_run_id
 
     llm_provider, configured_model, provider_name = await _resolve_provider(provider, db)
 
@@ -702,46 +765,29 @@ async def generate_semantic_globals(
     # removed); pruning must not read that absence as drift.
     privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
 
-    try:
-        metrics, joins, derived_columns, gen_warnings, segments = await asyncio.wait_for(
-            gen.generate_globals(
-                schema=schema,
-                provider=llm_provider,
-                model=configured_model or None,
-                # Pruned so the LLM is not invited to write metrics over gone tables.
-                # Strictly, without ``privacy``: what the policy hides is kept in the
-                # stored model below but must never reach the LLM.
-                # log=False: the post-lock prune below warns about the same drops.
-                all_tables=prune_to_schema(partial_model.tables, schema, log=False),
-                relationship_edges=relationship_edges,
-            ),
-            timeout=_GENERATION_TIMEOUT_SECONDS,
-        )
-    except TimeoutError as exc:
-        raise HTTPException(
-            status_code=504,
-            detail=f"Globals generation timed out after {_GENERATION_TIMEOUT_SECONDS}s",
-        ) from exc
-    except ValueError as exc:
-        # generate_globals wraps provider errors in ValueError; keep the stack.
-        logger.exception(
-            "generate_semantic_globals failed: connection=%s provider=%s",
-            connection_id,
-            provider_name,
-        )
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.exception(
-            "generate_semantic_globals failed: connection=%s provider=%s",
-            connection_id,
-            provider_name,
-        )
-        detail = str(exc) if str(exc) else "Globals generation failed"
-        raise HTTPException(status_code=500, detail=detail) from exc
+    metrics, joins, derived_columns, gen_warnings, segments = await _run_llm_phase(
+        gen.generate_globals(
+            schema=schema,
+            provider=llm_provider,
+            model=configured_model or None,
+            # Pruned so the LLM is not invited to write metrics over gone tables.
+            # Strictly, without ``privacy``: what the policy hides is kept in the
+            # stored model below but must never reach the LLM.
+            # log=False: the post-lock prune below warns about the same drops.
+            all_tables=prune_to_schema(partial_model.tables, schema, log=False),
+            relationship_edges=relationship_edges,
+        ),
+        what="Globals generation",
+        connection_id=connection_id,
+        provider=provider_name,
+    )
 
     # Re-read under a row lock so this doesn't clobber a concurrent batch write.
     await _lock_generation(connection_id, db, "globals generation")
-    current_model = await semantic_store.load_model(db, connection_id)
+    # One pass over the rows under the lock: the model and its marks together, after
+    # the lock rather than before it, so a mark added between a pre-lock snapshot and
+    # the save is not lost, and no concurrent writer waits on a second scan.
+    current_model, snapshot = await semantic_store.load_model_with_provenance(db, connection_id)
     if current_model is None:
         await db.rollback()
         raise HTTPException(
@@ -759,11 +805,35 @@ async def generate_semantic_globals(
                 f"(status is now '{current_model.generation_status}')"
             ),
         )
-    # After the lock, not before: a mark added between a pre-lock snapshot and the
-    # save would otherwise be lost. One pass: marks and the stored values of the
-    # marked fields together, so save_model does not re-read every row under the lock.
-    snapshot = await semantic_store.provenance_snapshot(db, connection_id)
-    provenance = snapshot.marks
+    current_header = await semantic_store.load_header(db, connection_id)
+    if (
+        current_header is not None
+        and current_header.generation_status == GenerationStatus.TABLES_PARTIAL
+        and current_header.generation_run_id != run_id
+    ):
+        # A fresh /generate/init started a new run while the globals LLM call was in
+        # flight. Finalising now would mark that run complete before its batches ran
+        # (they would then 409) and pass the old run's globals off as the new run's.
+        # A re-finalise of a complete model has no run id before or after, so it is
+        # not caught here. Nor is a *resume* init during globals: it keeps the same
+        # run id. Globals then finalises, and the resumed loop's batches get 409
+        # (status moved on), which is acceptable.
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Generation was restarted while globals ran — its results were discarded; "
+                "finish the new run"
+            ),
+        )
+    # A hand edit that names a column the table no longer has would be written back
+    # over the pruned row as a dangling reference, with a mark that stops every later
+    # regenerate from replacing it. Drop the dangling names first (a list keeps its live
+    # entries and its mark; a scalar or an emptied list is cleared), and tell the user.
+    provenance, protected, edit_notes = drop_dangling_edits(
+        snapshot.marks, snapshot.protected, schema, privacy
+    )
+    gen_warnings = [*gen_warnings, *edit_notes]
 
     # One bad LLM item must not fail the whole finalisation in save_model.
     metrics = _drop_unstorable(metrics, "metric", lambda m: m.name, connection_id)
@@ -794,9 +864,27 @@ async def generate_semantic_globals(
     # the globals call is in the stored rows. Pruned by schema membership, not by run
     # stamp, so finishing a partial run keeps every real table it annotated.
     pruned = prune_to_schema(current_model.tables, schema, privacy)
+    # Every table of the schema should have a row by now. One without is a table the
+    # LLM returned nothing for (twice, after the client's re-queue), one a "Finish
+    # with what's generated" never reached, or one created since the run started; the
+    # model is complete either way, so say so.
+    unannotated = sorted(key for key in (table_key(t) for t in schema.tables) if key not in pruned)
+    if unannotated:
+        sample = ", ".join(unannotated[:5]) + (", …" if len(unannotated) > 5 else "")
+        gen_warnings = [
+            *gen_warnings,
+            f"{len(unannotated)} table(s) have no annotation ({sample}): the LLM returned "
+            "nothing for them, the run was finished before reaching them, or they are new "
+            "since the run started. Regenerate to annotate them.",
+        ]
     # A marked edge is carried forward by carry_edited_relationships unbounded, so drop
     # the ones whose endpoints left the database first — against the live schema, not
     # the annotated tables, so a user edge to a real but unannotated table survives.
+    # Only *marked* edges are carried from ``current``: an unmarked FK edge to an
+    # endpoint the policy hides is not regenerated while it is hidden
+    # (``relationship_edges`` comes from the narrowed schema) and returns on the
+    # first globals run after it is un-hidden, from the FK it is built from. Nothing
+    # hand-written is lost — see "Finalisation" in semantic-model-generation.md.
     pruned_relationships = semantic_store.carry_edited_relationships(
         edges_in_schema(current_model.relationships, schema, privacy),
         relationship_edges,
@@ -827,14 +915,14 @@ async def generate_semantic_globals(
     )
 
     try:
-        await semantic_store.save_model(
+        stored = await semantic_store.save_model(
             db,
             connection_id,
             final,
             updated_by=user_id,
             source="generation",
             provenance=provenance,
-            protected=snapshot.protected,
+            protected=protected,
         )
     except ValueError as exc:
         # An over-long identity value the drops above did not cover; never a 500.
@@ -843,6 +931,5 @@ async def generate_semantic_globals(
     await _invalidate_connection_caches(connection_id, db)
     await db.commit()
     # What was stored, not ``final``: the store fits values (NULs, VARCHAR lengths)
-    # and dedupes name-keyed items, so the two can differ.
-    stored = await semantic_store.load_model(db, connection_id)
-    return stored if stored is not None else final
+    # and dedupes name-keyed items, and returns the result.
+    return stored
