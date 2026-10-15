@@ -29,6 +29,8 @@ export interface GenerateBatchResult {
   tables_done: number;
   tables_total: number;
   batch_size: number;
+  /** Keys of this batch the LLM returned nothing for; still pending on the server. */
+  omitted_table_keys: string[];
 }
 
 export const semanticApi = {

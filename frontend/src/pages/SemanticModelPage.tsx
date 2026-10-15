@@ -7,9 +7,15 @@
  * semantic type badges, and the pending suggestion feedback loop.
  */
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useParams } from 'react-router';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import {
+  replaceEqualDeep,
+  useIsMutating,
+  useQuery,
+  useMutation,
+  useQueryClient,
+} from '@tanstack/react-query';
 import axios from 'axios';
 import { AlertTriangle, Check, ChevronRight, Pencil, Plus, X } from 'lucide-react';
 
@@ -144,7 +150,8 @@ type ConfirmAction = 'regenerate' | 'restart';
 
 interface ConfirmDialogProps {
   /**
-   * `regenerate` reconciles onto the existing model and keeps hand edits; `restart`
+   * `regenerate` reconciles onto the existing model and keeps saved hand edits (the page
+   * will not start it over unsaved ones); `restart`
    * deletes the model first, edits included, so it is worded and styled as destructive.
    */
   action: ConfirmAction;
@@ -172,8 +179,8 @@ function GenerateConfirmDialog({ action, onConfirm, onCancel }: ConfirmDialogPro
           </p>
         ) : (
           <p className="mb-3 text-sm text-muted-foreground">
-            This will call the LLM to re-annotate the model from your current schema. Fields
-            you edited by hand are kept; tables and columns no longer in the database are
+            This will call the LLM to re-annotate the model from your current schema. Saved
+            edits you made by hand are kept; tables and columns no longer in the database are
             removed.
           </p>
         )}
@@ -437,7 +444,7 @@ export default function SemanticModelPageV2() {
   const [derivedForm, setDerivedForm] = useState<DerivedFormState>(emptyDerived);
 
   // Primary model query. `null` data means "known to have no model": Restart writes it
-  // after its DELETE, see `restartGeneration`.
+  // after its DELETE, see the `generation` mutation's restart path.
   const fetchModel = () => semanticApi.get(connectionId!) as Promise<SemanticModel>;
   const {
     data: model,
@@ -479,14 +486,6 @@ export default function SemanticModelPageV2() {
   });
 
 
-  // Seed an empty draft from every successful fetch — first load, and the reseed after a
-  // failed run dropped the draft. Keyed on `dataUpdatedAt`, not `model`: structural
-  // sharing hands back the same reference when a refetch returns identical data, and the
-  // draft would then stay empty (and every editor inert) until a reload.
-  useEffect(() => {
-    if (model && !draft) setDraft(model);
-  }, [dataUpdatedAt]); // eslint-disable-line react-hooks/exhaustive-deps
-
   // Auto-select first configured provider when none is selected
   const configuredProviders = useMemo(
     () => providers?.filter((p) => p.is_configured) ?? [],
@@ -497,6 +496,34 @@ export default function SemanticModelPageV2() {
       setSelectedProvider(configuredProviders[0].id ?? configuredProviders[0].provider_type);
     }
   }, [configuredProviders, selectedProvider]);
+
+  // A fresh read of the model. `fetchQuery` alone joins a fetch already in flight for the
+  // key — say a focus refetch that started before a run's batches landed — and would hand
+  // back that older snapshot, so cancel it first.
+  const fetchFreshModel = async () => {
+    await queryClient.cancelQueries({ queryKey: ['semantic', connectionId], exact: true });
+    return queryClient.fetchQuery<SemanticModel | null>({
+      queryKey: ['semantic', connectionId],
+      queryFn: fetchModel,
+      staleTime: 0,
+    });
+  };
+
+  // Bumped as every run starts. Nothing blocks a new run while a reseed is in flight (an
+  // empty draft is never dirty), and a reseed landing mid-run would re-arm the editor.
+  const runSeq = useRef(0);
+  // Fill an empty draft from a fresh fetch once a run has ended without handing this page
+  // a result. Only ever fills a null draft, so it is idempotent with every other seed (the
+  // `dataUpdatedAt` effect, a success handler). A failed fetch leaves the draft empty; the
+  // effect then seeds it from whichever later fetch succeeds.
+  const reseedDraft = () => {
+    const run = runSeq.current;
+    fetchFreshModel()
+      .then((m) => {
+        if (m && runSeq.current === run) setDraft((d) => d ?? m);
+      })
+      .catch(() => {});
+  };
 
   // Every generation path — a full run, Resume, Restart and "Finish with what's
   // generated" — ends the same way, so they share one pair of handlers rather than
@@ -512,13 +539,14 @@ export default function SemanticModelPageV2() {
   // A failed run has still reconciled whatever batches landed, so the pre-run draft is
   // stale: saving it would revert those values AND mark them user-edited, and neither
   // Resume nor a regenerate would touch them again. Drop it — Save stays disabled and
-  // every editor ignores input while `draft` is null — and refetch; the `dataUpdatedAt`
-  // effect re-seeds it from whichever later fetch succeeds. A failed refetch leaves the
-  // draft empty rather than resurrecting the pre-run cache.
+  // every editor ignores input while `draft` is null — then re-seed it here from a fresh
+  // fetch (reseedDraft), rather than leaving it to the `dataUpdatedAt` effect, which only
+  // seeds once the run is no longer pending. A failed fetch leaves the draft empty rather
+  // than resurrecting the pre-run cache.
   const handleGenerationError = () => {
     setGenProgress(null);
     setDraft(null);
-    queryClient.invalidateQueries({ queryKey: ['semantic', connectionId] });
+    reseedDraft();
   };
 
   // One run: init (fresh or resume) followed by the pending keys sliced into batches and
@@ -556,15 +584,35 @@ export default function SemanticModelPageV2() {
     for (let i = 0; i < pending.length; i += step) {
       queue.push(pending.slice(i, i + step));
     }
+    // A table the LLM returns nothing for stays pending server-side. It gets exactly
+    // one more attempt, as its own batch; a second omission counts as done for the
+    // bar, and /generate/globals names every table still without an annotation.
+    const retried = new Set<string>();
     const runWorker = async () => {
-      while (queue.length > 0 && !token.cancelled) {
-        const keys = queue.shift()!;
-        if (token.cancelled) return;
-        await withRetry(() => semanticApi.generateBatch(connectionId!, keys, providerParam), token);
-        // A batch that lands after the other worker failed must not move the bar of a
-        // run that has already been abandoned.
-        if (token.cancelled) return;
-        setGenProgress((p) => (p ? { ...p, tables_done: p.tables_done + keys.length } : null));
+      try {
+        while (queue.length > 0 && !token.cancelled) {
+          const keys = queue.shift()!;
+          const result = await withRetry(
+            () => semanticApi.generateBatch(connectionId!, keys, providerParam),
+            token,
+          );
+          // A batch that lands after the other worker failed must not move the bar of a
+          // run that has already been abandoned.
+          if (token.cancelled || !result) return;
+          // Only keys this batch actually carried: anything else would skew the bar.
+          const requeue = (result.omitted_table_keys ?? []).filter(
+            (k) => keys.includes(k) && !retried.has(k),
+          );
+          requeue.forEach((k) => retried.add(k));
+          if (requeue.length > 0) queue.push(requeue);
+          const landed = keys.length - requeue.length;
+          setGenProgress((p) => (p ? { ...p, tables_done: p.tables_done + landed } : null));
+        }
+      } catch (err) {
+        // withRetry cancels on its own failures; anything else thrown here must stop the
+        // sibling worker too, or it keeps dispatching batches for an abandoned run.
+        token.cancelled = true;
+        throw err;
       }
     };
     await Promise.all(Array.from({ length: Math.min(CONCURRENCY, queue.length) }, runWorker));
@@ -582,82 +630,89 @@ export default function SemanticModelPageV2() {
     return globals;
   };
 
-  // Every mutation below resets its three siblings on start: the error banner reads all
-  // four, and TanStack holds an error until that mutation re-runs or is reset.
-  const generate = useMutation({
-    mutationFn: () => runGeneration(false),
-    onMutate: () => {
-      finishGeneration.reset();
-      resumeGeneration.reset();
-      restartGeneration.reset();
-    },
-    onSuccess: handleGenerationSuccess,
-    onError: handleGenerationError,
-  });
+  type GenerationKind = 'full' | 'resume' | 'restart' | 'finish';
 
-  // Resume: generate only the tables the interrupted run had not reached, then globals.
-  const resumeGeneration = useMutation({
-    mutationFn: () => runGeneration(true),
-    onMutate: () => {
-      generate.reset();
-      finishGeneration.reset();
-      restartGeneration.reset();
+  // One mutation for every way a run can start, so there is one isPending, one error
+  // (TanStack clears it when the next run starts) and no cross-resets. Restart is the
+  // one destructive path: the model is deleted first, then a fresh (non-resumed) run —
+  // /generate/init on its own no longer discards anything. Finish runs /generate/globals
+  // alone: it accepts a tables_partial model and finalises over whatever is there.
+  const generation = useMutation<SemanticModel, Error, GenerationKind>({
+    // Keyed so a page mounted later can see a run this one started (see runningElsewhere).
+    mutationKey: ['semantic-generation', connectionId],
+    mutationFn: async (kind) => {
+      switch (kind) {
+        case 'full':
+          return runGeneration(false);
+        case 'resume':
+          return runGeneration(true);
+        case 'restart':
+          await semanticApi.delete(connectionId!);
+          // The model is gone server-side; keep no cached copy, or a failed init leaves
+          // the old editor and a stale interrupted banner on screen. Data is set to
+          // `null` rather than removed: removing an observed query makes it refetch at
+          // once, and the page's loading spinner would replace the progress bar mid-run.
+          queryClient.setQueryData<SemanticModel | null>(['semantic', connectionId], null);
+          return runGeneration(false);
+        case 'finish': {
+          const done = model?.generation_progress?.tables_done ?? 0;
+          setGenProgress({
+            tables_done: done,
+            tables_total: model?.generation_progress?.tables_total ?? done,
+            batch_size: 0,
+            // Skips straight to the globals label; there is no batch queue on this path.
+            phase: 'globals',
+          });
+          const globals = await withRetry(
+            () => semanticApi.generateGlobals(connectionId!, selectedProvider || undefined),
+            { cancelled: false },
+          );
+          if (!globals) throw new Error('Generation was cancelled');
+          return globals;
+        }
+      }
     },
-    onSuccess: handleGenerationSuccess,
-    onError: handleGenerationError,
-  });
-
-  // Restart is the one destructive path left: the model is deleted first, then a fresh
-  // (non-resumed) run — /generate/init on its own no longer discards anything.
-  const restartGeneration = useMutation({
-    mutationFn: async () => {
-      await semanticApi.delete(connectionId!);
-      // The model is gone server-side; keep neither its draft nor its cached copy, or a
-      // failed init leaves the old editor and a stale interrupted banner on screen. Data
-      // is set to `null` rather than removed: removing an observed query makes it refetch
-      // at once, and the page's loading spinner would replace the progress bar mid-run.
-      queryClient.setQueryData<SemanticModel | null>(['semantic', connectionId], null);
+    // Every editor ignores input while `draft` is null (see handleGenerationError), so
+    // nothing typed mid-run can be replaced by the result without a trace. The result
+    // re-seeds the draft on success; a failed run refetches and re-seeds from that.
+    onMutate: () => {
+      runSeq.current += 1;
       setDraft(null);
-      return runGeneration(false);
-    },
-    onMutate: () => {
-      generate.reset();
-      finishGeneration.reset();
-      resumeGeneration.reset();
     },
     onSuccess: handleGenerationSuccess,
     onError: handleGenerationError,
   });
 
-  // Finish an interrupted run without discarding the tables it already produced.
-  // `/generate/globals` accepts a `tables_partial` model and finalises over whatever is
-  // there, so this needs no init and no batch calls.
-  const finishGeneration = useMutation({
-    mutationFn: async () => {
-      const done = model?.generation_progress?.tables_done ?? 0;
-      setGenProgress({
-        tables_done: done,
-        tables_total: model?.generation_progress?.tables_total ?? done,
-        batch_size: 0,
-        // Skips straight to the globals label; there is no batch queue on this path.
-        phase: 'globals',
-      });
-      const globals = await withRetry(
-        () => semanticApi.generateGlobals(connectionId!, selectedProvider || undefined),
-        { cancelled: false },
-      );
-      if (!globals) throw new Error('Generation was cancelled');
-      return globals;
-    },
-    // Mirrors `generate.onMutate` — see the note there.
-    onMutate: () => {
-      generate.reset();
-      resumeGeneration.reset();
-      restartGeneration.reset();
-    },
-    onSuccess: handleGenerationSuccess,
-    onError: handleGenerationError,
-  });
+  // A run keeps going when the page that started it unmounts (the route remounts the page
+  // per connection, so leaving mid-run and coming back yields a new instance). That run is
+  // invisible to this instance's mutation, so count it from the mutation cache: while it
+  // is in flight this page must stay inert exactly as during its own run.
+  const runsInFlight = useIsMutating({ mutationKey: ['semantic-generation', connectionId] });
+  const runningElsewhere = runsInFlight > 0 && !generation.isPending;
+  // Every control that can start a run or write the model is disabled while one is in
+  // flight, whichever page instance owns it.
+  const anyGenerationPending = generation.isPending || runningElsewhere;
+
+  // The owner's handlers run on its unmounted instance, where setDraft is a no-op, so this
+  // page reseeds itself when such a run ends, success or failure alike. Not for runs
+  // started here: their own handlers seed (or reseed) the draft.
+  const wasRunningElsewhere = useRef(runningElsewhere);
+  useEffect(() => {
+    const ended = wasRunningElsewhere.current && !runningElsewhere;
+    wasRunningElsewhere.current = runningElsewhere;
+    if (ended && !draft) reseedDraft();
+  }, [runningElsewhere]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Seed an empty draft from every successful fetch — first load, and any later fetch
+  // once a failed run's own reseed (handleGenerationError) failed too; when that reseed
+  // succeeds, both fill the same null draft and the second is a no-op. Keyed on
+  // `dataUpdatedAt`, not `model`: structural sharing hands back the same reference when a
+  // refetch returns identical data, and the draft would then stay empty (and every
+  // editor inert) until a reload.
+  // Not while a run is in flight: a focus refetch would otherwise re-arm the editor mid-run.
+  useEffect(() => {
+    if (model && !draft && !anyGenerationPending) setDraft(model);
+  }, [dataUpdatedAt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // The sent draft is the mutation variable so onSuccess can tell whether the user kept
   // typing while the PUT was in flight.
@@ -683,6 +738,20 @@ export default function SemanticModelPageV2() {
       setDraft(updated);
       queryClient.invalidateQueries({ queryKey: ['semantic-suggestions', connectionId] });
     },
+    // E.g. a 409 because another tab applied it first: the list and the model are both
+    // out of date. Apply is disabled over unsaved edits, so the draft is the model as
+    // loaded and can be replaced — unless the user started editing meanwhile.
+    onError: () => {
+      queryClient.invalidateQueries({ queryKey: ['semantic-suggestions', connectionId] });
+      const before = draft;
+      // A run started before the refresh lands has dropped the draft on purpose.
+      const run = runSeq.current;
+      fetchFreshModel()
+        .then((m) => {
+          if (m && runSeq.current === run) setDraft((cur) => (cur === before ? m : cur));
+        })
+        .catch(() => {});
+    },
   });
 
   const connMatch = connections?.find((c) => c.id === connectionId);
@@ -690,21 +759,22 @@ export default function SemanticModelPageV2() {
   const displayModel = draft ?? model;
   const hasModel = !!displayModel;
 
-  // Any one of the four generation mutations writes the same connection's rows, so
-  // exactly one may run at a time — every control that can start one is disabled while
-  // any of the others is in flight.
-  const anyGenerationPending =
-    generate.isPending ||
-    finishGeneration.isPending ||
-    resumeGeneration.isPending ||
-    restartGeneration.isPending;
+  // Unsaved edits. Not `draft !== model`: the cache is structurally shared, so after a
+  // save or a run the two are equal in value but rarely the same reference.
+  const isDirty = useMemo(
+    () => !!draft && !!model && replaceEqualDeep(model, draft) !== model,
+    [draft, model],
+  );
 
-  // Why no generation can start, shared by the toolbar and the interrupted banner.
+  // Why no generation can start, shared by the toolbar and the interrupted banner (and so
+  // Resume, Finish and Restart). Every run drops the draft, so unsaved edits block one.
   const generateDisabledReason = !canGenerate
     ? 'Sign in to generate the semantic model'
     : !selectedProvider
       ? 'Configure an LLM provider in Settings first'
-      : null;
+      : isDirty
+        ? 'Save your changes first — starting a run discards unsaved edits'
+        : null;
 
   // A metric missing a field its type requires would save (empty strings pass the
   // backend's `str` validation) and then render as broken SQL in every prompt.
@@ -753,8 +823,8 @@ export default function SemanticModelPageV2() {
           action={confirmAction}
           onConfirm={() => {
             setConfirmAction(null);
-            if (confirmAction === 'restart') restartGeneration.mutate();
-            else generate.mutate();
+            if (confirmAction === 'restart') generation.mutate('restart');
+            else generation.mutate('full');
           }}
           onCancel={() => setConfirmAction(null)}
         />
@@ -789,6 +859,7 @@ export default function SemanticModelPageV2() {
                 <input
                   type="checkbox"
                   checked={displayModel.is_user_reviewed}
+                  disabled={!draft || applySuggestion.isPending}
                   onChange={(e) =>
                     setDraft((d) => (d ? { ...d, is_user_reviewed: e.target.checked } : d))
                   }
@@ -877,8 +948,8 @@ export default function SemanticModelPageV2() {
             {/* Held while any generation run is in flight: two runs would write the same
                 connection's rows concurrently. */}
             <button
-              onClick={() => hasModel ? setConfirmAction('regenerate') : generate.mutate()}
-              disabled={!canGenerate || anyGenerationPending || !selectedProvider}
+              onClick={() => hasModel ? setConfirmAction('regenerate') : generation.mutate('full')}
+              disabled={!!generateDisabledReason || anyGenerationPending}
               title={generateDisabledReason ?? undefined}
               className="rounded-md border border-primary px-4 py-1.5 text-sm text-primary transition-colors hover:bg-primary/10 disabled:cursor-not-allowed disabled:opacity-50"
             >
@@ -939,7 +1010,18 @@ export default function SemanticModelPageV2() {
                   }}
                 />
               </div>
+              <p className="text-xs text-muted-foreground">
+                Editing is paused while generation runs.
+              </p>
             </div>
+          )}
+
+          {/* A run with no bar: one started by this page before its first progress, or one
+              still going from before the user left and came back. */}
+          {anyGenerationPending && !genProgress && (
+            <p className="text-xs text-muted-foreground">
+              Generation is running. Editing is paused until it finishes.
+            </p>
           )}
 
           {/* Interrupted generation. Unmounted while any run is in flight, so the user
@@ -948,29 +1030,19 @@ export default function SemanticModelPageV2() {
             <GenerationBanner
               tablesDone={model.generation_progress?.tables_done ?? 0}
               tablesTotal={model.generation_progress?.tables_total ?? null}
-              canGenerate={canGenerate && !!selectedProvider}
+              canGenerate={!generateDisabledReason}
               disabledReason={generateDisabledReason}
               hasTables={Object.keys(model.tables ?? {}).length > 0}
-              onResume={() => resumeGeneration.mutate()}
-              onFinish={() => finishGeneration.mutate()}
+              onResume={() => generation.mutate('resume')}
+              onFinish={() => generation.mutate('finish')}
               onRestart={() => setConfirmAction('restart')}
             />
           )}
 
           {/* Generation error */}
-          {(generate.error ||
-            finishGeneration.error ||
-            resumeGeneration.error ||
-            restartGeneration.error) && (
+          {generation.error && (
             <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-              Generation failed:{' '}
-              {apiErrorMessage(
-                generate.error ??
-                  finishGeneration.error ??
-                  resumeGeneration.error ??
-                  restartGeneration.error,
-                'Unknown error',
-              )}
+              Generation failed: {apiErrorMessage(generation.error, 'Unknown error')}
             </div>
           )}
 
@@ -1022,7 +1094,7 @@ export default function SemanticModelPageV2() {
               <p className="mb-3 text-sm text-muted-foreground">No semantic model yet.</p>
               {canGenerate ? (
                 <button
-                  onClick={() => generate.mutate()}
+                  onClick={() => generation.mutate('full')}
                   disabled={anyGenerationPending || !selectedProvider}
                   className="rounded-md bg-brand-gradient px-6 py-2 text-sm font-medium text-white shadow-gradient-btn transition-opacity hover:opacity-90 disabled:opacity-50"
                 >
@@ -1085,6 +1157,13 @@ export default function SemanticModelPageV2() {
                 id={`sem-tabpanel-${activeTab}`}
                 aria-labelledby={`sem-tab-${activeTab}`}
               >
+              {/* Every editor ignores input while the draft is empty (a run in flight, or a
+                  failed run awaiting its reseed); disabling them says so instead of
+                  swallowing keystrokes. The model is shown read-only meanwhile and every
+                  control inside is paused; only the tabs stay outside and keep working. */}
+              {/* Inert while an apply is in flight too: its success and error handlers both
+                  replace the draft, which would drop anything typed during the POST. */}
+              <fieldset disabled={!draft || applySuggestion.isPending} className="contents">
 
               {/* Tables — existing editor (v2 fields are preserved via spread) */}
               {activeTab === 'tables' && (
@@ -1755,6 +1834,15 @@ export default function SemanticModelPageV2() {
               {/* Pending suggestions — corrections captured from chat feedback */}
               {activeTab === 'suggestions' && (
                 <div className="space-y-3">
+                  {applySuggestion.error && (
+                    <p
+                      role="alert"
+                      className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+                    >
+                      Could not apply the suggestion:{' '}
+                      {apiErrorMessage(applySuggestion.error, 'Unknown error')}
+                    </p>
+                  )}
                   {pendingSuggestions.length === 0 ? (
                     <p className="py-4 text-center text-sm text-muted-foreground">
                       No pending suggestions. Thumbs-down feedback on chat answers will
@@ -1792,7 +1880,19 @@ export default function SemanticModelPageV2() {
                           <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
                             <button
                               onClick={() => applySuggestion.mutate(s.id)}
-                              disabled={applySuggestion.isPending}
+                              // Applying writes the model and replaces the draft with the
+                              // result: mid-run it would race the run's writes and be replaced
+                              // in turn, and over unsaved edits it would discard them.
+                              disabled={
+                                applySuggestion.isPending || anyGenerationPending || isDirty
+                              }
+                              title={
+                                anyGenerationPending
+                                  ? 'Wait for generation to finish before applying suggestions'
+                                  : isDirty
+                                    ? 'Save your changes first — applying a suggestion discards unsaved edits'
+                                    : undefined
+                              }
                               className="flex items-center gap-1 rounded-md bg-brand-gradient px-3 py-1.5 text-xs font-medium text-white shadow-gradient-btn hover:opacity-90 disabled:opacity-50"
                             >
                               <Check className="h-3 w-3" />
@@ -1815,6 +1915,7 @@ export default function SemanticModelPageV2() {
                 </div>
               )}
 
+              </fieldset>
               </div>{/* end tabpanel */}
             </>
           )}

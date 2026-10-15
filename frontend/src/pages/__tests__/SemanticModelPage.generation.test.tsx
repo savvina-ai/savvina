@@ -12,9 +12,9 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter, Route, Routes } from 'react-router';
+import { Link, MemoryRouter, Route, Routes } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 vi.mock('../../api/semantic', () => ({
@@ -61,6 +61,7 @@ vi.mock('../../store/authStore', () => ({
 
 import { semanticApi } from '../../api/semantic';
 import SemanticModelPage from '../SemanticModelPage';
+import SemanticModelRoute from '../SemanticModelRoute';
 
 const BASE_MODEL = {
   tables: {
@@ -143,6 +144,7 @@ beforeEach(() => {
     tables_done: 0,
     tables_total: 10,
     batch_size: 4,
+    omitted_table_keys: [],
   } as never);
   vi.mocked(semanticApi.delete).mockResolvedValue(undefined as never);
 });
@@ -249,9 +251,9 @@ describe('SemanticModelPage — finishing an interrupted generation', () => {
     expect(semanticApi.generateGlobals).toHaveBeenCalledTimes(1);
   });
 
-  // The banner reads generate.error || finishGeneration.error, and TanStack holds an
-  // error until that same mutation re-runs or is reset. A failed full run followed by a
-  // successful Finish must not leave the red banner up over a model that is now complete.
+  // The banner reads the one generation mutation's error, which TanStack clears when the
+  // next run starts. A failed full run followed by a successful Finish must not leave the
+  // red banner up over a model that is now complete.
   it("clears a failed run's error banner once Finish succeeds", async () => {
     const user = userEvent.setup();
     vi.mocked(semanticApi.generateInit).mockResolvedValue({
@@ -362,7 +364,7 @@ describe('SemanticModelPage — resuming and restarting an interrupted generatio
     // 10 total, 1 pending → 9 already done before the first batch lands.
     expect(await screen.findByText('9 / 10')).toBeInTheDocument();
     gate.resolve({ connection_id: 'conn-1', table_keys: ['public.x'], tables_done: 10,
-                   tables_total: 10, batch_size: 4 });
+                   tables_total: 10, batch_size: 4, omitted_table_keys: [] });
     await waitFor(() => expect(semanticApi.generateGlobals).toHaveBeenCalled());
   });
 
@@ -471,7 +473,8 @@ describe('SemanticModelPage — confirming a restart', () => {
 
     const dialog = await screen.findByRole('dialog');
     expect(dialog).not.toHaveTextContent(/overwritten/i);
-    expect(dialog).toHaveTextContent(/edited by hand are kept/);
+    // Only saved edits survive: the run drops the draft, and is refused over unsaved ones.
+    expect(dialog).toHaveTextContent(/Saved edits you made by hand are kept/);
     // The phased path batches tables and does no column fingerprinting.
     expect(dialog).toHaveTextContent(/batches of up to 4, one LLM call per batch/);
     expect(dialog).not.toHaveTextContent(/fingerprint|invoked once/i);
@@ -560,6 +563,7 @@ describe('SemanticModelPage — after a failed run', () => {
       .mockRejectedValueOnce(httpError(409, 'A restart superseded this run') as never)
       .mockResolvedValue({
         connection_id: 'conn-1', table_keys: [], tables_done: 4, tables_total: 20, batch_size: 4,
+        omitted_table_keys: [],
       } as never);
 
     renderPage();
@@ -599,6 +603,117 @@ describe('SemanticModelPage — after a failed run', () => {
   });
 });
 
+describe('SemanticModelPage — the reseed after a failed run', () => {
+  it('re-enables the editor when the refetch resolves at once', async () => {
+    /*
+     * The reseed is the failure handler's own fetch, not an effect that has to observe
+     * the cache update after the run stopped being pending.
+     */
+    const user = userEvent.setup();
+    vi.mocked(semanticApi.get).mockResolvedValue(PARTIAL_MODEL as never);
+    vi.mocked(semanticApi.generateInit).mockResolvedValue({
+      connection_id: 'conn-1', tables_total: 10, batch_count: 1, batch_size: 4,
+      pending_table_keys: ['public.orders'], resumed: true,
+    } as never);
+    vi.mocked(semanticApi.generateBatch).mockRejectedValue(
+      httpError(500, 'provider exploded') as never,
+    );
+
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: 'Resume' }));
+    expect(await screen.findByText(/Generation failed: provider exploded/)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled(),
+    );
+    expect(screen.getByRole('checkbox', { name: 'Reviewed by user' })).toBeEnabled();
+    expect(semanticApi.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not seed the draft when the reseed lands after another run has started', async () => {
+    /*
+     * The draft is empty after a failure, so nothing blocks a second run while the
+     * reseed is still in flight. Its late result must not re-arm the editor mid-run.
+     */
+    const user = userEvent.setup();
+    const refetch = deferred<unknown>();
+    vi.mocked(semanticApi.get)
+      .mockResolvedValueOnce(PARTIAL_MODEL as never)
+      .mockReturnValueOnce(refetch.promise as never)
+      .mockResolvedValue(PARTIAL_MODEL as never);
+    vi.mocked(semanticApi.generateInit)
+      .mockResolvedValueOnce({
+        connection_id: 'conn-1', tables_total: 10, batch_count: 1, batch_size: 4,
+        pending_table_keys: ['public.orders'], resumed: true,
+      } as never);
+    vi.mocked(semanticApi.generateBatch).mockRejectedValue(
+      httpError(500, 'provider exploded') as never,
+    );
+
+    const { qc } = renderPage();
+    await user.click(await screen.findByRole('button', { name: 'Resume' }));
+    expect(await screen.findByText(/Generation failed: provider exploded/)).toBeInTheDocument();
+
+    // Second run, held at init while the first run's reseed lands.
+    const gate = deferred<unknown>();
+    vi.mocked(semanticApi.generateInit).mockReturnValue(gate.promise as never);
+    await user.click(screen.getByRole('button', { name: 'Resume' }));
+    await waitFor(() => expect(semanticApi.generateInit).toHaveBeenCalledTimes(2));
+
+    refetch.resolve(PARTIAL_MODEL);
+    // The reseed has landed in the cache; flush what it chains before asserting.
+    await waitFor(() =>
+      expect(qc.getQueryState(['semantic', 'conn-1'])?.dataUpdateCount).toBe(2),
+    );
+    await act(async () => {});
+    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeDisabled();
+    expect(screen.getByRole('checkbox', { name: 'Reviewed by user' })).toBeDisabled();
+  });
+});
+
+describe('SemanticModelPage — a refetch already in flight when a run fails', () => {
+  it('seeds the draft from a fresh fetch, not from the older refetch', async () => {
+    /*
+     * A refetch started before the batches landed carries a pre-batch snapshot. Reusing
+     * it for the reseed would put exactly the stale values back that dropping the draft
+     * exists to keep out.
+     */
+    const user = userEvent.setup();
+    const stale = deferred<unknown>();
+    const named = (display_name: string) => ({
+      ...PARTIAL_MODEL,
+      tables: { 'public.orders': { ...PARTIAL_MODEL.tables['public.orders'], display_name } },
+    });
+    vi.mocked(semanticApi.get)
+      .mockResolvedValueOnce(PARTIAL_MODEL as never)
+      .mockReturnValueOnce(stale.promise as never)
+      .mockResolvedValue(named('Orders (fresh)') as never);
+    const initGate = deferred<unknown>();
+    vi.mocked(semanticApi.generateInit).mockReturnValue(initGate.promise as never);
+    vi.mocked(semanticApi.generateBatch).mockRejectedValue(
+      httpError(500, 'provider exploded') as never,
+    );
+
+    const { qc } = renderPage();
+    await user.click(await screen.findByRole('button', { name: 'Resume' }));
+    // A focus-style refetch starts mid-run, before any batch has landed.
+    void qc.refetchQueries({ queryKey: ['semantic', 'conn-1'] });
+    await waitFor(() => expect(semanticApi.get).toHaveBeenCalledTimes(2));
+
+    initGate.resolve({
+      connection_id: 'conn-1', tables_total: 10, batch_count: 1, batch_size: 4,
+      pending_table_keys: ['public.orders'], resumed: true,
+    });
+    expect(await screen.findByText(/Generation failed: provider exploded/)).toBeInTheDocument();
+    expect(await screen.findByText('Orders (fresh)')).toBeInTheDocument();
+
+    stale.resolve(named('Orders (stale)'));
+    await act(async () => {});
+    expect(screen.queryByText('Orders (stale)')).not.toBeInTheDocument();
+    expect(screen.getByText('Orders (fresh)')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled();
+  });
+});
+
 describe('SemanticModelPage — when the reseed after a failed run also fails', () => {
   it('keeps the editor inert until a later refetch succeeds, then reseeds', async () => {
     /*
@@ -622,13 +737,16 @@ describe('SemanticModelPage — when the reseed after a failed run also fails', 
     vi.mocked(semanticApi.update).mockImplementation(async (_id, sent) => sent as never);
 
     const { qc } = renderPage();
-    await user.click(await screen.findByRole('button', { name: 'Resume' }));
+    // Expanded before the run: user-event treats everything inside the disabled fieldset
+    // as disabled (browsers only disable its form controls), so it cannot expand it later.
+    await user.click(await screen.findByText('Orders'));
+    await user.click(screen.getByRole('button', { name: 'Resume' }));
     expect(await screen.findByText(/Generation failed: provider exploded/)).toBeInTheDocument();
     await waitFor(() =>
       expect(qc.getQueryState(['semantic', 'conn-1'])?.status).toBe('error'),
     );
 
-    await user.click(screen.getByText('Orders'));
+    expect(screen.getByDisplayValue('Customer orders')).toBeDisabled();
     await user.type(screen.getByDisplayValue('Customer orders'), ' (edited)');
     expect(screen.getByDisplayValue('Customer orders')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Save Changes' })).toBeDisabled();
@@ -665,5 +783,425 @@ describe('SemanticModelPage — edits during a save', () => {
     gate.resolve(COMPLETE_MODEL);
     await waitFor(() => expect(screen.getByText('Saved')).toBeInTheDocument());
     expect(screen.getByRole('checkbox', { name: 'Reviewed by user' })).toBeChecked();
+  });
+});
+
+describe('SemanticModelPage — edits during a generation run', () => {
+  it('ignores input while a run is in flight and shows the result when it lands', async () => {
+    /*
+     * Any edit typed mid-run would be replaced by the result; rather than lose it
+     * silently, the draft is dropped when the run starts (every editor ignores input
+     * while it is empty, exactly as after a failed run) and re-seeded from the result.
+     */
+    const user = userEvent.setup();
+    const gate = deferred<unknown>();
+    vi.mocked(semanticApi.generateInit).mockReturnValue(gate.promise as never);
+
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: 'Resume' }));
+    const reviewed = screen.getByRole('checkbox', { name: 'Reviewed by user' });
+    await user.click(reviewed);
+    expect(reviewed).not.toBeChecked();
+
+    gate.resolve({
+      connection_id: 'conn-1', tables_total: 10, batch_count: 1, batch_size: 4,
+      pending_table_keys: [], resumed: true,
+    });
+    vi.mocked(semanticApi.generateGlobals).mockResolvedValue(
+      { ...COMPLETE_MODEL, is_user_reviewed: true } as never,
+    );
+    await waitFor(() =>
+      expect(screen.getByRole('checkbox', { name: 'Reviewed by user' })).toBeChecked(),
+    );
+    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled();
+    // The result seeds draft and cache alike, so the page is not dirty afterwards.
+    expect(screen.getByRole('button', { name: /^Regenerate$/ })).toBeEnabled();
+    expect(screen.queryByText(/Save your changes first/)).not.toBeInTheDocument();
+  });
+});
+
+describe('SemanticModelPage — tables the LLM omitted', () => {
+  it('re-queues omitted keys once and counts them done on the second omission', async () => {
+    const user = userEvent.setup();
+    vi.mocked(semanticApi.generateInit).mockResolvedValue({
+      connection_id: 'conn-1', tables_total: 4, batch_count: 1, batch_size: 4,
+      pending_table_keys: ['public.a', 'public.b', 'public.c', 'public.d'], resumed: true,
+    } as never);
+    vi.mocked(semanticApi.generateBatch).mockImplementation(async (_c, keys) => ({
+      connection_id: 'conn-1',
+      table_keys: keys,
+      tables_done: 0,
+      tables_total: 4,
+      batch_size: 4,
+      omitted_table_keys: keys.includes('public.d') ? ['public.d'] : [],
+    }) as never);
+    // Held open so the bar can be read once every batch has landed.
+    const globals = deferred<unknown>();
+    vi.mocked(semanticApi.generateGlobals).mockReturnValue(globals.promise as never);
+
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: 'Resume' }));
+
+    await waitFor(() => expect(semanticApi.generateGlobals).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(semanticApi.generateBatch).mock.calls.map(([, keys]) => keys)).toEqual([
+      ['public.a', 'public.b', 'public.c', 'public.d'],
+      ['public.d'],
+    ]);
+    // public.d counted once — on its second omission — never twice, never not at all.
+    expect(await screen.findByText('4 / 4')).toBeInTheDocument();
+
+    globals.resolve(COMPLETE_MODEL);
+    await waitFor(() => expect(screen.queryByText('4 / 4')).not.toBeInTheDocument());
+  });
+
+  it('retries an omission even after the sibling worker has run out of batches', async () => {
+    /*
+     * Two batches, two workers. The short batch lands first and its worker finds the
+     * queue empty and exits; the re-queued key must still be picked up by the worker
+     * whose batch reported it.
+     */
+    const user = userEvent.setup();
+    const PENDING = ['public.a', 'public.b', 'public.c', 'public.d', 'public.e'];
+    vi.mocked(semanticApi.generateInit).mockResolvedValue({
+      connection_id: 'conn-1', tables_total: 5, batch_count: 2, batch_size: 4,
+      pending_table_keys: PENDING, resumed: true,
+    } as never);
+    const firstBatch = deferred<unknown>();
+    const batchResult = (keys: string[], omitted: string[]) => ({
+      connection_id: 'conn-1', table_keys: keys, tables_done: 0, tables_total: 5,
+      batch_size: 4, omitted_table_keys: omitted,
+    });
+    vi.mocked(semanticApi.generateBatch).mockImplementation((async (
+      _c: string,
+      keys: string[],
+    ) => {
+      if (keys.length === 4) return firstBatch.promise;
+      return batchResult(keys, []);
+    }) as never);
+    const globals = deferred<unknown>();
+    vi.mocked(semanticApi.generateGlobals).mockReturnValue(globals.promise as never);
+
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: 'Resume' }));
+    await waitFor(() => expect(semanticApi.generateBatch).toHaveBeenCalledTimes(2));
+    // The short batch has landed and its worker is gone: 1 of 5 counted.
+    expect(await screen.findByText('1 / 5')).toBeInTheDocument();
+
+    firstBatch.resolve(batchResult(PENDING.slice(0, 4), ['public.b']));
+
+    await waitFor(() => expect(semanticApi.generateGlobals).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(semanticApi.generateBatch).mock.calls.map(([, keys]) => keys)).toEqual([
+      PENDING.slice(0, 4),
+      ['public.e'],
+      ['public.b'],
+    ]);
+    expect(await screen.findByText('5 / 5')).toBeInTheDocument();
+    globals.resolve(COMPLETE_MODEL);
+  });
+});
+
+describe('SemanticModelPage — the editor while a run is in flight', () => {
+  it('does not re-seed the draft from a refetch that lands mid-run', async () => {
+    /*
+     * A focus refetch mid-run would otherwise hand the editors a pre-result draft, and
+     * anything typed into it would be replaced by the result without a trace.
+     */
+    const user = userEvent.setup();
+    const gate = deferred<unknown>();
+    vi.mocked(semanticApi.generateInit).mockReturnValue(gate.promise as never);
+
+    const { qc } = renderPage();
+    await user.click(await screen.findByText('Orders'));
+    await user.click(screen.getByRole('button', { name: 'Resume' }));
+    await waitFor(() => expect(screen.getByDisplayValue('Customer orders')).toBeDisabled());
+
+    vi.mocked(semanticApi.get).mockResolvedValue({
+      ...PARTIAL_MODEL,
+      tables: {
+        'public.orders': { ...PARTIAL_MODEL.tables['public.orders'], description: 'Refetched' },
+      },
+    } as never);
+    await qc.refetchQueries({ queryKey: ['semantic', 'conn-1'] });
+    // Rendered from the refetch (as `model`, not as a draft).
+    const description = await screen.findByDisplayValue('Refetched');
+
+    expect(description).toBeDisabled();
+    expect(screen.getByRole('checkbox', { name: 'Reviewed by user' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeDisabled();
+
+    gate.resolve({
+      connection_id: 'conn-1', tables_total: 10, batch_count: 1, batch_size: 4,
+      pending_table_keys: [], resumed: true,
+    });
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled(),
+    );
+    // The result re-seeds the draft (generateGlobals answers with COMPLETE_MODEL).
+    expect(screen.getByDisplayValue('Customer orders')).toBeEnabled();
+  });
+
+  it('disables Apply on a suggestion while a run is in flight', async () => {
+    const user = userEvent.setup();
+    vi.mocked(semanticApi.getSuggestions).mockResolvedValue([
+      {
+        id: 'sug-1',
+        connection_id: 'conn-1',
+        table_key: 'public.orders',
+        field: 'status',
+        correction_type: 'add_value_mapping',
+        value: { raw_value: 'CMPLT', display_value: 'Completed' },
+        is_applied: false,
+        source_message_id: 'msg-1',
+        created_at: '2026-01-02T10:00:00Z',
+      },
+    ] as never);
+    const gate = deferred<unknown>();
+    vi.mocked(semanticApi.generateInit).mockReturnValue(gate.promise as never);
+
+    renderPage();
+    await user.click(await screen.findByRole('tab', { name: /Suggestions \(1\)/ }));
+    expect(await screen.findByRole('button', { name: 'Apply' })).toBeEnabled();
+
+    await user.click(screen.getByRole('button', { name: 'Resume' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Apply' })).toBeDisabled());
+    expect(screen.getByRole('button', { name: 'Apply' })).toHaveAttribute(
+      'title',
+      expect.stringMatching(/generation/i),
+    );
+    expect(semanticApi.applySuggestion).not.toHaveBeenCalled();
+
+    gate.resolve({
+      connection_id: 'conn-1', tables_total: 10, batch_count: 1, batch_size: 4,
+      pending_table_keys: [], resumed: true,
+    });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Apply' })).toBeEnabled());
+
+    // Applying seeds draft and cache alike, so the page is not dirty afterwards.
+    vi.mocked(semanticApi.applySuggestion).mockResolvedValue(
+      { ...COMPLETE_MODEL, is_user_reviewed: true } as never,
+    );
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
+    await waitFor(() =>
+      expect(screen.getByRole('checkbox', { name: 'Reviewed by user' })).toBeChecked(),
+    );
+    expect(semanticApi.applySuggestion).toHaveBeenCalledWith('conn-1', 'sug-1');
+    expect(screen.getByRole('button', { name: /^Regenerate$/ })).toBeEnabled();
+    expect(screen.queryByText(/Save your changes first/)).not.toBeInTheDocument();
+  });
+});
+
+describe('SemanticModelPage — unsaved edits', () => {
+  it('blocks every way to start a run until the edits are saved', async () => {
+    /*
+     * Every run drops the draft, and Regenerate keeps only what the server holds — so
+     * starting one over unsaved edits would discard them without a word.
+     */
+    const user = userEvent.setup();
+    vi.mocked(semanticApi.update).mockImplementation(async (_id, sent) => sent as never);
+
+    renderPage();
+    const regenerate = await screen.findByRole('button', { name: /^Regenerate$/ });
+    expect(regenerate).toBeEnabled();
+
+    await user.click(screen.getByRole('checkbox', { name: 'Reviewed by user' }));
+
+    const reason = /Save your changes first/;
+    expect(screen.getByRole('button', { name: /^Regenerate$/ })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^Regenerate$/ })).toHaveAttribute(
+      'title',
+      expect.stringMatching(reason),
+    );
+    for (const name of ['Resume', "Finish with what's generated", 'Restart from scratch']) {
+      expect(screen.getByRole('button', { name })).toBeDisabled();
+      expect(screen.getByRole('button', { name })).toHaveAttribute(
+        'title',
+        expect.stringMatching(reason),
+      );
+    }
+    expect(screen.getByText(reason)).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Save Changes' }));
+    await waitFor(() => expect(screen.getByText('Saved')).toBeInTheDocument());
+
+    expect(screen.getByRole('button', { name: /^Regenerate$/ })).toBeEnabled();
+    for (const name of ['Resume', "Finish with what's generated", 'Restart from scratch']) {
+      expect(screen.getByRole('button', { name })).toBeEnabled();
+    }
+    expect(screen.queryByText(reason)).not.toBeInTheDocument();
+  });
+
+  it('blocks applying a suggestion until the edits are saved', async () => {
+    // Applying replaces the draft with the server's result, so unsaved edits would go.
+    const user = userEvent.setup();
+    vi.mocked(semanticApi.update).mockImplementation(async (_id, sent) => sent as never);
+    vi.mocked(semanticApi.getSuggestions).mockResolvedValue([
+      {
+        id: 'sug-1',
+        connection_id: 'conn-1',
+        table_key: 'public.orders',
+        field: 'status',
+        correction_type: 'add_value_mapping',
+        value: { raw_value: 'CMPLT', display_value: 'Completed' },
+        is_applied: false,
+        source_message_id: 'msg-1',
+        created_at: '2026-01-02T10:00:00Z',
+      },
+    ] as never);
+
+    renderPage();
+    await user.click(await screen.findByRole('tab', { name: /Suggestions \(1\)/ }));
+    expect(await screen.findByRole('button', { name: 'Apply' })).toBeEnabled();
+
+    await user.click(screen.getByRole('checkbox', { name: 'Reviewed by user' }));
+    expect(screen.getByRole('button', { name: 'Apply' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Apply' })).toHaveAttribute(
+      'title',
+      'Save your changes first — applying a suggestion discards unsaved edits',
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Save Changes' }));
+    await waitFor(() => expect(screen.getByText('Saved')).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Apply' })).toBeEnabled();
+    expect(semanticApi.applySuggestion).not.toHaveBeenCalled();
+  });
+
+  it('is not dirty when an edit is undone', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    const reviewed = await screen.findByRole('checkbox', { name: 'Reviewed by user' });
+    await user.click(reviewed);
+    await user.click(reviewed);
+    expect(screen.getByRole('button', { name: /^Regenerate$/ })).toBeEnabled();
+  });
+});
+
+describe('SemanticModelPage — switching connections mid-run', () => {
+  it("remounts per connection, so a late result lands only in its own connection's cache", async () => {
+    /*
+     * The route element is reused when only `:connectionId` changes. Unkeyed, the draft,
+     * the progress bar and the pending run carried over to the next connection, and
+     * TanStack runs a pending mutation's onSuccess with the latest options — so A's
+     * result was written into B's cache and draft.
+     */
+    const user = userEvent.setup();
+    const MODEL_B = {
+      ...COMPLETE_MODEL,
+      tables: {
+        'public.customers': {
+          display_name: 'Customers',
+          description: 'People who buy',
+          default_filters: [],
+          columns: {},
+        },
+      },
+    };
+    const RESULT_A = {
+      ...COMPLETE_MODEL,
+      tables: {
+        'public.orders': { ...BASE_MODEL.tables['public.orders'], display_name: 'Orders (final)' },
+      },
+    };
+    vi.mocked(semanticApi.get).mockImplementation(
+      async (id: string) => (id === 'conn-2' ? MODEL_B : PARTIAL_MODEL) as never,
+    );
+    const gate = deferred<unknown>();
+    vi.mocked(semanticApi.generateGlobals).mockReturnValue(gate.promise as never);
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/semantic/conn-1']}>
+          <Link to="/semantic/conn-2">Go to B</Link>
+          <Routes>
+            <Route path="/semantic/:connectionId" element={<SemanticModelRoute />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await user.click(await screen.findByRole('button', { name: /Finish with what's generated/i }));
+    expect(await screen.findByText('Building metrics and joins…')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('link', { name: 'Go to B' }));
+    expect(await screen.findByText('Customers')).toBeInTheDocument();
+    // A's run does not follow the user to B.
+    expect(screen.queryByText('Building metrics and joins…')).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled(),
+    );
+
+    gate.resolve(RESULT_A);
+    await waitFor(() => expect(qc.getQueryData(['semantic', 'conn-1'])).toEqual(RESULT_A));
+    expect(qc.getQueryData(['semantic', 'conn-2'])).toEqual(MODEL_B);
+    expect(screen.getByText('Customers')).toBeInTheDocument();
+    expect(screen.queryByText('Orders (final)')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled();
+  });
+});
+
+describe('SemanticModelPage — returning to a connection whose run is still going', () => {
+  it('keeps the editor inert until that run ends, then seeds from its result', async () => {
+    /*
+     * Leaving mid-run unmounts the page that owns the run, but the run itself keeps
+     * going. The page mounted on return has its own mutation, so without looking at the
+     * mutation cache it would think nothing runs and let the user edit, save or start a
+     * second run over the first.
+     */
+    const user = userEvent.setup();
+    const RESULT_A = { ...COMPLETE_MODEL, is_user_reviewed: true };
+    let serverA: unknown = PARTIAL_MODEL;
+    vi.mocked(semanticApi.get).mockImplementation(
+      async (id: string) => (id === 'conn-2' ? COMPLETE_MODEL : serverA) as never,
+    );
+    const gate = deferred<unknown>();
+    vi.mocked(semanticApi.generateInit).mockReturnValue(gate.promise as never);
+    vi.mocked(semanticApi.generateGlobals).mockImplementation(async () => {
+      serverA = RESULT_A;
+      return RESULT_A as never;
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/semantic/conn-1']}>
+          <Link to="/semantic/conn-1">Go to A</Link>
+          <Link to="/semantic/conn-2">Go to B</Link>
+          <Routes>
+            <Route path="/semantic/:connectionId" element={<SemanticModelRoute />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await user.click(await screen.findByRole('button', { name: 'Resume' }));
+    await user.click(screen.getByRole('link', { name: 'Go to B' }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled(),
+    );
+    await user.click(screen.getByRole('link', { name: 'Go to A' }));
+
+    expect(await screen.findByText(/Generation is running/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Generating…' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Resume' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeDisabled();
+    // Give the remount's own refetch time to land: it must not arm the editor.
+    await waitFor(() => expect(semanticApi.get).toHaveBeenCalledTimes(3));
+    await act(async () => {});
+    expect(screen.getByRole('checkbox', { name: 'Reviewed by user' })).toBeDisabled();
+
+    gate.resolve({
+      connection_id: 'conn-1', tables_total: 10, batch_count: 1, batch_size: 4,
+      pending_table_keys: [], resumed: true,
+    });
+    await waitFor(() =>
+      expect(screen.getByRole('checkbox', { name: 'Reviewed by user' })).toBeEnabled(),
+    );
+    expect(screen.getByRole('checkbox', { name: 'Reviewed by user' })).toBeChecked();
+    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled();
+    expect(screen.queryByText(/Generation is running/)).not.toBeInTheDocument();
   });
 });
