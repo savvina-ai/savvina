@@ -267,14 +267,18 @@ async def _stage_prune_and_filter(
     """Stage 3b-4: apply schema pruning and semantic model filtering."""
     schema = sr.schema
     # The store is the only reader of semantic data; the blob column on ``conn``
-    # is unread (tests/test_semantic/test_blob_is_unread.py).
+    # is unread (tests/test_semantic/test_blob_is_unread.py). The cached read costs
+    # one small SELECT per turn and rebuilds the model only when its version moved;
+    # the instance is shared across turns, so nothing below may mutate it: the
+    # filters and the prompt compression only build ``model_copy`` copies, and the
+    # domain boost and the prompt formatter only read it.
     # A failed read costs the turn its business context, not the turn itself. The
     # read runs in a SAVEPOINT: on PostgreSQL a failed statement aborts the whole
     # transaction, and without it the turn's next query would fail too.
     _raw_semantic: SemanticModel | None
     try:
         async with db.begin_nested():
-            _raw_semantic = await semantic_store.load_model(db, connection_id)
+            _raw_semantic = await semantic_store.load_model_cached(db, connection_id)
     except Exception:
         logger.exception(
             "Could not load the semantic model for connection %s; continuing without it",

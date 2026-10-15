@@ -11,9 +11,12 @@ guarantees the correct order.  The DATABASE_URL points to a PostgreSQL test
 database; all router tests mock the DB session so no real connection is made.
 """
 
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 import os
 from unittest.mock import AsyncMock
+
+import pytest
 
 # Valid Fernet key used only for tests (base64-url encoding of 32 bytes)
 TEST_ENCRYPTION_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
@@ -38,6 +41,20 @@ os.environ["BEHIND_TLS_PROXY"] = "false"
 from app.config import get_settings  # noqa: E402
 
 get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_semantic_model_cache() -> Iterator[None]:
+    """Empty ``semantic.store``'s per-process model cache around every test.
+
+    The cache is module state keyed by connection id, and tests reuse ids, so one
+    test's cached model must never be served to another.
+    """
+    from app.semantic import store
+
+    store.clear_model_cache()
+    yield
+    store.clear_model_cache()
 
 
 # ── asyncpg mock helpers ──────────────────────────────────────────────────────

@@ -328,6 +328,64 @@ class TestStagePruneAndFilter:
         assert [c.name for c in out_schema.tables[0].columns] == ["id"]
         assert list(semantic_model.tables["public.orders"].columns) == ["id"]
 
+    async def test_stage_leaves_the_shared_cached_model_untouched(self, stored_semantic_model):
+        """``load_model_cached`` hands every turn the same instance, so narrowing it
+        to the schema and the question (and compacting it for the prompt) must copy,
+        never mutate."""
+        from app.semantic.models import Hierarchy, RelationshipEdge
+        from app.services.pipeline import _compact_semantic_model
+
+        def _table(name: str) -> TableInfo:
+            return TableInfo(
+                catalog=None,
+                name=name,
+                schema_name="public",
+                table_type="BASE TABLE",
+                columns=[ColumnInfo(name="id", data_type="integer", native_type="int4")],
+            )
+
+        names = [f"t{i}" for i in range(12)]
+        schema = DataSourceSchema(
+            source_type="postgresql", schemas=[], tables=[_table(n) for n in names]
+        )
+        stored = SemanticModel(
+            tables={
+                f"public.{n}": TableSemantic(
+                    display_name=n,
+                    primary_timestamp_column="gone",
+                    partition_columns=["id", "gone"],
+                    hierarchies=[Hierarchy(name="H", levels=["id", "gone"])],
+                    columns={
+                        "id": ColumnSemantic(display_name="Id"),
+                        "gone": ColumnSemantic(display_name="Gone"),
+                    },
+                )
+                for n in [*names, "stale"]
+            },
+            relationships=[
+                RelationshipEdge(
+                    from_table="public.t0",
+                    from_column="gone",
+                    to_table="public.t1",
+                    to_column="id",
+                    relationship_type="many_to_one",
+                    join_sql="public.t0.gone = public.t1.id",
+                )
+            ],
+            notes=["n"],
+        )
+        before = stored.model_dump(mode="json")
+        stored_semantic_model.return_value = stored
+        sr = _make_schema_result(schema=schema, embeddings_available=False)
+
+        _schema, filtered = await _stage_prune_and_filter(
+            sr, _make_conn_row(), "t0", _make_settings(), MagicMock(), MagicMock(), "c", "u", None
+        )
+        _compact_semantic_model(filtered)
+
+        assert "public.stale" not in filtered.tables
+        assert stored.model_dump(mode="json") == before
+
     async def test_semantic_model_comes_from_the_store_not_the_blob(self, stored_semantic_model):
         schema = DataSourceSchema(
             source_type="postgresql",

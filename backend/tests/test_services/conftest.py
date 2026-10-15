@@ -13,12 +13,12 @@ import pytest
 def stored_semantic_model() -> Iterator[AsyncMock]:
     """Stub the chat path's read of the semantic store; the stored model is None.
 
-    The chat pipeline loads the model with ``semantic_store.load_model(db, id)``.
+    The chat pipeline loads the model with ``semantic_store.load_model_cached(db, id)``.
     Service tests drive it with a mock session, so they stub that seam rather than
     stand up the semantic tables. Set ``.return_value`` to inject a model.
     """
     with patch(
-        "app.services.chat_service.semantic_store.load_model",
+        "app.services.chat_service.semantic_store.load_model_cached",
         new=AsyncMock(return_value=None),
     ) as load_model:
         yield load_model

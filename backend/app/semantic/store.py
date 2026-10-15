@@ -20,6 +20,7 @@ from the blob era's generator order.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,7 +30,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import uuid
 
 from pydantic import TypeAdapter
-from sqlalchemy import String, delete, func, null, select, update
+from sqlalchemy import String, delete, event, func, null, select, update
 
 from ..models.connection import Connection
 from ..models.semantic_store import (
@@ -430,6 +431,10 @@ async def save_model(
     its column, or a segment, derived-column or join name is over the unique
     index's byte limit; every other string is made to fit (``_fit_values``).
     Raises ``TypeError`` if ``protected`` is given without ``provenance``.
+
+    The caller must hold the connection row lock (``lock_and_reread_connection``):
+    the header's ``version`` is bumped in Python from the value read here, and
+    ``load_model_cached`` relies on it only ever growing.
     """
     if protected is not None and provenance is None:
         raise TypeError("protected values need the provenance they were read with")
@@ -512,6 +517,7 @@ async def save_model(
         for values in _dedupe_last_wins(fitted_items, key=lambda v: v["name"]):
             global_values.append((kind, values))
 
+    _note_write(db, connection_id)
     # populate_existing: a re-read under a row lock must see other transactions'
     # committed state, not an identity-mapped instance.
     header = await db.scalar(
@@ -687,6 +693,9 @@ async def delete_model(db: AsyncSession, connection_id: str, *, changed_by: str 
     the blob go together. ``null()``, not ``None``: ``None`` on a JSON column
     stores the JSON text ``'null'``.
     """
+    # Memory only, so safe before the commit: a rollback just costs one rebuild.
+    _model_cache.pop(connection_id, None)
+    _note_write(db, connection_id)
     await db.execute(
         update(Connection).where(Connection.id == connection_id).values(semantic_model=null())
     )
@@ -796,6 +805,103 @@ async def load_model(db: AsyncSession, connection_id: str) -> SemanticModel | No
     return SemanticModel.model_validate(data)
 
 
+# ── Read cache ────────────────────────────────────────────────────────────────
+# Every write that changes content bumps the header's ``version`` (``save_model``,
+# ``begin_generation``, ``reconcile_tables`` and ``apply_user_patch`` all do), so
+# ``(header id, version)`` identifies the content and a per-process cache can be
+# keyed by it. ``generation_progress`` is not content: ``advance_progress`` bumps
+# nothing, so a cached model may carry a stale progress figure, which the chat
+# path never reads. The header id is part of the key because a delete followed by
+# a fresh save starts the version at 1 again.
+#
+# The key is read before the model, in separate statements and without a shared
+# snapshot. A writer changes content and bumps the version in one transaction.
+# The bump is computed in Python from the header it read, so versions only grow
+# (and each names one committed state) because every writer holds the
+# connection row lock (``lock_and_reread_connection``) and re-reads the header
+# under it; ``save_model``, ``begin_generation``, ``reconcile_tables`` and
+# ``apply_user_patch`` all require that of their caller. Given that, a commit
+# landing between the key read and the model read can only leave the cache
+# holding content *newer* than its key, which the next call sees as a version
+# mismatch and rebuilds. Content older than its key cannot be cached.
+
+_MODEL_CACHE_SIZE = 32
+_model_cache: OrderedDict[str, tuple[str, int, SemanticModel]] = OrderedDict()
+
+# ``Session.info`` key: the connections this session has written semantic rows
+# for in its open transaction. Every writer flushes, so ``new``/``dirty``/
+# ``deleted`` are empty again by the time it returns; this is what tells
+# ``load_model_cached`` that what it would read is not committed yet.
+_WROTE_KEY = "semantic_store.uncommitted_writes"
+
+
+def _note_write(db: AsyncSession, connection_id: str) -> None:
+    """Record that ``db``'s open transaction writes ``connection_id``'s model."""
+    wrote: set[str] | None = db.info.get(_WROTE_KEY)
+    if wrote is None:
+        wrote = db.info[_WROTE_KEY] = set()
+        event.listen(db.sync_session, "after_transaction_end", _forget_writes)
+    wrote.add(connection_id)
+
+
+def _forget_writes(session: Any, transaction: Any) -> None:
+    # Only the root transaction's end (commit or rollback) settles the writes;
+    # a SAVEPOINT's release or rollback leaves the outer transaction open.
+    if transaction.parent is None:
+        session.info.get(_WROTE_KEY, set()).clear()
+
+
+async def load_model_cached(db: AsyncSession, connection_id: str) -> SemanticModel | None:
+    """``load_model``, served from a per-process cache while the header's version holds.
+
+    One SELECT of two header columns per call in place of the six statements and
+    the row validation ``load_model`` costs; the model is rebuilt only when the
+    version moved. For the chat path, which reads the model on every turn and
+    never writes it. The returned instance is shared, so callers must not mutate
+    it (the chat path only takes copies). With several worker processes each
+    keeps its own cache; the version read from the database keeps them honest.
+
+    A session whose open transaction has written this connection's model
+    (every store writer records that with ``_note_write``, and the store is the
+    only writer of semantic rows) bypasses the cache and gets a plain
+    ``load_model``: what it would read could be its own uncommitted write,
+    cached under a version that a rollback would free for another writer to
+    reuse with different content. Other pending ORM changes in the session are
+    irrelevant to the model and do not bypass it.
+    """
+    if connection_id in db.info.get(_WROTE_KEY, ()):
+        return await load_model(db, connection_id)
+    row = (
+        await db.execute(
+            select(SemanticModelRow.id, SemanticModelRow.version).where(
+                SemanticModelRow.connection_id == connection_id
+            )
+        )
+    ).first()
+    if row is None:
+        _model_cache.pop(connection_id, None)
+        return None
+    header_id, version = row
+    cached = _model_cache.get(connection_id)
+    if cached is not None and cached[0] == header_id and cached[1] == version:
+        _model_cache.move_to_end(connection_id)
+        return cached[2]
+    model = await load_model(db, connection_id)
+    if model is None:
+        _model_cache.pop(connection_id, None)
+        return None
+    _model_cache[connection_id] = (header_id, version, model)
+    _model_cache.move_to_end(connection_id)
+    while len(_model_cache) > _MODEL_CACHE_SIZE:
+        _model_cache.popitem(last=False)
+    return model
+
+
+def clear_model_cache() -> None:
+    """Drop every cached model. For tests."""
+    _model_cache.clear()
+
+
 # ── Generation run state ──────────────────────────────────────────────────────
 
 
@@ -822,14 +928,23 @@ async def begin_generation(
     first batch of a regenerate lands, so "has a row" would report the whole
     model done from the start. ``tables_done`` is supplied by the caller for the
     same reason: 0 for a fresh run, the stamped count for a resume.
+
+    The caller must hold the connection row lock (``lock_and_reread_connection``):
+    the header's ``version`` is bumped in Python from the value read here, and
+    ``load_model_cached`` relies on it only ever growing.
     """
     # Fit first: the strings come from the datasource, and PostgreSQL rejects NULs
     # and over-long values the blob accepted.
     fitted = _fit_values(
         SemanticModelRow, {"schema_hash": schema_hash, "source_dialect": source_dialect}
     )
+    _note_write(db, connection_id)
+    # populate_existing: a stale identity-mapped header would write a stale
+    # ``version + 1``, and the chat path's model cache is keyed on the version.
     header = await db.scalar(
-        select(SemanticModelRow).where(SemanticModelRow.connection_id == connection_id)
+        select(SemanticModelRow)
+        .where(SemanticModelRow.connection_id == connection_id)
+        .execution_options(populate_existing=True)
     )
     if header is None:
         header = SemanticModelRow(connection_id=connection_id)
@@ -1002,6 +1117,13 @@ async def reconcile_tables(
     the run), raises ``SemanticStoreConflict`` before writing anything: stamping
     this output with the new run id would make a resume of that run skip tables
     it never generated.
+
+    When anything changed or was inserted, the header's ``version`` is bumped:
+    ``load_model_cached`` is keyed on it.
+
+    The caller must hold the connection row lock (``lock_and_reread_connection``):
+    the header's ``version`` is bumped in Python from the value read here, and
+    ``load_model_cached`` relies on it only ever growing.
     """
     # Fit everything first: a ValueError must leave the session untouched. A
     # later key that fits to the same string as an earlier one replaces it.
@@ -1020,6 +1142,7 @@ async def reconcile_tables(
             columns[col_values["column_name"]] = col_values
         fitted_tables[table_values["table_key"]] = (table_values, columns)
 
+    _note_write(db, connection_id)
     header = await db.scalar(
         select(SemanticModelRow)
         .where(SemanticModelRow.connection_id == connection_id)
@@ -1037,6 +1160,7 @@ async def reconcile_tables(
         db.add(header)
         await db.flush()
     run_id = header.generation_run_id
+    changed = False
 
     existing_tables: dict[str, SemanticTableRow] = {}
     for chunk in _chunks(list(fitted_tables)):
@@ -1073,6 +1197,7 @@ async def reconcile_tables(
                 new_value[field] = generated_values[field]
         if new_value == old_value:
             continue
+        changed = True
         for field, value in new_value.items():
             setattr(row, field, value)
         row.version += 1
@@ -1127,6 +1252,7 @@ async def reconcile_tables(
             new_value["is_sensitive"] = old_value["is_sensitive"] or new_value["is_sensitive"]
             if new_value == old_value:
                 continue
+            changed = True
             for field, value in new_value.items():
                 setattr(col, field, value)
             col.version += 1
@@ -1146,6 +1272,12 @@ async def reconcile_tables(
             )
     for chunk in _chunks(new_column_rows):
         db.add_all(chunk)
+    if changed or new_table_rows or new_column_rows:
+        # Content moved: bump the header version the chat path's model cache is
+        # keyed on. A stamp-only reconcile (nothing new) leaves it alone.
+        header.version += 1
+        header.updated_at = _now()
+        header.updated_by = updated_by
     await db.flush()
 
 
@@ -1379,8 +1511,10 @@ async def update_table_fields(
     *,
     updated_by: str | None,
     mark_user_edited: bool,
-) -> None:
+) -> bool:
     """Apply ``values`` to one table row under an optimistic lock.
+
+    Returns whether anything was written.
 
     ``values`` is fitted (``_fit_values``) before the diff, because the stored
     row holds fitted values, and is compared with the stored row in its
@@ -1407,10 +1541,11 @@ async def update_table_fields(
     canonical = _canonical_table_row(row)
     diff = {field: value for field, value in values.items() if canonical.get(field) != value}
     if not diff:
-        return
+        return False
 
     connection_id = row.connection_id
     table_key = row.table_key
+    _note_write(db, connection_id)
     update_values: dict[str, Any] = {
         **diff,
         "version": expected_version + 1,
@@ -1444,6 +1579,7 @@ async def update_table_fields(
         changed_by=updated_by,
     )
     await db.flush()
+    return True
 
 
 def _sent(patch: BaseModel, *, exclude: frozenset[str] = frozenset()) -> dict[str, Any]:
@@ -1561,6 +1697,9 @@ async def apply_user_patch(
     (``update_table_fields``), but column rows and the rewritten list sections
     do not.
 
+    Any change bumps the header's ``version`` (the chat path's model cache is
+    keyed on it); an echo bumps nothing.
+
     Raises ``ValueError`` (before touching the session) for an over-long table
     key, column name, metric name, global-item name or relationship endpoint.
     """
@@ -1612,6 +1751,7 @@ async def apply_user_patch(
         {f: section_dump[f] for f in ("notes", "is_user_reviewed") if f in section_dump},
     )
 
+    _note_write(db, connection_id)
     header = await db.scalar(
         select(SemanticModelRow)
         .where(SemanticModelRow.connection_id == connection_id)
@@ -1624,8 +1764,9 @@ async def apply_user_patch(
         )
         assert header is not None
 
+    changed = False
     for table_key, (table_values, column_values) in fitted_tables.items():
-        await _apply_table_patch(
+        if await _apply_table_patch(
             db,
             header,
             connection_id,
@@ -1633,7 +1774,8 @@ async def apply_user_patch(
             table_values,
             column_values,
             updated_by=updated_by,
-        )
+        ):
+            changed = True
 
     for (kind, field), items in fitted_globals.items():
         existing_rows = list(
@@ -1652,6 +1794,7 @@ async def apply_user_patch(
         canonical_items = [_canonical_global_item(kind, row.payload) for row in existing_rows]
         if _payload_lists_equal(canonical_items, (item["payload"] for item in items)):
             continue
+        changed = True
         marks = _stored_marks(
             (row.name, canonical, row.user_edited_fields)
             for row, canonical in zip(existing_rows, canonical_items, strict=True)
@@ -1701,6 +1844,7 @@ async def apply_user_patch(
         if not _payload_lists_equal(
             canonical_metrics, (metric["payload"] for metric in fitted_metrics)
         ):
+            changed = True
             marks = _stored_marks(
                 (row.name, canonical, row.user_edited_fields)
                 for row, canonical in zip(existing_metric_rows, canonical_metrics, strict=True)
@@ -1743,6 +1887,7 @@ async def apply_user_patch(
         )
         existing_rel = [_canonical_relationship(row) for row in existing_rel_rows]
         if not _payload_lists_equal(existing_rel, fitted_rels):
+            changed = True
             marks = _stored_marks(
                 (_relationship_identity(edge), edge, row.user_edited_fields)
                 for row, edge in zip(existing_rel_rows, existing_rel, strict=True)
@@ -1792,6 +1937,8 @@ async def apply_user_patch(
             changed_by=updated_by,
         )
         header.user_edited_fields = sorted(set(header.user_edited_fields) | set(touched_header))
+    if touched_header or changed:
+        # One bump however much changed: the chat path's model cache is keyed on it.
         header.version += 1
         header.updated_at = _now()
         header.updated_by = updated_by
@@ -1811,8 +1958,11 @@ async def _apply_table_patch(
     columns: dict[str, dict[str, Any]] | None,
     *,
     updated_by: str,
-) -> None:
-    """Apply one table's fitted ``values`` and its fitted column patches."""
+) -> bool:
+    """Apply one table's fitted ``values`` and its fitted column patches.
+
+    Returns whether anything was written (an inserted row, or a changed field).
+    """
     row = await db.scalar(
         select(SemanticTableRow)
         .where(
@@ -1821,7 +1971,9 @@ async def _apply_table_patch(
         )
         .execution_options(populate_existing=True)
     )
+    changed = False
     if row is None:
+        changed = True
         row = SemanticTableRow(
             id=str(uuid.uuid4()),
             model_id=header.id,
@@ -1848,12 +2000,14 @@ async def _apply_table_patch(
             changed_by=updated_by,
         )
     elif values:
-        await update_table_fields(
+        changed = await update_table_fields(
             db, row.id, row.version, values, updated_by=updated_by, mark_user_edited=True
         )
 
     for column_name, column_values in (columns or {}).items():
-        await _apply_column_patch(db, row, column_name, column_values, updated_by=updated_by)
+        if await _apply_column_patch(db, row, column_name, column_values, updated_by=updated_by):
+            changed = True
+    return changed
 
 
 async def _apply_column_patch(
@@ -1863,8 +2017,11 @@ async def _apply_column_patch(
     values: dict[str, Any],
     *,
     updated_by: str,
-) -> None:
-    """Apply one column's fitted ``values``, writing only what differs from storage."""
+) -> bool:
+    """Apply one column's fitted ``values``, writing only what differs from storage.
+
+    Returns whether anything was written (an inserted row, or a changed field).
+    """
     row = await db.scalar(
         select(SemanticColumnRow)
         .where(
@@ -1897,7 +2054,7 @@ async def _apply_column_patch(
             new_value=values,
             changed_by=updated_by,
         )
-        return
+        return True
 
     old_value = {field: getattr(row, field) for field in _COLUMN_FIELDS}
     canonical = _canonical_column_row(row)
@@ -1905,7 +2062,7 @@ async def _apply_column_patch(
     if not diff_values:
         # An echo, not an edit: no setattr, no version bump, no history row, and
         # ``user_edited_fields`` is left exactly as it was.
-        return
+        return False
     for field, value in diff_values.items():
         setattr(row, field, value)
     row.user_edited_fields = sorted(set(row.user_edited_fields) | set(diff_values))
@@ -1925,3 +2082,4 @@ async def _apply_column_patch(
         changed_by=updated_by,
     )
     await db.flush()
+    return True
