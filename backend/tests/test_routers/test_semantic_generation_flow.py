@@ -80,7 +80,9 @@ _TABLES = (
 
 
 def _schema(
-    tables: dict[str, list[str]], fks: list[RelationshipInfo] | None = None
+    tables: dict[str, list[str]],
+    fks: list[RelationshipInfo] | None = None,
+    unreadable: list[str] | None = None,
 ) -> DataSourceSchema:
     return DataSourceSchema(
         source_type="postgresql",
@@ -98,6 +100,7 @@ def _schema(
             for name, columns in tables.items()
         ],
         relationships=fks or [],
+        unreadable_tables=unreadable or [],
     )
 
 
@@ -167,8 +170,12 @@ def flow(db):
     async def load_schema(connection_id, _user, session):
         return current["schema"], await session.get(Connection, connection_id)
 
-    def set_schema(tables: dict[str, list[str]], fks: list[RelationshipInfo] | None = None) -> None:
-        current["schema"] = _schema(tables, fks)
+    def set_schema(
+        tables: dict[str, list[str]],
+        fks: list[RelationshipInfo] | None = None,
+        unreadable: list[str] | None = None,
+    ) -> None:
+        current["schema"] = _schema(tables, fks, unreadable)
 
     with (
         patch("app.routers.semantic._load_schema_for_connection", new=load_schema),
@@ -565,3 +572,44 @@ class TestGenerationFlow:
         # Kept in the store, never shown to the LLM.
         assert set(llm.globals_tables) == {"public.orders"}
         assert set(llm.globals_tables["public.orders"].columns) == {"id", "customer_id"}
+
+    async def test_a_table_the_role_cannot_read_survives_a_regenerate(
+        self, http_client, db, flow
+    ) -> None:
+        """A table that exists but that the connection's role cannot read is not dropped:
+        its row, its hand edit and a user edge to it survive a full regenerate, and it
+        never reaches the LLM. A table that really left the database is still pruned."""
+        llm, set_schema = flow
+        set_schema({"orders": ["id", "customer_id"], "customers": ["id"], "legacy": ["id"]})
+        await _generate(http_client)
+        edge = {
+            "from_table": "public.orders",
+            "from_column": "customer_id",
+            "to_table": "public.customers",
+            "to_column": "id",
+            "join_sql": "public.orders.customer_id = public.customers.id",
+        }
+        resp = await http_client.put(
+            _BASE,
+            json={
+                "tables": {"public.customers": {"description": "hand table"}},
+                "relationships": [edge],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        # What a narrower role's introspection returns: customers is unreadable, not
+        # gone; legacy was dropped.
+        set_schema({"orders": ["id", "customer_id"]}, unreadable=["public.customers"])
+        await _generate(http_client)
+
+        stored = await store.load_model(db, _CID)
+        assert stored.generation_status == GenerationStatus.COMPLETE
+        assert stored.tables["public.customers"].description == "hand table"
+        assert "public.legacy" not in stored.tables
+        assert [store.relationship_key(r) for r in stored.relationships] == [
+            store.relationship_key(edge)
+        ]
+        marks = (await store.provenance_snapshot(db, _CID)).marks
+        assert "description" in marks["table"]["public.customers"]
+        assert set(llm.globals_tables) == {"public.orders"}

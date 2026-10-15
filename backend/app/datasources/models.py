@@ -63,6 +63,12 @@ class DataSourceSchema:
     tables: list[TableInfo] = field(default_factory=list)
     relationships: list[RelationshipInfo] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
+    # ``table_key`` of each table that exists in the database but that the connection's
+    # role cannot see (no privilege on it, or no USAGE on its schema), so it is absent
+    # from ``tables``. Unreadable is not dropped: whatever persists the semantic model
+    # keeps such a table, and drift does not report it as removed. Empty for an adapter
+    # that cannot tell the two apart, and for a schema cache written before this field.
+    unreadable_tables: list[str] = field(default_factory=list)
 
 
 @dataclass

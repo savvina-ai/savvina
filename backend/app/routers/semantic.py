@@ -862,8 +862,10 @@ async def generate_semantic_globals(
 
     # ``current_model.tables``, not the pre-LLM snapshot: a batch that landed during
     # the globals call is in the stored rows. Pruned by schema membership, not by run
-    # stamp, so finishing a partial run keeps every real table it annotated.
-    pruned = prune_to_schema(current_model.tables, schema, privacy)
+    # stamp, so finishing a partial run keeps every real table it annotated. A table
+    # the connection's role cannot read is absent from ``schema`` too, but it exists:
+    # ``keep_unreadable`` stops a narrower role from deleting its annotations.
+    pruned = prune_to_schema(current_model.tables, schema, privacy, keep_unreadable=True)
     # Every table of the schema should have a row by now. One without is a table the
     # LLM returned nothing for (twice, after the client's re-queue), one a "Finish
     # with what's generated" never reached, or one created since the run started; the
@@ -884,9 +886,10 @@ async def generate_semantic_globals(
     # endpoint the policy hides is not regenerated while it is hidden
     # (``relationship_edges`` comes from the narrowed schema) and returns on the
     # first globals run after it is un-hidden, from the FK it is built from. Nothing
-    # hand-written is lost — see "Finalisation" in semantic-model-generation.md.
+    # hand-written is lost — see "Finalisation" in semantic-model-generation.md. An
+    # endpoint on a table the role cannot read follows the same rule.
     pruned_relationships = semantic_store.carry_edited_relationships(
-        edges_in_schema(current_model.relationships, schema, privacy),
+        edges_in_schema(current_model.relationships, schema, privacy, keep_unreadable=True),
         relationship_edges,
         provenance,
         render_tables=set(pruned),

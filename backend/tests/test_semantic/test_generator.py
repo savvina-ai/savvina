@@ -630,6 +630,57 @@ class TestDetectDriftPrivacy:
         assert any('"public.orders.ssn"' in w for w in warnings)
 
 
+class TestUnreadableTables:
+    """A table the role cannot read exists: persisting keeps it, drift names it once."""
+
+    def _schema(self) -> DataSourceSchema:
+        schema = _schema_with_tables(["orders"], extra_columns=["customer_id"])
+        schema.unreadable_tables = ["public.customers"]
+        return schema
+
+    def test_prune_keeps_an_unreadable_table_only_when_asked(self) -> None:
+        tables = {
+            "public.orders": _tbl("id"),
+            "public.customers": _tbl("id", name="Customers"),
+            "public.gone": _tbl("id"),
+        }
+        kept = prune_to_schema(tables, self._schema(), keep_unreadable=True)
+        assert set(kept) == {"public.orders", "public.customers"}
+        assert kept["public.customers"] == tables["public.customers"]
+        # The default is strict: a prompt must not offer a table nothing can query.
+        assert set(prune_to_schema(tables, self._schema())) == {"public.orders"}
+
+    def test_an_edge_to_an_unreadable_table_is_live_only_when_asked(self) -> None:
+        to_unreadable = _edge("public.orders", "customer_id", "public.customers", "id")
+        gone = _edge("public.orders", "customer_id", "public.ghosts", "id")
+        edges = [to_unreadable, gone]
+        assert edges_in_schema(edges, self._schema(), keep_unreadable=True) == [to_unreadable]
+        assert edges_in_schema(edges, self._schema()) == []
+
+    def test_drift_names_unreadable_tables_once_instead_of_calling_them_removed(self) -> None:
+        stored = SemanticModel(
+            tables={
+                "public.orders": _tbl("id", name="Orders"),
+                "public.customers": _tbl("id", name="Customers"),
+                "public.ghosts": _tbl("id", name="Ghosts"),
+            },
+            business_metrics=[
+                SimpleMetric(
+                    name="Customer count",
+                    definition="COUNT(*)",
+                    aggregation=AggregationType.COUNT,
+                    related_tables=["customers"],
+                ),
+            ],
+        )
+        warnings = SemanticModelGenerator().detect_drift(self._schema(), stored)
+        assert not any('"public.customers"' in w and "no longer exists" in w for w in warnings)
+        assert not any("Customer count" in w for w in warnings)
+        unreadable = [w for w in warnings if "cannot read" in w]
+        assert len(unreadable) == 1 and "public.customers" in unreadable[0]
+        assert any('"public.ghosts"' in w and "no longer exists" in w for w in warnings)
+
+
 class TestTableKeyAndHidesColumn:
     def test_table_key_is_schema_dot_name(self) -> None:
         from app.datasources.models import ColumnInfo, TableInfo, table_key

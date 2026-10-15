@@ -125,10 +125,18 @@ _FK_ROWS = [
 ]
 
 
+# pg_class: every relation, whatever the role may see. Same tables as _TABLE_ROWS, so
+# nothing is unreadable unless a test says otherwise.
+_RELATION_ROWS = [
+    FakeRecord({"table_schema": "public", "table_name": "users"}),
+    FakeRecord({"table_schema": "public", "table_name": "orders"}),
+]
+
+
 def _minimal_side_effect(extra_column_rows=None):
-    """Build side_effect list for MINIMAL_PRIVACY (5 fetch calls)."""
+    """Build side_effect list for MINIMAL_PRIVACY (6 fetch calls; the last is pg_class)."""
     cols = extra_column_rows if extra_column_rows is not None else _COLUMN_ROWS
-    return [_SCHEMA_ROW, _TABLE_ROWS, cols, _PK_ROWS, _FK_ROWS]
+    return [_SCHEMA_ROW, _TABLE_ROWS, cols, _PK_ROWS, _FK_ROWS, _RELATION_ROWS]
 
 
 # ── Config schema ─────────────────────────────────────────────────────────────
@@ -527,6 +535,7 @@ class TestIntrospect:
             ],
             [],  # pks
             [],  # fks
+            [],  # pg_class relations
         ]
         p = PrivacySettings(
             excluded_tables=["secrets"],
@@ -584,6 +593,7 @@ class TestIntrospect:
             cols,
             [],
             [],
+            [],  # pg_class relations
         ]
 
         result = await adapter.introspect(MINIMAL_PRIVACY)
@@ -635,6 +645,7 @@ class TestIntrospect:
             cols,
             [],
             [],
+            [],  # pg_class relations
         ]
         p = PrivacySettings(
             excluded_columns=["public.users.internal_notes"],
@@ -680,6 +691,7 @@ class TestIntrospect:
             [],  # fks
             # include_column_comments=False → no comments fetch
             [FakeRecord({"schemaname": "public", "relname": "users", "n_live_tup": 42})],
+            [],  # pg_class relations
         ]
         p = PrivacySettings(
             include_sample_values=False, include_column_comments=False, include_row_counts=True
@@ -688,6 +700,61 @@ class TestIntrospect:
         result = await adapter.introspect(p)
 
         assert result.tables[0].row_count_approx == 42
+
+    async def test_tables_the_role_cannot_see_are_named_unreadable(self):
+        """information_schema hides a table the role holds no privilege on; pg_class
+        does not. The difference is unreadable, not dropped."""
+        adapter, conn = make_adapter_with_pool()
+        conn.fetch.side_effect = [
+            *_minimal_side_effect()[:-1],
+            [
+                *_RELATION_ROWS,
+                FakeRecord({"table_schema": "public", "table_name": "payroll"}),
+                FakeRecord({"table_schema": "hr", "table_name": "salaries"}),
+            ],
+        ]
+
+        result = await adapter.introspect(MINIMAL_PRIVACY)
+
+        assert {t.name for t in result.tables} == {"users", "orders"}
+        assert result.unreadable_tables == ["hr.salaries", "public.payroll"]
+
+    async def test_an_excluded_table_is_not_named_unreadable(self):
+        adapter, conn = make_adapter_with_pool()
+        conn.fetch.side_effect = [
+            *_minimal_side_effect()[:-1],
+            [
+                *_RELATION_ROWS,
+                FakeRecord({"table_schema": "public", "table_name": "payroll"}),
+                FakeRecord({"table_schema": "hr", "table_name": "salaries"}),
+            ],
+        ]
+        p = PrivacySettings(
+            excluded_schemas=["hr"],
+            excluded_tables=["payroll"],
+            include_sample_values=False,
+            include_column_comments=False,
+            include_row_counts=False,
+        )
+
+        result = await adapter.introspect(p)
+
+        assert result.unreadable_tables == []
+
+    async def test_an_unreadable_catalog_leaves_the_list_empty(self):
+        """A server that revokes pg_class must not break introspection."""
+        import asyncpg
+
+        adapter, conn = make_adapter_with_pool()
+        conn.fetch.side_effect = [
+            *_minimal_side_effect()[:-1],
+            asyncpg.exceptions.InsufficientPrivilegeError("permission denied for pg_class"),
+        ]
+
+        result = await adapter.introspect(MINIMAL_PRIVACY)
+
+        assert {t.name for t in result.tables} == {"users", "orders"}
+        assert result.unreadable_tables == []
 
     async def test_not_connected_raises_runtime_error(self):
         adapter = PostgreSQLDataSource()  # pool never set

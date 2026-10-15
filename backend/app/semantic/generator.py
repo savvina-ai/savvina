@@ -356,6 +356,7 @@ def prune_to_schema(
     privacy: PrivacySettings | None = None,
     *,
     log: bool = True,
+    keep_unreadable: bool = False,
 ) -> dict[str, TableSemantic]:
     """Bound a model's tables to what ``schema`` still has. Pure; never mutates ``tables``.
 
@@ -376,6 +377,12 @@ def prune_to_schema(
     not because it is gone: it is carried through unchanged, references to it
     included.
 
+    **So is one the role cannot read.** With ``keep_unreadable``, a table in
+    ``schema.unreadable_tables`` (it exists, but the connection's role holds no
+    privilege on it) is carried through unchanged too. Whatever persists the model
+    passes it; a call that builds an LLM prompt leaves it off, since nothing over
+    such a table could run.
+
     **Near-miss spellings are dropped, not remapped.** Rows backfilled from an old
     blob can carry an LLM spelling (``public.Orders``, ``"OrderID"``) that the
     generator later grounds to the real key. Such a row is dropped like any other
@@ -392,11 +399,12 @@ def prune_to_schema(
     """
     real_columns = {table_key(t): [c.name for c in t.columns] for t in schema.tables}
     real_keys = list(real_columns)
+    unreadable = set(schema.unreadable_tables) if keep_unreadable else set()
     out: dict[str, TableSemantic] = {}
     for key, table in tables.items():
         if key in real_columns:
             out[key] = _prune_table(key, table, real_columns[key], privacy, log=log)
-        elif policy_hides_table(key, privacy):
+        elif policy_hides_table(key, privacy) or key in unreadable:
             out[key] = table.model_copy()
         elif log:
             target = SemanticModelGenerator._resolve_real_key(key, real_keys, bare_ok=True)
@@ -408,19 +416,24 @@ def edges_in_schema(
     edges: Sequence[RelationshipEdge],
     schema: DataSourceSchema,
     privacy: PrivacySettings | None = None,
+    *,
+    keep_unreadable: bool = False,
 ) -> list[RelationshipEdge]:
     """The edges whose both endpoints are real columns of real tables in ``schema``.
 
     Bounded by the live schema, not by the annotated tables: a user-authored edge
     to a real but unannotated table must survive "Finish with what's generated".
-    An endpoint ``privacy`` hides (its table, or its column) counts as live.
+    An endpoint ``privacy`` hides (its table, or its column) counts as live, and so,
+    with ``keep_unreadable``, does one on a table the role cannot read
+    (``prune_to_schema``'s rule).
     """
     live = {table_key(t): {c.name for c in t.columns} for t in schema.tables}
+    unreadable = set(schema.unreadable_tables) if keep_unreadable else set()
 
     def alive(table: str, column: str) -> bool:
         if table in live:
             return column in live[table] or policy_hides_column(table, column, privacy)
-        return policy_hides_table(table, privacy)
+        return policy_hides_table(table, privacy) or table in unreadable
 
     return [
         e for e in edges if alive(e.from_table, e.from_column) and alive(e.to_table, e.to_column)
@@ -1666,8 +1679,16 @@ class SemanticModelGenerator:
         as removed: the store keeps hidden annotations, and ``current_schema`` (with
         the policy applied) lacks them because they are hidden, not gone — the same
         rule as ``prune_to_schema``.
+
+        Nor is a stored table in ``current_schema.unreadable_tables``: it exists, but
+        the connection's role cannot read it. One warning names those instead, since
+        a regenerate cannot fix a missing grant.
         """
         warnings: list[str] = []
+        unreadable = set(current_schema.unreadable_tables)
+        # A metric may name a table bare, so match an unreadable one either way.
+        unreadable_names = unreadable | {key.rpartition(".")[2] for key in unreadable}
+        stored_unreadable: list[str] = []
 
         def _norm(name: str) -> str:
             """Strip SQL quoting characters that LLMs may emit around identifiers."""
@@ -1692,6 +1713,9 @@ class SemanticModelGenerator:
             if tbl_key not in current_tables:
                 if policy_hides_table(tbl_key, privacy):
                     continue
+                if tbl_key in unreadable:
+                    stored_unreadable.append(tbl_key)
+                    continue
                 warnings.append(
                     f'Table "{tbl_key}" referenced in semantic model '
                     f"no longer exists in the database"
@@ -1705,6 +1729,15 @@ class SemanticModelGenerator:
                     warnings.append(
                         f'Column "{tbl_key}.{col}" referenced in semantic model no longer exists'
                     )
+
+        if stored_unreadable:
+            names = sorted(stored_unreadable)
+            sample = ", ".join(names[:5]) + (", …" if len(names) > 5 else "")
+            warnings.append(
+                f"{len(names)} table(s) in the semantic model exist in the database but this "
+                f"connection's database role cannot read them: {sample}. Their annotations "
+                "are kept; grant the role access to use them."
+            )
 
         semantic_tables = set(stored_model.tables.keys())
         new_tables = current_tables - semantic_tables
@@ -1722,6 +1755,7 @@ class SemanticModelGenerator:
                     norm_t not in current_tables
                     and norm_t not in current_tables_bare
                     and norm_t not in stored_hidden_bare
+                    and norm_t not in unreadable_names
                     and not policy_hides_table(norm_t, privacy, bare_ok=True)
                 ):
                     warnings.append(

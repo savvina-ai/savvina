@@ -119,3 +119,27 @@ class TestApplyPrivacyToSchema:
             "id",
             "amount",
         ]
+
+
+class TestUnreadableTables:
+    """``unreadable_tables`` must survive the schema cache and the privacy narrowing,
+    or drift and globals would read an unreadable table as dropped again."""
+
+    def test_round_trips_through_the_schema_cache(self) -> None:
+        schema = _schema()
+        schema.unreadable_tables = ["store.payroll", "finance.ledger"]
+        assert _schema_from_dict(_schema_to_dict(schema)).unreadable_tables == [
+            "store.payroll",
+            "finance.ledger",
+        ]
+
+    def test_a_cache_written_before_the_field_reads_as_empty(self) -> None:
+        old = _schema_to_dict(_schema())
+        del old["unreadable_tables"]
+        assert _schema_from_dict(old).unreadable_tables == []
+
+    def test_the_narrowing_keeps_them_minus_what_the_policy_hides(self) -> None:
+        schema = _schema()
+        schema.unreadable_tables = ["store.payroll", "finance.ledger", "store.audit"]
+        privacy = PrivacySettings(excluded_schemas=["finance"], excluded_tables=["audit"])
+        assert _apply_privacy_to_schema(schema, privacy).unreadable_tables == ["store.payroll"]

@@ -29,6 +29,7 @@ from ..datasources.models import (
 from ..datasources.registry import create_datasource
 from ..models.connection import Connection
 from ..models.user_schema_cache import UserSchemaCache
+from ..semantic.generator import policy_hides_table
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -184,6 +185,7 @@ def _schema_from_dict(d: dict) -> DataSourceSchema:
         ],
         relationships=[RelationshipInfo(**r) for r in d.get("relationships", [])],
         metadata=d.get("metadata", {}),
+        unreadable_tables=list(d.get("unreadable_tables", [])),
     )
 
 
@@ -228,6 +230,11 @@ def _apply_privacy_to_schema(
             and not privacy.hides_column(f"{r.to_schema}.{r.to_table}", r.to_column)
         ],
         metadata=schema.metadata,
+        # Introspection leaves excluded tables out of this list, but a cache written
+        # before a privacy change can still name one.
+        unreadable_tables=[
+            key for key in schema.unreadable_tables if not policy_hides_table(key, privacy)
+        ],
     )
 
 
