@@ -250,16 +250,26 @@ _FISCAL_DIMENSION_SUFFIXES: tuple[str, ...] = ("_year", "_quarter", "_period")
 _FISCAL_DIMENSION_PREFIXES: tuple[str, ...] = ("fiscal_", "budget_", "calendar_", "tax_")
 
 
-def policy_hides_table(key: str, privacy: PrivacySettings | None) -> bool:
-    """Whether ``privacy`` explains why table ``key`` (``schema.table``) is absent.
+def policy_hides_table(key: str, privacy: PrivacySettings | None, *, bare_ok: bool = False) -> bool:
+    """Whether ``privacy`` explains why table ``key`` is absent.
 
     ``_apply_privacy_to_schema`` removes excluded schemas and tables from the
     schema the generation routes see, so an absent table can be hidden rather
-    than gone. A key is ``f"{schema_name}.{name}"`` and either part may itself
-    contain a dot, so every split is tried rather than one guessed.
+    than gone. A stored key is ``f"{schema_name}.{name}"`` and either part may
+    itself contain a dot, so every split is tried rather than one guessed.
+
+    ``bare_ok=True`` is for a metric's ``related_tables`` entry, which
+    ``detect_drift`` accepts unqualified: such a name is hidden when
+    ``excluded_tables`` lists it bare or under any schema (the same leniency
+    ``detect_drift`` gives a bare live name; a schema or table name containing a
+    dot can make that match over-broad, which only suppresses a warning). Without
+    ``bare_ok`` a bare key is never treated as hidden, so pruning still drops
+    such anomalies.
     """
     if privacy is None:
         return False
+    if bare_ok and "." not in key:
+        return any(entry.rpartition(".")[2] == key for entry in privacy.excluded_tables)
     return any(
         privacy.is_table_excluded(key[:i], key[i + 1 :]) for i, ch in enumerate(key) if ch == "."
     )
@@ -1629,7 +1639,7 @@ class SemanticModelGenerator:
                 if (
                     norm_t not in current_tables
                     and norm_t not in current_tables_bare
-                    and not policy_hides_table(norm_t, privacy)
+                    and not policy_hides_table(norm_t, privacy, bare_ok=True)
                 ):
                     warnings.append(
                         f'Business metric "{metric.name}" references '

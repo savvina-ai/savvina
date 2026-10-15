@@ -15,13 +15,20 @@ from app.datasources.models import (
     SchemaInfo,
     TableInfo,
 )
-from app.semantic.generator import SemanticModelGenerator, edges_in_schema, prune_to_schema
+from app.semantic.generator import (
+    SemanticModelGenerator,
+    edges_in_schema,
+    policy_hides_table,
+    prune_to_schema,
+)
 from app.semantic.models import (
     GENERATION_BATCH_SIZE,
+    AggregationType,
     ColumnSemantic,
     Hierarchy,
     RelationshipEdge,
     SemanticModel,
+    SimpleMetric,
     TablesBatchResponse,
     TableSemantic,
 )
@@ -330,6 +337,15 @@ class TestPruneToSchema:
         out = prune_to_schema({"public.orders": _tbl("id"), "public.gone": _tbl("id")}, schema)
         assert set(out) == {"public.orders"}
 
+    def test_a_bare_key_is_dropped_even_when_the_policy_hides_that_table(self) -> None:
+        # A bare stored key is an old-blob/LLM anomaly, not a hidden "public.payroll".
+        out = prune_to_schema(
+            {"payroll": _tbl("id")},
+            _schema_with_tables(["orders"]),
+            PrivacySettings(excluded_tables=["public.payroll"]),
+        )
+        assert out == {}
+
     def test_drops_columns_the_table_no_longer_has(self) -> None:
         schema = _schema_with_tables(["orders"], extra_columns=["total"])
         out = prune_to_schema({"public.orders": _tbl("id", "total", "dropped_col")}, schema)
@@ -536,6 +552,43 @@ class TestDetectDriftPrivacy:
     _PRIVACY = PrivacySettings(
         excluded_tables=["public.payroll"], excluded_columns=["public.orders.ssn"]
     )
+
+    def test_a_metric_naming_a_hidden_table_bare_is_not_drift(self) -> None:
+        """related_tables may be bare ("payroll"); the policy lists "public.payroll"."""
+        schema = _schema_with_tables(["orders"])
+        stored = SemanticModel(
+            tables={"public.orders": _tbl("id", name="Orders")},
+            business_metrics=[
+                SimpleMetric(
+                    name="Payroll total",
+                    definition="SUM(x)",
+                    aggregation=AggregationType.SUM,
+                    related_tables=["payroll"],
+                ),
+                SimpleMetric(
+                    name="Ghost total",
+                    definition="SUM(x)",
+                    aggregation=AggregationType.SUM,
+                    related_tables=["ghosts"],
+                ),
+            ],
+        )
+        warnings = SemanticModelGenerator().detect_drift(schema, stored, self._PRIVACY)
+        assert not any("Payroll total" in w for w in warnings)
+        assert any("Ghost total" in w for w in warnings)
+
+    def test_policy_hides_table_bare_keys_only_with_bare_ok(self) -> None:
+        qualified = PrivacySettings(excluded_tables=["public.payroll"])
+        bare = PrivacySettings(excluded_tables=["payroll"])
+        assert policy_hides_table("payroll", qualified, bare_ok=True)
+        assert not policy_hides_table("payroll", qualified)
+        assert policy_hides_table("payroll", bare, bare_ok=True)
+        assert policy_hides_table("public.payroll", bare)
+        assert policy_hides_table("public.payroll", qualified)
+        assert not policy_hides_table("orders", qualified, bare_ok=True)
+        assert not policy_hides_table("public.orders", bare)
+        assert not policy_hides_table("payroll", None)
+        assert policy_hides_table("hr.people", PrivacySettings(excluded_schemas=["hr"]))
 
     def _stored(self) -> SemanticModel:
         return SemanticModel(
