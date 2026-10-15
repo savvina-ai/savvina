@@ -311,13 +311,21 @@ def _write_history(
     new_value: dict[str, Any] | None,
     changed_by: str | None,
 ) -> None:
-    """Append one history row. Synchronous — it only stages an ORM object."""
+    """Append one history row. Synchronous — it only stages an ORM object.
+
+    ``entity_key`` is fitted like any other value: a column key is
+    ``"{table_key}.{column_name}"``, and two identity values that each fit their
+    own column can together exceed the key's.
+    The key is best-effort audit context (a truncated key can collide); ``entity_id``
+    is the stable reference.
+    """
+    fitted = _fit_values(SemanticHistoryRow, {"entity_key": entity_key})
     db.add(
         SemanticHistoryRow(
             connection_id=connection_id,
             entity_type=entity_type,
             entity_id=entity_id,
-            entity_key=entity_key,
+            entity_key=fitted["entity_key"],
             action=action,
             source=source,
             old_value=old_value,

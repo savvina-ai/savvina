@@ -487,6 +487,97 @@ class TestFitsPostgresLimits:
         assert await semantic_db.scalar(select(SemanticModelRow)) is None
         assert await semantic_db.scalar(select(SemanticHistoryRow)) is None
 
+    async def test_history_entity_key_fits_its_column(self, semantic_db, connection_id) -> None:
+        """A column key is ``table_key + "." + column_name``: two identity values that
+        each fit their 512-character column make 1025, one over ``entity_key``'s 1024."""
+        limit = SemanticHistoryRow.__table__.c.entity_key.type.length
+        table_key = "t" * SemanticTableRow.__table__.c.table_key.type.length
+        column_name = "c" * SemanticColumnRow.__table__.c.column_name.type.length
+        assert len(f"{table_key}.{column_name}") > limit
+
+        def annotated(display_name: str) -> dict[str, TableSemantic]:
+            return {
+                table_key: TableSemantic(
+                    display_name="T",
+                    columns={column_name: ColumnSemantic(display_name=display_name)},
+                )
+            }
+
+        await store.save_model(
+            semantic_db, connection_id, SemanticModel(tables=annotated("C")), updated_by="u1"
+        )
+        await semantic_db.commit()
+        await _begin(semantic_db, connection_id, tables_total=1)
+        # A changed column writes a column history row, keyed by table_key.column_name.
+        await store.reconcile_tables(semantic_db, connection_id, annotated("C2"), updated_by="gen")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        keys = (
+            await semantic_db.scalars(
+                select(SemanticHistoryRow.entity_key).where(
+                    SemanticHistoryRow.entity_type == "column"
+                )
+            )
+        ).all()
+        assert keys, "the changed column should have written a history row"
+        assert all(len(key) <= limit for key in keys)
+
+    async def test_history_entity_key_fits_its_column_on_a_user_patch(
+        self, semantic_db, connection_id
+    ) -> None:
+        """The PUT path builds the same ``table_key.column_name`` key in both its
+        update and insert branches."""
+        limit = SemanticHistoryRow.__table__.c.entity_key.type.length
+        table_key = "t" * SemanticTableRow.__table__.c.table_key.type.length
+        name_length = SemanticColumnRow.__table__.c.column_name.type.length
+        column_name = "c" * name_length
+        other_long_name = "d" * name_length
+        assert len(f"{table_key}.{column_name}") > limit
+
+        await store.save_model(
+            semantic_db,
+            connection_id,
+            SemanticModel(
+                tables={
+                    table_key: TableSemantic(
+                        display_name="T",
+                        columns={column_name: ColumnSemantic(display_name="C")},
+                    )
+                }
+            ),
+            updated_by="u1",
+        )
+        await semantic_db.commit()
+        # One column is updated, the other is inserted.
+        await store.apply_user_patch(
+            semantic_db,
+            connection_id,
+            SemanticModelUpdate(
+                tables={
+                    table_key: TableSemanticUpdate(
+                        columns={
+                            column_name: ColumnSemanticUpdate(display_name="Edited"),
+                            other_long_name: ColumnSemanticUpdate(display_name="New"),
+                        }
+                    )
+                }
+            ),
+            updated_by="u2",
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        keys = (
+            await semantic_db.scalars(
+                select(SemanticHistoryRow.entity_key).where(
+                    SemanticHistoryRow.entity_type == "column"
+                )
+            )
+        ).all()
+        assert len(keys) >= 2, "both the updated and the inserted column should be audited"
+        assert all(len(key) <= limit for key in keys)
+
     def test_fit_values_strips_nul_recursively_in_json_columns(self) -> None:
         fitted = store._fit_values(
             SemanticMetricRow,
