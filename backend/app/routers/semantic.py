@@ -6,9 +6,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
 import logging
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import func, null, select, update
@@ -375,29 +376,26 @@ async def _load_schema_for_connection(
     return schema, conn
 
 
-# Identity columns for metrics (and the store's other name-keyed rows) are VARCHAR(512).
-# A generator item named longer than that would make ``save_model`` raise and fail the
-# whole finalisation, so ``/generate/globals`` drops it instead.
-_MAX_GENERATED_NAME_LENGTH = 512
+def _drop_unstorable[T](
+    items: list[T],
+    kind: semantic_store.NameKind,
+    name_of: Callable[[T], str],
+    connection_id: str,
+) -> list[T]:
+    """``items`` without the ones ``save_model`` would reject for their name.
 
-
-class _Named(Protocol):
-    name: str
-
-
-def _drop_overlong_names[T: _Named](items: list[T], kind: str, connection_id: str) -> list[T]:
-    """``items`` without the ones whose name (NULs stripped) is too long to store."""
+    The rule is the store's (``name_rejection``): one bad LLM item must not fail
+    the whole finalisation, and the router must not keep its own copy of the
+    column limits.
+    """
     kept: list[T] = []
     for item in items:
-        length = len(item.name.replace("\x00", ""))
-        if length > _MAX_GENERATED_NAME_LENGTH:
+        why = semantic_store.name_rejection(kind, name_of(item))
+        if why is not None:
             logger.warning(
-                "generate_semantic_globals: dropped generated %s %r... (%d characters, "
-                "limit %d): connection=%s",
+                "generate_semantic_globals: dropped generated %s: %s: connection=%s",
                 kind,
-                item.name[:60],
-                length,
-                _MAX_GENERATED_NAME_LENGTH,
+                why,
                 connection_id,
             )
             continue
@@ -769,9 +767,12 @@ async def generate_semantic_globals(
     provenance = await semantic_store.provenance_map(db, connection_id)
 
     # One bad LLM item must not fail the whole finalisation in save_model.
-    metrics = _drop_overlong_names(metrics, "metric", connection_id)
-    segments = _drop_overlong_names(segments, "segment", connection_id)
-    derived_columns = _drop_overlong_names(derived_columns, "derived column", connection_id)
+    metrics = _drop_unstorable(metrics, "metric", lambda m: m.name, connection_id)
+    segments = _drop_unstorable(segments, "segment", lambda s: s.name, connection_id)
+    derived_columns = _drop_unstorable(
+        derived_columns, "derived_column", lambda d: d.name, connection_id
+    )
+    joins = _drop_unstorable(joins, "common_join", lambda j: j.join_pattern, connection_id)
 
     # A user-authored metric, segment, derived column or join carries provenance;
     # the generator's fresh set must not replace it. Name-keyed, like the store.

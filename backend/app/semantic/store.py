@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 import uuid
 
 from pydantic import TypeAdapter
@@ -153,6 +153,24 @@ _IDENTITY_COLUMNS = frozenset(
     }
 )
 
+# ``semantic_global_items.name`` is Text (a join pattern is SQL and must never be
+# truncated) but sits in a unique btree index, and PostgreSQL refuses an index
+# entry over about a third of a page (2704 bytes, tuple header and the other
+# indexed columns included). A Text identity column is therefore bounded by bytes,
+# with room to spare for ``connection_id`` and ``kind``.
+_MAX_INDEXED_TEXT_BYTES = 2000
+
+# The kinds of named item ``name_rejection`` checks.
+NameKind = Literal["metric", "segment", "derived_column", "common_join"]
+
+# The row class whose ``name`` column a generated item of each kind is stored in.
+_NAME_ROW_BY_KIND: dict[NameKind, type] = {
+    "metric": SemanticMetricRow,
+    "segment": SemanticGlobalItemRow,
+    "derived_column": SemanticGlobalItemRow,
+    "common_join": SemanticGlobalItemRow,
+}
+
 
 def _strip_nul(value: Any) -> Any:
     """Remove NUL characters from a string, or from every string (and object key)
@@ -174,9 +192,12 @@ def _fit_values(row_cls: type, values: dict[str, Any]) -> dict[str, Any]:
     fail a whole save. NULs are stripped (recursively inside JSON values) and a
     bounded string is truncated to its column length. Identity columns
     (``_IDENTITY_COLUMNS``) are never truncated: one that does not fit raises
-    ``ValueError``, which the routes map to HTTP 400. Keys that are not columns
-    of ``row_cls`` pass through unchanged. Migration 0003 does the same for the
-    backfill (``_clean_row`` / ``_fit_identity``).
+    ``ValueError``, which the routes map to HTTP 400. An identity column that is
+    unbounded Text is bounded by the unique index it sits in instead
+    (``_MAX_INDEXED_TEXT_BYTES``, measured in UTF-8 bytes, which is what the
+    index measures). Keys that are not columns of ``row_cls`` pass through
+    unchanged. Migration 0003 does the same for the backfill (``_clean_row`` /
+    ``_fit_identity``).
     """
     columns = row_cls.__table__.c  # type: ignore[attr-defined]
     out: dict[str, Any] = {}
@@ -186,22 +207,47 @@ def _fit_values(row_cls: type, values: dict[str, Any]) -> dict[str, Any]:
             out[key] = value
             continue
         value = _strip_nul(value)
-        length = getattr(column.type, "length", None) if isinstance(column.type, String) else None
-        if isinstance(value, str) and length is not None and len(value) > length:
-            if key in _IDENTITY_COLUMNS:
-                raise ValueError(
-                    f"{key} {value[:60]!r}... is {len(value)} characters; the limit is {length}"
+        if isinstance(value, str) and isinstance(column.type, String):
+            length = column.type.length
+            if length is None:
+                if key in _IDENTITY_COLUMNS:
+                    size = len(value.encode("utf-8"))
+                    if size > _MAX_INDEXED_TEXT_BYTES:
+                        raise ValueError(
+                            f"{key} {value[:60]!r}... is {size} bytes; the limit is "
+                            f"{_MAX_INDEXED_TEXT_BYTES} bytes"
+                        )
+            elif len(value) > length:
+                if key in _IDENTITY_COLUMNS:
+                    raise ValueError(
+                        f"{key} {value[:60]!r}... is {len(value)} characters; the limit is {length}"
+                    )
+                logger.warning(
+                    "semantic store: truncated %s.%s from %d to %d characters",
+                    row_cls.__tablename__,  # type: ignore[attr-defined]
+                    key,
+                    len(value),
+                    length,
                 )
-            logger.warning(
-                "semantic store: truncated %s.%s from %d to %d characters",
-                row_cls.__tablename__,  # type: ignore[attr-defined]
-                key,
-                len(value),
-                length,
-            )
-            value = value[:length]
+                value = value[:length]
         out[key] = value
     return out
+
+
+def name_rejection(kind: NameKind, name: str) -> str | None:
+    """Why ``save_model`` would reject an item of ``kind`` named ``name``, or ``None``.
+
+    ``kind`` is ``"metric"``, ``"segment"``, ``"derived_column"`` or
+    ``"common_join"`` (whose name is its ``join_pattern``). The same rule
+    ``_fit_values`` applies at the save — NULs stripped first, then the column's
+    length or, for an indexed Text column, the index's byte limit — so a caller
+    can drop one bad generated item instead of failing the whole save.
+    """
+    try:
+        _fit_values(_NAME_ROW_BY_KIND[kind], {"name": name})
+    except ValueError as exc:
+        return str(exc)
+    return None
 
 
 def _table_row_values(table_dump: dict[str, Any]) -> dict[str, Any]:
@@ -369,7 +415,8 @@ async def save_model(
 
     Raises ``ValueError`` (before touching the session) if an identity value — a
     table key, column name, metric name or relationship endpoint — is longer than
-    its column; every other string is made to fit (``_fit_values``).
+    its column, or a segment, derived-column or join name is over the unique
+    index's byte limit; every other string is made to fit (``_fit_values``).
     """
     prov = provenance or {}
     dumped = model.model_dump(mode="json")
@@ -1484,7 +1531,7 @@ async def apply_user_patch(
     do not.
 
     Raises ``ValueError`` (before touching the session) for an over-long table
-    key, column name, metric name or relationship endpoint.
+    key, column name, metric name, global-item name or relationship endpoint.
     """
     # Fit everything first: a ValueError must leave the session untouched.
     fitted_tables = _fit_table_patches(patch)

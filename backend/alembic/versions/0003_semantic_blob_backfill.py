@@ -218,12 +218,25 @@ def _fit_identity(value: Any, column: sa.Column) -> str | None:
     return text
 
 
-def _warn_skipped(connection_id: Any, what: str, key: Any) -> None:
+# Same rule as ``store._MAX_INDEXED_TEXT_BYTES``: ``semantic_global_items.name`` is
+# Text but sits in a unique btree index, which PostgreSQL caps at about a third of
+# a page. Measured in UTF-8 bytes, which is what the index measures.
+_MAX_INDEXED_NAME_BYTES = 2000
+
+
+def _warn_skipped(
+    connection_id: Any,
+    what: str,
+    key: Any,
+    *,
+    reason: str = "identity value exceeds its column length",
+) -> None:
     logger.warning(
-        "connection %s: skipping %s %r: identity value exceeds its column length",
+        "connection %s: skipping %s %r: %s",
         connection_id,
         what,
         str(key)[:80],
+        reason,
     )
 
 
@@ -432,10 +445,19 @@ def backfill_connection(
         for item in items:
             if not isinstance(item, dict):
                 continue
-            # ``name`` is unbounded Text, so no length check; NULs are stripped.
-            name = str(
-                (item.get("join_pattern") if kind == "common_join" else item.get("name")) or ""
-            ).replace("\x00", "")
+            # ``name`` is unbounded Text, but the unique index it sits in is not.
+            raw_name = (
+                item.get("join_pattern") if kind == "common_join" else item.get("name")
+            ) or ""
+            name = str(raw_name).replace("\x00", "")
+            if len(name.encode("utf-8")) > _MAX_INDEXED_NAME_BYTES:
+                _warn_skipped(
+                    connection_id,
+                    kind,
+                    raw_name,
+                    reason=f"name exceeds the unique index's {_MAX_INDEXED_NAME_BYTES}-byte limit",
+                )
+                continue
             # First occurrence wins, as for metrics above.
             if (kind, name) in seen:
                 continue

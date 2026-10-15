@@ -21,6 +21,7 @@ from app.models.semantic_store import (
     SemanticRelationshipRow,
     SemanticTableRow,
 )
+from app.semantic import store
 from app.semantic.models import SemanticModel
 from tests.migration_utils import load_migration
 
@@ -325,6 +326,31 @@ class TestBoundedValues:
         await _run_backfill(semantic_db)
         names = (await semantic_db.scalars(select(SemanticColumnRow.column_name))).all()
         assert names == ["ok"]
+
+    async def test_over_long_join_pattern_skips_only_that_item(
+        self, semantic_db, connection_id, caplog
+    ) -> None:
+        """A join pattern is unbounded Text, but it sits in a unique index that
+        PostgreSQL caps by bytes; one over the cap would fail the whole connection."""
+        blob = {
+            "tables": {"public.t": {"columns": {}}},
+            "common_joins": [
+                {"description": "too long", "tables": [], "join_pattern": "j" * 3000},
+                {"description": "fine", "tables": [], "join_pattern": "o.id = c.id"},
+            ],
+        }
+        await _seed_blob(semantic_db, connection_id, blob)
+        with caplog.at_level(logging.WARNING):
+            await _run_backfill(semantic_db)
+        names = (await semantic_db.scalars(select(SemanticGlobalItemRow.name))).all()
+        assert names == ["o.id = c.id"]
+        assert connection_id in caplog.text and "skipping common_join" in caplog.text
+
+    def test_index_name_cap_matches_the_store(self) -> None:
+        """A migration must not import app code, so this test is what keeps the two
+        caps equal."""
+        mig = load_migration("0003_semantic_blob_backfill.py")
+        assert mig._MAX_INDEXED_NAME_BYTES == store._MAX_INDEXED_TEXT_BYTES
 
 
 class TestBooleanCoercion:

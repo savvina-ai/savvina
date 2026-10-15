@@ -597,9 +597,57 @@ class TestFitsPostgresLimits:
         assert store._fit_values(SemanticTableRow, {"domain": "d" * 200})["domain"] == "d" * 128
         with pytest.raises(ValueError, match="limit is 512"):
             store._fit_values(SemanticTableRow, {"table_key": "k" * 513})
-        # Global-item names are unbounded Text: only NULs go.
-        long_name = "n" * 5000
-        assert store._fit_values(SemanticGlobalItemRow, {"name": long_name})["name"] == long_name
+        # Global-item names are Text, bounded by the unique index's byte limit, not a length.
+        assert store._fit_values(SemanticGlobalItemRow, {"name": "n" * 2000})["name"] == "n" * 2000
+        with pytest.raises(ValueError, match="bytes"):
+            store._fit_values(SemanticGlobalItemRow, {"name": "n" * 5000})
+
+    def test_indexed_text_identity_is_bounded_by_bytes_not_characters(self) -> None:
+        limit = store._MAX_INDEXED_TEXT_BYTES
+        assert (
+            store._fit_values(SemanticGlobalItemRow, {"name": "n" * limit})["name"] == "n" * limit
+        )
+        with pytest.raises(ValueError, match="bytes"):
+            store._fit_values(SemanticGlobalItemRow, {"name": "n" * (limit + 1)})
+        # A multibyte character counts for its encoded size ("é" is two bytes).
+        with pytest.raises(ValueError, match="bytes"):
+            store._fit_values(SemanticGlobalItemRow, {"name": "é" * (limit // 2 + 1)})
+        # Text that is not an identity stays unbounded.
+        long_text = "d" * 10_000
+        assert (
+            store._fit_values(SemanticTableRow, {"description": long_text})["description"]
+            == long_text
+        )
+
+    def test_name_rejection_matches_the_save_rule(self) -> None:
+        over_index = store._MAX_INDEXED_TEXT_BYTES + 1
+        assert store.name_rejection("metric", "Revenue") is None
+        assert store.name_rejection("metric", "a" * 512 + "\x00") is None  # NULs go first
+        assert "limit is 512" in (store.name_rejection("metric", "a" * 513) or "")
+        # Segments and derived columns share the Text ``name`` column with joins, so
+        # only the unique index's byte limit bounds them.
+        assert store.name_rejection("segment", "s" * 513) is None
+        assert store.name_rejection("segment", "s" * over_index) is not None
+        assert store.name_rejection("derived_column", "d" * 513) is None
+        assert store.name_rejection("derived_column", "d" * over_index) is not None
+        assert store.name_rejection("common_join", "j" * store._MAX_INDEXED_TEXT_BYTES) is None
+        assert "bytes" in (store.name_rejection("common_join", "j" * over_index) or "")
+
+    async def test_over_long_join_pattern_raises_and_writes_nothing(
+        self, semantic_db, connection_id
+    ) -> None:
+        model = SemanticModel(
+            common_joins=[
+                CommonJoin(
+                    description="too long for the unique index",
+                    tables=["public.orders"],
+                    join_pattern="j" * (store._MAX_INDEXED_TEXT_BYTES + 1),
+                )
+            ]
+        )
+        with pytest.raises(ValueError, match="name"):
+            await store.save_model(semantic_db, connection_id, model, updated_by="u1")
+        assert await semantic_db.scalar(select(SemanticModelRow)) is None
 
     def test_column_references_are_as_wide_as_column_names(self) -> None:
         # A truncated reference would name a column that does not exist.

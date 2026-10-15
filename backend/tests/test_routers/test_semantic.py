@@ -18,6 +18,7 @@ from app.semantic import store as semantic_store
 from app.semantic.models import (
     GENERATION_BATCH_SIZE,
     AggregationType,
+    CommonJoin,
     DerivedColumn,
     GenerationProgress,
     GenerationStatus,
@@ -1254,30 +1255,42 @@ class TestGenerateGlobals:
         near_miss = [r for r in caplog.records if "near-miss" in r.getMessage()]
         assert len(near_miss) == 1
 
-    async def test_overlong_generated_names_are_dropped_not_fatal(
+    async def test_unstorable_generated_names_are_dropped_not_fatal(
         self, http_client, caplog
     ) -> None:
         long_name = "x" * 513
         fits_once_nuls_go = "a" * 512 + "\x00"
+        # Segments, derived columns and joins share a Text ``name`` column that only
+        # the unique index's byte limit bounds; a metric name is VARCHAR(512).
+        too_long_for_index = "x" * (semantic_store._MAX_INDEXED_TEXT_BYTES + 1)
         metrics = [
             SimpleMetric(name=long_name, definition="1", aggregation=AggregationType.SUM),
             SimpleMetric(name="ok", definition="1", aggregation=AggregationType.SUM),
             SimpleMetric(name=fits_once_nuls_go, definition="1", aggregation=AggregationType.SUM),
         ]
         segments = [
-            Segment(name=long_name, sql_expression="1=1"),
+            Segment(name=too_long_for_index, sql_expression="1=1"),
             Segment(name="seg", sql_expression="1=1"),
         ]
         derived = [
-            DerivedColumn(name=long_name, sql_expression="a/b"),
+            DerivedColumn(name=too_long_for_index, sql_expression="a/b"),
             DerivedColumn(name="ratio", sql_expression="a/b"),
+        ]
+        # A join is keyed by its pattern, which is Text bounded by the unique index.
+        joins = [
+            CommonJoin(
+                description="too long for the index",
+                tables=["public.orders"],
+                join_pattern="j" * (semantic_store._MAX_INDEXED_TEXT_BYTES + 1),
+            ),
+            CommonJoin(description="fine", tables=["public.orders"], join_pattern="o.id = c.id"),
         ]
         with caplog.at_level(logging.WARNING, logger="app.routers.semantic"):
             resp, save, _ = await self._run(
                 http_client,
                 model=self._partial(),
                 schema=_schema(["orders"]),
-                llm=(metrics, [], derived, [], segments),
+                llm=(metrics, joins, derived, [], segments),
             )
 
         assert resp.status_code == 200
@@ -1285,8 +1298,9 @@ class TestGenerateGlobals:
         assert [m.name for m in saved.business_metrics] == ["ok", fits_once_nuls_go]
         assert [s.name for s in saved.segments] == ["seg"]
         assert [d.name for d in saved.derived_columns] == ["ratio"]
+        assert [j.join_pattern for j in saved.common_joins] == ["o.id = c.id"]
         dropped = [r for r in caplog.records if "dropped generated" in r.getMessage()]
-        assert len(dropped) == 3
+        assert len(dropped) == 4
 
     async def test_store_value_error_is_400_not_500(self, http_client) -> None:
         db = _mock_db(MockResult(single=_make_conn()))
