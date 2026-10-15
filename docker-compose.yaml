@@ -112,6 +112,7 @@ services:
       # secret so it never lands in the image config or layer history.
       secrets:
         - hf_token
+        - ca_bundle
     # Override the Dockerfile's appuser with the host developer's UID/GID so
     # bind-mounted volumes (./volumes/backend-data) are writable without root.
     # Intentional UID mismatch: the process runs as the host UID, not appuser.
@@ -218,6 +219,10 @@ services:
 secrets:
   hf_token:
     environment: HF_TOKEN
+  # Optional CA bundle (PEM) for builds behind a TLS-inspecting proxy. Set
+  # CA_BUNDLE to its path; /dev/null (an empty file) leaves the default trust store.
+  ca_bundle:
+    file: ${CA_BUNDLE:-/dev/null}
 
 volumes:
   ollama_models:

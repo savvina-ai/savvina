@@ -7,6 +7,14 @@ set -u
 
 HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)"
 export HF_TOKEN
+
+# Optional CA bundle for networks whose TLS-inspecting proxy re-signs the model
+# CDN's certificate. Skipped when the secret is absent or empty (the compose
+# default), so the image's own trust store is used.
+if [ -s /run/secrets/ca_bundle ]; then
+    export SSL_CERT_FILE=/run/secrets/ca_bundle
+    export REQUESTS_CA_BUNDLE=/run/secrets/ca_bundle
+fi
 PYTHON="${PYTHON:-python}"
 
 for attempt in 1 2 3; do

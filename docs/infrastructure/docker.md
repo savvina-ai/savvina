@@ -223,11 +223,12 @@ FROM --platform=$BUILDPLATFORM python:3.12-slim AS model-cache
 RUN pip install --no-cache-dir fastembed
 ENV FASTEMBED_CACHE_PATH=/app/fastembed_cache
 # Optional HF_TOKEN arrives as a BuildKit secret (never a build arg), so it
-# is not recorded in this stage's config or history. download_model.sh
+# is not recorded in this stage's config or history. An optional ca_bundle
+# secret (CA_BUNDLE) adds a proxy's root CA for the download. download_model.sh
 # retries three times and then fails the build rather than producing an
 # image without the embedding model.
 COPY download_model.sh /download_model.sh
-RUN --mount=type=secret,id=hf_token sh /download_model.sh
+RUN --mount=type=secret,id=hf_token --mount=type=secret,id=ca_bundle sh /download_model.sh
 
 # ── builder ───────────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS builder
