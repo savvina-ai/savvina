@@ -343,7 +343,7 @@ def _header(
     schema_hash: str,
     done: int = 0,
     total: int = 2,
-    run_id: str = "run-1",
+    run_id: str | None = "run-1",
 ):
     return semantic_store.SemanticHeader(
         generation_status=str(status),
@@ -731,6 +731,31 @@ class TestGenerateBatch:
             app.dependency_overrides[get_db] = lambda: _mock_db()
             resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
         assert resp.status_code == 400
+
+    async def test_a_partial_header_without_a_run_id_is_400(self, http_client) -> None:
+        """Migration 0003 backfills an interrupted blob-era run as tables_partial with no
+        run id. Stamping tables with None would leave progress at 0 and make a later
+        resume regenerate everything, so the batch sends the client to /generate/init."""
+        reconcile = AsyncMock()
+        with (
+            patch("app.routers.semantic._load_schema_for_connection") as mock_load,
+            patch("app.routers.semantic.SemanticModelGenerator") as mock_gen,
+            patch(
+                f"{_STORE}.load_header",
+                new=AsyncMock(
+                    return_value=_header(GenerationStatus.TABLES_PARTIAL, "h", run_id=None)
+                ),
+            ),
+            patch(f"{_STORE}.reconcile_tables", new=reconcile),
+        ):
+            mock_load.return_value = (_schema(["orders"]), _make_conn())
+            mock_gen.return_value.compute_schema_hash.return_value = "h"
+            app.dependency_overrides[get_db] = lambda: _mock_db()
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+        assert resp.status_code == 400
+        assert "/generate/init" in resp.json()["detail"]
+        reconcile.assert_not_awaited()
+        mock_gen.return_value.generate_tables.assert_not_called()
 
     async def test_changed_schema_is_409(self, http_client) -> None:
         with (

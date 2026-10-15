@@ -532,6 +532,16 @@ async def generate_semantic_batch(
     # The run this batch belongs to. A /generate/init that lands while the LLM call
     # is in flight mints a new one; see the post-lock check below.
     run_id = header.generation_run_id
+    if run_id is None:
+        # A tables_partial header with no run id — migration 0003 backfills an
+        # interrupted blob-era run that way. There is nothing to stamp tables with:
+        # reconciling would write NULL, the progress count would stay 0 and a later
+        # resume would regenerate every table. /generate/init (resume=true included)
+        # mints the id.
+        raise HTTPException(
+            status_code=400,
+            detail="Call /generate/init first before calling /generate/batch",
+        )
 
     gen = SemanticModelGenerator()
     if header.schema_hash != gen.compute_schema_hash(schema):
