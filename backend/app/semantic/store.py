@@ -6,7 +6,8 @@
 The only module that knows both the ORM rows in ``app/models/semantic_store.py``
 and the Pydantic shape in ``app/semantic/models.py``. Routers and services call
 this; they never hand-merge semantic dicts and never touch
-``Connection.semantic_model``.
+``Connection.semantic_model`` — the legacy blob is unread everywhere and is
+cleared only here, by ``delete_model``.
 
 Nothing here commits. The caller owns the transaction, so a write and the cache
 invalidation beside it share one ``await db.commit()``.
@@ -28,8 +29,9 @@ from typing import TYPE_CHECKING, Any, Literal
 import uuid
 
 from pydantic import TypeAdapter
-from sqlalchemy import String, delete, func, select, update
+from sqlalchemy import String, delete, func, null, select, update
 
+from ..models.connection import Connection
 from ..models.semantic_store import (
     SemanticColumnRow,
     SemanticGlobalItemRow,
@@ -648,7 +650,17 @@ async def save_model(
 
 
 async def delete_model(db: AsyncSession, connection_id: str, *, changed_by: str | None) -> None:
-    """Delete every semantic row for a connection, recording one history entry."""
+    """Delete every semantic row for a connection, recording one history entry.
+
+    Also clears the legacy ``connections.semantic_model`` blob, rows or no rows:
+    the migration that drops that column must find no connection with a blob but
+    no ``semantic_models`` row, and this is the one place that knows the rows and
+    the blob go together. ``null()``, not ``None``: ``None`` on a JSON column
+    stores the JSON text ``'null'``.
+    """
+    await db.execute(
+        update(Connection).where(Connection.id == connection_id).values(semantic_model=null())
+    )
     header = await db.scalar(
         select(SemanticModelRow).where(SemanticModelRow.connection_id == connection_id)
     )

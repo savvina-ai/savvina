@@ -219,8 +219,7 @@ class TestDeleteConnection:
     async def test_success_returns_204(self, http_client, stub_deletes):
         conn = _make_conn()
         # execute calls: (1) get conn, (2) get session ids, (3) del cache, (4) del examples,
-        # (5) del UserSchemaCache, (6) del TableEmbeddingCache, (7) del SemanticSuggestion,
-        # (8) null the legacy blob
+        # (5) del UserSchemaCache, (6) del TableEmbeddingCache, (7) del SemanticSuggestion
         db = _mock_db(
             MockResult(single=conn),
             MockResult(rows=[]),  # no chat sessions → skip message/session deletes
@@ -229,15 +228,12 @@ class TestDeleteConnection:
             MockResult(),  # delete UserSchemaCache
             MockResult(),  # delete TableEmbeddingCache
             MockResult(),  # delete SemanticSuggestion
-            MockResult(),  # clear the legacy semantic_model blob
         )
         app.dependency_overrides[get_db] = lambda: db
         resp = await http_client.delete("/api/v1/connections/conn-123")
         assert resp.status_code == 204
-        assert db.execute.call_count == 8
-        # The legacy blob is cleared with SQL NULL (a bound None would store JSON 'null').
-        sql = [str(c.args[0].compile()) for c in db.execute.call_args_list]
-        assert any(q.startswith("UPDATE connections SET semantic_model=NULL") for q in sql), sql
+        assert db.execute.call_count == 7
+        # The legacy blob is cleared by store.delete_model, patched out here.
         # Soft-delete never fires ON DELETE CASCADE, so the semantic rows go explicitly.
         stub_deletes.assert_awaited_once()
         args, kwargs = stub_deletes.await_args
@@ -265,12 +261,11 @@ class TestDeleteConnection:
             MockResult(),  # delete UserSchemaCache
             MockResult(),  # delete TableEmbeddingCache
             MockResult(),  # delete SemanticSuggestion
-            MockResult(),  # clear the legacy semantic_model blob
         )
         app.dependency_overrides[get_db] = lambda: db
         resp = await http_client.delete("/api/v1/connections/conn-123")
         assert resp.status_code == 204
-        assert db.execute.call_count == 10
+        assert db.execute.call_count == 9
 
 
 # ── GET /api/v1/connections/{id}/schema ─────────────────────────────────────────

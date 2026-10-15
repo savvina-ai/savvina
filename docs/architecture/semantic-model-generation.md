@@ -55,7 +55,7 @@ Seven tables: one header row per connection (`semantic_models`), one row per tab
 - Each connection is backfilled inside its own SAVEPOINT, so one malformed blob (or a NUL inside a JSON payload) fails only that connection; it is logged and skipped, and the upgrade continues. A final summary line reports `N/M connections backfilled; failed: …` (logged as an error when any failed).
 - `user_edited_fields` is seeded empty: nothing in a blob distinguishes LLM output from a hand edit, so the first regenerate treats every migrated value as regenerable.
 - It refuses to run in offline `--sql` mode, because the backfill reads data and cannot be rendered as static SQL.
-- `connections.semantic_model` is left in place and unread, and is dropped by a later migration (one release on). `DELETE /semantic` and deleting a connection both clear it, so that later migration finds no connection with a blob but no `semantic_models` row.
+- `connections.semantic_model` is left in place and unread, and is dropped by a later migration (one release on). `store.delete_model` clears it (rows or no rows) and both `DELETE /semantic` and deleting a connection go through that, so the later migration finds no connection with a blob but no `semantic_models` row.
 - Downgrading past `0003` is a no-op; roll forward instead.
 
 ---
@@ -309,7 +309,7 @@ TIME EXPRESSIONS (use these for date-based questions):
 | Endpoint | File | What it does |
 |---|---|---|
 | `PUT /{id}/semantic` | `routers/semantic.py: update_semantic_model()` | Applies the patch through `store.apply_user_patch`: per-field provenance, optimistic lock, `409` on conflict |
-| `DELETE /{id}/semantic` | `routers/semantic.py: delete_semantic_model()` | Deletes every semantic row (`store.delete_model`) and clears the legacy `connections.semantic_model` blob |
+| `DELETE /{id}/semantic` | `routers/semantic.py: delete_semantic_model()` | Deletes every semantic row and the legacy `connections.semantic_model` blob through `store.delete_model` |
 
 `apply_user_patch` marks every field a person changes in that row's `user_edited_fields`, which is what makes the next regenerate skip it. The frontend PUTs the whole draft on every save, so each incoming value is compared with what is stored and only a field that actually differs is written, marked and audited. In the patch, a `null` top-level section is "not supplied" (the stored value is kept) and `[]` is an explicit clear. Inside a table, `null` also means "not supplied" for `display_name` and `default_filters`, and inside a column for `display_name`, `value_mappings`, `is_sensitive`, `is_non_additive` and `semantic_type`; for every other nullable field (`description`, `grain`, `currency`, …) `null` clears the value. Metrics, joins, segments, derived columns and relationships are replaced as whole sections when supplied, but provenance is per item: only an item that is new or whose payload changed is marked. Applying a suggestion (`POST …/suggestions/{id}/apply`) goes through the same patch path, so it is also remembered as a hand edit.
 

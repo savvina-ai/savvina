@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from sqlalchemy import delete, func, null, select, update
+from sqlalchemy import delete, func, select, update
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -248,14 +248,9 @@ async def delete_connection(
     await db.execute(
         delete(SemanticSuggestion).where(SemanticSuggestion.connection_id == connection_id)
     )
-    # Soft-delete never fires ON DELETE CASCADE, so the semantic rows go explicitly.
+    # Soft-delete never fires ON DELETE CASCADE, so the semantic rows (and the legacy
+    # blob, which the store clears with them) go explicitly.
     await semantic_store.delete_model(db, connection_id, changed_by=_user.id)
-    # Also clear the legacy blob: the migration that drops it must find no connection
-    # with a blob but no semantic_models row. ``null()``, not None: None on a JSON
-    # column stores the JSON text 'null'.
-    await db.execute(
-        update(Connection).where(Connection.id == connection_id).values(semantic_model=null())
-    )
     if conn.source_type == "postgresql":
         config_dict = json.loads(decrypt_value(conn.config_encrypted, settings.encryption_key))
         await _evict_pg_pool(config_dict)

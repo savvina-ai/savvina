@@ -533,7 +533,8 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     # Deliberately a no-op. Nothing writes ``connections.semantic_model`` any more
-    # after this migration, so the blob is frozen at what it held when this ran;
+    # after this migration (``store.delete_model`` only clears it), so the blob is
+    # frozen at what it held when this ran;
     # deleting the rows on downgrade would discard every edit made since.
     # Downgrading past 0003 is not supported; roll forward instead.
     pass

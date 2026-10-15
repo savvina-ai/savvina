@@ -12,7 +12,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from sqlalchemy import func, null, select, update
+from sqlalchemy import func, select, update
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,7 +22,6 @@ from ..auth.limiter import limiter
 from ..config import get_settings
 from ..database import get_db
 from ..datasources.models import PrivacySettings
-from ..models.connection import Connection
 from ..models.semantic_suggestion import SemanticSuggestion
 from ..models.user import User
 from ..models.user_schema_cache import UserSchemaCache
@@ -125,13 +124,8 @@ async def delete_semantic_model(
     # Take the connection row lock (it also covers the 404) so a delete serialises
     # with locked PUT / suggestion-apply writers instead of racing their rows.
     await lock_and_reread_connection(connection_id, db)
+    # Rows and the legacy blob both go; the store owns that pairing.
     await semantic_store.delete_model(db, connection_id, changed_by=current_user.id)
-    # Also clear the legacy blob: the migration that drops it must find no connection
-    # with a blob but no semantic_models row. ``null()``, not None: None on a JSON
-    # column stores the JSON text 'null'.
-    await db.execute(
-        update(Connection).where(Connection.id == connection_id).values(semantic_model=null())
-    )
     await _invalidate_connection_caches(connection_id, db)
     await db.commit()
 

@@ -10,6 +10,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects import postgresql
 
 from app.database import Base
+from app.models.connection import Connection
 from app.models.semantic_store import (
     SemanticColumnRow,
     SemanticGlobalItemRow,
@@ -298,6 +299,22 @@ class TestRoundTrip:
         assert (await semantic_db.scalars(select(SemanticMetricRow))).all() == []
 
 
+async def _seed_legacy_blob(db, cid: str) -> None:
+    await db.execute(
+        update(Connection).where(Connection.id == cid).values(semantic_model={"tables": {}})
+    )
+
+
+async def _blob_is_sql_null(db, cid: str) -> bool:
+    """True only for SQL NULL: a JSON 'null' text (a bound None) does not match ``IS NULL``."""
+    count = await db.scalar(
+        select(func.count())
+        .select_from(Connection)
+        .where(Connection.id == cid, Connection.semantic_model.is_(None))
+    )
+    return count == 1
+
+
 class TestDeleteAndHistory:
     async def test_delete_cascades_every_row(self, semantic_db, connection_id) -> None:
         await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
@@ -316,9 +333,37 @@ class TestDeleteAndHistory:
             assert (await semantic_db.scalars(select(row_type))).all() == []
         assert await store.load_model(semantic_db, connection_id) is None
 
-    async def test_delete_without_a_model_is_a_noop(self, semantic_db, connection_id) -> None:
+    async def test_delete_clears_the_legacy_blob_with_sql_null(
+        self, semantic_db, connection_id
+    ) -> None:
+        """The migration that drops the blob must find no connection with a blob but no
+        semantic_models row. SQL NULL, not a bound None: on a JSON column, None is
+        stored as the JSON text 'null', which ``IS NULL`` does not match."""
+        await _seed_legacy_blob(semantic_db, connection_id)
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
         await store.delete_model(semantic_db, connection_id, changed_by="u1")
         await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert await _blob_is_sql_null(semantic_db, connection_id)
+
+    async def test_delete_clears_the_blob_even_without_rows(
+        self, semantic_db, connection_id
+    ) -> None:
+        """Exactly the state the blob-drop migration must never find."""
+        await _seed_legacy_blob(semantic_db, connection_id)
+        await semantic_db.commit()
+        await store.delete_model(semantic_db, connection_id, changed_by="u1")
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        assert await _blob_is_sql_null(semantic_db, connection_id)
+
+    async def test_delete_without_a_model_writes_no_history(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.delete_model(semantic_db, connection_id, changed_by="u1")
+        await semantic_db.commit()
+        assert await semantic_db.scalar(select(SemanticHistoryRow)) is None
 
     async def test_save_and_delete_write_history(self, semantic_db, connection_id) -> None:
         await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
