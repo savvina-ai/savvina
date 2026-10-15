@@ -86,7 +86,7 @@ routers/semantic.py: generate_semantic_init()
   │    ├─ get_connection_or_404()                         # DB load, org-scoped
   │    ├─ UserSchemaCache (DB read)                       # load cached schema JSON
   │    ├─ _schema_from_dict()                             # deserialise to DataSourceSchema
-  │    └─ _apply_privacy_to_schema()                      # strip excluded tables/schemas
+  │    └─ _apply_privacy_to_schema()                      # strip excluded schemas/tables/columns (+ their FKs)
   ├─ SemanticModelGenerator.prepare_generation(schema)
   │    └─ _build_relationship_graph(schema)               # FK edges from DataSourceSchema.relationships
   ├─ _lock_generation()                                   # connection row lock (FOR UPDATE)
@@ -134,7 +134,7 @@ routers/semantic.py: generate_semantic_globals()
 **Functions:** `_schema_from_dict()`, `_apply_privacy_to_schema()` (from `services/schema_utils.py`)  
 **Model:** `models/user_schema_cache.py` → `UserSchemaCache`
 
-All three phases begin the same way: load the schema JSON from `UserSchemaCache` for this user + connection and deserialise it. If no cached schema exists, the schema is introspected live and cached; a failure there returns HTTP 400. Privacy settings are applied via `_apply_privacy_to_schema()` to strip excluded schemas/tables before any LLM call.
+All three phases begin the same way: load the schema JSON from `UserSchemaCache` for this user + connection and deserialise it. If no cached schema exists, the schema is introspected live and cached; a failure there returns HTTP 400. Privacy settings are applied via `_apply_privacy_to_schema()` to strip excluded schemas/tables, `excluded_columns` (exact `schema.table.column`) and the foreign keys on those columns before any LLM call.
 
 ### Phase 1 — Init: Batch Plan
 
@@ -213,7 +213,7 @@ Generates cross-table business KPIs, derived columns, join patterns, and named s
 After `generate_globals()` returns, `routers/semantic.py: generate_semantic_globals()` re-reads the model under the connection row lock (`409` if it was deleted or its status moved on meanwhile) and assembles the final model:
 
 - **Hand-authored items are carried through.** A metric, segment, derived column or common join with provenance replaces any generated item of the same name (or, for joins, the same `join_pattern`); the generator's set is added around it. A generated item whose name the store would reject (`store.name_rejection`: a metric name over 512 characters, or a segment, derived-column or join name over the index's byte limit) is dropped with a warning.
-- **Pruning.** `prune_to_schema` drops tables and columns that left the database and clears references to them (primary timestamp/date column, partition and cluster columns, hierarchy levels; a hierarchy left with no levels is dropped). `edges_in_schema` drops relationships whose endpoints left the database, bounded by the live schema rather than the annotated tables, so a hand-written edge to a real but unannotated table survives. `carry_edited_relationships` then keeps hand-edited relationships through the regenerated set. **What the connection's privacy settings hide is kept, not pruned**: an excluded table, or a column in `excluded_columns`, is absent from the schema because it is hidden rather than gone, so it is carried through together with references to it. `default_filters` are free SQL and are not rewritten.
+- **Pruning.** `prune_to_schema` drops tables and columns that left the database and clears references to them (primary timestamp/date column, partition and cluster columns, hierarchy levels; a hierarchy left with no levels is dropped). `edges_in_schema` drops relationships whose endpoints left the database, bounded by the live schema rather than the annotated tables, so a hand-written edge to a real but unannotated table survives. `carry_edited_relationships` then keeps hand-edited relationships through the regenerated set. **What the connection's privacy settings hide is kept, not pruned**: an excluded table, or a column in `excluded_columns`, is absent from the schema because it is hidden rather than gone, so it is carried through together with references to it. For relationships only the edges a user has marked (edited) are carried through, by `carry_edited_relationships`; an unmarked foreign-key edge to a privacy-hidden endpoint is not regenerated while the endpoint is hidden (the fresh edges come from the narrowed schema) and returns on the next globals run after it is un-hidden. `default_filters` are free SQL and are not rewritten.
 - Near-miss spellings in stored keys (for example rows migrated from a blob with an LLM's `public.Orders`) are dropped like any absent key, with a warning naming the key they would have matched, because a remap would keep the value but lose the user-edit marks keyed by the old spelling.
 
 | Method | What it produces |

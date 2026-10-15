@@ -1271,8 +1271,25 @@ class TestProvenanceSurvivesFullSave:
                 connection_id,
                 _rich_model(),
                 updated_by="gen",
-                protected={"table": {}, "column": {}},
+                protected={"table": {"public.orders": {"description": "x"}}, "column": {}},
             )
+        with pytest.raises(TypeError, match="provenance"):
+            await store.save_model(
+                semantic_db,
+                connection_id,
+                _rich_model(),
+                updated_by="gen",
+                provenance={},
+                protected={"table": {"public.orders": {"description": "x"}}, "column": {}},
+            )
+        # An empty ``protected`` has nothing to restore, so it needs no provenance.
+        await store.save_model(
+            semantic_db,
+            connection_id,
+            _rich_model(),
+            updated_by="gen",
+            protected={},
+        )
 
     async def test_full_save_self_read_restores_only_the_fields_provenance_names(
         self, semantic_db, connection_id
@@ -2001,6 +2018,12 @@ class TestContentWritesBumpTheHeaderVersion:
         await db.commit()
         return await self._version(db)
 
+    async def test_begin_generation_bumps_it(self, semantic_db, connection_id) -> None:
+        before = await self._seed(semantic_db, connection_id)
+        await _begin(semantic_db, connection_id)
+        await semantic_db.commit()
+        assert await self._version(semantic_db) == before + 1
+
     async def test_a_table_edit_bumps_it(self, semantic_db, connection_id) -> None:
         before = await self._seed(semantic_db, connection_id)
         body = SemanticModelUpdate(
@@ -2333,7 +2356,7 @@ class TestModelCache:
         row = await semantic_db.scalar(
             select(SemanticTableRow).where(SemanticTableRow.table_key == "public.orders")
         )
-        await store.update_table_fields(
+        await store._update_table_fields(
             semantic_db,
             row.id,
             row.version,
@@ -2415,7 +2438,7 @@ class TestOptimisticLock:
     ) -> None:
         row = await self._seed_and_read(semantic_db, connection_id)
         with pytest.raises(store.SemanticStoreConflict):
-            await store.update_table_fields(
+            await store._update_table_fields(
                 semantic_db,
                 row.id,
                 expected_version=row.version + 1,
@@ -2441,7 +2464,7 @@ class TestOptimisticLock:
         assert row.version == stale_version
 
         with pytest.raises(store.SemanticStoreConflict):
-            await store.update_table_fields(
+            await store._update_table_fields(
                 semantic_db,
                 table_id,
                 expected_version=stale_version,
@@ -2466,7 +2489,7 @@ class TestOptimisticLock:
 
     async def test_matching_version_writes_and_bumps(self, semantic_db, connection_id) -> None:
         row = await self._seed_and_read(semantic_db, connection_id)
-        await store.update_table_fields(
+        await store._update_table_fields(
             semantic_db,
             row.id,
             expected_version=row.version,
@@ -2489,7 +2512,7 @@ class TestOptimisticLock:
 
     async def test_an_echo_writes_nothing(self, semantic_db, connection_id) -> None:
         row = await self._seed_and_read(semantic_db, connection_id)
-        await store.update_table_fields(
+        await store._update_table_fields(
             semantic_db,
             row.id,
             expected_version=row.version,

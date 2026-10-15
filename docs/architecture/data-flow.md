@@ -16,7 +16,7 @@ routers/chat.py: process_message()
        │    ├─ UserSchemaCache (DB read)
        │    ├─ adapter.introspect()                  # if cache miss
        │    ├─ _schema_from_dict()                   # deserialise stored JSON
-       │    ├─ _apply_privacy_to_schema()            # strip excluded tables/schemas
+       │    ├─ _apply_privacy_to_schema()            # strip excluded schemas/tables/columns (+ their FKs)
        │    └─ cache.compute_embedding_async()        # build per-table embeddings
        ├─ schema_pruning._select_relevant_tables()   # schema pruning (cosine similarity + domain boost)
        │    ├─ QueryCache.compute_embedding_async()
@@ -292,7 +292,7 @@ Schema introspection is expensive (multiple SQL queries against the user's datab
 
 - Cache hit → `_schema_from_dict()` deserialises the stored JSON back to `DataSourceSchema`
 - Cache miss → `adapter.connect()` + `adapter.introspect(privacy)` + `_schema_to_dict()` stores the result
-- `_apply_privacy_to_schema()` strips excluded schemas/tables before any further use
+- `_apply_privacy_to_schema()` strips excluded schemas/tables, `excluded_columns` (exact `schema.table.column`) and the foreign keys on those columns before any further use
 - If `table_embeddings` are absent, builds them: `_build_table_text(table)` per table → `cache.compute_embedding_async()` → stored on `UserSchemaCache.table_embeddings`
 
 ### Step 5: Intent Classification

@@ -430,13 +430,13 @@ async def save_model(
     table key, column name, metric name or relationship endpoint — is longer than
     its column, or a segment, derived-column or join name is over the unique
     index's byte limit; every other string is made to fit (``_fit_values``).
-    Raises ``TypeError`` if ``protected`` is given without ``provenance``.
+    Raises ``TypeError`` if ``protected`` is non-empty without ``provenance``.
 
     The caller must hold the connection row lock (``lock_and_reread_connection``):
     the header's ``version`` is bumped in Python from the value read here, and
     ``load_model_cached`` relies on it only ever growing.
     """
-    if protected is not None and provenance is None:
+    if protected and not provenance:
         raise TypeError("protected values need the provenance they were read with")
     prov = provenance or {}
     dumped = model.model_dump(mode="json")
@@ -1503,7 +1503,7 @@ def _insert_marks(values: Mapping[str, Any], defaults: Mapping[str, Any]) -> lis
     return sorted(field for field, value in values.items() if value != defaults.get(field))
 
 
-async def update_table_fields(
+async def _update_table_fields(
     db: AsyncSession,
     table_id: str,
     expected_version: int,
@@ -1514,7 +1514,8 @@ async def update_table_fields(
 ) -> bool:
     """Apply ``values`` to one table row under an optimistic lock.
 
-    Returns whether anything was written.
+    Returns whether anything was written. Does not bump the header version: the
+    caller (``apply_user_patch``) must, because ``load_model_cached`` is keyed on it.
 
     ``values`` is fitted (``_fit_values``) before the diff, because the stored
     row holds fitted values, and is compared with the stored row in its
@@ -1694,7 +1695,7 @@ async def apply_user_patch(
 
     The caller must hold the connection row lock (``lock_and_reread_connection``)
     for the whole call: table rows carry an optimistic version check
-    (``update_table_fields``), but column rows and the rewritten list sections
+    (``_update_table_fields``), but column rows and the rewritten list sections
     do not.
 
     Any change bumps the header's ``version`` (the chat path's model cache is
@@ -2000,7 +2001,7 @@ async def _apply_table_patch(
             changed_by=updated_by,
         )
     elif values:
-        changed = await update_table_fields(
+        changed = await _update_table_fields(
             db, row.id, row.version, values, updated_by=updated_by, mark_user_edited=True
         )
 
