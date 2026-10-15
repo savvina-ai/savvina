@@ -295,7 +295,7 @@ async def _stage_prune_and_filter(
         )
     semantic_model: SemanticModel | None = _raw_semantic
     if semantic_model:
-        semantic_model = _filter_semantic_to_schema(semantic_model, schema, privacy)
+        semantic_model = _filter_semantic_to_schema(semantic_model, schema)
         semantic_model = _filter_semantic_by_relevance(semantic_model, message)
     return schema, semantic_model
 

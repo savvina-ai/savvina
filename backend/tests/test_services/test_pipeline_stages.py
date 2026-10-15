@@ -37,6 +37,7 @@ from app.services.execution import (
     _StreamResult,
 )
 from app.services.intent_classifier import QueryIntent
+from app.services.schema_utils import _apply_privacy_to_schema
 
 pytestmark = pytest.mark.usefixtures("stored_semantic_model")
 
@@ -271,8 +272,15 @@ class TestStagePruneAndFilter:
         assert result == (schema, None)
         assert events == ["savepoint", "load", "rollback:RuntimeError"]
 
-    async def test_privacy_reaches_the_semantic_filter(self, stored_semantic_model):
-        """A stale schema still listing an excluded column must not leak it."""
+    async def test_stage_passes_the_narrowed_schema_to_the_semantic_filter(
+        self, stored_semantic_model
+    ):
+        """The stage's contract with its caller: it receives the schema already narrowed
+        by ``_apply_privacy_to_schema`` (as ``_resolve_schema`` returns it), returns that
+        schema and filters the semantic model against it, so an excluded column leaks
+        into neither. The real stale-cache narrowing is covered by
+        ``TestResolveSchemaNarrowsStaleCache``.
+        """
         schema = DataSourceSchema(
             source_type="postgresql",
             schemas=[],
@@ -300,9 +308,12 @@ class TestStagePruneAndFilter:
                 )
             }
         )
-        sr = _make_schema_result(schema=schema, embeddings_available=False)
+        privacy = PrivacySettings(excluded_columns=["public.orders.hidden"])
+        sr = _make_schema_result(
+            schema=_apply_privacy_to_schema(schema, privacy), embeddings_available=False
+        )
 
-        _, semantic_model = await _stage_prune_and_filter(
+        out_schema, semantic_model = await _stage_prune_and_filter(
             sr,
             _make_conn_row(),
             "question",
@@ -311,9 +322,10 @@ class TestStagePruneAndFilter:
             MagicMock(),
             "conn-1",
             "u",
-            PrivacySettings(excluded_columns=["public.orders.hidden"]),
+            privacy,
         )
 
+        assert [c.name for c in out_schema.tables[0].columns] == ["id"]
         assert list(semantic_model.tables["public.orders"].columns) == ["id"]
 
     async def test_semantic_model_comes_from_the_store_not_the_blob(self, stored_semantic_model):

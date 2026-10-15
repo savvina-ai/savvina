@@ -550,8 +550,9 @@ async def generate_semantic_batch(
         raise HTTPException(status_code=400, detail=f"Unknown table keys: {unknown}")
 
     llm_provider, configured_model, _ = await _resolve_provider(provider, db)
-    # Strict (no ``privacy``): adapter FKs are filtered by table only, so an FK on an
-    # excluded column would otherwise name that column in the prompt.
+    # ``_apply_privacy_to_schema`` already strips ``excluded_columns`` and the FKs on
+    # them (including from a stale schema cache), so the strict call (no ``privacy``)
+    # is defence in depth: no edge on a column outside the schema reaches the prompt.
     relationship_edges = edges_in_schema(gen._build_relationship_graph(schema), schema)
 
     try:
@@ -692,11 +693,13 @@ async def generate_semantic_globals(
     llm_provider, configured_model, provider_name = await _resolve_provider(provider, db)
 
     gen = SemanticModelGenerator()
-    # Strict (no ``privacy``): adapter FKs are filtered by table only, so an FK on an
-    # excluded column would otherwise reach the prompt and be saved as a fresh edge.
+    # ``_apply_privacy_to_schema`` already strips ``excluded_columns`` and the FKs on
+    # them (including from a stale schema cache), so the strict call (no ``privacy``)
+    # is defence in depth: no edge on a column outside the schema reaches the prompt
+    # or is saved as a fresh edge.
     relationship_edges = edges_in_schema(gen._build_relationship_graph(schema), schema)
-    # ``schema`` has the policy applied (excluded schemas/tables removed, excluded
-    # columns never introspected); pruning must not read that absence as drift.
+    # ``schema`` has the policy applied (excluded schemas, tables and columns
+    # removed); pruning must not read that absence as drift.
     privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
 
     try:

@@ -253,10 +253,11 @@ _FISCAL_DIMENSION_PREFIXES: tuple[str, ...] = ("fiscal_", "budget_", "calendar_"
 def policy_hides_table(key: str, privacy: PrivacySettings | None, *, bare_ok: bool = False) -> bool:
     """Whether ``privacy`` explains why table ``key`` is absent.
 
-    ``_apply_privacy_to_schema`` removes excluded schemas and tables from the
-    schema the generation routes see, so an absent table can be hidden rather
-    than gone. A stored key is ``f"{schema_name}.{name}"`` and either part may
-    itself contain a dot, so every split is tried rather than one guessed.
+    ``_apply_privacy_to_schema`` removes excluded schemas, tables and
+    ``excluded_columns`` from the schema the generation routes see, so an absent
+    table can be hidden rather than gone. A stored key is ``f"{schema_name}.{name}"``
+    and either part may itself contain a dot, so every split is tried rather than
+    one guessed.
 
     ``bare_ok=True`` is for a metric's ``related_tables`` entry, which
     ``detect_drift`` accepts unqualified: such a name is hidden when
@@ -279,7 +280,8 @@ def policy_hides_column(table_key: str, column: str, privacy: PrivacySettings | 
     """Whether ``privacy`` explains why ``column`` is absent from ``table_key``.
 
     Exact ``schema.table.column`` membership in ``excluded_columns``, which is what
-    the adapters skip at introspection. Deliberately not
+    the adapters skip at introspection and ``_apply_privacy_to_schema`` strips
+    from the schema. Deliberately not
     ``PrivacySettings.is_column_excluded``: that also matches the sensitive-name
     patterns, and the adapters still introspect those columns.
     """

@@ -23,8 +23,10 @@ from app.services.schema_pruning import (
     _build_table_text,
     _filter_semantic_by_relevance,
     _filter_semantic_to_schema,
+    _resolve_schema,
     _select_relevant_tables,
 )
+from app.services.schema_utils import _apply_privacy_to_schema, _schema_to_dict
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
@@ -425,14 +427,17 @@ class TestFilterSemanticToSchemaPrivacy:
         assert "Zorblax confidential moment" in prompt
 
     def test_privacy_excluded_column_is_dropped_even_from_a_stale_schema(self) -> None:
-        """A stale schema cache can still hold a newly excluded column."""
+        """A stale schema cache can still hold a newly excluded column. The chat path
+        narrows the schema with ``_apply_privacy_to_schema`` before this filter sees
+        it, so the narrowed schema is what the filter — and column validation — get."""
         stale_schema = _make_schema(
             _make_table("store", "orders", ["id", "amount", "secret_ts"]),
             _make_table("store", "customers", ["id"]),
         )
         privacy = PrivacySettings(excluded_columns=["store.orders.secret_ts"])
+        narrowed = _apply_privacy_to_schema(stale_schema, privacy)
 
-        result = _filter_semantic_to_schema(self._model(), stale_schema, privacy)
+        result = _filter_semantic_to_schema(self._model(), narrowed)
 
         orders = result.tables["store.orders"]
         assert set(orders.columns) == {"id", "amount"}
@@ -446,14 +451,15 @@ class TestFilterSemanticToSchemaPrivacy:
         # The caller's schema is not narrowed in place.
         assert [c.name for c in stale_schema.tables[0].columns] == ["id", "amount", "secret_ts"]
 
-    def test_exclusion_is_exact_not_a_sensitive_name_pattern(self) -> None:
-        """Same rule as ``policy_hides_column``: only exact ``schema.table.column``."""
+    def test_a_column_the_schema_still_has_is_kept(self) -> None:
+        """Exactness lives in ``_apply_privacy_to_schema``; this filter trusts the
+        schema it is given, so a column present there (``secret`` is only a
+        sensitive-name pattern, not an exclusion) stays."""
         schema = _make_schema(
             _make_table("store", "orders", ["id", "amount", "secret_ts"]),
             _make_table("store", "customers", ["id"]),
         )
-        # "secret" is a default sensitive pattern, but the column is not excluded.
-        result = _filter_semantic_to_schema(self._model(), schema, PrivacySettings())
+        result = _filter_semantic_to_schema(self._model(), schema)
 
         assert "secret_ts" in result.tables["store.orders"].columns
 
@@ -482,6 +488,37 @@ class TestFilterSemanticToSchemaPrivacy:
         assert "secret_ts" in model.tables["store.orders"].columns
         assert model.tables["store.orders"].primary_timestamp_column == "secret_ts"
         assert len(model.relationships) == 2
+
+
+class TestResolveSchemaNarrowsStaleCache:
+    """The schema the chat stages receive comes from ``_resolve_schema``; a per-user
+    cache written before a privacy change must not carry the newly excluded column."""
+
+    async def test_cached_schema_loses_a_newly_excluded_column(self) -> None:
+        stale = _make_schema(
+            _make_table("store", "orders", ["id", "amount", "secret_ts"]),
+            _make_table("store", "customers", ["id"]),
+        )
+        usc = MagicMock()
+        usc.schema_cache = _schema_to_dict(stale)
+        db = MagicMock()
+        db.execute = AsyncMock(
+            return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=usc))
+        )
+        privacy = PrivacySettings(excluded_columns=["store.orders.secret_ts"])
+
+        result = await _resolve_schema(
+            conn=MagicMock(id="conn-1"),
+            adapter=MagicMock(),
+            config_dict={},
+            privacy=privacy,
+            connected=False,
+            db=db,
+            user_id="u1",
+        )
+
+        orders = next(t for t in result.schema.tables if t.name == "orders")
+        assert [c.name for c in orders.columns] == ["id", "amount"]
 
 
 # ── Domain-aware schema pruning ────────────────────────────────────────────────

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import logging
 import re
@@ -21,7 +21,7 @@ from ..datasources.models import DataSourceSchema, PrivacySettings, TableInfo
 from ..models.connection import Connection
 from ..models.table_embedding_cache import TableEmbeddingCache
 from ..models.user_schema_cache import UserSchemaCache
-from ..semantic.generator import edges_in_schema, policy_hides_column, prune_to_schema
+from ..semantic.generator import edges_in_schema, prune_to_schema
 from ..semantic.models import SemanticModel
 from .schema_utils import (
     _apply_privacy_to_schema,
@@ -48,35 +48,17 @@ class _SchemaResult:
     embeddings_available: bool = False
 
 
-def _schema_without_excluded_columns(
-    schema: DataSourceSchema, privacy: PrivacySettings | None
-) -> DataSourceSchema:
-    """``schema`` minus the columns ``privacy`` excludes (exact ``schema.table.column``)."""
-    if privacy is None or not privacy.excluded_columns:
-        return schema
-    tables = [
-        replace(
-            t,
-            columns=[
-                c
-                for c in t.columns
-                if not policy_hides_column(f"{t.schema_name}.{t.name}", c.name, privacy)
-            ],
-        )
-        for t in schema.tables
-    ]
-    return replace(schema, tables=tables)
-
-
 def _filter_semantic_to_schema(
     semantic: SemanticModel,
     schema: DataSourceSchema,
-    privacy: PrivacySettings | None = None,
 ) -> SemanticModel:
     """Return a copy of semantic model narrowed to the tables AND columns in schema.
 
-    ``schema`` is the privacy-filtered schema the LLM will see. The stored model can
-    hold annotations for tables and columns the privacy settings hide (generation
+    ``schema`` is the privacy-filtered schema the LLM will see
+    (``_apply_privacy_to_schema`` has removed excluded schemas, tables and
+    ``excluded_columns``, so a stale cache carrying a newly excluded column is
+    already narrowed by the time it reaches here). The stored model can hold
+    annotations for tables and columns the privacy settings hide (generation
     keeps them so un-hiding loses no work), so narrowing by table alone would leak a
     hidden column's name, description, timestamp role or join to the prompt. Hence:
 
@@ -91,14 +73,8 @@ def _filter_semantic_to_schema(
       gone stale, or a hidden column) and is logged;
     - common_joins that reference pruned tables are dropped.
 
-    Defence in depth: introspection already omits ``privacy.excluded_columns``, but a
-    stale schema cache (a request racing a privacy change) can still carry one, so
-    when ``privacy`` is given those columns are removed from the schema first and
-    everything above is computed against the narrowed copy.
-
     Business metrics are kept as-is — they remain useful signal regardless of table scope.
     """
-    schema = _schema_without_excluded_columns(schema, privacy)
     visible = {f"{t.schema_name}.{t.name}" for t in schema.tables}
     filtered_tables = prune_to_schema(semantic.tables, schema, log=False)
     filtered_rels = edges_in_schema(semantic.relationships, schema)

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 import json
 import logging
@@ -189,25 +189,47 @@ def _schema_from_dict(d: dict) -> DataSourceSchema:
 def _apply_privacy_to_schema(
     schema: DataSourceSchema, privacy: PrivacySettings
 ) -> DataSourceSchema:
-    """Return a copy of schema with excluded schemas/tables/relationships removed.
+    """Return a copy of schema with excluded schemas, tables, columns and relationships removed.
 
     Ensures _validate_columns_against_schema enforces privacy settings,
     not just format_schema_for_llm. Relationships are filtered so that
-    FK annotations cannot reveal excluded table names to the LLM.
+    FK annotations cannot reveal excluded table or column names to the LLM.
+
+    Columns in ``excluded_columns`` (exact ``schema.table.column``, the rule the
+    adapters apply at introspection) are removed as well: introspection already
+    omits them, but a schema cache written before a privacy change still carries
+    them, and every consumer of this function — chat validation and pruning,
+    drift, generation — must not see one. The sensitive-name patterns are
+    deliberately not applied here: the adapters still introspect those columns.
     """
     visible = {
         (t.schema_name, t.name)
         for t in schema.tables
         if not privacy.is_table_excluded(t.schema_name, t.name)
     }
+    excluded_columns = set(privacy.excluded_columns)
+
+    def _column_hidden(schema_name: str, table: str, column: str) -> bool:
+        return f"{schema_name}.{table}.{column}" in excluded_columns
+
     return DataSourceSchema(
         source_type=schema.source_type,
         schemas=[s for s in schema.schemas if s.name not in privacy.excluded_schemas],
-        tables=[t for t in schema.tables if not privacy.is_table_excluded(t.schema_name, t.name)],
+        tables=[
+            replace(
+                t,
+                columns=[c for c in t.columns if not _column_hidden(t.schema_name, t.name, c.name)],
+            )
+            for t in schema.tables
+            if (t.schema_name, t.name) in visible
+        ],
         relationships=[
             r
             for r in schema.relationships
-            if (r.from_schema, r.from_table) in visible and (r.to_schema, r.to_table) in visible
+            if (r.from_schema, r.from_table) in visible
+            and (r.to_schema, r.to_table) in visible
+            and not _column_hidden(r.from_schema, r.from_table, r.from_column)
+            and not _column_hidden(r.to_schema, r.to_table, r.to_column)
         ],
         metadata=schema.metadata,
     )
