@@ -31,6 +31,8 @@ class Connection(Base):
     # Cached SemanticModel as a dict
     # Unread since the semantic store; kept for one release, hence deferred.
     semantic_model: Mapped[dict | None] = mapped_column(JSON, nullable=True, deferred=True)
+    # Unwritten since the semantic store (the header row's ``updated_at`` is the
+    # live value) and no longer served; dropped together with ``semantic_model``.
     semantic_model_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

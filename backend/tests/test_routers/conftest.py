@@ -104,6 +104,8 @@ def _make_conn(**kwargs) -> MagicMock:
     m.source_type = kwargs.get("source_type", "postgresql")
     m.execution_mode = kwargs.get("execution_mode", "auto_execute")
     m.is_active = kwargs.get("is_active", True)
+    # Kept although the API no longer serves it, so the response-shape assertions prove
+    # the API drops the field rather than never seeing it.
     m.semantic_model_updated_at = kwargs.get("semantic_model_updated_at")
     m.created_at = kwargs.get("created_at", now)
     m.updated_at = kwargs.get("updated_at", now)

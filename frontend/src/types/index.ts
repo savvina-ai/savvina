@@ -53,7 +53,6 @@ export interface Connection {
   execution_mode: 'auto_execute' | 'review_first' | 'generate_only';
   is_active: boolean;
   schema_cached_at: string | null;
-  semantic_model_updated_at: string | null;
   created_at: string;
 }
 

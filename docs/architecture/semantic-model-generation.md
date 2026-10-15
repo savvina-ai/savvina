@@ -55,7 +55,7 @@ Seven tables: one header row per connection (`semantic_models`), one row per tab
 - Each connection is backfilled inside its own SAVEPOINT, so one malformed blob (or a NUL inside a JSON payload) fails only that connection; it is logged and skipped, and the upgrade continues. A final summary line reports `N/M connections backfilled; failed: …` (logged as an error when any failed).
 - `user_edited_fields` is seeded empty: nothing in a blob distinguishes LLM output from a hand edit, so the first regenerate treats every migrated value as regenerable.
 - It refuses to run in offline `--sql` mode, because the backfill reads data and cannot be rendered as static SQL.
-- `connections.semantic_model` is left in place and unread, and is dropped by a later migration (one release on). `store.delete_model` clears it (rows or no rows) and both `DELETE /semantic` and deleting a connection go through that, so the later migration finds no connection with a blob but no `semantic_models` row.
+- `connections.semantic_model` is left in place and unread, and is dropped by a later migration (one release on). `store.delete_model` clears it (rows or no rows) and both `DELETE /semantic` and deleting a connection go through that, so the later migration finds no connection with a blob but no `semantic_models` row. `connections.semantic_model_updated_at` is unwritten since the store and no longer served by the connections API; it is dropped by the same migration.
 - Downgrading past `0003` is a no-op; roll forward instead.
 
 ---

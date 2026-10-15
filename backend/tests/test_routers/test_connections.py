@@ -128,6 +128,7 @@ class TestListConnections:
         assert len(data) == 1
         assert data[0]["id"] == "abc-123"
         assert data[0]["name"] == "Sales DB"
+        assert "semantic_model_updated_at" not in data[0]
 
 
 # ── GET /api/v1/connections/{id} ─────────────────────────────────────────────────
@@ -149,6 +150,7 @@ class TestGetConnection:
         body = resp.json()
         assert body["id"] == "conn-123"
         assert body["name"] == "My DB"
+        assert "semantic_model_updated_at" not in body
 
     async def test_returns_404_for_unknown_connection(self, http_client):
         db = _mock_db(MockResult(single=None))
@@ -593,3 +595,16 @@ class TestGetConnectionConfig:
             )
         assert resp.status_code == 200
         assert captured_config["password"] == "new-pass"
+
+
+# ── Response shape ──────────────────────────────────────────────────────────────
+
+
+class TestConnectionResponseShape:
+    def test_semantic_model_updated_at_is_not_served(self) -> None:
+        """Nothing writes Connection.semantic_model_updated_at since the semantic store;
+        the column goes with the legacy blob, so the API stops serving a stale value."""
+        from app.schemas.connection import ConnectionDetail, ConnectionResponse
+
+        assert "semantic_model_updated_at" not in ConnectionResponse.model_fields
+        assert "semantic_model_updated_at" not in ConnectionDetail.model_fields
