@@ -349,6 +349,14 @@ def _no_provenance() -> dict:
     }
 
 
+def _snapshot(
+    marks: dict | None = None, protected: dict | None = None
+) -> semantic_store.ProvenanceSnapshot:
+    return semantic_store.ProvenanceSnapshot(
+        marks=marks or _no_provenance(), protected=protected or {"table": {}, "column": {}}
+    )
+
+
 def _reset_limiter() -> None:
     from app.auth.limiter import limiter
 
@@ -928,6 +936,7 @@ class TestGenerateGlobals:
         schema: DataSourceSchema,
         llm=([], [], [], [], []),
         provenance: dict | None = None,
+        protected: dict | None = None,
         save: AsyncMock | None = None,
         db: MagicMock | None = None,
         extra_patches: tuple = (),
@@ -957,8 +966,8 @@ class TestGenerateGlobals:
                 ),
             ),
             patch(
-                f"{_STORE}.provenance_map",
-                new=AsyncMock(return_value=provenance or _no_provenance()),
+                f"{_STORE}.provenance_snapshot",
+                new=AsyncMock(return_value=_snapshot(provenance, protected)),
             ),
             patch(f"{_STORE}.save_model", new=save),
             ExitStack() as stack,
@@ -1003,6 +1012,7 @@ class TestGenerateGlobals:
             ),
         ]
         provenance = {**_no_provenance(), "metric": {"Hand": ["payload"]}}
+        protected = {"table": {"public.orders": {"description": "kept"}}, "column": {}}
         db = _mock_db(MockResult(single=_make_conn()), MockResult(), MockResult(), MockResult())
         resp, save, _ = await self._run(
             http_client,
@@ -1010,6 +1020,7 @@ class TestGenerateGlobals:
             schema=_schema(["orders"]),
             llm=(llm_metrics, [], [], [], []),
             provenance=provenance,
+            protected=protected,
             db=db,
         )
 
@@ -1023,6 +1034,7 @@ class TestGenerateGlobals:
         assert saved.generation_status == GenerationStatus.COMPLETE
         assert save.await_args.kwargs["source"] == "generation"
         assert save.await_args.kwargs["provenance"] == provenance
+        assert save.await_args.kwargs["protected"] == protected
         db.commit.assert_awaited_once()
 
     async def test_without_a_partial_model_is_400(self, http_client) -> None:
@@ -1325,7 +1337,7 @@ class TestGenerateGlobals:
 
         async def provenance(*_a, **_k):
             calls.append("provenance")
-            return _no_provenance()
+            return _snapshot()
 
         resp, _, _ = await self._run(
             http_client,
@@ -1334,7 +1346,7 @@ class TestGenerateGlobals:
             db=_mock_db(MockResult(), MockResult(), MockResult()),  # cache deletes only
             extra_patches=(
                 patch("app.routers.semantic.lock_and_reread_connection", new=lock),
-                patch(f"{_STORE}.provenance_map", new=provenance),
+                patch(f"{_STORE}.provenance_snapshot", new=provenance),
             ),
         )
         assert resp.status_code == 200

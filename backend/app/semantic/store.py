@@ -111,6 +111,9 @@ _CHUNK = 500
 # but a quoted identifier containing a dot can in principle make two columns
 # share a key (the same encoding as prod).
 ProvenanceMap = dict[str, dict[str, list[str]]]
+# ``{"table": {key: {field: value}}, "column": {"key.column": {field: value}}}``: the
+# stored values of the marked table and column fields, which a full rebuild writes back.
+ProtectedValues = dict[str, dict[str, dict[str, Any]]]
 _HEADER_KEY = ""
 # Review state rather than content: ``/generate/globals`` resets it on purpose.
 _HEADER_UNPROTECTED = frozenset({"is_user_reviewed"})
@@ -402,24 +405,34 @@ async def save_model(
     updated_by: str | None,
     source: str = "user",
     provenance: ProvenanceMap | None = None,
+    protected: ProtectedValues | None = None,
 ) -> None:
     """Replace every semantic row for ``connection_id`` with ``model``.
 
     A full replace, used where the caller holds the whole model (``/generate/
     globals``). The non-destructive regenerate path uses ``reconcile_tables``.
 
-    ``provenance`` is a ``provenance_map`` snapshot taken *before* this call. For
+    ``provenance`` is ``provenance_snapshot(...).marks`` taken *before* this call. For
     the header, tables and columns, every field it names takes the *stored*
-    value over the incoming model's (``_protected_values``) and gets its
+    value over the incoming model's (``protected``) and gets its
     ``user_edited_fields`` back. Metrics, relationships and global items get
     their marker back but their payload comes from ``model`` — the globals route
     swaps each marked item back in itself before calling this.
+
+    ``protected`` is the stored values for the marked table and column fields and
+    must come from the same ``provenance_snapshot`` as ``provenance``
+    (``provenance_snapshot(...).protected``). Without it the values are read here
+    and restricted to the fields ``provenance`` names — a second pass over every
+    row, which the globals route avoids by passing the snapshot's.
 
     Raises ``ValueError`` (before touching the session) if an identity value — a
     table key, column name, metric name or relationship endpoint — is longer than
     its column, or a segment, derived-column or join name is over the unique
     index's byte limit; every other string is made to fit (``_fit_values``).
+    Raises ``TypeError`` if ``protected`` is given without ``provenance``.
     """
+    if protected is not None and provenance is None:
+        raise TypeError("protected values need the provenance they were read with")
     prov = provenance or {}
     dumped = model.model_dump(mode="json")
 
@@ -513,11 +526,27 @@ async def save_model(
         await db.flush()  # header.id is a Python-side default applied at flush
         action = "insert"
         old_value: dict[str, Any] | None = None
-        protected: dict[str, dict[str, dict[str, Any]]] = {}
+        stored_values: ProtectedValues = {}
     else:
         action = "update"
         old_value = _header_to_dict(header)
-        protected = await _protected_values(db, header.id, provenance) if provenance else {}
+        if (
+            protected is None
+            and provenance
+            and (provenance.get("table") or provenance.get("column"))
+        ):
+            # Not supplied by the caller: read the marked values before the rows go.
+            snap = (await provenance_snapshot(db, connection_id)).protected
+            # Only the fields ``provenance`` names, as the caller's marks define them.
+            protected = {
+                kind: {
+                    key: {f: v for f, v in values.items() if f in provenance[kind][key]}
+                    for key, values in snap[kind].items()
+                    if key in provenance.get(kind, {})
+                }
+                for kind in ("table", "column")
+            }
+        stored_values = protected or {}
         # Cascades clear tables → columns.
         await db.execute(delete(SemanticTableRow).where(SemanticTableRow.model_id == header.id))
         await db.execute(delete(SemanticMetricRow).where(SemanticMetricRow.model_id == header.id))
@@ -573,7 +602,7 @@ async def save_model(
             updated_by=updated_by,
             **table_values,
         )
-        for field, value in protected.get("table", {}).get(table_key, {}).items():
+        for field, value in stored_values.get("table", {}).get(table_key, {}).items():
             setattr(row, field, value)
         row.user_edited_fields = prov.get("table", {}).get(table_key, [])
         table_rows.append(row)
@@ -585,7 +614,7 @@ async def save_model(
                 **col_values,
             )
             col_key = f"{table_key}.{col_values['column_name']}"
-            for field, value in protected.get("column", {}).get(col_key, {}).items():
+            for field, value in stored_values.get("column", {}).get(col_key, {}).items():
                 setattr(col_row, field, value)
             col_row.user_edited_fields = prov.get("column", {}).get(col_key, [])
             column_rows.append(col_row)
@@ -1123,13 +1152,30 @@ async def reconcile_tables(
 # ── Provenance ────────────────────────────────────────────────────────────────
 
 
-async def provenance_map(db: AsyncSession, connection_id: str) -> ProvenanceMap:
-    """Every row's ``user_edited_fields``, keyed by entity so a full save can restore it.
+@dataclass(frozen=True)
+class ProvenanceSnapshot:
+    """What a full rebuild carries across, read in one pass.
 
-    Reads fresh (``populate_existing``): it runs right before a full rebuild and
-    must see committed state, not stale identity-mapped rows.
+    ``marks`` is the ``ProvenanceMap``. ``protected`` holds, for every marked
+    table and column row, the stored value of each marked field
+    (``{"table": {key: {field: value}}, "column": {"key.column": {...}}}``),
+    which ``save_model`` writes back over the incoming model's.
     """
-    out: ProvenanceMap = {
+
+    marks: ProvenanceMap
+    protected: ProtectedValues
+
+
+async def provenance_snapshot(db: AsyncSession, connection_id: str) -> ProvenanceSnapshot:
+    """Every row's ``user_edited_fields``, plus the stored values of the marked
+    table and column fields, keyed by entity — in one pass over the rows.
+
+    Reads fresh (``populate_existing``): it runs right before a full rebuild,
+    under the connection row lock, and must see committed state rather than
+    stale identity-mapped rows. One pass, because every scan made while that
+    lock is held blocks concurrent PUT and suggestion-apply writers.
+    """
+    marks: ProvenanceMap = {
         "model": {},
         "table": {},
         "column": {},
@@ -1137,15 +1183,16 @@ async def provenance_map(db: AsyncSession, connection_id: str) -> ProvenanceMap:
         "global_item": {},
         "relationship": {},
     }
+    protected: ProtectedValues = {"table": {}, "column": {}}
     header = await db.scalar(
         select(SemanticModelRow)
         .where(SemanticModelRow.connection_id == connection_id)
         .execution_options(populate_existing=True)
     )
     if header is None:
-        return out
+        return ProvenanceSnapshot(marks=marks, protected=protected)
     if header.user_edited_fields:
-        out["model"][_HEADER_KEY] = list(header.user_edited_fields)
+        marks["model"][_HEADER_KEY] = list(header.user_edited_fields)
     tables = list(
         (
             await db.scalars(
@@ -1158,7 +1205,11 @@ async def provenance_map(db: AsyncSession, connection_id: str) -> ProvenanceMap:
     key_by_table_id = {row.id: row.table_key for row in tables}
     for row in tables:
         if row.user_edited_fields:
-            out["table"][row.table_key] = list(row.user_edited_fields)
+            fields = list(row.user_edited_fields)
+            marks["table"][row.table_key] = fields
+            protected["table"][row.table_key] = {
+                f: getattr(row, f) for f in fields if f in _TABLE_FIELDS
+            }
     for chunk in _chunks(list(key_by_table_id)):
         cols = await db.scalars(
             select(SemanticColumnRow)
@@ -1168,7 +1219,11 @@ async def provenance_map(db: AsyncSession, connection_id: str) -> ProvenanceMap:
         for col in cols:
             if col.user_edited_fields:
                 key = f"{key_by_table_id[col.table_id]}.{col.column_name}"
-                out["column"][key] = list(col.user_edited_fields)
+                fields = list(col.user_edited_fields)
+                marks["column"][key] = fields
+                protected["column"][key] = {
+                    f: getattr(col, f) for f in fields if f in _COLUMN_FIELDS
+                }
     metrics = await db.scalars(
         select(SemanticMetricRow)
         .where(SemanticMetricRow.model_id == header.id)
@@ -1176,7 +1231,7 @@ async def provenance_map(db: AsyncSession, connection_id: str) -> ProvenanceMap:
     )
     for m in metrics:
         if m.user_edited_fields:
-            out["metric"][m.name] = list(m.user_edited_fields)
+            marks["metric"][m.name] = list(m.user_edited_fields)
     items = await db.scalars(
         select(SemanticGlobalItemRow)
         .where(SemanticGlobalItemRow.model_id == header.id)
@@ -1184,7 +1239,7 @@ async def provenance_map(db: AsyncSession, connection_id: str) -> ProvenanceMap:
     )
     for item in items:
         if item.user_edited_fields:
-            out["global_item"][f"{item.kind}:{item.name}"] = list(item.user_edited_fields)
+            marks["global_item"][f"{item.kind}:{item.name}"] = list(item.user_edited_fields)
     rels = await db.scalars(
         select(SemanticRelationshipRow)
         .where(SemanticRelationshipRow.model_id == header.id)
@@ -1192,51 +1247,15 @@ async def provenance_map(db: AsyncSession, connection_id: str) -> ProvenanceMap:
     )
     for rel in rels:
         if rel.user_edited_fields:
-            out["relationship"][relationship_key(_relationship_row_to_dict(rel))] = list(
+            marks["relationship"][relationship_key(_relationship_row_to_dict(rel))] = list(
                 rel.user_edited_fields
             )
-    return out
+    return ProvenanceSnapshot(marks=marks, protected=protected)
 
 
-async def _protected_values(
-    db: AsyncSession, model_id: str, provenance: ProvenanceMap
-) -> dict[str, dict[str, dict[str, Any]]]:
-    """``{"table": {key: {field: stored_value}}, "column": {...}}`` for edited fields.
-
-    Read before ``save_model`` deletes the rows, and fresh (``populate_existing``)
-    so the values are the committed ones.
-    """
-    out: dict[str, dict[str, dict[str, Any]]] = {"table": {}, "column": {}}
-    if not provenance.get("table") and not provenance.get("column"):
-        return out
-    tables = list(
-        (
-            await db.scalars(
-                select(SemanticTableRow)
-                .where(SemanticTableRow.model_id == model_id)
-                .execution_options(populate_existing=True)
-            )
-        ).all()
-    )
-    key_by_id = {row.id: row.table_key for row in tables}
-    for row in tables:
-        fields = provenance.get("table", {}).get(row.table_key)
-        if fields:
-            out["table"][row.table_key] = {f: getattr(row, f) for f in fields if f in _TABLE_FIELDS}
-    wanted = provenance.get("column", {})
-    if wanted:
-        for chunk in _chunks(list(key_by_id)):
-            cols = await db.scalars(
-                select(SemanticColumnRow)
-                .where(SemanticColumnRow.table_id.in_(list(chunk)))
-                .execution_options(populate_existing=True)
-            )
-            for col in cols:
-                key = f"{key_by_id[col.table_id]}.{col.column_name}"
-                fields = wanted.get(key)
-                if fields:
-                    out["column"][key] = {f: getattr(col, f) for f in fields if f in _COLUMN_FIELDS}
-    return out
+async def provenance_map(db: AsyncSession, connection_id: str) -> ProvenanceMap:
+    """``provenance_snapshot(...).marks`` — for callers and tests that need only the marks."""
+    return (await provenance_snapshot(db, connection_id)).marks
 
 
 def carry_edited_relationships(

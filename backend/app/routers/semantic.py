@@ -760,8 +760,10 @@ async def generate_semantic_globals(
             ),
         )
     # After the lock, not before: a mark added between a pre-lock snapshot and the
-    # save would otherwise be lost.
-    provenance = await semantic_store.provenance_map(db, connection_id)
+    # save would otherwise be lost. One pass: marks and the stored values of the
+    # marked fields together, so save_model does not re-read every row under the lock.
+    snapshot = await semantic_store.provenance_snapshot(db, connection_id)
+    provenance = snapshot.marks
 
     # One bad LLM item must not fail the whole finalisation in save_model.
     metrics = _drop_unstorable(metrics, "metric", lambda m: m.name, connection_id)
@@ -826,7 +828,13 @@ async def generate_semantic_globals(
 
     try:
         await semantic_store.save_model(
-            db, connection_id, final, updated_by=user_id, source="generation", provenance=provenance
+            db,
+            connection_id,
+            final,
+            updated_by=user_id,
+            source="generation",
+            provenance=provenance,
+            protected=snapshot.protected,
         )
     except ValueError as exc:
         # An over-long identity value the drops above did not cover; never a 500.

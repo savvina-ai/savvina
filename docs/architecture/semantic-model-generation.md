@@ -115,12 +115,13 @@ routers/semantic.py: generate_semantic_globals()
        │    schema_type=GlobalSectionsResponse, ...)
        ├─ _detect_ratio_pairs(schema)                     # auto-detect num/denom column pairs
        └─ _validate_metrics_time_columns(metrics, schema) # warn if time patterns on fiscal tables
-  └─ (router assembles final SemanticModel):
+  └─ (router assembles final SemanticModel, after the row lock):
+       ├─ store.provenance_snapshot()                     # marks + stored values of marked fields, one pass
        ├─ prune_to_schema() / edges_in_schema()           # drop what left the database, keep what privacy hides
        ├─ gen.build_time_expressions(dialect)             # dialect-specific SQL time snippets
        ├─ gen.compute_schema_hash(schema)                 # SHA-256 for drift detection
        ├─ gen._auto_generate_notes(schema)                # fiscal-period table guidance notes
-       └─ store.save_model(..., provenance=...)           # full row rebuild, per-field provenance restored
+       └─ store.save_model(..., provenance=..., protected=...)  # full row rebuild, per-field provenance restored
 ```
 
 ---

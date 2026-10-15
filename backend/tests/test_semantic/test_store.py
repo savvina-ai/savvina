@@ -1178,6 +1178,146 @@ class TestProvenanceSurvivesFullSave:
         assert prov["column"] == {"public.orders.status": ["display_name"]}
         assert prov["metric"] == {} and prov["global_item"] == {} and prov["relationship"] == {}
 
+    async def test_snapshot_reports_marks_and_stored_values_in_one_pass(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        await self._mark(
+            semantic_db,
+            table_fields=["description"],
+            column_fields=["display_name"],
+            header_fields=["notes"],
+        )
+        snap = await store.provenance_snapshot(semantic_db, connection_id)
+        assert snap.marks == await store.provenance_map(semantic_db, connection_id)
+        assert snap.protected == {
+            "table": {"public.orders": {"description": "One row per order"}},
+            "column": {"public.orders.status": {"display_name": "Status"}},
+        }
+
+    async def test_full_save_uses_the_protected_values_it_is_given(
+        self, semantic_db, connection_id
+    ) -> None:
+        """The globals route passes the snapshot's values so save_model does not
+        re-read every row under the lock; the given values win over a re-read."""
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        await self._mark(semantic_db, table_fields=["description"], column_fields=["display_name"])
+        snap = await store.provenance_snapshot(semantic_db, connection_id)
+
+        rebuilt = _rich_model()
+        rebuilt.tables["public.orders"].description = "LLM rewrote this"
+        rebuilt.tables["public.orders"].columns["status"].display_name = "LLM Status"
+        await store.save_model(
+            semantic_db,
+            connection_id,
+            rebuilt,
+            updated_by="gen",
+            source="generation",
+            provenance=snap.marks,
+            protected={
+                "table": {"public.orders": {"description": "from snapshot"}},
+                "column": {"public.orders.status": {"display_name": "Snap Status"}},
+            },
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        loaded = await store.load_model(semantic_db, connection_id)
+        orders = loaded.tables["public.orders"]
+        assert orders.description == "from snapshot"
+        assert orders.columns["status"].display_name == "Snap Status"
+        prov = await store.provenance_map(semantic_db, connection_id)
+        assert prov["table"] == {"public.orders": ["description"]}
+        assert prov["column"] == {"public.orders.status": ["display_name"]}
+
+    async def test_full_save_reads_protected_values_only_when_not_given(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        await self._mark(semantic_db, table_fields=["description"], column_fields=["display_name"])
+        snap = await store.provenance_snapshot(semantic_db, connection_id)
+
+        with patch.object(store, "provenance_snapshot", wraps=store.provenance_snapshot) as spy:
+            await store.save_model(
+                semantic_db,
+                connection_id,
+                _rich_model(),
+                updated_by="gen",
+                provenance=snap.marks,
+                protected=snap.protected,
+            )
+        spy.assert_not_called()
+        await semantic_db.commit()
+
+        with patch.object(store, "provenance_snapshot", wraps=store.provenance_snapshot) as spy:
+            await store.save_model(
+                semantic_db,
+                connection_id,
+                _rich_model(),
+                updated_by="gen",
+                provenance=snap.marks,
+            )
+        spy.assert_called_once()
+
+    async def test_full_save_rejects_protected_values_without_provenance(
+        self, semantic_db, connection_id
+    ) -> None:
+        with pytest.raises(TypeError, match="provenance"):
+            await store.save_model(
+                semantic_db,
+                connection_id,
+                _rich_model(),
+                updated_by="gen",
+                protected={"table": {}, "column": {}},
+            )
+
+    async def test_full_save_self_read_restores_only_the_fields_provenance_names(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        await self._mark(semantic_db, table_fields=["description", "grain"])
+        marks = await store.provenance_map(semantic_db, connection_id)
+        assert marks["table"]["public.orders"] == ["description", "grain"]
+        stored_grain = _rich_model().tables["public.orders"].grain
+        marks["table"]["public.orders"] = ["description"]
+
+        rebuilt = _rich_model()
+        rebuilt.tables["public.orders"].description = "LLM rewrote this"
+        rebuilt.tables["public.orders"].grain = "LLM grain"
+        assert stored_grain != "LLM grain"
+        await store.save_model(
+            semantic_db, connection_id, rebuilt, updated_by="gen", provenance=marks
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        orders = (await store.load_model(semantic_db, connection_id)).tables["public.orders"]
+        assert orders.description == "One row per order"
+        assert orders.grain == "LLM grain"
+
+    async def test_full_save_skips_the_self_read_without_table_or_column_marks(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        marks = {
+            "model": {},
+            "table": {},
+            "column": {},
+            "metric": {"Revenue": ["payload"]},
+            "global_item": {},
+            "relationship": {},
+        }
+        with patch.object(store, "provenance_snapshot", wraps=store.provenance_snapshot) as spy:
+            await store.save_model(
+                semantic_db, connection_id, _rich_model(), updated_by="gen", provenance=marks
+            )
+        spy.assert_not_called()
+
     async def test_full_save_restores_marks_and_stored_values(
         self, semantic_db, connection_id
     ) -> None:
