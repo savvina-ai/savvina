@@ -518,11 +518,12 @@ Remove the semantic model from a connection: every semantic row is deleted, hand
 
 ### `GET /api/v1/connections/{id}/semantic/drift`
 
-Report schema drift since the semantic model was generated — tables or columns that have since been added, removed, or changed type, and which the stored model therefore describes incorrectly.
+Report schema drift since the semantic model was generated: tables and columns the model references that no longer exist, tables added since generation, tables that exist but the connection's role cannot read, and business metrics that name a missing table. Added columns on existing tables and type or nullability changes are not reported.
 
-Cheap to call: it diffs the stored model against the *cached* schema and runs no introspection or statistical queries against the source database. Refresh the schema first (`POST /api/v1/connections/{id}/schema/refresh`) if you need drift measured against the live database.
+Each call introspects the source database live (catalog views and `pg_stats` only, no statistical queries), stores the result as the caller's schema cache, and diffs the stored model against it, so no separate schema refresh is needed. Table embeddings and cached query answers are flushed only when the schema actually changed. If the source cannot be reached, the check falls back to the caller's cached schema and says so in the response. Rate limited to 10 requests per minute.
 
-**Response `200`:** `DriftReport` — `{"connection_id": ..., "warnings": [...], "warning_count": N, "checked_at": "..."}`
+**Response `200`:** `DriftReport` — `{"connection_id": ..., "warnings": [...], "warning_count": N, "checked_at": "...", "schema_source": "live" | "cache", "schema_cached_at": "..." | null, "refresh_error": "..." | null}`. `schema_source` is `"cache"` only on the fallback, with `schema_cached_at` and `refresh_error` saying which cache was used and why.
+**Response `400`:** The source could not be reached and there is no cached schema to fall back to
 **Response `404`:** No semantic model — generate one first
 
 ---

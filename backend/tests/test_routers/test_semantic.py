@@ -203,35 +203,44 @@ class TestDeleteSemanticModel:
 
 
 class TestCheckDrift:
-    async def test_returns_200_no_warnings(self, http_client):
-        usc = MagicMock()
-        usc.schema_cache = {"tables": {}}
-        db = _mock_db(
-            MockResult(single=_make_conn()),  # get_connection_or_404
-            MockResult(single=usc),  # user schema cache lookup
-        )
+    """Check Drift introspects live, so a drop shows up without a separate refresh."""
+
+    def setup_method(self) -> None:
+        _reset_limiter()
+
+    async def test_compares_against_a_live_introspection(self, http_client):
+        db = _mock_db(MockResult(single=_make_conn()))  # get_connection_or_404
         app.dependency_overrides[get_db] = lambda: db
+        stored = SemanticModel(
+            tables={
+                "public.orders": TableSemantic(display_name="Orders"),
+                "public.coupons": TableSemantic(display_name="Coupons"),
+            }
+        )
+        refresh = AsyncMock(return_value=_schema(["orders"]))
         with (
-            patch(f"{_STORE}.load_model", new=AsyncMock(return_value=_populated())),
-            patch("app.routers.semantic._schema_from_dict", return_value=MagicMock()),
-            patch("app.routers.semantic.SemanticModelGenerator") as mock_gen,
+            patch(f"{_STORE}.load_model", new=AsyncMock(return_value=stored)),
+            patch("app.routers.semantic.refresh_user_schema_cache", new=refresh),
         ):
-            mock_gen.return_value.detect_drift = MagicMock(return_value=[])
             resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
         assert resp.status_code == 200
-        assert resp.json()["warnings"] == []
+        body = resp.json()
+        assert any('"public.coupons"' in w for w in body["warnings"])
+        assert body["schema_source"] == "live"
+        assert body["refresh_error"] is None
+        refresh.assert_awaited_once()
+        # The refreshed cache is persisted.
+        db.commit.assert_awaited()
 
     async def test_what_the_policy_hides_is_not_reported_as_removed(self, http_client):
         """The store keeps hidden annotations; drift must read the policy, not the absence."""
-        usc = MagicMock()
-        usc.schema_cache = {"tables": {}}
         conn = _make_conn(
             privacy_settings={
                 "excluded_tables": ["public.payroll"],
                 "excluded_columns": ["public.orders.ssn"],
             }
         )
-        db = _mock_db(MockResult(single=conn), MockResult(single=usc))
+        db = _mock_db(MockResult(single=conn))
         app.dependency_overrides[get_db] = lambda: db
         stored = SemanticModel(
             tables={
@@ -243,12 +252,13 @@ class TestCheckDrift:
                 "public.ghosts": TableSemantic(display_name="Ghosts"),
             }
         )
-        # The cache as introspected: orders.ssn excluded at introspection, payroll present.
+        # A cache written before the policy: payroll present, so the narrowing must
+        # still remove it before the comparison.
         with (
             patch(f"{_STORE}.load_model", new=AsyncMock(return_value=stored)),
             patch(
-                "app.routers.semantic._schema_from_dict",
-                return_value=_schema(["orders", "payroll"]),
+                "app.routers.semantic.refresh_user_schema_cache",
+                new=AsyncMock(return_value=_schema(["orders", "payroll"])),
             ),
         ):
             resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
@@ -258,22 +268,68 @@ class TestCheckDrift:
         # A table that is genuinely gone is still reported.
         assert any('"public.ghosts"' in w for w in warnings)
 
+    async def test_an_unreachable_source_falls_back_to_the_cache_and_says_so(self, http_client):
+        from datetime import UTC, datetime
+
+        from app.services.schema_utils import SchemaRefreshError, _schema_to_dict
+
+        usc = MagicMock()
+        usc.schema_cache = _schema_to_dict(_schema(["orders"]))
+        usc.schema_cached_at = datetime(2026, 9, 24, 7, 16, tzinfo=UTC)
+        db = _mock_db(MockResult(single=_make_conn()), MockResult(single=usc))
+        app.dependency_overrides[get_db] = lambda: db
+        stored = SemanticModel(
+            tables={
+                "public.orders": TableSemantic(display_name="Orders"),
+                "public.ghosts": TableSemantic(display_name="Ghosts"),
+            }
+        )
+        with (
+            patch(f"{_STORE}.load_model", new=AsyncMock(return_value=stored)),
+            patch(
+                "app.routers.semantic.refresh_user_schema_cache",
+                new=AsyncMock(side_effect=SchemaRefreshError("connection refused")),
+            ),
+        ):
+            resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["schema_source"] == "cache"
+        assert body["schema_cached_at"].startswith("2026-09-24T07:16")
+        assert body["refresh_error"] == "connection refused"
+        assert any('"public.ghosts"' in w for w in body["warnings"])
+
+    async def test_an_unreachable_source_with_no_cache_is_400(self, http_client):
+        from app.services.schema_utils import SchemaRefreshError
+
+        db = _mock_db(
+            MockResult(single=_make_conn()),  # get_connection_or_404
+            MockResult(single=None),  # no user schema cache to fall back to
+        )
+        app.dependency_overrides[get_db] = lambda: db
+        with (
+            patch(f"{_STORE}.load_model", new=AsyncMock(return_value=_populated())),
+            patch(
+                "app.routers.semantic.refresh_user_schema_cache",
+                new=AsyncMock(side_effect=SchemaRefreshError("connection refused")),
+            ),
+        ):
+            resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
+        assert resp.status_code == 400
+        assert "connection refused" in resp.json()["detail"]
+
     async def test_returns_404_no_semantic_model(self, http_client):
         db = _mock_db(MockResult(single=_make_conn()))
         app.dependency_overrides[get_db] = lambda: db
-        with patch(f"{_STORE}.load_model", new=AsyncMock(return_value=None)):
+        refresh = AsyncMock()
+        with (
+            patch(f"{_STORE}.load_model", new=AsyncMock(return_value=None)),
+            patch("app.routers.semantic.refresh_user_schema_cache", new=refresh),
+        ):
             resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
         assert resp.status_code == 404
-
-    async def test_returns_404_no_schema_cache(self, http_client):
-        db = _mock_db(
-            MockResult(single=_make_conn()),  # get_connection_or_404
-            MockResult(single=None),  # no user schema cache for this user
-        )
-        app.dependency_overrides[get_db] = lambda: db
-        with patch(f"{_STORE}.load_model", new=AsyncMock(return_value=_populated())):
-            resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
-        assert resp.status_code == 404
+        # No model, no reason to touch the data source.
+        refresh.assert_not_awaited()
 
 
 # ── Phased generation ───────────────────────────────────────────────────────────

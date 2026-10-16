@@ -259,7 +259,7 @@ When `SemanticModelGenerator.generate()` is called directly (not via phased endp
 **Method:** `SemanticModelGenerator.detect_drift(current_schema, stored_model)` → `list[str]`  
 **Endpoint:** `GET /{connection_id}/semantic/drift`
 
-Purely structural comparison — no LLM, no DB re-query:
+The route first re-introspects the source live through `refresh_user_schema_cache` (the helper behind the explicit schema Refresh), stores the result as the caller's schema cache, and flushes table embeddings and cached query answers only when the schema hash changed. If the source cannot be reached it falls back to the cached schema and reports `schema_source: "cache"`. The comparison itself is purely structural — no LLM, no statistical queries:
 - Tables removed from the DB since generation → warning per missing table
 - Columns removed → warning per missing column
 - Tables added since generation → "N new tables added" summary

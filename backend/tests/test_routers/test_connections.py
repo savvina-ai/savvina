@@ -332,8 +332,8 @@ class TestRefreshSchema:
         )
         app.dependency_overrides[get_db] = lambda: db
         with (
-            patch("app.routers.connections.decrypt_value", return_value='{"host":"localhost"}'),
-            patch("app.routers.connections.create_datasource", return_value=adapter),
+            patch("app.utils.encryption.decrypt_value", return_value='{"host":"localhost"}'),
+            patch("app.services.schema_utils.create_datasource", return_value=adapter),
         ):
             resp = await http_client.post("/api/v1/connections/conn-123/schema/refresh")
         assert resp.status_code == 200
@@ -348,8 +348,8 @@ class TestRefreshSchema:
         db = _mock_db(MockResult(single=conn))
         app.dependency_overrides[get_db] = lambda: db
         with (
-            patch("app.routers.connections.decrypt_value", return_value='{"host":"localhost"}'),
-            patch("app.routers.connections.create_datasource", return_value=adapter),
+            patch("app.utils.encryption.decrypt_value", return_value='{"host":"localhost"}'),
+            patch("app.services.schema_utils.create_datasource", return_value=adapter),
         ):
             resp = await http_client.post("/api/v1/connections/conn-123/schema/refresh")
         assert resp.status_code == 400

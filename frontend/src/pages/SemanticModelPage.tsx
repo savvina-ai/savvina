@@ -457,16 +457,26 @@ export default function SemanticModelPageV2() {
     enabled: !!connectionId,
   });
 
-  // Drift report — manual trigger only
+  // Drift report — manual trigger only. The server introspects the live database on
+  // each check (and refreshes the schema cache), so a failure is not retried.
   const {
     data: driftReport,
-    refetch: checkDrift,
+    error: driftError,
+    refetch: refetchDrift,
     isFetching: driftChecking,
   } = useQuery<DriftReport>({
     queryKey: ['semantic-drift', connectionId],
     queryFn: () => semanticApi.getDrift(connectionId!),
     enabled: false,
+    retry: false,
   });
+  const checkDrift = async () => {
+    const { data } = await refetchDrift();
+    // A live check refreshed the schema cache; the column dropdowns read it.
+    if (data?.schema_source === 'live') {
+      void queryClient.invalidateQueries({ queryKey: ['schema', connectionId] });
+    }
+  };
 
   // Schema — the authoritative column list behind the table editor's column dropdowns.
   // `table.columns` only holds columns the generator annotated, a subset on a partial model.
@@ -1060,6 +1070,32 @@ export default function SemanticModelPageV2() {
                   <li key={i} className="list-disc">{w}</li>
                 ))}
               </ul>
+            </div>
+          )}
+
+          {/* Drift check outcome — an error, a clean result, or the warnings below */}
+          {driftError && !driftChecking && (
+            <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+              Drift check failed: {apiErrorMessage(driftError, 'Unknown error')}
+            </div>
+          )}
+          {driftReport && !driftError && !driftChecking && driftReport.warning_count === 0 && (
+            <div className="flex items-center gap-2 rounded-xl border border-border bg-muted/40 px-4 py-3 text-sm text-muted-foreground">
+              <Check className="h-4 w-4" />
+              No drift — the model matches the{' '}
+              {driftReport.schema_source === 'live' ? 'live' : 'cached'} schema (checked at{' '}
+              {new Date(driftReport.checked_at).toLocaleTimeString()}).
+            </div>
+          )}
+          {driftReport?.schema_source === 'cache' && !driftError && !driftChecking && (
+            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-700 dark:text-amber-400">
+              Could not reach the database
+              {driftReport.refresh_error ? ` (${driftReport.refresh_error})` : ''}, so drift was
+              checked against the schema cached
+              {driftReport.schema_cached_at
+                ? ` at ${new Date(driftReport.schema_cached_at).toLocaleString()}`
+                : ''}
+              .
             </div>
           )}
 

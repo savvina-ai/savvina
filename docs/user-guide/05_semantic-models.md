@@ -80,7 +80,7 @@ POST /api/v1/connections/{id}/semantic/generate/globals?provider=claude
 |--------|-------------|
 | **Generate / Regenerate** | First setup, or after a schema change. Regenerating refreshes the LLM-written parts of the model and keeps the fields you edited by hand, including metrics, segments, derived columns and joins you wrote or edited. A generated item you deleted may come back. Tables and columns that no longer exist in the database are removed. |
 | **Save Changes** | Persist in-progress edits. All edits live in a local draft until saved. |
-| **Check Drift** | Compare the saved model against your cached schema (privacy settings applied); warns if referenced tables or columns no longer exist. Refresh the schema first to compare against the live database. |
+| **Check Drift** | Compare the saved model against the live database (privacy settings applied); warns if referenced tables or columns no longer exist, if new tables appeared, or if the connection's role cannot read a table. Each check also refreshes your cached schema. If the database cannot be reached, the check uses your cached schema and says so. |
 | **Delete** | Remove the semantic layer entirely, including your edits. Queries still work but without business context. |
 | **Marked as reviewed** | Tracking flag only — has no effect on prompt generation. Use it to indicate the model has been human-verified. Regenerating clears it. |
 

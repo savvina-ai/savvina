@@ -99,6 +99,85 @@ async def get_or_refresh_schema(
     return schema
 
 
+class SchemaRefreshError(Exception):
+    """The data source could not be connected to or introspected."""
+
+
+async def refresh_user_schema_cache(
+    conn: Connection,
+    user_id: str,
+    db: AsyncSession,
+    encryption_key: str,
+    *,
+    always_flush: bool = False,
+) -> DataSourceSchema:
+    """Introspect ``conn`` live and store the result as this user's schema cache.
+
+    Returns the schema as introspected (privacy applied at introspection, not
+    ``_apply_privacy_to_schema``). Table embeddings and cached query answers are
+    built from the schema, so they are flushed when its hash changed, or always
+    with ``always_flush`` (the explicit Refresh, which has always cleared them).
+    Raises ``SchemaRefreshError`` when the source cannot be reached; nothing is
+    written then. The caller commits.
+    """
+    from sqlalchemy import delete, select  # local to avoid circular at module level
+
+    from ..models.cache import QueryCacheEntry
+    from ..models.table_embedding_cache import TableEmbeddingCache
+    from ..semantic.generator import SemanticModelGenerator
+    from ..utils.encryption import decrypt_value
+
+    config_dict = json.loads(decrypt_value(conn.config_encrypted, encryption_key))
+    privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
+    adapter = create_datasource(conn.source_type)
+    try:
+        result = await adapter.connect(config_dict)
+        if result is not None and result.success is False:
+            raise SchemaRefreshError(result.message)
+        schema = await adapter.introspect(privacy)
+    except SchemaRefreshError:
+        raise
+    except Exception as exc:
+        raise SchemaRefreshError(str(exc) or repr(exc)) from exc
+    finally:
+        await adapter.disconnect()
+
+    schema_hash = SemanticModelGenerator().compute_schema_hash(schema)
+    now = datetime.now(UTC)
+    usc = (
+        await db.execute(
+            select(UserSchemaCache).where(
+                UserSchemaCache.connection_id == conn.id,
+                UserSchemaCache.user_id == user_id,
+            )
+        )
+    ).scalar_one_or_none()
+    changed = usc is None or usc.schema_hash != schema_hash
+    if usc is None:
+        db.add(
+            UserSchemaCache(
+                connection_id=conn.id,
+                user_id=user_id,
+                schema_cache=_schema_to_dict(schema),
+                schema_cached_at=now,
+                schema_hash=schema_hash,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    else:
+        usc.schema_cache = _schema_to_dict(schema)
+        usc.schema_cached_at = now
+        usc.schema_hash = schema_hash
+        usc.updated_at = now
+    if changed or always_flush:
+        await db.execute(
+            delete(TableEmbeddingCache).where(TableEmbeddingCache.connection_id == conn.id)
+        )
+        await db.execute(delete(QueryCacheEntry).where(QueryCacheEntry.connection_id == conn.id))
+    return schema
+
+
 def _extract_tables_from_sql(sql: str) -> list[str]:
     """Extract referenced table names from a SQL string using sqlparse."""
     tables: list[str] = []

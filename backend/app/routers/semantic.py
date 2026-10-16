@@ -9,7 +9,7 @@ import asyncio
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import func, select, update
@@ -49,9 +49,11 @@ from ..semantic.models import (
     ValueMapping,
 )
 from ..services.schema_utils import (
+    SchemaRefreshError,
     _apply_privacy_to_schema,
     _schema_from_dict,
     get_or_refresh_schema,
+    refresh_user_schema_cache,
 )
 from ._utils import (
     _invalidate_connection_caches,
@@ -139,47 +141,78 @@ async def delete_semantic_model(
 
 
 @router.get("/{connection_id}/semantic/drift", response_model=DriftReport)
+@limiter.limit("10/minute")
 async def check_drift(
+    request: Request,
     connection_id: str,
     current_admin: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> DriftReport:
     """Check for schema drift since the semantic model was last generated.
 
-    OVERHEAD: catalog-read — reads current schema from cache (no DB introspection),
-    then diffs structure against stored semantic model. No statistical re-queries.
+    Compares against a fresh introspection, so a table dropped a minute ago shows up
+    without a separate schema refresh, and stores it as the user's schema cache. When
+    the data source cannot be reached the check falls back to that cache and says so
+    in the report; with no cache either it fails.
+
+    OVERHEAD: catalog-read — the introspection reads catalog views and pg_stats only,
+    then diffs structure against the stored semantic model. No statistical re-queries.
     """
     conn = await get_connection_or_404(connection_id, db)
     stored_model = await semantic_store.load_model(db, connection_id)
     if stored_model is None:
         raise HTTPException(status_code=404, detail="No semantic model — generate one first")
 
-    usc_result = await db.execute(
-        select(UserSchemaCache).where(
-            UserSchemaCache.connection_id == connection_id,
-            UserSchemaCache.user_id == current_admin.id,
+    schema_source: Literal["live", "cache"] = "live"
+    schema_cached_at: str | None = None
+    refresh_error: str | None = None
+    try:
+        schema = await refresh_user_schema_cache(
+            conn, current_admin.id, db, get_settings().encryption_key
         )
-    )
-    user_schema_cache = usc_result.scalar_one_or_none()
-    if not user_schema_cache or not user_schema_cache.schema_cache:
-        raise HTTPException(
-            status_code=404,
-            detail="No schema cached — run a schema refresh first",
+    except SchemaRefreshError as exc:
+        logger.warning(
+            "check_drift: live introspection failed, using the cached schema: "
+            "connection=%s error=%s",
+            connection_id,
+            exc,
         )
+        user_schema_cache = (
+            await db.execute(
+                select(UserSchemaCache).where(
+                    UserSchemaCache.connection_id == connection_id,
+                    UserSchemaCache.user_id == current_admin.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if not user_schema_cache or not user_schema_cache.schema_cache:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not reach the data source to check drift: {exc}",
+            ) from exc
+        schema = _schema_from_dict(user_schema_cache.schema_cache)
+        schema_source = "cache"
+        cached_at = user_schema_cache.schema_cached_at
+        schema_cached_at = cached_at.isoformat() if cached_at else None
+        refresh_error = str(exc)
 
     privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
-    schema = _schema_from_dict(user_schema_cache.schema_cache)
     if privacy:
         schema = _apply_privacy_to_schema(schema, privacy)
 
     # The store keeps what the policy hides; that absence from ``schema`` is not drift.
     warnings = SemanticModelGenerator().detect_drift(schema, stored_model, privacy)
+    # Persist the refreshed cache (a no-op on the fallback path).
+    await db.commit()
 
     return DriftReport(
         connection_id=connection_id,
         warnings=warnings,
         warning_count=len(warnings),
         checked_at=datetime.now(UTC).isoformat(),
+        schema_source=schema_source,
+        schema_cached_at=schema_cached_at,
+        refresh_error=refresh_error,
     )
 
 

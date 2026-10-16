@@ -337,6 +337,10 @@ export interface DriftReport {
   warnings: string[];
   warning_count: number;
   checked_at: string;
+  /** "live": compared against a fresh introspection; "cache": the database was unreachable. */
+  schema_source: 'live' | 'cache';
+  schema_cached_at: string | null;
+  refresh_error: string | null;
 }
 
 // ── Schema ──

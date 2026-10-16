@@ -19,6 +19,7 @@ The old "mirror" classes (``SemanticModelResponse``, ``TableSemanticSchema``,
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -47,6 +48,12 @@ class DriftReport(BaseModel):
     warnings: list[str]
     warning_count: int
     checked_at: str
+    # "live": compared against a fresh introspection, which also refreshed the schema
+    # cache. "cache": the data source could not be reached, so the comparison used the
+    # schema cached at ``schema_cached_at``; ``refresh_error`` says why.
+    schema_source: Literal["live", "cache"] = "live"
+    schema_cached_at: str | None = None
+    refresh_error: str | None = None
 
 
 class GenerateInitResponse(BaseModel):
