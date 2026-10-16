@@ -45,7 +45,7 @@ def table_key(table: TableInfo) -> str:
 
     One encoding, defined once. A schema or table name that itself contains a dot
     makes the key ambiguous to split; the readers that must split one
-    (``semantic.generator.policy_hides_table``) try every split rather than guess.
+    (``semantic.drift.policy_hides_table``) try every split rather than guess.
     """
     return f"{table.schema_name}.{table.name}"
 

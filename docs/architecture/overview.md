@@ -239,10 +239,11 @@ All providers share response parsing logic in `providers/base.py` — `parse_llm
 See [Semantic Model Generation](semantic-model-generation.md) for the full call chain, LLM prompts, and post-processing steps.
 
 - `semantic/models.py` — Pydantic v2 models + enums: `SemanticModel`, `TableSemantic`, `ColumnSemantic`, `BusinessMetric` (discriminated union of `SimpleMetric`, `RatioMetric`, `DerivedMetric`, `CumulativeMetric`, `ConversionMetric`), `DerivedColumn`, `CommonJoin`, `RelationshipEdge`, `Segment`; enums: `SemanticType`, `CardinalityClass`, `RelationshipType`, `MetricType`, `GenerationStatus`
-- `semantic/generator.py` — `SemanticModelGenerator` class: sends schema DDL batches to LLM (`generate_tables()`), generates cross-table sections (`generate_globals()`), detects drift (`detect_drift()`), computes schema hash and time expressions
+- `semantic/generator.py` — `SemanticModelGenerator` class: sends schema DDL batches to LLM (`generate_tables()`), generates cross-table sections (`generate_globals()`), builds drift warnings (`detect_drift()`), computes schema hash and time expressions
+- `semantic/drift.py` — `compute_drift()`, the one schema-vs-model diff shared by the drift check and apply-drift, and `summarize_model_change()`, the by-name before/after summary an apply returns and logs
 - `semantic/formatter.py` — `SemanticFormatter.format_for_prompt()` converts `SemanticModel` to structured text injected as `## Business Context` in the LLM system prompt
 - `semantic/store.py` — the only reader/writer of the normalised semantic tables: assembles a `SemanticModel` from rows, reconciles generated output onto them without overwriting hand-edited fields, applies user patches with per-field provenance and an optimistic lock, and records history
-- `routers/semantic.py` — three-phase generation endpoints (`/generate/init`, `/generate/batch`, `/generate/globals`), model CRUD, and drift check
+- `routers/semantic.py` — three-phase generation endpoints (`/generate/init`, `/generate/batch`, `/generate/globals`), model CRUD, drift check, apply-drift (with a `dry_run` preview) and its history
 
 ### Query Cache
 

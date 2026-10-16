@@ -332,12 +332,56 @@ class TestRefreshSchema:
         )
         app.dependency_overrides[get_db] = lambda: db
         with (
-            patch("app.utils.encryption.decrypt_value", return_value='{"host":"localhost"}'),
+            patch("app.services.schema_utils.decrypt_value", return_value='{"host":"localhost"}'),
             patch("app.services.schema_utils.create_datasource", return_value=adapter),
         ):
             resp = await http_client.post("/api/v1/connections/conn-123/schema/refresh")
         assert resp.status_code == 200
         assert db.execute.call_count == 4
+
+    async def test_an_unchanged_schema_still_flushes_the_derived_caches(self, http_client):
+        """The explicit Refresh always clears embeddings and cached answers, even when
+        the schema hash says nothing changed (``flush="always"``)."""
+        from app.datasources.models import ColumnInfo, DataSourceSchema, TableInfo
+        from app.models.cache import QueryCacheEntry
+        from app.models.table_embedding_cache import TableEmbeddingCache
+        from app.semantic.generator import SemanticModelGenerator
+
+        schema = DataSourceSchema(
+            source_type="postgresql",
+            schemas=[],
+            tables=[
+                TableInfo(
+                    catalog=None,
+                    schema_name="public",
+                    name="orders",
+                    table_type="table",
+                    columns=[ColumnInfo(name="id", data_type="integer", native_type="int4")],
+                )
+            ],
+        )
+        cache = MagicMock()
+        cache.schema_hash = SemanticModelGenerator().compute_schema_hash(schema)
+        adapter = MagicMock()
+        adapter.connect = AsyncMock()
+        adapter.introspect = AsyncMock(return_value=schema)
+        adapter.disconnect = AsyncMock()
+        db = _mock_db(
+            MockResult(single=_make_conn()),  # get_connection_or_404
+            MockResult(single=cache),  # the user's cache, same hash
+            MockResult(),  # delete TableEmbeddingCache
+            MockResult(),  # delete QueryCacheEntry
+        )
+        app.dependency_overrides[get_db] = lambda: db
+        with (
+            patch("app.services.schema_utils.decrypt_value", return_value='{"host":"localhost"}'),
+            patch("app.services.schema_utils.create_datasource", return_value=adapter),
+        ):
+            resp = await http_client.post("/api/v1/connections/conn-123/schema/refresh")
+        assert resp.status_code == 200
+        deleted = [call.args[0].table.name for call in db.execute.await_args_list[2:]]
+        assert deleted == [TableEmbeddingCache.__tablename__, QueryCacheEntry.__tablename__]
+        db.commit.assert_awaited_once()
 
     async def test_introspection_error_returns_400(self, http_client):
         conn = _make_conn()
@@ -348,7 +392,7 @@ class TestRefreshSchema:
         db = _mock_db(MockResult(single=conn))
         app.dependency_overrides[get_db] = lambda: db
         with (
-            patch("app.utils.encryption.decrypt_value", return_value='{"host":"localhost"}'),
+            patch("app.services.schema_utils.decrypt_value", return_value='{"host":"localhost"}'),
             patch("app.services.schema_utils.create_datasource", return_value=adapter),
         ):
             resp = await http_client.post("/api/v1/connections/conn-123/schema/refresh")

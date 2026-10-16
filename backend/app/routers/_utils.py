@@ -58,16 +58,26 @@ async def lock_and_reread_connection(conn_id: str, db: AsyncSession) -> Connecti
     return conn
 
 
-async def _invalidate_connection_caches(connection_id: str, db: AsyncSession) -> None:
+async def _invalidate_connection_caches(
+    connection_id: str, db: AsyncSession, *, keep_schema: bool = False
+) -> None:
     """Delete QueryCacheEntry, UserSchemaCache, and TableEmbeddingCache rows for
     *connection_id*.
 
     Call before ``db.commit()`` whenever the semantic model, schema, privacy
     settings, or connection config is mutated so that stale cached queries and
     schema data are not served on the next request.
+
+    ``keep_schema=True`` leaves ``UserSchemaCache`` alone, for a caller that has just
+    stored a live introspection there (apply-drift): deleting it would throw the fresh
+    schema away and leave the page's next schema read on a 404 until a Schema Refresh.
+    CE has a single user, so the row kept is the caller's own.
     """
     await db.execute(delete(QueryCacheEntry).where(QueryCacheEntry.connection_id == connection_id))
-    await db.execute(delete(UserSchemaCache).where(UserSchemaCache.connection_id == connection_id))
+    if not keep_schema:
+        await db.execute(
+            delete(UserSchemaCache).where(UserSchemaCache.connection_id == connection_id)
+        )
     await db.execute(
         delete(TableEmbeddingCache).where(TableEmbeddingCache.connection_id == connection_id)
     )

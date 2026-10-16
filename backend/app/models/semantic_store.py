@@ -250,13 +250,13 @@ class SemanticHistoryRow(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     connection_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    # 'model' | 'table' | 'column' | 'metric' | 'relationship' | 'global_item'
+    # 'model' | 'table' | 'column' | 'metric' | 'relationship' | 'global_item' | 'drift_apply'
     entity_type: Mapped[str] = mapped_column(String(32), nullable=False)
     entity_id: Mapped[str] = mapped_column(String(36), nullable=False)
     entity_key: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
     # 'insert' | 'update' | 'delete'
     action: Mapped[str] = mapped_column(String(16), nullable=False)
-    # 'user' | 'generation' | 'migration'
+    # 'user' | 'generation' | 'migration' | 'drift'
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="user")
     old_value: Mapped[dict[str, Any] | None] = mapped_column(_JSON, nullable=True)
     new_value: Mapped[dict[str, Any] | None] = mapped_column(_JSON, nullable=True)

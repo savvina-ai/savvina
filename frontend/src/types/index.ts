@@ -341,6 +341,49 @@ export interface DriftReport {
   schema_source: 'live' | 'cache';
   schema_cached_at: string | null;
   refresh_error: string | null;
+  /** True when a table was added or removed, or a column removed — what Apply Drift acts on. */
+  has_actionable_changes: boolean;
+}
+
+/** Mirrors `DriftApplySummary` in backend/app/semantic/drift.py. Every list is sorted. */
+export interface DriftApplySummary {
+  /**
+   * A preview: nothing was written. `tables_added` are what the apply would send to the
+   * LLM; relationships to them and the LLM's items over them appear only on apply.
+   */
+  dry_run: boolean;
+  changed: boolean;
+  tables_added: string[];
+  tables_removed: string[];
+  /** Surviving table key → removed column names. */
+  columns_removed: Record<string, string[]>;
+  metrics_added: string[];
+  metrics_removed: string[];
+  joins_added: string[];
+  joins_removed: string[];
+  derived_columns_added: string[];
+  derived_columns_removed: string[];
+  segments_added: string[];
+  segments_removed: string[];
+  /** `from_table.from_column → to_table.to_column`. */
+  relationships_added: string[];
+  relationships_removed: string[];
+  /** New tables the LLM returned nothing for; still missing from the model. */
+  tables_not_annotated: string[];
+  warnings: string[];
+}
+
+/** Mirrors `ApplyDriftResponse` in backend/app/schemas/semantic.py. */
+export interface ApplyDriftResponse {
+  semantic_model: SemanticModel;
+  summary: DriftApplySummary;
+}
+
+/** Mirrors `DriftApplyHistoryEntry` in backend/app/schemas/semantic.py. */
+export interface DriftApplyHistoryEntry {
+  applied_at: string;
+  applied_by: string | null;
+  summary: DriftApplySummary;
 }
 
 // ── Schema ──

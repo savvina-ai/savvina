@@ -880,7 +880,8 @@ async def load_model_with_provenance(
 
     For the globals route, which needs both under the connection row lock and
     must not scan every row twice while concurrent PUT and suggestion-apply
-    writers wait on that lock. With no model the snapshot is empty.
+    writers wait on that lock; and for apply-drift, whose preview must diff and
+    assemble from one read. With no model the snapshot is empty.
     """
     rows = await _fetch_rows(db, connection_id)
     if rows is None:
@@ -1211,9 +1212,9 @@ async def reconcile_tables(
     never cleared by generation.
 
     Nothing is ever deleted here: a table or column that left the schema keeps
-    its row through every batch. Removing those is ``/generate/globals``'s job,
-    via ``generator.prune_to_schema`` before its full save (the CE has no
-    apply-drift).
+    its row through every batch. Removing those is the job of
+    ``/generate/globals`` and ``/apply-drift``, via ``generator.prune_to_schema``
+    before their full save.
 
     A regenerate identical to what is stored writes no history row and bumps
     no version, but every table the batch names is stamped with the header's
@@ -2233,3 +2234,93 @@ async def _apply_column_patch(
     )
     await db.flush()
     return True
+
+
+# ── Drift-apply log ────────────────────────────────────────────────────────────
+
+# ``semantic_model_history.entity_type`` of the one row each Apply Drift adds.
+DRIFT_APPLY_ENTITY = "drift_apply"
+
+
+@dataclass(frozen=True)
+class DriftApplyRecord:
+    """One logged Apply Drift: when, by whom, and its summary as it was returned.
+
+    ``summary`` is the row's JSON as stored (``{}`` for a null one), unvalidated:
+    an entry written before a field changed type may no longer fit
+    ``DriftApplySummary``, and the history route skips it rather than fail.
+    """
+
+    applied_at: datetime
+    applied_by: str | None
+    summary: dict[str, Any]
+
+
+async def record_drift_apply(
+    db: AsyncSession,
+    connection_id: str,
+    summary: Mapping[str, Any],
+    *,
+    applied_by: str | None,
+) -> None:
+    """Log one Apply Drift's summary as a ``drift_apply`` history row.
+
+    The per-row history ``save_model`` writes says *that* rows were replaced, not
+    what the apply meant; this row keeps the by-name summary so the page can list
+    past applies after a reload. ``entity_id`` is the header's id (the one row a
+    full save keeps). Only stages the row: the caller commits it in the same
+    transaction as the save, so an apply is in the log exactly when it happened.
+    A connection with no header logs nothing.
+    """
+    header_id = await db.scalar(
+        select(SemanticModelRow.id).where(SemanticModelRow.connection_id == connection_id)
+    )
+    if header_id is None:
+        return
+    _write_history(
+        db,
+        connection_id=connection_id,
+        entity_type=DRIFT_APPLY_ENTITY,
+        entity_id=header_id,
+        entity_key="",
+        action="update",
+        source="drift",
+        old_value=None,
+        # NULs stripped like every other store write: JSONB rejects ``\u0000``.
+        new_value=_strip_nul(dict(summary)),
+        changed_by=applied_by,
+    )
+
+
+async def list_drift_applies(
+    db: AsyncSession, connection_id: str, *, limit: int = 20, offset: int = 0
+) -> list[DriftApplyRecord]:
+    """The connection's logged Apply Drifts, newest first; ``offset`` skips the newest
+    (the history route pages past entries it cannot read).
+
+    The history table has no foreign key to the connection (it outlives a delete),
+    so entries from before a model delete are listed too.
+    """
+    rows = (
+        (
+            await db.execute(
+                select(SemanticHistoryRow)
+                .where(
+                    SemanticHistoryRow.connection_id == connection_id,
+                    SemanticHistoryRow.entity_type == DRIFT_APPLY_ENTITY,
+                )
+                # The id breaks a timestamp tie, so ``offset`` pages see a stable order.
+                .order_by(SemanticHistoryRow.created_at.desc(), SemanticHistoryRow.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        DriftApplyRecord(
+            applied_at=row.created_at, applied_by=row.changed_by, summary=row.new_value or {}
+        )
+        for row in rows
+    ]

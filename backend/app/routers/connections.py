@@ -286,7 +286,7 @@ async def refresh_schema(
     conn = await get_connection_or_404(connection_id, db)
     try:
         schema = await refresh_user_schema_cache(
-            conn, current_user.id, db, settings.encryption_key, always_flush=True
+            conn, current_user.id, db, settings.encryption_key, flush="always"
         )
     except SchemaRefreshError as e:
         raise HTTPException(status_code=400, detail=f"Schema refresh failed: {e}") from e

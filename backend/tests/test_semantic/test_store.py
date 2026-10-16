@@ -1323,6 +1323,40 @@ class TestProvenanceSurvivesFullSave:
         assert prov["table"] == {"public.orders": ["description"]}
         assert prov["column"] == {"public.orders.status": ["display_name"]}
 
+    async def test_a_mark_for_an_item_the_new_model_dropped_is_ignored(
+        self, semantic_db, connection_id
+    ) -> None:
+        """apply-drift removes a hand-edited metric over a dropped table and passes the
+        snapshot's marks as they were: a mark with no item left to carry it is not an
+        error, and takes no row with it."""
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        revenue = await semantic_db.scalar(
+            select(SemanticMetricRow).where(SemanticMetricRow.name == "Revenue")
+        )
+        revenue.user_edited_fields = ["definition"]
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+        snap = await store.provenance_snapshot(semantic_db, connection_id)
+        assert snap.marks["metric"] == {"Revenue": ["definition"]}
+
+        rebuilt = _rich_model()
+        rebuilt.business_metrics = [m for m in rebuilt.business_metrics if m.name != "Revenue"]
+        await store.save_model(
+            semantic_db,
+            connection_id,
+            rebuilt,
+            updated_by="u1",
+            source="drift",
+            provenance=snap.marks,
+            protected=snap.protected,
+        )
+        await semantic_db.commit()
+        semantic_db.expunge_all()
+
+        names = {r.name for r in (await semantic_db.scalars(select(SemanticMetricRow))).all()}
+        assert names == {"Orders"}
+
     async def test_dangling_hand_edits_are_dropped_before_a_full_save(
         self, semantic_db, connection_id
     ) -> None:
@@ -2850,3 +2884,85 @@ class TestOptimisticLock:
         )
         assert again.version == 1
         assert again.user_edited_fields == []
+
+
+class TestDriftApplyLog:
+    """Each Apply Drift's summary, logged in the history table and listed newest first."""
+
+    async def test_records_and_lists_newest_first(self, semantic_db, connection_id) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await store.record_drift_apply(
+            semantic_db, connection_id, {"tables_removed": ["public.a"]}, applied_by="u1"
+        )
+        await semantic_db.commit()
+        await store.record_drift_apply(
+            semantic_db, connection_id, {"tables_removed": ["public.b"]}, applied_by="u2"
+        )
+        await semantic_db.commit()
+
+        records = await store.list_drift_applies(semantic_db, connection_id)
+        assert [r.summary["tables_removed"] for r in records] == [["public.b"], ["public.a"]]
+        assert [r.applied_by for r in records] == ["u2", "u1"]
+        assert records[0].applied_at >= records[1].applied_at
+
+    async def test_the_row_is_a_drift_apply_history_row(self, semantic_db, connection_id) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await store.record_drift_apply(
+            semantic_db, connection_id, {"changed": True}, applied_by="u1"
+        )
+        await semantic_db.commit()
+        row = await semantic_db.scalar(
+            select(SemanticHistoryRow).where(
+                SemanticHistoryRow.entity_type == store.DRIFT_APPLY_ENTITY
+            )
+        )
+        assert row is not None
+        assert row.source == "drift"
+        assert row.new_value == {"changed": True}
+        header_id = await semantic_db.scalar(
+            select(SemanticModelRow.id).where(SemanticModelRow.connection_id == connection_id)
+        )
+        assert row.entity_id == header_id
+
+    async def test_nul_characters_are_stripped(self, semantic_db, connection_id) -> None:
+        """PostgreSQL JSONB rejects ``\\u0000``; an LLM warning can carry one."""
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await store.record_drift_apply(
+            semantic_db,
+            connection_id,
+            {"warnings": ["bad\x00name"], "columns_removed": {"public.a\x00": ["x\x00"]}},
+            applied_by="u1",
+        )
+        await semantic_db.commit()
+        [record] = await store.list_drift_applies(semantic_db, connection_id)
+        assert record.summary == {"warnings": ["badname"], "columns_removed": {"public.a": ["x"]}}
+
+    async def test_other_history_is_not_listed(self, semantic_db, connection_id) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        assert await store.list_drift_applies(semantic_db, connection_id) == []
+
+    async def test_without_a_model_nothing_is_logged(self, semantic_db, connection_id) -> None:
+        await store.record_drift_apply(
+            semantic_db, connection_id, {"changed": True}, applied_by="u1"
+        )
+        await semantic_db.commit()
+        assert await store.list_drift_applies(semantic_db, connection_id) == []
+
+    async def test_limit(self, semantic_db, connection_id) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        for i in range(3):
+            await store.record_drift_apply(semantic_db, connection_id, {"n": i}, applied_by="u1")
+            await semantic_db.commit()
+        records = await store.list_drift_applies(semantic_db, connection_id, limit=2)
+        assert [r.summary["n"] for r in records] == [2, 1]
+
+    async def test_offset_skips_the_newest(self, semantic_db, connection_id) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        for name in ("a", "b", "c"):
+            await store.record_drift_apply(
+                semantic_db, connection_id, {"tables_removed": [f"public.{name}"]}, applied_by="u1"
+            )
+            await semantic_db.commit()
+        page = await store.list_drift_applies(semantic_db, connection_id, limit=1, offset=1)
+        assert [r.summary["tables_removed"] for r in page] == [["public.b"]]

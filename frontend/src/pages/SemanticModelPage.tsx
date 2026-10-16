@@ -12,6 +12,7 @@ import { useParams } from 'react-router';
 import {
   replaceEqualDeep,
   useIsMutating,
+  useMutationState,
   useQuery,
   useMutation,
   useQueryClient,
@@ -25,13 +26,19 @@ import { metricValidationError } from '../lib/semanticUtils';
 import SemanticModelEditor from '../components/SemanticModelEditor';
 import BusinessMetricEditor from '../components/BusinessMetricEditor';
 import GenerationBanner from '../components/semantic/GenerationBanner';
+import DriftSummaryPanel from '../components/semantic/DriftSummaryPanel';
+import DriftHistory from '../components/semantic/DriftHistory';
+import { summaryAnnouncement } from '../components/semantic/driftSummaryRows';
 import { useProviders } from '../hooks/useProviders';
 import { useConnections } from '../hooks/useConnections';
 import { useAuthStore } from '../store/authStore';
 import { cn } from '@/lib/utils';
 import { apiErrorMessage } from '@/lib/apiError';
 import type {
+  ApplyDriftResponse,
   DerivedColumn,
+  DriftApplyHistoryEntry,
+  DriftApplySummary,
   DriftReport,
   RelationshipEdge,
   SchemaTable,
@@ -39,6 +46,40 @@ import type {
   SemanticModel,
   SemanticSuggestionResponse,
 } from '../types';
+
+const SUGGESTION_PENDING_REASON = 'Wait for the suggestion to finish applying';
+const RUN_PENDING_REASON = 'Wait for the current run to finish';
+const DRIFT_APPLY_PENDING_REASON = 'Wait for the drift apply to finish';
+
+/** Logged Apply Drifts the page lists, newest first. */
+const DRIFT_HISTORY_LIMIT = 10;
+
+/**
+ * One sentence for the status line after a successful Check Drift. `heldBecause` is why
+ * Preview & apply is disabled now that the check has settled, if it is: the sentence
+ * offers the button only when it can be used.
+ */
+function driftCheckAnnouncement(report: DriftReport, heldBecause: string | null): string {
+  const cachedAt = report.schema_cached_at
+    ? ` at ${new Date(report.schema_cached_at).toLocaleString()}`
+    : '';
+  const cached =
+    report.schema_source === 'cache'
+      ? ` the schema cached${cachedAt}; the database could not be reached.`
+      : null;
+  if (report.warning_count > 0) {
+    const n = report.warning_count;
+    const found = `Schema drift detected: ${n} warning${n === 1 ? '' : 's'}`;
+    // Preview & apply is held on a cached report: both need the live database.
+    if (cached) return `${found} against${cached}`;
+    if (!report.has_actionable_changes) return `${found}.`;
+    return heldBecause
+      ? `${found}. Preview & apply is not available yet: ${heldBecause}.`
+      : `${found}. Preview & apply is available.`;
+  }
+  if (!cached) return 'No drift: the model matches the live schema.';
+  return `No drift against${cached}`;
+}
 
 // ── Semantic type badge ────────────────────────────────────────────────────
 
@@ -470,12 +511,68 @@ export default function SemanticModelPageV2() {
     enabled: false,
     retry: false,
   });
+
+  // What the last Apply Drift changed. The route returns it (and logs it, see Drift
+  // history); it stays on screen until dismissed, the next preview or apply, or the next
+  // run.
+  const [driftSummary, setDriftSummary] = useState<DriftApplySummary | null>(null);
+  // The preview of an Apply Drift (the same route with dry_run: nothing written, no LLM
+  // call). Kept until applied, cancelled, or the next Check Drift; anything else that
+  // writes the model drops it, since the apply would no longer do what it lists.
+  const [driftPreview, setDriftPreview] = useState<DriftApplySummary | null>(null);
+  // Why an apply started by an earlier mount of this page failed. Its own error renders in
+  // the preview panel, which this mount never had. Cleared by the next check, preview or run.
+  const [elsewhereApplyError, setElsewhereApplyError] = useState<string | null>(null);
+  // Bumped on every drop, so a preview still in flight when its predecessor's state was
+  // dropped is ignored when it lands (see previewDrift). The reset does the same for its
+  // failure: this observer stops tracking that mutation, so no "Preview failed" from a
+  // preview the page has moved past.
+  const previewSeq = useRef(0);
+  const dropPreview = () => {
+    previewSeq.current += 1;
+    setDriftPreview(null);
+    previewDrift.reset();
+    setDriftStatus('');
+  };
+  // Where focus goes once the control that had it unmounts: a closed panel, a preview
+  // that replaced Preview & apply, an apply that took its preview with it. Set only by
+  // those transitions, so no other state change moves focus (see the effect below).
+  // 'panel' and 'result' focus the preview and result panels themselves: focus is what
+  // gets them read, and a region takes no Space or Enter.
+  const focusAfterClose = useRef<'preview' | 'panel' | 'result' | 'check' | null>(null);
+  const previewButtonRef = useRef<HTMLButtonElement>(null);
+  const checkDriftButtonRef = useRef<HTMLButtonElement>(null);
+  const previewPanelRef = useRef<HTMLDivElement>(null);
+  const resultPanelRef = useRef<HTMLDivElement>(null);
+  // Speaks for a preview or result that arrived without focus moving to it: one from an
+  // apply an earlier mount started, or one that landed after the user moved on. Never set
+  // alongside a focus move, which reads the panel already. Cleared by the next action.
+  const [driftStatus, setDriftStatus] = useState('');
+  // Why Preview & apply would be held once a check settles; set each render (see below).
+  const previewReasonOnceCheckedRef = useRef<string | null>(null);
+
   const checkDrift = async () => {
-    const { data } = await refetchDrift();
+    // A fresh report starts clean: no preview of the last one, and (dropPreview) none
+    // still in flight and no "Preview failed" under it. A failed apply's error goes with
+    // the preview it renders in; the next preview's start resets it.
+    dropPreview();
+    setElsewhereApplyError(null);
+    const started = Date.now();
+    const result = await refetchDrift();
+    // Only this check's own report. A failed check keeps the last report's data, and one
+    // whose query was removed mid-flight (an apply or a run landing first) can resolve as
+    // a success carrying the previous report; neither refreshed anything. TanStack stamps
+    // `dataUpdatedAt` only when a fetch (or a cache write) lands, so a stale one is older.
+    const fresh = result.status === 'success' && result.dataUpdatedAt >= started;
+    if (!fresh) return;
     // A live check refreshed the schema cache; the column dropdowns read it.
-    if (data?.schema_source === 'live') {
+    if (result.data.schema_source === 'live') {
       void queryClient.invalidateQueries({ queryKey: ['schema', connectionId] });
     }
+    // Focus stays on Check Drift, so its outcome is spoken from the status line (cleared
+    // by dropPreview above, so a repeat of the same sentence is still a change). A failure
+    // needs none: its alert speaks for itself.
+    setDriftStatus(driftCheckAnnouncement(result.data, previewReasonOnceCheckedRef.current));
   };
 
   // Schema — the authoritative column list behind the table editor's column dropdowns.
@@ -492,6 +589,13 @@ export default function SemanticModelPageV2() {
   const { data: suggestions } = useQuery<SemanticSuggestionResponse[]>({
     queryKey: ['semantic-suggestions', connectionId],
     queryFn: () => semanticApi.getSuggestions(connectionId!),
+    enabled: !!connectionId && !!model,
+  });
+
+  // Logged Apply Drifts (semantic_model_history), newest first — what survives a reload.
+  const { data: driftHistory } = useQuery<DriftApplyHistoryEntry[]>({
+    queryKey: ['semantic-drift-history', connectionId],
+    queryFn: () => semanticApi.getDriftHistory(connectionId!, DRIFT_HISTORY_LIMIT),
     enabled: !!connectionId && !!model,
   });
 
@@ -685,12 +789,72 @@ export default function SemanticModelPageV2() {
     // Every editor ignores input while `draft` is null (see handleGenerationError), so
     // nothing typed mid-run can be replaced by the result without a trace. The result
     // re-seeds the draft on success; a failed run refetches and re-seeds from that.
+    // The drift report goes at the start, not on success: it described the model the run
+    // is replacing, and a failed run has still reconciled the batches that landed, so it
+    // is no truer of the model either outcome leaves. The next Check Drift reads that.
     onMutate: () => {
       runSeq.current += 1;
       setDraft(null);
+      setDriftSummary(null);
+      dropPreview();
+      setElsewhereApplyError(null);
+      queryClient.removeQueries({ queryKey: ['semantic-drift', connectionId] });
     },
     onSuccess: handleGenerationSuccess,
     onError: handleGenerationError,
+  });
+
+  // Apply Drift writes the model like a run does, so the editor is paused the same way
+  // (`anyGenerationPending`) and the result re-seeds the draft. It can take as long as a
+  // small run — one LLM call per GENERATION_BATCH_SIZE new tables, then a globals pass —
+  // so it is keyed like `generation` and a page mounted mid-apply stays inert too.
+  const applyDrift = useMutation({
+    mutationKey: ['semantic-apply-drift', connectionId],
+    mutationFn: () => semanticApi.applyDrift(connectionId!, selectedProvider || undefined),
+    // The preview stays: a failed apply shows its error beside it, to retry or cancel.
+    onMutate: () => {
+      runSeq.current += 1;
+      setDraft(null);
+      setDriftSummary(null);
+    },
+    onSuccess: ({ semantic_model: m, summary }) => {
+      queryClient.setQueryData(['semantic', connectionId], m);
+      setDraft(m);
+      // The report is stale now; the next Check Drift reads the applied model.
+      queryClient.removeQueries({ queryKey: ['semantic-drift', connectionId] });
+      // The apply introspected live and the purge keeps that schema cached; the column
+      // dropdowns read it.
+      void queryClient.invalidateQueries({ queryKey: ['schema', connectionId] });
+      focusAfterClose.current = 'result';
+      dropPreview();
+      setDriftSummary(summary);
+      void queryClient.invalidateQueries({ queryKey: ['semantic-drift-history', connectionId] });
+    },
+    onError: () => reseedDraft(),
+  });
+
+  const previewDrift = useMutation({
+    mutationFn: () => semanticApi.applyDrift(connectionId!, selectedProvider || undefined, true),
+    onMutate: () => {
+      setDriftPreview(null);
+      setDriftSummary(null);
+      // The last apply's error belongs to the preview it failed under, which every path
+      // to a new preview (Cancel, Check Drift, a save, a run) has dropped.
+      applyDrift.reset();
+      setElsewhereApplyError(null);
+      setDriftStatus('');
+      previewSeq.current += 1;
+      return previewSeq.current;
+    },
+    // Not if the preview was dropped meanwhile (a Check Drift, a run, a save): it would
+    // describe a report or a model that is no longer on screen.
+    onSuccess: ({ summary }, _vars, seq) => {
+      if (seq !== previewSeq.current) return;
+      // A dry run still introspects live and refreshes the schema cache.
+      void queryClient.invalidateQueries({ queryKey: ['schema', connectionId] });
+      focusAfterClose.current = 'panel';
+      setDriftPreview(summary);
+    },
   });
 
   // A run keeps going when the page that started it unmounts (the route remounts the page
@@ -699,19 +863,84 @@ export default function SemanticModelPageV2() {
   // is in flight this page must stay inert exactly as during its own run.
   const runsInFlight = useIsMutating({ mutationKey: ['semantic-generation', connectionId] });
   const runningElsewhere = runsInFlight > 0 && !generation.isPending;
-  // Every control that can start a run or write the model is disabled while one is in
-  // flight, whichever page instance owns it.
-  const anyGenerationPending = generation.isPending || runningElsewhere;
+  const runInFlight = generation.isPending || runningElsewhere;
+  // The same for an Apply Drift started by an earlier instance of this page.
+  const appliesInFlight = useIsMutating({ mutationKey: ['semantic-apply-drift', connectionId] });
+  const applyingElsewhere = appliesInFlight > 0 && !applyDrift.isPending;
+  const applyInFlight = applyDrift.isPending || applyingElsewhere;
+  // Every control that can start a run or write the model is disabled while a run or an
+  // Apply Drift is in flight, whichever page instance owns it.
+  const anyGenerationPending = runInFlight || applyInFlight;
 
   // The owner's handlers run on its unmounted instance, where setDraft is a no-op, so this
-  // page reseeds itself when such a run ends, success or failure alike. Not for runs
-  // started here: their own handlers seed (or reseed) the draft.
-  const wasRunningElsewhere = useRef(runningElsewhere);
+  // page reseeds itself when such a run or apply ends, success or failure alike. Not for
+  // ones started here: their own handlers seed (or reseed) the draft.
+  const busyElsewhere = runningElsewhere || applyingElsewhere;
+  const wasBusyElsewhere = useRef(busyElsewhere);
   useEffect(() => {
-    const ended = wasRunningElsewhere.current && !runningElsewhere;
-    wasRunningElsewhere.current = runningElsewhere;
+    const ended = wasBusyElsewhere.current && !busyElsewhere;
+    wasBusyElsewhere.current = busyElsewhere;
     if (ended && !draft) reseedDraft();
-  }, [runningElsewhere]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [busyElsewhere]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The outcome of an apply an earlier mount started: its handlers ran on that unmounted
+  // instance (the report and the cache are handled there), so this one shows the result
+  // or the error. Only for an apply it saw in flight — not one that settled before this
+  // mount, which the person has already seen or left behind.
+  const applies = useMutationState({
+    filters: { mutationKey: ['semantic-apply-drift', connectionId] },
+    select: (m) => m.state,
+  });
+  const latestApply = applies[applies.length - 1];
+  const wasApplyingElsewhere = useRef(applyingElsewhere);
+  useEffect(() => {
+    const ended = wasApplyingElsewhere.current && !applyingElsewhere;
+    wasApplyingElsewhere.current = applyingElsewhere;
+    if (!ended || !latestApply) return;
+    if (latestApply.status === 'success') {
+      const { summary } = latestApply.data as ApplyDriftResponse;
+      setDriftSummary(summary);
+      // Nothing on this mount had focus to move to the result. A failure needs no status
+      // line: its alert speaks for itself.
+      setDriftStatus(summaryAnnouncement(summary));
+    } else if (latestApply.status === 'error') {
+      setElsewhereApplyError(apiErrorMessage(latestApply.error, 'Unknown error'));
+    }
+  }, [applyingElsewhere]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Moves focus as `focusAfterClose` asks, to the first focusable element of its chain:
+  // 'panel' (a preview landed) and 'result' (an apply succeeded) the panel itself;
+  // 'preview' (Cancel) Preview & apply; every chain ends at Check Drift. After an apply,
+  // Check Drift is enabled again by the time this runs: the mutation settles in the
+  // microtasks after its onSuccess, before React renders the state that onSuccess set.
+  useEffect(() => {
+    const target = focusAfterClose.current;
+    if (!target) return;
+    focusAfterClose.current = null;
+    // Only focus that was lost: every trigger unmounts the control that had it, leaving
+    // <body>. A preview or apply can take long enough for the user to move on, and
+    // pulling focus from a field would make the next keystroke land somewhere else — so
+    // the status line says what arrived instead.
+    const active = document.activeElement;
+    if (active && active !== document.body) {
+      const arrived =
+        target === 'panel' ? driftPreview : target === 'result' ? driftSummary : null;
+      if (arrived) setDriftStatus(summaryAnnouncement(arrived));
+      return;
+    }
+    const chain: { current: HTMLElement | null }[] =
+      target === 'panel'
+        ? [previewPanelRef, checkDriftButtonRef]
+        : target === 'result'
+          ? [resultPanelRef, checkDriftButtonRef]
+          : target === 'preview'
+            ? [previewButtonRef, checkDriftButtonRef]
+            : [checkDriftButtonRef];
+    chain
+      .map((r) => r.current)
+      .find((el) => el && !(el instanceof HTMLButtonElement && el.disabled))
+      ?.focus();
+  }, [driftPreview, driftSummary]);
 
   // Seed an empty draft from every successful fetch — first load, and any later fetch
   // once a failed run's own reseed (handleGenerationError) failed too; when that reseed
@@ -733,6 +962,8 @@ export default function SemanticModelPageV2() {
       // The store normalises and fits what it is given, so the editor shows what was
       // stored — unless the draft moved on mid-save, when replacing it would drop edits.
       setDraft((cur) => (cur === sent ? m : cur));
+      // A preview is stale once the stored model changes.
+      dropPreview();
       setSaveError(null);
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 3000);
@@ -746,6 +977,7 @@ export default function SemanticModelPageV2() {
     onSuccess: (updated) => {
       queryClient.setQueryData(['semantic', connectionId], updated);
       setDraft(updated);
+      dropPreview();
       queryClient.invalidateQueries({ queryKey: ['semantic-suggestions', connectionId] });
     },
     // E.g. a 409 because another tab applied it first: the list and the model are both
@@ -784,7 +1016,47 @@ export default function SemanticModelPageV2() {
       ? 'Configure an LLM provider in Settings first'
       : isDirty
         ? 'Save your changes first — starting a run discards unsaved edits'
-        : null;
+        : applySuggestion.isPending
+          ? SUGGESTION_PENDING_REASON
+          : null;
+
+  // Why a drift preview or apply cannot start. Not this page's own apply: its button
+  // reads "Applying…" instead.
+  const driftWaitReason = runInFlight
+    ? RUN_PENDING_REASON
+    : applyingElsewhere
+      ? DRIFT_APPLY_PENDING_REASON
+      : null;
+  // A suggestion or a save landing mid-apply would refill the draft the apply dropped,
+  // and a save would drop the preview the apply reports its failure in.
+  const previewReasonOnceChecked = isDirty
+    ? 'Save your changes first — applying drift discards unsaved edits'
+    : (driftWaitReason ??
+      (applySuggestion.isPending
+        ? SUGGESTION_PENDING_REASON
+        : save.isPending
+          ? 'Wait for the save to finish'
+          : null));
+  // Read by checkDrift once its report lands, to say whether Preview & apply is usable.
+  previewReasonOnceCheckedRef.current = previewReasonOnceChecked;
+  // A check in flight too: an apply landing before it would be followed by its news of
+  // the drift the apply just removed.
+  const previewDisabledReason =
+    !isDirty && !driftWaitReason && driftChecking
+      ? 'Wait for the drift check to finish'
+      : previewReasonOnceChecked;
+  // New tables are annotated by the LLM, so an apply that adds one needs a provider.
+  const applyDisabledReason =
+    previewDisabledReason ??
+    ((driftPreview?.tables_added.length ?? 0) > 0 && !selectedProvider
+      ? 'Configure an LLM provider in Settings first'
+      : null);
+  // A report against the cached schema cannot be previewed or applied: both introspect
+  // the live database, which that check could not reach.
+  const previewButtonReason =
+    driftReport?.schema_source === 'cache'
+      ? 'The database could not be reached — check drift again once it is back'
+      : previewDisabledReason;
 
   // A metric missing a field its type requires would save (empty strings pass the
   // backend's `str` validation) and then render as broken SQL in every prompt.
@@ -963,12 +1235,22 @@ export default function SemanticModelPageV2() {
               title={generateDisabledReason ?? undefined}
               className="rounded-md border border-primary px-4 py-1.5 text-sm text-primary transition-colors hover:bg-primary/10 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {anyGenerationPending ? 'Generating…' : hasModel ? 'Regenerate' : 'Generate'}
+              {runInFlight ? 'Generating…' : hasModel ? 'Regenerate' : 'Generate'}
             </button>
 
+            {/* Held during a run or an apply: the report would be stale the moment it
+                lands, and would outlive it with Preview & apply enabled. */}
             <button
+              ref={checkDriftButtonRef}
               onClick={() => void checkDrift()}
-              disabled={driftChecking || !displayModel}
+              disabled={driftChecking || !displayModel || anyGenerationPending}
+              title={
+                applyInFlight
+                  ? DRIFT_APPLY_PENDING_REASON
+                  : runInFlight
+                    ? RUN_PENDING_REASON
+                    : undefined
+              }
               className="rounded-md border border-border px-4 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-muted disabled:opacity-50"
             >
               {driftChecking ? 'Checking…' : 'Check Drift'}
@@ -981,9 +1263,11 @@ export default function SemanticModelPageV2() {
                 // regenerating and mark them user-edited, so regeneration skips them for good.
                 disabled={save.isPending || !draft || anyGenerationPending}
                 title={
-                  anyGenerationPending
-                    ? 'Wait for generation to finish — saving now would overwrite the regenerated values'
-                    : undefined
+                  applyInFlight
+                    ? `${DRIFT_APPLY_PENDING_REASON} — saving now would overwrite the applied values`
+                    : anyGenerationPending
+                      ? 'Wait for generation to finish — saving now would overwrite the regenerated values'
+                      : undefined
                 }
                 className="rounded-md bg-brand-gradient px-4 py-1.5 text-sm font-medium text-white shadow-gradient-btn transition-opacity hover:opacity-90 disabled:opacity-50"
               >
@@ -1030,7 +1314,8 @@ export default function SemanticModelPageV2() {
               still going from before the user left and came back. */}
           {anyGenerationPending && !genProgress && (
             <p className="text-xs text-muted-foreground">
-              Generation is running. Editing is paused until it finishes.
+              {applyInFlight ? 'Applying schema drift.' : 'Generation is running.'} Editing
+              is paused until it finishes.
             </p>
           )}
 
@@ -1075,7 +1360,7 @@ export default function SemanticModelPageV2() {
 
           {/* Drift check outcome — an error, a clean result, or the warnings below */}
           {driftError && !driftChecking && (
-            <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+            <div role="alert" className="rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
               Drift check failed: {apiErrorMessage(driftError, 'Unknown error')}
             </div>
           )}
@@ -1100,7 +1385,8 @@ export default function SemanticModelPageV2() {
           )}
 
           {/* Drift warning banner — from fresh drift check */}
-          {(driftReport?.warnings?.length ?? 0) > 0 && (
+          {/* Not after a failed re-check: TanStack keeps the last report's data then. */}
+          {(driftReport?.warnings?.length ?? 0) > 0 && !driftError && (
             <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3">
               <div className="mb-2 flex items-center gap-2">
                 <AlertTriangle className="h-4 w-4 text-destructive" />
@@ -1117,11 +1403,119 @@ export default function SemanticModelPageV2() {
                 ))}
               </ul>
               <p className="mt-2 text-xs text-destructive/70">
-                Checked at {new Date(driftReport!.checked_at).toLocaleTimeString()} —
-                Regenerate to sync.
+                Checked at {new Date(driftReport!.checked_at).toLocaleTimeString()}
               </p>
+              {driftReport!.has_actionable_changes && !driftPreview && (
+                <div className="mt-3 flex flex-col gap-2">
+                  <p className="text-xs text-destructive/70">
+                    Removes deleted tables, with the metrics, joins and derived columns that
+                    list them, segments that apply only to them, and relationships over them,
+                    and deleted columns, with the relationships and references that used them.
+                    Annotates new tables and adds new cross-table items beside the existing
+                    ones. Hidden tables are kept, and so are tables the connection cannot read
+                    when PostgreSQL can tell them apart from dropped ones. You will see what
+                    it removes and which tables it annotates before anything is applied.
+                  </p>
+                  <button
+                    ref={previewButtonRef}
+                    onClick={() => previewDrift.mutate()}
+                    disabled={
+                      !!previewButtonReason || anyGenerationPending || previewDrift.isPending
+                    }
+                    title={previewButtonReason ?? undefined}
+                    className="self-start rounded-md border border-destructive/40 bg-destructive/20 px-3 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/30 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {previewDrift.isPending ? 'Preparing preview…' : 'Preview & apply'}
+                  </button>
+                </div>
+              )}
+              {previewDrift.error && !previewDrift.isPending && (
+                <p role="alert" className="mt-2 text-xs text-destructive">
+                  Preview failed: {apiErrorMessage(previewDrift.error, 'Unknown error')}
+                </p>
+              )}
             </div>
           )}
+
+          {elsewhereApplyError && (
+            <div
+              role="alert"
+              className="rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+            >
+              Apply drift failed: {elsewhereApplyError}
+            </div>
+          )}
+
+          {/* Only a preview with something to apply has Cancel; one that found nothing is
+              closed with Dismiss instead. */}
+          {driftPreview && (
+            <DriftSummaryPanel
+              summary={driftPreview}
+              region
+              panelRef={previewPanelRef}
+              onDismiss={
+                driftPreview.changed
+                  ? undefined
+                  : () => {
+                      focusAfterClose.current = 'check';
+                      dropPreview();
+                    }
+              }
+            >
+              {driftPreview.changed && (
+                <div className="mt-3 space-y-2">
+                  {/* Beside the buttons it concerns: the preview stays, to retry or cancel. */}
+                  {applyDrift.error && !applyDrift.isPending && (
+                    <p role="alert" className="text-xs text-destructive">
+                      Apply drift failed: {apiErrorMessage(applyDrift.error, 'Unknown error')}
+                    </p>
+                  )}
+                  {/* Cancel first: the first Tab from the focused preview reaches it, and the
+                      destructive confirm only after. */}
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => {
+                        focusAfterClose.current = 'preview';
+                        dropPreview();
+                      }}
+                      disabled={applyDrift.isPending}
+                      className="rounded-md border border-border px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted disabled:opacity-50"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={() => applyDrift.mutate()}
+                      disabled={!!applyDisabledReason || applyInFlight}
+                      title={applyDisabledReason ?? undefined}
+                      className="rounded-md border border-destructive/40 bg-destructive/20 px-3 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/30 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {applyDrift.isPending ? 'Applying…' : 'Apply these changes'}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </DriftSummaryPanel>
+          )}
+
+          {driftSummary && (
+            <DriftSummaryPanel
+              summary={driftSummary}
+              region
+              panelRef={resultPanelRef}
+              onDismiss={() => {
+                focusAfterClose.current = 'check';
+                setDriftSummary(null);
+                setDriftStatus('');
+              }}
+            />
+          )}
+
+          <DriftHistory entries={driftHistory ?? []} limit={DRIFT_HISTORY_LIMIT} />
+
+          {/* Always mounted, so a change to its text is announced (see driftStatus). */}
+          <p role="status" className="sr-only">
+            {driftStatus}
+          </p>
 
 
           {/* Empty state */}
@@ -1923,11 +2317,13 @@ export default function SemanticModelPageV2() {
                                 applySuggestion.isPending || anyGenerationPending || isDirty
                               }
                               title={
-                                anyGenerationPending
-                                  ? 'Wait for generation to finish before applying suggestions'
-                                  : isDirty
-                                    ? 'Save your changes first — applying a suggestion discards unsaved edits'
-                                    : undefined
+                                applyInFlight
+                                  ? `${DRIFT_APPLY_PENDING_REASON} before applying suggestions`
+                                  : anyGenerationPending
+                                    ? 'Wait for generation to finish before applying suggestions'
+                                    : isDirty
+                                      ? 'Save your changes first — applying a suggestion discards unsaved edits'
+                                      : undefined
                               }
                               className="flex items-center gap-1 rounded-md bg-brand-gradient px-3 py-1.5 text-xs font-medium text-white shadow-gradient-btn hover:opacity-90 disabled:opacity-50"
                             >

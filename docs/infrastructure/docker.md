@@ -378,7 +378,7 @@ The frontend waits for the backend health check before Nginx starts — this pre
 
 ## HTTPS
 
-The stack itself speaks plain HTTP, which is what you want for `localhost` and trusted LAN use. To serve it over HTTPS, put a TLS-terminating reverse proxy in front of the frontend port and bind the frontend to `127.0.0.1`. Set `BEHIND_TLS_PROXY=true` in `.env` so the backend marks the session cookie `Secure` and sends HSTS; the proxy must disable response buffering and allow read timeouts of at least 300 s (900 s for semantic-model generation) so streamed chat responses are not cut off. A worked Caddy example is in [Deployment → Configure HTTPS](../administration/deployment.md#5-configure-https).
+The stack itself speaks plain HTTP, which is what you want for `localhost` and trusted LAN use. To serve it over HTTPS, put a TLS-terminating reverse proxy in front of the frontend port and bind the frontend to `127.0.0.1`. Set `BEHIND_TLS_PROXY=true` in `.env` so the backend marks the session cookie `Secure` and sends HSTS; the proxy must disable response buffering and allow read timeouts of at least 300 s (900 s for semantic-model generation and apply-drift) so streamed chat responses are not cut off. A worked Caddy example is in [Deployment → Configure HTTPS](../administration/deployment.md#5-configure-https).
 
 ---
 

@@ -21,6 +21,7 @@ vi.mock('../../api/semantic', () => ({
   semanticApi: {
     get: vi.fn(),
     getDrift: vi.fn(),
+    getDriftHistory: vi.fn(),
     getSuggestions: vi.fn(),
     applySuggestion: vi.fn(),
     update: vi.fn(),
@@ -56,7 +57,7 @@ vi.mock('../../hooks/useProviders', () => ({
 }));
 
 vi.mock('../../store/authStore', () => ({
-  useAuthStore: (selector: any) => selector({ user: { id: 'u1' } }),
+  useAuthStore: (selector: (s: unknown) => unknown) => selector({ user: { id: 'u1' } }),
 }));
 
 import { semanticApi } from '../../api/semantic';
@@ -128,6 +129,7 @@ function deferred<T>() {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(semanticApi.get).mockResolvedValue(PARTIAL_MODEL as never);
+  vi.mocked(semanticApi.getDriftHistory).mockResolvedValue([] as never);
   vi.mocked(semanticApi.getSuggestions).mockResolvedValue([] as never);
   vi.mocked(semanticApi.generateGlobals).mockResolvedValue(COMPLETE_MODEL as never);
   vi.mocked(semanticApi.generateInit).mockResolvedValue({

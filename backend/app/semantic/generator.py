@@ -14,6 +14,13 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from ..datasources.models import ColumnInfo, DataSourceSchema, PrivacySettings, table_key
+from .drift import (
+    SchemaDrift,
+    compute_drift,
+    policy_hides_column,
+    policy_hides_table,
+    strip_ident_quotes,
+)
 from .models import (
     GENERATION_BATCH_SIZE,
     AggregationType,
@@ -250,44 +257,6 @@ _FISCAL_DIMENSION_SUFFIXES: tuple[str, ...] = ("_year", "_quarter", "_period")
 _FISCAL_DIMENSION_PREFIXES: tuple[str, ...] = ("fiscal_", "budget_", "calendar_", "tax_")
 
 
-def policy_hides_table(key: str, privacy: PrivacySettings | None, *, bare_ok: bool = False) -> bool:
-    """Whether ``privacy`` explains why table ``key`` is absent.
-
-    ``_apply_privacy_to_schema`` removes excluded schemas, tables and
-    ``excluded_columns`` from the schema the generation routes see, so an absent
-    table can be hidden rather than gone. A stored key is ``table_key(...)``
-    (``datasources.models.table_key``) and either part may itself contain a dot, so
-    every split is tried rather than one guessed.
-
-    ``bare_ok=True`` is for a metric's ``related_tables`` entry, which
-    ``detect_drift`` accepts unqualified: such a name is hidden when
-    ``excluded_tables`` lists it bare or under any schema (the same leniency
-    ``detect_drift`` gives a bare live name; a schema or table name containing a
-    dot can make that match over-broad, which only suppresses a warning). Without
-    ``bare_ok`` a bare key is never treated as hidden, so pruning still drops
-    such anomalies.
-
-    A bare name carries no schema, so ``excluded_schemas`` cannot be applied to it
-    here; ``detect_drift`` resolves that case through the stored model's qualified
-    keys.
-    """
-    if privacy is None:
-        return False
-    if bare_ok and "." not in key:
-        return any(entry.rpartition(".")[2] == key for entry in privacy.excluded_tables)
-    return any(
-        privacy.is_table_excluded(key[:i], key[i + 1 :]) for i, ch in enumerate(key) if ch == "."
-    )
-
-
-def policy_hides_column(key: str, column: str, privacy: PrivacySettings | None) -> bool:
-    """Whether ``privacy`` explains why ``column`` is absent from table ``key``.
-
-    Delegates to ``PrivacySettings.hides_column``.
-    """
-    return privacy is not None and privacy.hides_column(key, column)
-
-
 def _warn_near_miss(kind: str, name: str, target: str | None, where: str) -> None:
     """Warn that a dropped stored ``name`` was a near-miss spelling of live ``target``.
 
@@ -360,8 +329,8 @@ def prune_to_schema(
 ) -> dict[str, TableSemantic]:
     """Bound a model's tables to what ``schema`` still has. Pure; never mutates ``tables``.
 
-    A regenerate reconciles onto the stored rows and never blanks them, and the
-    CE has no apply-drift, so ``/generate/globals`` calls this to stop tables and
+    A regenerate reconciles onto the stored rows and never blanks them, so
+    ``/generate/globals`` and ``/apply-drift`` both call this to stop tables and
     columns that left the database from living in the model forever:
 
     - a table whose key (``schema.name``) is not in ``schema`` is dropped, and
@@ -440,6 +409,21 @@ def edges_in_schema(
     ]
 
 
+def names_any_table(refs: Iterable[str], targets: set[str], real_keys: list[str]) -> bool:
+    """Whether any of ``refs`` (an LLM item's table list) names one of ``targets``.
+
+    Each ref is resolved against ``real_keys`` by ``_resolve_real_key``'s rules —
+    quote-stripped, case-insensitive, or a bare table name that is unique among
+    ``real_keys`` — so ``events`` counts for ``public.events`` only when no other
+    real table is called ``events``. Pass every table the model can name as
+    ``real_keys``, not just ``targets``, so a bare name is not claimed by the wrong one.
+    """
+    return any(
+        SemanticModelGenerator._resolve_real_key(ref, real_keys, bare_ok=True) in targets
+        for ref in refs
+    )
+
+
 _TABLE_REFERENCE_FIELDS = (
     "primary_timestamp_column",
     "primary_date_column",
@@ -459,6 +443,8 @@ def drop_dangling_edits(
     protected: dict[str, dict[str, dict[str, Any]]],
     schema: DataSourceSchema,
     privacy: PrivacySettings | None = None,
+    *,
+    log: bool = True,
 ) -> tuple[dict[str, dict[str, list[str]]], dict[str, dict[str, dict[str, Any]]], list[str]]:
     """``marks`` and ``protected`` with each table edit's references to gone columns dropped.
 
@@ -486,7 +472,8 @@ def drop_dangling_edits(
     alone: whether its row survives is ``prune_to_schema``'s decision. A table
     left with no marks or no protected values loses that entry.
 
-    Also returns one human-readable note per table field changed. Pure: the
+    Also returns one human-readable note per table field changed, and logs it
+    unless ``log=False`` (a dry run, which only previews the trim). Pure: the
     returned dicts and mark lists are new and every rewritten value is a new list
     (of new hierarchy dicts); an unchanged protected value is the input's object.
     """
@@ -536,7 +523,8 @@ def drop_dangling_edits(
                 out_marks["table"][key] = [f for f in out_marks["table"].get(key, []) if f != field]
                 verb = "is" if len(dropped) == 1 else "are"
                 note = f"{key}.{field}: hand edit cleared — {names} {verb} no longer in the table"
-            logger.warning("Dangling hand edit: %s", note)
+            if log:
+                logger.warning("Dangling hand edit: %s", note)
             notes.append(note)
         if not out_protected["table"][key]:
             del out_protected["table"][key]
@@ -926,12 +914,9 @@ class SemanticModelGenerator:
 
     @staticmethod
     def _strip_quotes(name: str) -> str:
-        """``"public"."Orders"`` / ```sales`.`orders``` → ``public.Orders`` / ``sales.orders``.
-
-        Strips surrounding whitespace on the whole key, then double quotes, MySQL
-        backticks and whitespace around each dotted part.
-        """
-        return ".".join(part.strip().strip('"`') for part in name.strip().split("."))
+        """``drift.strip_ident_quotes`` — the one identifier normaliser; kept under this
+        name for its callers."""
+        return strip_ident_quotes(name)
 
     @classmethod
     def _resolve_real_key(cls, name: str, real_keys: list[str], *, bare_ok: bool) -> str | None:
@@ -1666,6 +1651,8 @@ class SemanticModelGenerator:
         current_schema: DataSourceSchema,
         stored_model: SemanticModel,
         privacy: PrivacySettings | None = None,
+        *,
+        drift: SchemaDrift | None = None,
     ) -> list[str]:
         """
         Compare current schema structure against stored semantic model.
@@ -1675,6 +1662,11 @@ class SemanticModelGenerator:
         (tables/columns added, removed, renamed). It NEVER re-runs
         statistical queries.
 
+        The table/column half is ``semantic/drift.compute_drift`` — the same diff
+        ``apply_drift`` acts on, so the check cannot report what the apply would not
+        remove. ``drift`` is that diff when the caller already computed it (the drift
+        route does, for ``has_actionable_changes``); otherwise it is computed here.
+
         With ``privacy``, a stored table or column the policy hides is not reported
         as removed: the store keeps hidden annotations, and ``current_schema`` (with
         the policy applied) lacks them because they are hidden, not gone — the same
@@ -1682,56 +1674,40 @@ class SemanticModelGenerator:
 
         Nor is a stored table in ``current_schema.unreadable_tables``: it exists, but
         the connection's role cannot read it. One warning names those instead, since
-        a regenerate cannot fix a missing grant.
+        neither a regenerate nor apply-drift can fix a missing grant.
         """
         warnings: list[str] = []
-        unreadable = set(current_schema.unreadable_tables)
-        # A metric may name a table bare, so match an unreadable one either way.
-        unreadable_names = unreadable | {key.rpartition(".")[2] for key in unreadable}
-        stored_unreadable: list[str] = []
+        if drift is None:
+            drift = compute_drift(current_schema, stored_model, privacy)
 
-        def _norm(name: str) -> str:
-            """Strip SQL quoting characters that LLMs may emit around identifiers."""
-            return name.replace("`", "").replace('"', "").replace("'", "")
-
-        current_tables = {table_key(t) for t in current_schema.tables}
-        # Bare names (without schema prefix) for metrics generated by LLMs that omit schema
-        current_tables_bare = {t.name for t in current_schema.tables}
-        # A bare metric table under an excluded schema: the policy cannot be asked
-        # about a bare name, but the stored model holds the qualified key it came from.
-        stored_hidden_bare = {
-            key.rpartition(".")[2]
-            for key in stored_model.tables
-            if key not in current_tables and policy_hides_table(key, privacy)
-        }
-        current_columns: dict[str, set[str]] = {}
-        for t in current_schema.tables:
-            key = table_key(t)
-            current_columns[key] = {c.name for c in t.columns}
-
+        live_columns = {table_key(t): {c.name for c in t.columns} for t in current_schema.tables}
         for tbl_key in stored_model.tables:
-            if tbl_key not in current_tables:
-                if policy_hides_table(tbl_key, privacy):
-                    continue
-                if tbl_key in unreadable:
-                    stored_unreadable.append(tbl_key)
-                    continue
+            if tbl_key in drift.removed_table_keys:
                 warnings.append(
                     f'Table "{tbl_key}" referenced in semantic model '
                     f"no longer exists in the database"
                 )
             else:
-                stored_cols = {_norm(c) for c in stored_model.tables[tbl_key].columns}
-                live_cols = current_columns.get(tbl_key, set())
-                for col in stored_cols - live_cols:
-                    if policy_hides_column(tbl_key, col, privacy):
-                        continue
+                gone = drift.removed_columns.get(tbl_key, ())
+                live = live_columns.get(tbl_key, set())
+                # Normalised then deduplicated: ``"a"`` and ``a`` stored side by side,
+                # both gone, are one missing column to a reader.
+                missing = {strip_ident_quotes(c) for c in gone if strip_ident_quotes(c) not in live}
+                for col in sorted(missing):
                     warnings.append(
                         f'Column "{tbl_key}.{col}" referenced in semantic model no longer exists'
                     )
+                # A quoted spelling of a column that exists is a blob-era duplicate key,
+                # not a missing column: named under its stored spelling.
+                for col in sorted(c for c in gone if strip_ident_quotes(c) in live):
+                    warnings.append(
+                        f'Column key "{tbl_key}.{col}" in the semantic model is a quoted '
+                        f'spelling of "{strip_ident_quotes(col)}"; '
+                        "Apply Drift removes the duplicate"
+                    )
 
-        if stored_unreadable:
-            names = sorted(stored_unreadable)
+        if drift.unreadable_table_keys:
+            names = sorted(drift.unreadable_table_keys)
             sample = ", ".join(names[:5]) + (", …" if len(names) > 5 else "")
             warnings.append(
                 f"{len(names)} table(s) in the semantic model exist in the database but this "
@@ -1739,17 +1715,29 @@ class SemanticModelGenerator:
                 "are kept; grant the role access to use them."
             )
 
-        semantic_tables = set(stored_model.tables.keys())
-        new_tables = current_tables - semantic_tables
-        if new_tables:
-            sample = ", ".join(sorted(new_tables)[:5])
+        if drift.new_table_keys:
+            sample = ", ".join(sorted(drift.new_table_keys)[:5])
             warnings.append(
-                f"{len(new_tables)} new table(s) added since semantic model was generated: {sample}"
+                f"{len(drift.new_table_keys)} new table(s) added since semantic model "
+                f"was generated: {sample}"
             )
 
+        current_tables = {table_key(t) for t in current_schema.tables}
+        # Bare names (without schema prefix) for metrics generated by LLMs that omit schema
+        current_tables_bare = {t.name for t in current_schema.tables}
+        # A metric may name a table bare, so match an unreadable one either way.
+        unreadable = set(current_schema.unreadable_tables)
+        unreadable_names = unreadable | {key.rpartition(".")[2] for key in unreadable}
+        # A bare metric table under an excluded schema: the policy cannot be asked
+        # about a bare name, but the stored model holds the qualified key it came from.
+        stored_hidden_bare = {
+            key.rpartition(".")[2]
+            for key in stored_model.tables
+            if key not in current_tables and policy_hides_table(key, privacy)
+        }
         for metric in stored_model.business_metrics:
             for t in metric.related_tables:
-                norm_t = _norm(t)
+                norm_t = strip_ident_quotes(t)
                 # Accept both "public.orders" (qualified) and "orders" (bare)
                 if (
                     norm_t not in current_tables

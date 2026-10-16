@@ -16,10 +16,12 @@ from app.datasources.models import (
     SchemaInfo,
     TableInfo,
 )
+from app.semantic.drift import SchemaDrift
 from app.semantic.generator import (
     SemanticModelGenerator,
     drop_dangling_edits,
     edges_in_schema,
+    names_any_table,
     policy_hides_table,
     prune_to_schema,
 )
@@ -750,6 +752,14 @@ class TestDropDanglingEdits:
             "partition_columns",
         ]
 
+    def test_log_false_returns_the_notes_without_logging_them(self, caplog) -> None:
+        """A dry run previews the notes; it must not log a trim that never happened."""
+        schema = _schema_with_tables(["orders"])
+        with caplog.at_level(logging.WARNING, logger="app.semantic.generator"):
+            _, _, notes = drop_dangling_edits(self._MARKS, self._PROTECTED, schema, log=False)
+        assert len(notes) == 2
+        assert "Dangling hand edit" not in caplog.text
+
     def test_a_reference_to_a_hidden_column_is_kept(self) -> None:
         schema = _schema_with_tables(["orders"])
         privacy = PrivacySettings(excluded_columns=["public.orders.created_ts"])
@@ -890,3 +900,109 @@ class TestDetectDriftBareNamesUnderAnExcludedSchema:
         assert not any("Payroll" in w for w in warnings)
         assert any("Ghost" in w for w in warnings)
         assert not any("hr.salaries" in w for w in warnings)
+
+
+class TestDetectDriftTakesAPrecomputedDiff:
+    """``detect_drift(drift=...)`` reports from the caller's diff instead of recomputing."""
+
+    def test_a_passed_drift_is_used_instead_of_recomputed(self) -> None:
+        schema = _schema_with_tables(["orders"])
+        stored = SemanticModel(tables={"public.orders": TableSemantic(display_name="Orders")})
+        # The schema and model agree, but the caller's diff says a table is gone: the
+        # warnings follow the diff, so the route can compute it once and reuse it.
+        drift = SchemaDrift(removed_table_keys={"public.orders"})
+        warnings = SemanticModelGenerator().detect_drift(schema, stored, drift=drift)
+        assert warnings == [
+            'Table "public.orders" referenced in semantic model no longer exists in the database'
+        ]
+
+
+class TestDetectDriftNamesAQuotedDuplicate:
+    """A stored ``'"status"'`` beside a live ``status`` is reported as what it is — a
+    duplicate key the apply removes — not as a column that no longer exists."""
+
+    def test_a_quoted_spelling_of_a_live_column_gets_its_own_warning(self) -> None:
+        schema = _schema_with_tables(["orders"], ["status"])
+        stored = SemanticModel(
+            tables={"public.orders": _tbl("id", "status", '"status"', name="Orders")}
+        )
+        warnings = SemanticModelGenerator().detect_drift(schema, stored)
+        assert warnings == [
+            'Column key "public.orders."status"" in the semantic model is a quoted spelling '
+            'of "status"; Apply Drift removes the duplicate'
+        ]
+
+    def test_a_quoted_key_of_a_gone_column_is_still_reported_gone(self) -> None:
+        schema = _schema_with_tables(["orders"])
+        stored = SemanticModel(tables={"public.orders": _tbl("id", '"legacy"', name="Orders")})
+        warnings = SemanticModelGenerator().detect_drift(schema, stored)
+        assert warnings == [
+            'Column "public.orders.legacy" referenced in semantic model no longer exists'
+        ]
+
+
+class TestAQuotedKeyOfAHiddenColumnIsHidden:
+    """A blob-era key ``'"ssn"'`` for a column the policy hides is hidden, not gone —
+    the rule ``compute_drift`` applies, so the prune never drops (and the summary
+    never names) what the check says is hidden."""
+
+    _PRIVACY = PrivacySettings(excluded_columns=["public.orders.ssn"])
+
+    def test_prune_keeps_it(self) -> None:
+        out = prune_to_schema(
+            {"public.orders": _tbl("id", '"ssn"')}, _schema_with_tables(["orders"]), self._PRIVACY
+        )
+        assert set(out["public.orders"].columns) == {"id", '"ssn"'}
+
+    def test_a_reference_to_it_is_kept(self) -> None:
+        table = _tbl("id", '"ssn"').model_copy(update={"partition_columns": ['"ssn"']})
+        out = prune_to_schema(
+            {"public.orders": table}, _schema_with_tables(["orders"]), self._PRIVACY
+        )
+        assert out["public.orders"].partition_columns == ['"ssn"']
+
+    def test_a_hand_edit_naming_it_is_kept(self) -> None:
+        marks = _marks({"public.orders": ["partition_columns"]})
+        protected = {"table": {"public.orders": {"partition_columns": ['"ssn"']}}, "column": {}}
+        out_marks, out_protected, notes = drop_dangling_edits(
+            marks, protected, _schema_with_tables(["orders"]), self._PRIVACY
+        )
+        assert out_protected == protected and out_marks["table"] == marks["table"]
+        assert notes == []
+
+    def test_an_edge_on_it_is_alive(self) -> None:
+        edge = _edge("public.orders", '"ssn"', "public.orders", "id")
+        assert edges_in_schema([edge], _schema_with_tables(["orders"]), self._PRIVACY) == [edge]
+
+    def test_a_quoted_key_of_a_visible_column_is_still_a_near_miss(self) -> None:
+        """Only the policy check strips quotes: ``'"id"'`` beside a live ``id`` is a
+        near-miss spelling and is dropped, as before."""
+        out = prune_to_schema(
+            {"public.orders": _tbl("id", '"id"')}, _schema_with_tables(["orders"]), self._PRIVACY
+        )
+        assert set(out["public.orders"].columns) == {"id"}
+
+
+class TestNamesAnyTable:
+    """Whether an LLM item's table list names one of the target tables, by the
+    generator's near-miss rules (quotes, case, a unique bare name)."""
+
+    _KEYS: ClassVar[list[str]] = ["public.orders", "public.events", "sales.events"]
+
+    @pytest.mark.parametrize(
+        ("refs", "expected"),
+        [
+            (["public.events"], True),
+            (['"public"."events"'], True),
+            (["PUBLIC.EVENTS"], True),
+            (["public.orders"], False),
+            ([], False),
+            # Ambiguous bare name: public.events or sales.events — not evidence.
+            (["events"], False),
+        ],
+    )
+    def test_qualified_and_near_miss_refs(self, refs: list[str], expected: bool) -> None:
+        assert names_any_table(refs, {"public.events"}, self._KEYS) is expected
+
+    def test_a_unique_bare_name_counts(self) -> None:
+        assert names_any_table(["orders"], {"public.orders"}, self._KEYS) is True

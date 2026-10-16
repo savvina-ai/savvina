@@ -6,16 +6,21 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from datetime import UTC, datetime
 import logging
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from pydantic import ValidationError
 from sqlalchemy import func, select, update
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+    from ..datasources.models import DataSourceSchema
+    from ..semantic.drift import SchemaDrift
+    from ..semantic.models import RelationshipEdge
 
 from ..auth.dependencies import get_current_active_user
 from ..auth.limiter import limiter
@@ -28,6 +33,8 @@ from ..models.user_schema_cache import UserSchemaCache
 from ..providers._factory import resolve_provider_config
 from ..schemas.pagination import PaginatedResponse
 from ..schemas.semantic import (
+    ApplyDriftResponse,
+    DriftApplyHistoryEntry,
     DriftReport,
     GenerateBatchRequest,
     GenerateBatchResponse,
@@ -36,16 +43,23 @@ from ..schemas.semantic import (
     SemanticSuggestionResponse,
 )
 from ..semantic import store as semantic_store
+from ..semantic.drift import DriftApplySummary, compute_drift, summarize_model_change
 from ..semantic.generator import (
     SemanticModelGenerator,
     drop_dangling_edits,
     edges_in_schema,
+    names_any_table,
     prune_to_schema,
 )
 from ..semantic.models import (
     GENERATION_BATCH_SIZE,
+    BusinessMetric,
+    CommonJoin,
+    DerivedColumn,
     GenerationStatus,
+    Segment,
     SemanticModel,
+    TableSemantic,
     ValueMapping,
 )
 from ..services.schema_utils import (
@@ -141,7 +155,8 @@ async def delete_semantic_model(
 
 
 @router.get("/{connection_id}/semantic/drift", response_model=DriftReport)
-@limiter.limit("10/minute")
+# A live introspection per call, like POST .../schema/refresh: the same limit.
+@limiter.limit("5/minute")
 async def check_drift(
     request: Request,
     connection_id: str,
@@ -201,7 +216,9 @@ async def check_drift(
         schema = _apply_privacy_to_schema(schema, privacy)
 
     # The store keeps what the policy hides; that absence from ``schema`` is not drift.
-    warnings = SemanticModelGenerator().detect_drift(schema, stored_model, privacy)
+    # One diff for the warnings and the flag, the same diff apply-drift acts on.
+    drift = compute_drift(schema, stored_model, privacy)
+    warnings = SemanticModelGenerator().detect_drift(schema, stored_model, privacy, drift=drift)
     # Persist the refreshed cache (a no-op on the fallback path).
     await db.commit()
 
@@ -213,7 +230,639 @@ async def check_drift(
         schema_source=schema_source,
         schema_cached_at=schema_cached_at,
         refresh_error=refresh_error,
+        has_actionable_changes=not drift.is_empty,
     )
+
+
+# ── Apply drift ─────────────────────────────────────────────────────────────────
+
+
+def _without_removed_tables(
+    model: SemanticModel, removed: set[str]
+) -> tuple[list[BusinessMetric], list[CommonJoin], list[DerivedColumn], list[Segment]]:
+    """The model's global items minus the ones naming a removed table by its stored key.
+
+    Exact-key only (``schema.table``): a bare-name reference is not evidence enough
+    to delete a hand-written metric, so it stays and ``detect_drift`` reports it.
+    A segment is removed when every table it applies to is removed; otherwise the
+    removed tables are dropped from its ``applicable_tables`` and it stays. A
+    segment with no ``applicable_tables`` applies everywhere and is kept.
+    """
+    metrics = [m for m in model.business_metrics if not any(t in removed for t in m.related_tables)]
+    joins = [j for j in model.common_joins if not any(t in removed for t in j.tables)]
+    derived = [d for d in model.derived_columns if not any(t in removed for t in d.base_tables)]
+    segments = [
+        s.model_copy(
+            update={"applicable_tables": [t for t in s.applicable_tables if t not in removed]}
+        )
+        if any(t in removed for t in s.applicable_tables)
+        else s
+        for s in model.segments
+        if not (s.applicable_tables and all(t in removed for t in s.applicable_tables))
+    ]
+    return metrics, joins, derived, segments
+
+
+def _rebuild_relationships(
+    current: Sequence[RelationshipEdge],
+    catalog: list[RelationshipEdge],
+    provenance: semantic_store.ProvenanceMap,
+    schema: DataSourceSchema,
+    privacy: PrivacySettings | None,
+    *,
+    render_tables: set[str],
+    keep_hidden_endpoints: bool,
+    new_tables: set[str] | None,
+) -> list[RelationshipEdge]:
+    """The relationship list a rebuild saves — one rule for globals and apply-drift.
+
+    Edges of ``current`` with a gone endpoint leave first (``edges_in_schema``; a
+    hidden or unreadable endpoint counts as live). Marked edges are then carried over
+    the rebuilt ``catalog`` edges bounded to ``render_tables``
+    (``carry_edited_relationships``).
+
+    ``new_tables`` — the apply's rule: a catalog edge the model does not have is added
+    only when it touches one of these (newly annotated) tables. Deleting an unmarked FK
+    edge leaves no mark, so its absence from a model that has had every chance to hold
+    it is the user's deletion, and re-adding it on every apply would undo that — the
+    rule the LLM items follow. Globals passes ``None`` and rebuilds every catalog edge,
+    as a Regenerate should.
+
+    ``keep_hidden_endpoints`` — the apply's rule: an unmarked edge of ``current`` whose
+    endpoint the policy hides or the role cannot read has no catalog twin (the catalog
+    is built from the narrowed schema), yet its endpoint exists, so it is kept — the
+    apply never removes what is hidden or unreadable. An edge alive in the strict
+    schema is the catalog's to rebuild and leaves if the catalog no longer has it.
+    Globals drops hidden-endpoint edges on purpose: they return from the FK once the
+    endpoint is visible again (see "Finalisation" in semantic-model-generation.md).
+    """
+    key = semantic_store.relationship_key
+    survivors = edges_in_schema(current, schema, privacy, keep_unreadable=True)
+    rebuilt = semantic_store.carry_edited_relationships(
+        survivors, catalog, provenance, render_tables=render_tables
+    )
+    if new_tables is not None:
+        had = {key(e) for e in current}
+        rebuilt = [
+            e
+            for e in rebuilt
+            if key(e) in had or e.from_table in new_tables or e.to_table in new_tables
+        ]
+    if keep_hidden_endpoints:
+        strict = {key(e) for e in edges_in_schema(survivors, schema)}
+        have = {key(e) for e in rebuilt}
+        rebuilt += [e for e in survivors if (k := key(e)) not in strict and k not in have]
+    return rebuilt
+
+
+# One apply is one HTTP request, and the proxy gives it 900s (``frontend/nginx.conf``).
+# Each LLM phase may take up to ``_GENERATION_TIMEOUT_SECONDS`` (180s): three table
+# batches and the globals pass are four calls, 720s, which leaves room for the live
+# introspection and the save. New tables past the cap are not sent; the next drift
+# check names them again and the next apply annotates them.
+_DRIFT_MAX_NEW_TABLES = 3 * GENERATION_BATCH_SIZE
+
+
+def _deferred_tables_warning(deferred: list[str], *, preview: bool) -> str:
+    """The warning naming the new tables past ``_DRIFT_MAX_NEW_TABLES`` (up to 5 of them)."""
+    count = len(deferred)
+    sample = ", ".join(deferred[:5]) + (", …" if count > 5 else "")
+    noun, pronoun = ("table", "it") if count == 1 else ("tables", "them")
+    if preview:
+        what = f"{count} more new {noun} will not be annotated by this apply"
+        then = f"Run Check Drift and apply again afterwards to annotate {pronoun}."
+    else:
+        verb = "was" if count == 1 else "were"
+        what = f"{count} more new {noun} {verb} not annotated by this apply"
+        then = f"Run Check Drift and apply again to annotate {pronoun}."
+    return f"{what} (at most {_DRIFT_MAX_NEW_TABLES} per apply): {sample}. {then}"
+
+
+async def _new_tables_in_send_order(
+    db: AsyncSession, connection_id: str, new_keys: set[str]
+) -> list[str]:
+    """``new_keys`` in the order the apply sends them: sorted, except that the tables
+    the newest logged apply reported in ``tables_not_annotated`` go last.
+
+    Only the first ``_DRIFT_MAX_NEW_TABLES`` are sent. In plain sorted order, tables
+    the LLM keeps returning nothing for would hold the front of the list on every
+    apply and starve the ones past the cap; moved last, they are retried once the
+    others are in. The log is read only when the cap applies. An entry whose summary
+    is not a dict, or whose field is missing or not a list of strings, orders nothing.
+    """
+    ordered = sorted(new_keys)
+    if len(ordered) <= _DRIFT_MAX_NEW_TABLES:
+        return ordered
+    retry: set[str] = set()
+    for record in await semantic_store.list_drift_applies(db, connection_id, limit=1):
+        field = (
+            record.summary.get("tables_not_annotated") if isinstance(record.summary, dict) else None
+        )
+        if isinstance(field, list):
+            retry = {key for key in field if isinstance(key, str)}
+    return [k for k in ordered if k not in retry] + [k for k in ordered if k in retry]
+
+
+class _DriftAssembly(NamedTuple):
+    """What ``_drift_applied_model`` returns.
+
+    ``removed_items`` names, by the store's kinds (``metric``, ``common_join``,
+    ``derived_column``, ``segment``), the items taken out because they named a
+    removed table, for ``summarize_model_change(removed_items=...)``.
+    ``llm_warnings`` are the generator's metric checks over the LLM metrics actually
+    added (empty without new tables).
+    """
+
+    model: SemanticModel
+    provenance: semantic_store.ProvenanceMap
+    protected: semantic_store.ProtectedValues
+    notes: list[str]
+    removed_items: dict[str, set[str]]
+    llm_warnings: list[str]
+
+
+def _drift_applied_model(
+    current_model: SemanticModel,
+    snapshot: semantic_store.ProvenanceSnapshot,
+    *,
+    schema: DataSourceSchema,
+    privacy: PrivacySettings | None,
+    drift: SchemaDrift,
+    dialect: str,
+    gen: SemanticModelGenerator,
+    relationship_edges: list[RelationshipEdge],
+    new_tables: dict[str, TableSemantic],
+    llm_items: tuple[list[BusinessMetric], list[CommonJoin], list[DerivedColumn], list[Segment]],
+    connection_id: str,
+    log: bool = True,
+) -> _DriftAssembly:
+    """*current_model* with *drift* applied, and what ``save_model`` needs to store it.
+
+    No session: the apply runs this under the row lock, with the drift recomputed
+    against the re-read model, and saves the result; the dry run runs it on an
+    unlocked read, with no new tables and no LLM items, and only diffs the result — so
+    a preview is computed by the code that applies it. The dry run passes
+    ``log=False``: the hand-edit trims and near-miss drops it previews did not happen,
+    so they must not be logged as if they had.
+
+    Returns a ``_DriftAssembly``; its ``notes`` are ``drop_dangling_edits``' notes on
+    the hand edits it trimmed. The fields a generation sets (``generated_at``,
+    ``generation_model``, ``is_user_reviewed``, ``generation_warnings``) are left to
+    the caller.
+    """
+    provenance, protected, edit_notes = drop_dangling_edits(
+        snapshot.marks, snapshot.protected, schema, privacy, log=log
+    )
+
+    # Removed tables and columns leave here; hidden and unreadable ones stay.
+    pruned = prune_to_schema(current_model.tables, schema, privacy, log=log, keep_unreadable=True)
+    merged_tables = {**pruned, **new_tables}
+    metrics, joins, derived_columns, segments = _without_removed_tables(
+        current_model, drift.removed_table_keys
+    )
+    removed_items = {
+        "metric": {m.name for m in current_model.business_metrics} - {m.name for m in metrics},
+        "common_join": {j.join_pattern for j in current_model.common_joins}
+        - {j.join_pattern for j in joins},
+        "derived_column": {d.name for d in current_model.derived_columns}
+        - {d.name for d in derived_columns},
+        "segment": {s.name for s in current_model.segments} - {s.name for s in segments},
+    }
+    # A removed item's marks leave with it. ``save_model`` stamps marks by name, so a
+    # mark left behind would land on a same-named item the LLM adds below: frozen
+    # against regeneration and shown as hand-edited, though no one edited it.
+    gone_globals = {
+        f"{kind}:{name}"
+        for kind in ("common_join", "derived_column", "segment")
+        for name in removed_items[kind]
+    }
+    provenance = {
+        **provenance,
+        "metric": {
+            k: v
+            for k, v in provenance.get("metric", {}).items()
+            if k not in removed_items["metric"]
+        },
+        "global_item": {
+            k: v for k, v in provenance.get("global_item", {}).items() if k not in gone_globals
+        },
+    }
+    llm_warnings: list[str] = []
+    if new_tables:
+        llm_metrics, llm_joins, llm_derived, llm_segments = llm_items
+        # Only items over a newly annotated table are new. The globals pass sees every
+        # table, so an item over unchanged tables alone is one the model has had a
+        # chance to hold already: if it is missing, the user deleted it (or it is a
+        # near-duplicate of one they kept), and adding it back on every apply would
+        # undo that. A segment with no ``applicable_tables`` applies everywhere, so it
+        # is not about the new tables either.
+        added_keys = set(new_tables)
+        known = sorted(set(merged_tables) | {table_key(t) for t in schema.tables})
+
+        def over_new(refs: list[str]) -> bool:
+            return names_any_table(refs, added_keys, known)
+
+        llm_metrics = [m for m in llm_metrics if over_new(m.related_tables)]
+        llm_joins = [j for j in llm_joins if over_new(j.tables)]
+        llm_derived = [d for d in llm_derived if over_new(d.base_tables)]
+        llm_segments = [s for s in llm_segments if over_new(s.applicable_tables)]
+        # Additive: an existing item (hand-written or generated) is never replaced.
+        llm_metrics, llm_joins, llm_derived, llm_segments = _drop_unstorable_items(
+            llm_metrics, llm_joins, llm_derived, llm_segments, connection_id
+        )
+        have_metrics = {m.name for m in metrics}
+        have_joins = {j.join_pattern for j in joins}
+        have_derived = {d.name for d in derived_columns}
+        have_segments = {s.name for s in segments}
+        added_metrics = [m for m in llm_metrics if m.name not in have_metrics]
+        metrics = metrics + added_metrics
+        # The globals pass's own warnings may name metrics dropped above, and so point
+        # at the user's same-named one; the same check over what was added cannot.
+        llm_warnings = gen._validate_metrics_time_columns(added_metrics, schema)
+        joins = joins + [j for j in llm_joins if j.join_pattern not in have_joins]
+        derived_columns = derived_columns + [d for d in llm_derived if d.name not in have_derived]
+        segments = segments + [s for s in llm_segments if s.name not in have_segments]
+
+    relationships = _rebuild_relationships(
+        current_model.relationships,
+        relationship_edges,
+        provenance,
+        schema,
+        privacy,
+        render_tables=set(merged_tables),
+        keep_hidden_endpoints=True,
+        new_tables=set(new_tables),
+    )
+
+    model = current_model.model_copy(
+        update={
+            "tables": merged_tables,
+            "business_metrics": metrics,
+            "common_joins": joins,
+            "derived_columns": derived_columns,
+            "segments": segments,
+            "relationships": relationships,
+            **_rebuilt_fields(gen, schema, dialect),
+        }
+    )
+    return _DriftAssembly(model, provenance, protected, edit_notes, removed_items, llm_warnings)
+
+
+@router.post("/{connection_id}/semantic/apply-drift", response_model=ApplyDriftResponse)
+@limiter.limit("5/minute")
+async def apply_drift(
+    request: Request,
+    connection_id: str,
+    provider: str = "claude",
+    dry_run: bool = False,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> ApplyDriftResponse:
+    """Apply the schema drift ``GET .../semantic/drift`` reports to the stored model.
+
+    - Removed tables: dropped, with every metric, join and derived column that names
+      them by key, every segment that applies only to them (a segment that also
+      applies to a surviving table just loses the removed ones from its list), and
+      every relationship touching them.
+    - Removed columns: dropped from their table, with the references to them
+      (``prune_to_schema``'s rule, the same one a regenerate applies) and any hand
+      edit naming them (``drop_dangling_edits``).
+    - New tables: annotated by the LLM (in batches, at most ``_DRIFT_MAX_NEW_TABLES``
+      per apply so one request stays inside the proxy timeout; a warning names the
+      rest, which the next apply takes), then — if it annotated any — one globals
+      pass. Of its metrics, joins, derived columns and segments only those over a
+      newly annotated table are taken (one over unchanged tables alone may be one the
+      user deleted), merged *additively*: an existing item keeps its payload against
+      a same-named new one. Its warnings are recomputed over the metrics added. A new
+      table that the model re-read under the lock already holds (stored by a run
+      that finished meanwhile) is left as stored and does not count as new.
+      An item removed above is not "existing": a same-named LLM item replaces it,
+      without its marks, and the summary reports it as removed and added.
+    - Relationships, time expressions, notes and the schema hash are recomputed.
+
+    No LLM call when nothing was added. The schema is always a **live**
+    introspection: acting on a cached one could delete what still exists, so an
+    unreachable source is a 400. What the privacy policy hides and what the
+    connection's role cannot read are never treated as removed (``compute_drift``).
+    A run in progress or interrupted (``tables_partial``) is a 409: pruning under it
+    would race its batches.
+
+    ``dry_run=true`` is the preview: the same assembly (``_drift_applied_model``) on
+    the unlocked read the drift was computed from, no LLM call, nothing written but
+    the refreshed schema cache (which every call commits). New tables are listed by
+    name in ``tables_added`` — exactly the ones the apply would send, in its order
+    (``_new_tables_in_send_order``); relationships to them and the LLM's items over
+    them appear only on apply. The preview's ``warnings`` are the hand-edit notes and,
+    past ``_DRIFT_MAX_NEW_TABLES``, the deferred-tables warning.
+
+    Answers with the stored model (on a dry run, the model as it is) and
+    ``summarize_model_change`` of the result against the model it was built from —
+    every cascade named. Every apply that writes also logs that summary in its save's
+    transaction (``semantic_store.record_drift_apply``); a dry run and an apply with no
+    drift to act on (before or under the lock) write, purge and log nothing. An apply
+    whose result equals the current model (the LLM returned nothing for the only new
+    tables) saves and purges nothing, but is logged when it skipped tables, because the
+    next apply reads that entry to retry them last.
+    Rate limited to 5/minute, like ``POST .../schema/refresh``: every call (a preview
+    too) runs a live introspection. A preview and its apply are two calls.
+    """
+    user_id: str = current_user.id
+    conn = await get_connection_or_404(connection_id, db)
+    # With provenance in the same pass: the dry run previews this very read, so the
+    # drift it diffs and the model it assembles cannot come from two different states.
+    stored_model, stored_snapshot = await semantic_store.load_model_with_provenance(
+        db, connection_id
+    )
+    if stored_model is None:
+        raise HTTPException(status_code=404, detail="No semantic model — generate one first")
+    header = await semantic_store.load_header(db, connection_id)
+    if header is not None and header.generation_status == GenerationStatus.TABLES_PARTIAL:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A generation run is in progress or was interrupted — finish or restart it first"
+            ),
+        )
+
+    try:
+        schema = await refresh_user_schema_cache(conn, user_id, db, get_settings().encryption_key)
+    except SchemaRefreshError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Could not reach the data source to apply drift: {exc}"
+        ) from exc
+    privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
+    if privacy:
+        schema = _apply_privacy_to_schema(schema, privacy)
+
+    drift = compute_drift(schema, stored_model, privacy)
+    # The refreshed schema cache (an upsert plus cache deletes, which take row locks) is
+    # committed now rather than held open through the LLM calls: a rollback below must
+    # not lose it, and concurrent chat cache writes must not wait on it. Safe because
+    # the session keeps loaded objects on commit and the model is re-read under the lock.
+    await db.commit()
+    if drift.is_empty:
+        return ApplyDriftResponse(
+            semantic_model=stored_model, summary=DriftApplySummary(dry_run=dry_run)
+        )
+
+    gen = SemanticModelGenerator()
+    # Strict (no ``privacy``), as in the generation routes: no edge on a column
+    # outside the schema reaches a prompt or is saved as a fresh edge.
+    relationship_edges = edges_in_schema(gen._build_relationship_graph(schema), schema)
+    dialect = conn.source_type
+    new_keys = await _new_tables_in_send_order(db, connection_id, drift.new_table_keys)
+    to_annotate = new_keys[:_DRIFT_MAX_NEW_TABLES]
+    deferred = new_keys[_DRIFT_MAX_NEW_TABLES:]
+
+    if dry_run:
+        # No lock: nothing is written, and a write landing after the read is re-diffed
+        # by the apply itself. The provenance is what ``drop_dangling_edits`` needs to
+        # name the hand edits the apply would trim.
+        preview = _drift_applied_model(
+            stored_model,
+            stored_snapshot,
+            schema=schema,
+            privacy=privacy,
+            drift=drift,
+            dialect=dialect,
+            gen=gen,
+            relationship_edges=relationship_edges,
+            new_tables={},
+            llm_items=([], [], [], []),
+            connection_id=connection_id,
+            log=False,
+        )
+        notes = list(preview.notes)
+        if deferred:
+            notes.append(_deferred_tables_warning(deferred, preview=True))
+        summary = summarize_model_change(
+            stored_model, preview.model, warnings=notes, removed_items=preview.removed_items
+        )
+        return ApplyDriftResponse(
+            semantic_model=stored_model,
+            summary=summary.model_copy(
+                update={
+                    "dry_run": True,
+                    # The tables the apply would send, sorted for display like every list.
+                    # ``changed`` follows: a new table alone is a change.
+                    "tables_added": sorted(to_annotate),
+                }
+            ),
+        )
+
+    new_tables: dict[str, TableSemantic] = {}
+    llm_items: tuple[list[BusinessMetric], list[CommonJoin], list[DerivedColumn], list[Segment]]
+    llm_items = ([], [], [], [])
+    configured_model: str | None = None
+    provider_name: str | None = None
+    if to_annotate:
+        llm_provider, configured_model, provider_name = await _resolve_provider(provider, db)
+        for start in range(0, len(to_annotate), GENERATION_BATCH_SIZE):
+            batch = to_annotate[start : start + GENERATION_BATCH_SIZE]
+            generated = await _run_llm_phase(
+                gen.generate_tables(
+                    schema=schema,
+                    provider=llm_provider,
+                    model=configured_model or None,
+                    table_keys=batch,
+                    relationship_edges=relationship_edges,
+                ),
+                what=f"Drift batch {batch} generation",
+                connection_id=connection_id,
+                provider=provider_name,
+            )
+            # ``generate_tables`` grounds its output to the batch it was given.
+            new_tables.update(generated)
+        if new_tables:
+            # Nothing to say about tables the LLM returned nothing for: skip the call
+            # (and the warnings it would add to a model it changed nothing in).
+            # Pruned strictly so the LLM is not invited to write metrics over gone or
+            # hidden tables; log=False, the post-lock prune warns about the same drops.
+            prompt_tables = {
+                **prune_to_schema(stored_model.tables, schema, log=False),
+                **new_tables,
+            }
+            # Its warnings are dropped: ``_drift_applied_model`` re-runs the check over
+            # the metrics it actually adds (``llm_warnings``).
+            metrics, joins, derived, _, segments = await _run_llm_phase(
+                gen.generate_globals(
+                    schema=schema,
+                    provider=llm_provider,
+                    model=configured_model or None,
+                    all_tables=prompt_tables,
+                    relationship_edges=relationship_edges,
+                ),
+                what="Drift globals generation",
+                connection_id=connection_id,
+                provider=provider_name,
+            )
+            llm_items = (metrics, joins, derived, segments)
+
+    # Re-read under the row lock: a PUT or a batch may have landed during the LLM calls.
+    await _lock_generation(connection_id, db, "apply-drift")
+    current_model, snapshot = await semantic_store.load_model_with_provenance(db, connection_id)
+    if current_model is None:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Semantic model was deleted during apply-drift")
+    current_header = await semantic_store.load_header(db, connection_id)
+    if (
+        current_header is not None
+        and current_header.generation_status == GenerationStatus.TABLES_PARTIAL
+    ):
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A generation run started while drift was being applied — its results "
+                "were discarded"
+            ),
+        )
+
+    # A Regenerate or another apply may have stored a "new" table while the LLM ran.
+    # The re-read holds it now: it is not new, so its stored annotation is not
+    # overwritten, and items over it do not count as "over a new table".
+    new_tables = {k: v for k, v in new_tables.items() if k not in current_model.tables}
+    # The drift the apply acts on is the one against the model it saves over, not the
+    # pre-lock read: a table a PUT added during the LLM calls that the database no
+    # longer has leaves with its items, and a drift another tab applied meanwhile is
+    # not applied — or logged — twice.
+    drift = compute_drift(schema, current_model, privacy)
+    if drift.is_empty:
+        # Every table sent to the LLM is stored by now too (``new_tables`` is empty).
+        # Nothing to do: no row rewrite, no version bump, no cache purge, no log entry.
+        await db.rollback()
+        return ApplyDriftResponse(semantic_model=current_model, summary=DriftApplySummary())
+    assembly = _drift_applied_model(
+        current_model,
+        snapshot,
+        schema=schema,
+        privacy=privacy,
+        drift=drift,
+        dialect=dialect,
+        gen=gen,
+        relationship_edges=relationship_edges,
+        new_tables=new_tables,
+        llm_items=llm_items,
+        connection_id=connection_id,
+    )
+    gen_warnings = [*assembly.llm_warnings, *assembly.notes]
+    if deferred:
+        gen_warnings.append(_deferred_tables_warning(deferred, preview=False))
+    header_update: dict[str, Any] = {"generation_warnings": gen_warnings}
+    if new_tables:
+        # New LLM content: unreviewed, like after a generation run.
+        header_update.update(
+            {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "generation_model": configured_model or provider_name,
+                "is_user_reviewed": False,
+            }
+        )
+    final = assembly.model.model_copy(update=header_update)
+
+    def summary_of(after: SemanticModel) -> DriftApplySummary:
+        return summarize_model_change(
+            current_model,
+            after,
+            # Sent and still missing: the LLM returned nothing for them. The tables past
+            # the cap were never sent; the warning above names those.
+            tables_not_annotated=sorted(set(to_annotate) - set(after.tables)),
+            warnings=gen_warnings,
+            removed_items=assembly.removed_items,
+        )
+
+    summary = summary_of(final)
+    if not summary.changed and not assembly.notes:
+        # The LLM returned nothing for the only new tables: the model is as it was. (A
+        # trimmed hand edit — ``notes`` — is a change the lists do not show, so it is
+        # saved.) Not saved or purged. Skipped tables are still logged, and the commit
+        # releases the lock: the next apply orders its new tables by the newest log
+        # entry's ``tables_not_annotated`` (``_new_tables_in_send_order``), so without
+        # the entry the tables the LLM keeps skipping would hold the front of the list
+        # and starve the rest.
+        if summary.tables_not_annotated:
+            await semantic_store.record_drift_apply(
+                db, connection_id, summary.model_dump(mode="json"), applied_by=user_id
+            )
+            await db.commit()
+        else:
+            await db.rollback()
+        return ApplyDriftResponse(semantic_model=current_model, summary=summary)
+
+    try:
+        stored = await semantic_store.save_model(
+            db,
+            connection_id,
+            final,
+            updated_by=user_id,
+            source="drift",
+            provenance=assembly.provenance,
+            protected=assembly.protected,
+        )
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Of what was stored: the store fits values and dedupes name-keyed items.
+    summary = summary_of(stored)
+    # Logged in the save's transaction: an apply is in the log exactly when it happened.
+    await semantic_store.record_drift_apply(
+        db, connection_id, summary.model_dump(mode="json"), applied_by=user_id
+    )
+    # The schema cache holds this apply's own live introspection: kept (the page's
+    # column lists read it); the query and embedding caches go.
+    await _invalidate_connection_caches(connection_id, db, keep_schema=True)
+    await db.commit()
+    return ApplyDriftResponse(semantic_model=stored, summary=summary)
+
+
+@router.get("/{connection_id}/semantic/drift/history", response_model=list[DriftApplyHistoryEntry])
+async def drift_apply_history(
+    connection_id: str,
+    limit: int = Query(10, ge=1, le=50),
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[DriftApplyHistoryEntry]:
+    """The connection's logged Apply Drifts, newest first.
+
+    Each summary is validated into today's ``DriftApplySummary``: a field an older
+    entry lacks takes its default, so the page can render it; an entry that does not
+    validate at all is skipped and logged, and the route reads on so the response
+    still holds ``limit`` entries when the log has them.
+
+    OVERHEAD: app-only — reads ``semantic_model_history`` in the app DB.
+    """
+    await get_connection_or_404(connection_id, db)
+    entries: list[DriftApplyHistoryEntry] = []
+    offset = 0
+    while len(entries) < limit:
+        wanted = limit - len(entries)
+        records = await semantic_store.list_drift_applies(
+            db, connection_id, limit=wanted, offset=offset
+        )
+        offset += len(records)
+        for record in records:
+            try:
+                summary = DriftApplySummary.model_validate(record.summary)
+            except ValidationError:
+                # A row from before a field changed type, or not a summary at all: one
+                # bad entry must not 500 the whole list. Skipped, and said so in the log;
+                # the next page fills its place.
+                logger.warning(
+                    "drift_apply_history: skipping unreadable entry: connection=%s at=%s",
+                    connection_id,
+                    record.applied_at.isoformat(),
+                )
+                continue
+            entries.append(
+                DriftApplyHistoryEntry(
+                    applied_at=record.applied_at.isoformat(),
+                    applied_by=record.applied_by,
+                    summary=summary,
+                )
+            )
+        if len(records) < wanted:
+            break  # the log ran out
+    return entries
 
 
 # ── Semantic suggestions ────────────────────────────────────────────────────────
@@ -434,7 +1083,7 @@ def _drop_unstorable[T](
         why = semantic_store.name_rejection(kind, name_of(item))
         if why is not None:
             logger.warning(
-                "generate_semantic_globals: dropped generated %s: %s: connection=%s",
+                "dropped generated %s: %s: connection=%s",
                 kind,
                 why,
                 connection_id,
@@ -442,6 +1091,35 @@ def _drop_unstorable[T](
             continue
         kept.append(item)
     return kept
+
+
+def _drop_unstorable_items(
+    metrics: list[BusinessMetric],
+    joins: list[CommonJoin],
+    derived: list[DerivedColumn],
+    segments: list[Segment],
+    connection_id: str,
+) -> tuple[list[BusinessMetric], list[CommonJoin], list[DerivedColumn], list[Segment]]:
+    """``_drop_unstorable`` over the four kinds of LLM global item, keyed as the store
+    keys them (metrics, derived columns and segments by name, joins by pattern)."""
+    return (
+        _drop_unstorable(metrics, "metric", lambda m: m.name, connection_id),
+        _drop_unstorable(joins, "common_join", lambda j: j.join_pattern, connection_id),
+        _drop_unstorable(derived, "derived_column", lambda d: d.name, connection_id),
+        _drop_unstorable(segments, "segment", lambda s: s.name, connection_id),
+    )
+
+
+def _rebuilt_fields(
+    gen: SemanticModelGenerator, schema: DataSourceSchema, dialect: str
+) -> dict[str, Any]:
+    """The model fields every rebuild (globals, apply-drift) recomputes from the schema."""
+    return {
+        "time_expressions": gen.build_time_expressions(dialect),
+        "schema_hash": gen.compute_schema_hash(schema),
+        "source_dialect": dialect,
+        "notes": gen._auto_generate_notes(schema),
+    }
 
 
 _RATE_LIMIT_MARK = "[RATE_LIMIT]"
@@ -761,8 +1439,8 @@ async def generate_semantic_globals(
     Finalises the model (``generation_status = "complete"``) over whatever
     tables are stored, which is what makes "Finish with what's generated" work.
     Tables and columns that are no longer in the schema are pruned here
-    (``prune_to_schema``): a regenerate never blanks the model and the CE has no
-    apply-drift, so this is where they leave.
+    (``prune_to_schema``), as they are by ``/apply-drift``: a regenerate never
+    blanks the model, so this is where a full run drops them.
     """
     user_id: str = current_user.id
     schema, conn = await _load_schema_for_connection(connection_id, current_user, db)
@@ -869,12 +1547,9 @@ async def generate_semantic_globals(
     gen_warnings = [*gen_warnings, *edit_notes]
 
     # One bad LLM item must not fail the whole finalisation in save_model.
-    metrics = _drop_unstorable(metrics, "metric", lambda m: m.name, connection_id)
-    segments = _drop_unstorable(segments, "segment", lambda s: s.name, connection_id)
-    derived_columns = _drop_unstorable(
-        derived_columns, "derived_column", lambda d: d.name, connection_id
+    metrics, joins, derived_columns, segments = _drop_unstorable_items(
+        metrics, joins, derived_columns, segments, connection_id
     )
-    joins = _drop_unstorable(joins, "common_join", lambda j: j.join_pattern, connection_id)
 
     # A user-authored metric, segment, derived column or join carries provenance;
     # the generator's fresh set must not replace it. Name-keyed, like the store.
@@ -912,20 +1587,18 @@ async def generate_semantic_globals(
             "nothing for them, the run was finished before reaching them, or they are new "
             "since the run started. Regenerate to annotate them.",
         ]
-    # A marked edge is carried forward by carry_edited_relationships unbounded, so drop
-    # the ones whose endpoints left the database first — against the live schema, not
-    # the annotated tables, so a user edge to a real but unannotated table survives.
-    # Only *marked* edges are carried from ``current``: an unmarked FK edge to an
-    # endpoint the policy hides is not regenerated while it is hidden
-    # (``relationship_edges`` comes from the narrowed schema) and returns on the
-    # first globals run after it is un-hidden, from the FK it is built from. Nothing
-    # hand-written is lost — see "Finalisation" in semantic-model-generation.md. An
-    # endpoint on a table the role cannot read follows the same rule.
-    pruned_relationships = semantic_store.carry_edited_relationships(
-        edges_in_schema(current_model.relationships, schema, privacy, keep_unreadable=True),
+    # Every catalog edge over the annotated tables, marked edges carried; an unmarked
+    # edge to a hidden endpoint is not carried and returns from the FK once un-hidden
+    # (``_rebuild_relationships``; "Finalisation" in semantic-model-generation.md).
+    pruned_relationships = _rebuild_relationships(
+        current_model.relationships,
         relationship_edges,
         provenance,
+        schema,
+        privacy,
         render_tables=set(pruned),
+        keep_hidden_endpoints=False,
+        new_tables=None,
     )
 
     dialect = conn.source_type
@@ -937,16 +1610,13 @@ async def generate_semantic_globals(
             "derived_columns": derived_columns,
             "segments": segments,
             "relationships": pruned_relationships,
-            "time_expressions": gen.build_time_expressions(dialect),
-            "schema_hash": gen.compute_schema_hash(schema),
-            "source_dialect": dialect,
             "generated_at": datetime.now(UTC).isoformat(),
             "is_user_reviewed": False,
             "generation_model": configured_model or provider_name,
             "generation_status": GenerationStatus.COMPLETE,
             "generation_progress": None,
             "generation_warnings": gen_warnings,
-            "notes": gen._auto_generate_notes(schema),
+            **_rebuilt_fields(gen, schema, dialect),
         }
     )
 

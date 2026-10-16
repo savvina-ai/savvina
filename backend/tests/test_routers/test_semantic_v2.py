@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.database import get_db
+from app.datasources.models import ColumnInfo, DataSourceSchema, SchemaInfo, TableInfo
 from app.main import app
 from app.semantic import store as semantic_store
 from app.semantic.models import SemanticModel
@@ -69,6 +70,24 @@ def _populated() -> SemanticModel:
     return SemanticModel.model_validate(_POPULATED_MODEL)
 
 
+def _live(*tables: tuple[str, list[str]]) -> DataSourceSchema:
+    """What the live introspection returns: ``public`` tables with the given columns."""
+    return DataSourceSchema(
+        source_type="postgresql",
+        schemas=[SchemaInfo(name="public")],
+        tables=[
+            TableInfo(
+                catalog=None,
+                schema_name="public",
+                name=name,
+                table_type="table",
+                columns=[ColumnInfo(name=c, data_type="text", native_type="text") for c in cols],
+            )
+            for name, cols in tables
+        ],
+    )
+
+
 # ── GET /api/v1/connections/{id}/semantic/drift ──────────────────────────────────
 
 
@@ -108,58 +127,41 @@ class TestCheckDrift:
         resp = await http_client.get("/api/v1/connections/missing/semantic/drift")
         assert resp.status_code == 404
 
-    async def test_clean_schema_returns_empty_warnings(self, http_client) -> None:
-        conn = _make_conn()
-        db = _mock_db(MockResult(single=conn))
+    async def _check(self, http_client, live: DataSourceSchema):
+        db = _mock_db(MockResult(single=_make_conn()))
         app.dependency_overrides[get_db] = lambda: db
-
         with (
             patch(f"{_STORE}.load_model", new=AsyncMock(return_value=_populated())),
-            patch("app.routers.semantic.SemanticModelGenerator") as mock_gen,
-            patch("app.routers.semantic.refresh_user_schema_cache", new=AsyncMock()),
+            patch(
+                "app.routers.semantic.refresh_user_schema_cache",
+                new=AsyncMock(return_value=live),
+            ),
         ):
-            mock_gen.return_value.detect_drift.return_value = []
-            resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
+            return await http_client.get("/api/v1/connections/conn-123/semantic/drift")
+
+    async def test_clean_schema_returns_empty_warnings(self, http_client) -> None:
+        resp = await self._check(http_client, _live(("orders", ["status"])))
 
         assert resp.status_code == 200
         body = resp.json()
         assert body["warnings"] == []
         assert body["warning_count"] == 0
+        assert body["has_actionable_changes"] is False
         assert body["connection_id"] == "conn-123"
 
     async def test_drift_with_removed_table_returns_warnings(self, http_client) -> None:
-        conn = _make_conn()
-        db = _mock_db(MockResult(single=conn))
-        app.dependency_overrides[get_db] = lambda: db
-
-        warning = 'Table "public.deleted_table" referenced in semantic model no longer exists'
-        with (
-            patch(f"{_STORE}.load_model", new=AsyncMock(return_value=_populated())),
-            patch("app.routers.semantic.SemanticModelGenerator") as mock_gen,
-            patch("app.routers.semantic.refresh_user_schema_cache", new=AsyncMock()),
-        ):
-            mock_gen.return_value.detect_drift.return_value = [warning]
-            resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
+        resp = await self._check(http_client, _live(("customers", ["id"])))
 
         assert resp.status_code == 200
         body = resp.json()
-        assert body["warning_count"] == 1
-        assert body["warnings"][0] == warning
+        assert any('"public.orders"' in w for w in body["warnings"])
+        assert body["warning_count"] == len(body["warnings"])
+        assert body["has_actionable_changes"] is True
 
     async def test_drift_response_has_checked_at(self, http_client) -> None:
-        conn = _make_conn()
-        db = _mock_db(MockResult(single=conn))
-        app.dependency_overrides[get_db] = lambda: db
+        resp = await self._check(http_client, _live(("orders", ["status"])))
 
-        with (
-            patch(f"{_STORE}.load_model", new=AsyncMock(return_value=_populated())),
-            patch("app.routers.semantic.SemanticModelGenerator") as mock_gen,
-            patch("app.routers.semantic.refresh_user_schema_cache", new=AsyncMock()),
-        ):
-            mock_gen.return_value.detect_drift.return_value = []
-            resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
-
-        assert "checked_at" in resp.json()
+        assert datetime.fromisoformat(resp.json()["checked_at"]).tzinfo is not None
 
 
 # ── GET /api/v1/connections/{id}/semantic/suggestions ────────────────────────────

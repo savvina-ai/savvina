@@ -3,6 +3,8 @@
 
 import apiClient from './client';
 import type {
+  ApplyDriftResponse,
+  DriftApplyHistoryEntry,
   DriftReport,
   PaginatedResponse,
   SemanticModel,
@@ -76,6 +78,28 @@ export const semanticApi = {
   getDrift: (connectionId: string) =>
     apiClient
       .get<DriftReport>(`/api/v1/connections/${connectionId}/semantic/drift`)
+      .then(r => r.data),
+
+  /**
+   * Applies what `getDrift` reported, or with `dryRun` previews it: same summary, nothing
+   * written, no LLM call. 400 when the database is unreachable, 409 during a run.
+   */
+  applyDrift: (connectionId: string, provider?: string, dryRun = false) =>
+    apiClient
+      .post<ApplyDriftResponse>(
+        `/api/v1/connections/${connectionId}/semantic/apply-drift`,
+        undefined,
+        { params: { ...(provider ? { provider } : {}), ...(dryRun ? { dry_run: true } : {}) } },
+      )
+      .then(r => r.data),
+
+  /** Logged Apply Drifts, newest first. */
+  getDriftHistory: (connectionId: string, limit = 10) =>
+    apiClient
+      .get<DriftApplyHistoryEntry[]>(
+        `/api/v1/connections/${connectionId}/semantic/drift/history`,
+        { params: { limit } },
+      )
       .then(r => r.data),
 
   getSuggestions: (connectionId: string) =>
