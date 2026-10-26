@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
-from app.routers._utils import _invalidate_connection_caches
+from sqlalchemy.dialects import postgresql
+
+from app.routers._utils import _invalidate_connection_caches, lock_and_reread_connection
 
 from .conftest import MockResult, _mock_db
 
@@ -26,3 +28,11 @@ class TestInvalidateConnectionCaches:
         db = _mock_db(MockResult(), MockResult())
         await _invalidate_connection_caches("conn-1", db, keep_schema=True)
         assert _tables_deleted(db) == {"query_cache", "table_embedding_cache"}
+
+
+class TestLockAndRereadConnection:
+    async def test_takes_no_key_update_so_fk_inserts_are_not_blocked(self) -> None:
+        db = _mock_db(MockResult(single=object()))
+        await lock_and_reread_connection("conn-1", db)
+        sql = str(db.execute.await_args.args[0].compile(dialect=postgresql.dialect()))
+        assert "FOR NO KEY UPDATE" in sql

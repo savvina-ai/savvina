@@ -127,6 +127,11 @@ class Settings(BaseSettings):
     # Changes are persisted to app_settings and take effect on next process restart.
     db_pool_size: int = 10
     db_max_overflow: int = 20
+    # Server-side cap, in seconds, on any row-lock wait on the app database (0 disables).
+    # Environment-only (DB_LOCK_TIMEOUT_SECONDS): applied when each connection opens.
+    # Through PgBouncer in transaction mode the startup parameter must be allowed via
+    # `ignore_startup_parameters = lock_timeout`, or set DB_LOCK_TIMEOUT_SECONDS=0.
+    db_lock_timeout_seconds: int = Field(30, ge=0)
 
     _WEAK_DEFAULTS: frozenset[str] = frozenset(
         {"change-this", "secret", "changeme", "your-secret-key"}

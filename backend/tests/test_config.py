@@ -213,3 +213,18 @@ class TestBehindTlsProxy:
             behind_tls_proxy=False,
         )
         assert s.behind_tls_proxy is False
+
+
+class TestDbLockTimeout:
+    _REQUIRED: ClassVar[dict] = TestLogLevelValidator._REQUIRED
+
+    def test_default_is_thirty_seconds(self):
+        assert Settings(**self._REQUIRED).db_lock_timeout_seconds == 30
+
+    def test_zero_disables_the_timeout(self):
+        assert Settings(**self._REQUIRED, db_lock_timeout_seconds=0).db_lock_timeout_seconds == 0
+
+    def test_negative_is_rejected(self):
+        """Postgres refuses a negative lock_timeout at connect time, so fail at startup."""
+        with pytest.raises(ValidationError, match="db_lock_timeout_seconds"):
+            Settings(**self._REQUIRED, db_lock_timeout_seconds=-1)

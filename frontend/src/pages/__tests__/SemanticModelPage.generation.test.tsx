@@ -253,6 +253,36 @@ describe('SemanticModelPage — finishing an interrupted generation', () => {
     expect(semanticApi.generateGlobals).toHaveBeenCalledTimes(1);
   });
 
+  it('retries a 503 with backoff, then succeeds', async () => {
+    const user = userEvent.setup();
+    vi.mocked(semanticApi.generateGlobals)
+      .mockRejectedValueOnce(httpError(503, 'Provider unavailable') as never)
+      .mockResolvedValue(COMPLETE_MODEL as never);
+
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: /Finish with what's generated/i }));
+
+    // First retry waits 2s (real timers).
+    await waitFor(() => expect(semanticApi.generateGlobals).toHaveBeenCalledTimes(2), {
+      timeout: 5000,
+    });
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /^Regenerate$/ })).toBeEnabled(),
+    );
+    expect(screen.queryByText(/Generation failed:/)).not.toBeInTheDocument();
+  }, 10000);
+
+  it('does not retry a 504: the server already spent its whole timeout', async () => {
+    const user = userEvent.setup();
+    vi.mocked(semanticApi.generateGlobals).mockRejectedValue(httpError(504, 'timed out') as never);
+
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: /Finish with what's generated/i }));
+
+    expect(await screen.findByText(/Generation failed: timed out/)).toBeInTheDocument();
+    expect(semanticApi.generateGlobals).toHaveBeenCalledTimes(1);
+  });
+
   // The banner reads the one generation mutation's error, which TanStack clears when the
   // next run starts. A failed full run followed by a successful Finish must not leave the
   // red banner up over a model that is now complete.

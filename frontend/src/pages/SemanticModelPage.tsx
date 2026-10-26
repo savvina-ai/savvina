@@ -405,13 +405,14 @@ const MAX_GENERATION_RETRIES = 4;
 type RetryToken = { cancelled: boolean };
 
 /**
- * Retry a generation call on a throttle or a dropped connection.
+ * Retry a generation call on a throttle, a transient outage or a dropped connection.
  *
- * 429 covers both our own per-IP limiter and an upstream provider throttle, which the
- * backend maps to 429 rather than 422 precisely so this retry can see it. Any other
- * status is permanent for this run, and continuing would burn the remaining batches
- * against a provider that is going to refuse them too — so the first permanent failure
- * cancels the shared token.
+ * 429 covers both our own per-IP limiter and an upstream provider throttle; 503 covers
+ * a provider 5xx or dropped connection and a busy connection row lock. The backend maps
+ * these to 429/503 rather than 422 precisely so this retry can see them (the SDKs'
+ * own silent retries are off for generation). Any other status is permanent for this
+ * run, and continuing would burn the remaining batches against a provider that is going
+ * to refuse them too — so the first permanent failure cancels the shared token.
  *
  * Module-level rather than a closure inside the full-run mutation, because the
  * globals-only "Finish with what's generated" path must share this exact policy rather
@@ -425,7 +426,7 @@ async function withRetry<T>(call: () => Promise<T>, token: RetryToken): Promise<
     } catch (err: unknown) {
       const status = axios.isAxiosError(err) ? err.response?.status : undefined;
       const isNetworkError = axios.isAxiosError(err) && !err.response;
-      const isRetryable = status === 429 || isNetworkError;
+      const isRetryable = status === 429 || status === 503 || isNetworkError;
       if (!isRetryable || attempt === MAX_GENERATION_RETRIES - 1) {
         token.cancelled = true;
         throw err;

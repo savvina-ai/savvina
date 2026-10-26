@@ -827,6 +827,36 @@ class TestGenerateBatch:
         assert record.exc_info is None
         assert "provider=claude" in record.getMessage()
 
+    async def test_a_provider_outage_is_503_so_the_client_retries(
+        self, http_client, caplog
+    ) -> None:
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches()
+        with (
+            caplog.at_level(logging.WARNING, logger="app.routers.semantic"),
+            p_load as mock_load,
+            p_prov,
+            p_gen as mock_gen,
+            p_hdr,
+            p_rec,
+            p_adv,
+        ):
+            self._wire(
+                mock_load,
+                mock_gen,
+                ValueError(
+                    "LLM call failed in generate_tables: [PROVIDER_UNAVAILABLE] "
+                    "The provider returned HTTP 503."
+                ),
+            )
+            app.dependency_overrides[get_db] = lambda: _mock_db()
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+        assert resp.status_code == 503
+        assert "[PROVIDER_UNAVAILABLE]" in resp.json()["detail"]
+        # Expected and retried: a warning, no traceback.
+        [record] = [r for r in caplog.records if r.name == "app.routers.semantic"]
+        assert record.levelno == logging.WARNING
+        assert record.exc_info is None
+
     async def test_an_exhausted_quota_is_422_not_a_retried_throttle(self, http_client) -> None:
         p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches()
         with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:

@@ -90,7 +90,7 @@ routers/semantic.py: generate_semantic_init()
   │    ├─ _schema_from_dict()                             # deserialise to DataSourceSchema
   │    └─ _apply_privacy_to_schema()                      # strip excluded schemas/tables/columns (+ their FKs)
   ├─ table_key(t) for each table / gen.compute_schema_hash(schema)  # work list + hash; no LLM call
-  ├─ _lock_generation()                                   # connection row lock (FOR UPDATE)
+  ├─ _lock_generation()                                   # connection row lock (FOR NO KEY UPDATE)
   └─ store.pending_table_keys() / store.begin_generation() # work list + header stamp; no table/column row touched
 
 routers/semantic.py: generate_semantic_batch(body.table_keys)  (one call per batch)
@@ -150,7 +150,7 @@ All three phases begin the same way: load the schema JSON from `UserSchemaCache`
 
 Init makes no LLM call. It takes the table keys from the privacy-filtered schema (`datasources.models.table_key`), hashes the schema (`SemanticModelGenerator.compute_schema_hash`) and sizes the batches with `GENERATION_BATCH_SIZE = 4`. The relationship graph is not built here: each LLM phase builds it when it needs it, with `_build_relationship_graph(schema)`, which reads `DataSourceSchema.relationships` (already populated by `introspect()` from `information_schema`) and makes no DB query.
 
-The router takes the connection row lock (`FOR UPDATE`) and stamps the header row (`store.begin_generation`): `generation_status = "tables_partial"`, `generation_progress = {tables_done, tables_total, batch_size}`, `schema_hash` from the cached schema, and a fresh `generation_run_id` (kept, not minted, on `?resume=true`). **Nothing is blanked** — init is never destructive and touches no table or column row; a run reconciles onto the rows that already exist.
+The router takes the connection row lock (`FOR NO KEY UPDATE`) and stamps the header row (`store.begin_generation`): `generation_status = "tables_partial"`, `generation_progress = {tables_done, tables_total, batch_size}`, `schema_hash` from the cached schema, and a fresh `generation_run_id` (kept, not minted, on `?resume=true`). **Nothing is blanked** — init is never destructive and touches no table or column row; a run reconciles onto the rows that already exist.
 
 `GenerateInitResponse` carries `tables_total`, `batch_count`, `batch_size`, `resumed` and `pending_table_keys`, the exact work list: every table on a fresh run, or only the tables the interrupted run had not stamped on a resume (`store.pending_table_keys` compares each table row's `generation_run_id` with the header's). The frontend slices that list into batches itself; the server keeps nothing positional. `batch_count` is the number of batches the list makes (at least 1). A resume is refused with `400` when there is no `tables_partial` model and with `409` when the schema hash no longer matches. A `tables_partial` model backfilled by migration 0003 from a blob-era interrupted run has neither a schema hash nor a run id; `resume=true` on such a model runs a fresh, non-destructive run (every table pending, hand edits kept) and answers `resumed: false`.
 

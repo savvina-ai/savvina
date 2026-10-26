@@ -6,9 +6,9 @@
 Only the LLM (``generate_tables`` / ``generate_globals``), provider resolution and
 schema loading are mocked; everything else — the routes, the row lock, the store's
 reconcile, run stamping, provenance and the full save — runs against an in-memory
-SQLite database. SQLite ignores ``FOR UPDATE``, so this proves the flow, not the
-locking (that is covered against PostgreSQL by review, and by the route unit tests
-asserting the lock is taken).
+SQLite database. SQLite ignores ``FOR NO KEY UPDATE`` / ``FOR UPDATE``, so this
+proves the flow, not the locking (that is covered against PostgreSQL by review, and
+by the route unit tests asserting the lock is taken).
 """
 
 from __future__ import annotations

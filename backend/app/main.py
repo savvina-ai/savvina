@@ -29,6 +29,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import DBAPIError
 from starlette.datastructures import MutableHeaders
 
 if TYPE_CHECKING:
@@ -47,6 +48,7 @@ from .config import get_settings
 from .core.logging_config import configure_logging as _configure_logging
 from .core.request_context import request_id_var
 from .database import async_session_maker
+from .db_errors import db_error_handler
 from .version import __version__
 
 logger = logging.getLogger(__name__)
@@ -325,26 +327,9 @@ async def lifespan(app: FastAPI):
     # so all subsequent requests use the persisted pool configuration.
     _pool_keys = {"db_pool_size", "db_max_overflow"}
     if _pool_keys & {r.key for r in _rows}:
-        from sqlalchemy.ext.asyncio import (
-            async_sessionmaker as _async_sm,
-        )
-        from sqlalchemy.ext.asyncio import (
-            create_async_engine as _cae,
-        )
+        from .database import rebuild_engine
 
-        import app.database as _db_mod
-
-        _new_engine = _cae(
-            settings.database_url,
-            echo=settings.debug,
-            pool_pre_ping=True,
-            pool_recycle=3600,
-            pool_size=settings.db_pool_size,
-            max_overflow=settings.db_max_overflow,
-        )
-        await _db_mod.engine.dispose()
-        _db_mod.engine = _new_engine
-        _db_mod.async_session_maker = _async_sm(_new_engine, expire_on_commit=False)
+        await rebuild_engine()
         logger.info(
             "Database pool recreated: pool_size=%d, max_overflow=%d",
             settings.db_pool_size,
@@ -405,6 +390,7 @@ app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
 # so that SlowAPIMiddleware can find it even during tests that skip lifespan.
 app.state.limiter = _limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_exception_handler(DBAPIError, db_error_handler)
 
 # ── Middleware stack (registration order = innermost → outermost) ─────────────
 #

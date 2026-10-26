@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 
@@ -19,7 +20,9 @@ from .base import (
     LLMResponse,
     ModelInfo,
     _raise_if_fetch_error,
+    is_transient_status,
     parse_llm_response,
+    provider_unavailable,
 )
 from .registry import register_provider
 
@@ -223,8 +226,11 @@ class OpenAIProvider(BaseLLMProvider):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ]
+        # The app owns retries for generation (the page's backoff); the SDK's own
+        # silent ones would multiply them and outlast the router's timeout.
+        client = self._client.with_options(max_retries=0)
         try:
-            response = await self._client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=model or self._default_model,
                 messages=messages,
                 max_tokens=max_tokens,
@@ -232,21 +238,55 @@ class OpenAIProvider(BaseLLMProvider):
                 response_format={"type": "json_object"},
             )
         except openai.APIStatusError as exc:
+            if is_transient_status(exc.status_code):
+                raise provider_unavailable(
+                    f"The provider returned HTTP {exc.status_code}."
+                ) from exc
             # Fall back to base (text-mode) only for 400 — provider doesn't support json_object.
             # Any other status (429 rate-limit, 401 auth, …) is a real error; surface it.
-            if exc.status_code != 400:
-                raise self._normalize_api_error(exc) from exc
-            return await super().generate_structured(
-                system_prompt,
-                user_message,
-                schema_type,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+            # A 400 that says the prompt itself is too large is a real error too: a
+            # text-mode resend of the same prompt would fail the same way.
+            normalized = self._normalize_api_error(exc)
+            if exc.status_code != 400 or str(normalized).startswith("[CONTEXT_EXCEEDED]"):
+                raise normalized from exc
+            # Run the text-mode fallback on the same no-retry client (a shallow copy, so
+            # self is untouched). A 5xx inside it still surfaces as an untagged
+            # [PROVIDER_ERROR] from the shared normaliser (chat uses it too), so the page
+            # will not retry it; the fallback only runs after a 400, which is rare.
+            scoped = copy.copy(self)
+            scoped._client = client
+            try:
+                return await super(OpenAIProvider, scoped).generate_structured(
+                    system_prompt,
+                    user_message,
+                    schema_type,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except openai.APIConnectionError as conn_exc:
+                raise provider_unavailable(
+                    "The connection to the provider failed or timed out."
+                ) from conn_exc
+        except openai.APIConnectionError as exc:
+            raise provider_unavailable(
+                "The connection to the provider failed or timed out."
+            ) from exc
         if not response.choices:
             raise ValueError("OpenAIProvider.generate_structured: no choices in response")
-        raw = response.choices[0].message.content or "{}"
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise ValueError(
+                f"The model's reply was cut off at the {max_tokens}-token output limit, so "
+                f"the structured result is incomplete. Use a model with a larger output "
+                f"limit or annotate fewer tables per run."
+            )
+        raw = choice.message.content
+        if not raw or not raw.strip():
+            raise ValueError(
+                "[EMPTY_RESPONSE] The model returned an empty reply (a content filter or "
+                "a reasoning model that spent its output budget). Try again or switch model."
+            )
         return schema_type.model_validate(json.loads(raw))
 
     async def health_check(self) -> tuple[bool, str]:

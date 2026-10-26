@@ -429,6 +429,7 @@ Phase 2 — call once per batch. Sends one batch of tables to the LLM, reconcile
 **Response `422`:** The LLM call failed or its response could not be used (including an exhausted provider balance, `[QUOTA_EXCEEDED]`, which waiting does not fix), or the request body failed validation (`table_keys` empty or more than 4 entries)
 **Response `429`:** The provider throttled the call (the detail carries `[RATE_LIMIT]`), or the per-IP limit was hit — retry with backoff
 **Response `500`:** An unexpected error
+**Response `503`:** The provider was unavailable (a 5xx or a dropped connection; the detail carries `[PROVIDER_UNAVAILABLE]`): retry with backoff
 **Response `504`:** The batch timed out (180 s)
 
 ---
@@ -447,9 +448,10 @@ Tables and columns that are no longer in the database are removed here, together
 **Response `422`:** The LLM call failed or its response could not be used
 **Response `429`:** The provider throttled the call, or the per-IP limit was hit — retry with backoff
 **Response `500`:** An unexpected error
+**Response `503`:** The provider was unavailable (a 5xx or a dropped connection; the detail carries `[PROVIDER_UNAVAILABLE]`): retry with backoff
 **Response `504`:** Timed out (180 s)
 
-An LLM failure fails this call like a batch (`422`, or `429` on a throttle): the model stays `tables_partial`, and the web client offers **Finish with what's generated** and **Resume**.
+An LLM failure fails this call like a batch (`422`, `429` on a throttle, or `503` on a provider outage): the model stays `tables_partial`, and the web client offers **Finish with what's generated** and **Resume**.
 
 A completed model can carry `generation_warnings` from this call: the generator's own warnings (for example a time-series pattern in a metric over a fiscal-period table); one note per hand edit that named a column the table no longer has (a primary timestamp or date column naming it, or a list left empty, is cleared and no longer counts as a hand edit; a list with live entries keeps them and stays a hand edit); and one warning naming every table of the schema that has no annotation (the LLM returned nothing for it, the run was finished before reaching it, or it is new since the run started).
 
@@ -548,9 +550,10 @@ Removing is structural and makes no LLM call. Hand edits on surviving tables are
 **Response `422`:** The LLM pass for new tables failed, or the provider's quota is exhausted
 **Response `429`:** The provider throttled the LLM pass (retry later), or the per-IP rate limit was hit
 **Response `500`:** The LLM pass failed unexpectedly
+**Response `503`:** The provider was unavailable for the LLM pass (a 5xx or a dropped connection; the detail carries `[PROVIDER_UNAVAILABLE]`): the model is unchanged; the route does not retry on its own, so apply again
 **Response `504`:** The LLM pass timed out
 
-On a `422`, `500` or `504`, or a provider-throttle `429`, the model is unchanged (the refreshed schema cache is already committed).
+On a `422`, `500`, `503` or `504`, or a provider-throttle `429`, the model is unchanged (the refreshed schema cache is already committed).
 
 ---
 
@@ -1150,5 +1153,6 @@ Update application settings. Each key is persisted to `app_settings` and survive
 | 422 | Request body failed schema validation (FastAPI/pydantic) |
 | 500 | Server error (LLM failure, unexpected exception) |
 | 502 | Upstream provider unreachable or rejected the credentials (provider model-fetch endpoints) |
+| 503 | Retryable. Any route can answer `503` with `Retry-After: 5` when a database row lock is held by a long operation on the same connection for longer than `DB_LOCK_TIMEOUT_SECONDS` (detail: "This connection is busy with another operation; try again shortly."). The semantic-generation routes also answer `503` when the LLM provider is unavailable. |
 
 Errors return a JSON body: `{"detail": "Human-readable error message"}`

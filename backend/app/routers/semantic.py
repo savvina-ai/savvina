@@ -31,6 +31,7 @@ from ..models.semantic_suggestion import SemanticSuggestion
 from ..models.user import User
 from ..models.user_schema_cache import UserSchemaCache
 from ..providers._factory import resolve_provider_config
+from ..providers.base import PROVIDER_UNAVAILABLE_MARK
 from ..schemas.pagination import PaginatedResponse
 from ..schemas.semantic import (
     ApplyDriftResponse,
@@ -1138,6 +1139,9 @@ async def _run_llm_phase[T](
       sees it. Logged as a warning without a traceback: throttles are expected and
       retried. (A provider's exhausted quota carries ``[QUOTA_EXCEEDED]`` instead
       and is a 422: waiting does not fix it.)
+    - ``ValueError`` carrying ``[PROVIDER_UNAVAILABLE]`` (a provider 5xx or a dropped
+      connection; the SDK's own retries are off for these calls): 503, retried by the
+      page like a throttle, logged as a warning without a traceback.
     - Any other ``ValueError``: 422, logged with its traceback.
     - Anything else: 500, logged with its traceback.
 
@@ -1162,6 +1166,15 @@ async def _run_llm_phase[T](
                 "%s throttled: connection=%s provider=%s: %s", what, connection_id, provider, exc
             )
             raise HTTPException(status_code=429, detail=str(exc)) from exc
+        if PROVIDER_UNAVAILABLE_MARK in str(exc):
+            logger.warning(
+                "%s provider unavailable: connection=%s provider=%s: %s",
+                what,
+                connection_id,
+                provider,
+                exc,
+            )
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         logger.exception("%s failed: connection=%s provider=%s", what, connection_id, provider)
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
@@ -1170,7 +1183,7 @@ async def _run_llm_phase[T](
 
 
 async def _lock_generation(connection_id: str, db: AsyncSession, during: str) -> None:
-    """Take the connection row lock (``FOR UPDATE``) the generation routes serialise on.
+    """Take the connection row lock (``FOR NO KEY UPDATE``) the generation routes serialise on.
 
     The helper 404s on a vanished row; these routes report 409 instead (after a
     rollback), because the connection existed when the request started and the
@@ -1367,7 +1380,7 @@ async def generate_semantic_batch(
             connection_id,
         )
 
-    # Take the connection row lock (FOR UPDATE) before reconciling. It is what
+    # Take the connection row lock (FOR NO KEY UPDATE) before reconciling. It is what
     # serialises concurrent batches, and advance_progress's recount of this run's
     # stamped tables is only correct because no other batch stamps rows between
     # its count and its write.

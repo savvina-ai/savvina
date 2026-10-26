@@ -38,17 +38,22 @@ async def get_connection_or_404(
 
 
 async def lock_and_reread_connection(conn_id: str, db: AsyncSession) -> Connection:
-    """Re-fetch *conn_id* under ``FOR UPDATE``, bypassing the identity-map cache.
+    """Re-fetch *conn_id* under ``FOR NO KEY UPDATE``, bypassing the identity-map cache.
 
     Call immediately before composing a write to the semantic store
     (``semantic/store.py``) in any handler that read the connection earlier in
     the same request, so the write merges into the latest committed state
     rather than a stale snapshot from a concurrent request.
+
+    ``FOR NO KEY UPDATE`` (not ``FOR UPDATE``): writers still exclude each other,
+    but the ``FOR KEY SHARE`` lock a foreign-key insert (chat session, cache entry,
+    verified example, suggestion) takes on this row does not conflict, so a long
+    save or apply does not stall chat.
     """
     stmt = (
         select(Connection)
         .where(Connection.id == conn_id, Connection.is_active.is_(True))
-        .with_for_update()
+        .with_for_update(key_share=True)
         .execution_options(populate_existing=True)
     )
     result = await db.execute(stmt)

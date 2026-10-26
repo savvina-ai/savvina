@@ -16,8 +16,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import openai
+from pydantic import BaseModel
 import pytest
 
+from app.providers.base import BaseLLMProvider, is_transient_status
 from app.providers.openai_provider import OpenAIProvider
 
 _FAKE_URL = "https://api.openai.com/v1/chat/completions"
@@ -27,6 +29,7 @@ def _make_provider() -> OpenAIProvider:
     """Instantiate OpenAIProvider without calling __init__ (avoids network setup)."""
     provider = OpenAIProvider.__new__(OpenAIProvider)
     provider._client = MagicMock()
+    provider._client.with_options.return_value = provider._client
     provider._default_model = "gpt-4o"
     return provider
 
@@ -276,3 +279,202 @@ class TestOpenAIProviderAPIStatusErrors:
             await provider.generate_response(
                 system_prompt="sys", user_message="q", conversation_history=[]
             )
+
+
+class _Schema(BaseModel):
+    value: str = "default"
+
+
+def _structured_response(content: str | None, finish_reason: str = "stop") -> MagicMock:
+    choice = MagicMock()
+    choice.message.content = content
+    choice.finish_reason = finish_reason
+    response = MagicMock()
+    response.choices = [choice]
+    return response
+
+
+class TestOpenAIGenerateStructuredGuards:
+    async def test_truncated_reply_raises(self) -> None:
+        """A reply cut off at max_tokens is incomplete, however valid the JSON prefix."""
+        provider = _make_provider()
+        provider._client.chat.completions.create = AsyncMock(
+            return_value=_structured_response('{"value": "x"}', finish_reason="length")
+        )
+        with pytest.raises(ValueError, match="cut off"):
+            await provider.generate_structured(
+                system_prompt="sys", user_message="q", schema_type=_Schema, max_tokens=123
+            )
+
+    @pytest.mark.parametrize("content", [None, "", "   "])
+    async def test_blank_reply_raises_instead_of_becoming_empty_json(
+        self, content: str | None
+    ) -> None:
+        provider = _make_provider()
+        provider._client.chat.completions.create = AsyncMock(
+            return_value=_structured_response(content)
+        )
+        with pytest.raises(ValueError, match=r"\[EMPTY_RESPONSE\]"):
+            await provider.generate_structured(
+                system_prompt="sys", user_message="q", schema_type=_Schema
+            )
+
+    async def test_a_model_that_answers_an_empty_object_still_validates(self) -> None:
+        provider = _make_provider()
+        provider._client.chat.completions.create = AsyncMock(
+            return_value=_structured_response("{}")
+        )
+        result = await provider.generate_structured(
+            system_prompt="sys", user_message="q", schema_type=_Schema
+        )
+        assert result.value == "default"
+
+    async def test_context_exceeded_400_is_not_retried_in_text_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = _make_provider()
+        body = {"error": {"message": "too long", "code": "context_length_exceeded"}}
+        provider._client.chat.completions.create = AsyncMock(
+            side_effect=_make_api_status_error(400, body)
+        )
+        fallback = AsyncMock()
+        monkeypatch.setattr(BaseLLMProvider, "generate_structured", fallback)
+        with pytest.raises(ValueError, match=r"\[CONTEXT_EXCEEDED\]"):
+            await provider.generate_structured(
+                system_prompt="sys", user_message="q", schema_type=_Schema
+            )
+        fallback.assert_not_awaited()
+
+    async def test_other_400_still_falls_back_to_text_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 400 that means "json_object unsupported" keeps the text-mode fallback."""
+        provider = _make_provider()
+        body = {"error": {"message": "unsupported response_format", "code": "invalid"}}
+        provider._client.chat.completions.create = AsyncMock(
+            side_effect=_make_api_status_error(400, body)
+        )
+        sentinel = _Schema(value="from-fallback")
+        fallback = AsyncMock(return_value=sentinel)
+        monkeypatch.setattr(BaseLLMProvider, "generate_structured", fallback)
+        result = await provider.generate_structured(
+            system_prompt="sys", user_message="q", schema_type=_Schema
+        )
+        assert result is sentinel
+        fallback.assert_awaited_once()
+
+    async def test_structured_calls_disable_the_sdk_retries(self) -> None:
+        provider = _make_provider()
+        provider._client.chat.completions.create = AsyncMock(
+            return_value=_structured_response('{"value": "x"}')
+        )
+        await provider.generate_structured(
+            system_prompt="sys", user_message="q", schema_type=_Schema
+        )
+        provider._client.with_options.assert_called_once_with(max_retries=0)
+
+    @pytest.mark.parametrize("status", [408, 409, 500, 501, 502, 503, 504, 520, 524, 529])
+    async def test_transient_status_is_tagged_retryable(self, status: int) -> None:
+        provider = _make_provider()
+        provider._client.chat.completions.create = AsyncMock(
+            side_effect=_make_api_status_error(status, {"error": {"message": "down"}})
+        )
+        with pytest.raises(ValueError, match=r"\[PROVIDER_UNAVAILABLE\]"):
+            await provider.generate_structured(
+                system_prompt="sys", user_message="q", schema_type=_Schema
+            )
+
+    async def test_a_dropped_connection_is_tagged_retryable(self) -> None:
+        provider = _make_provider()
+        provider._client.chat.completions.create = AsyncMock(
+            side_effect=openai.APIConnectionError(request=httpx.Request("POST", _FAKE_URL))
+        )
+        with pytest.raises(ValueError, match=r"\[PROVIDER_UNAVAILABLE\]"):
+            await provider.generate_structured(
+                system_prompt="sys", user_message="q", schema_type=_Schema
+            )
+
+    async def test_a_permanent_status_is_not_tagged_retryable(self) -> None:
+        provider = _make_provider()
+        provider._client.chat.completions.create = AsyncMock(
+            side_effect=_make_api_status_error(401, {"error": {"message": "bad key"}})
+        )
+        with pytest.raises(ValueError, match=r"\[AUTH_ERROR\]"):
+            await provider.generate_structured(
+                system_prompt="sys", user_message="q", schema_type=_Schema
+            )
+
+    async def test_429_is_a_rate_limit_not_unavailable(self) -> None:
+        provider = _make_provider()
+        provider._client.chat.completions.create = AsyncMock(
+            side_effect=_make_api_status_error(429, {"error": {"message": "slow down"}})
+        )
+        with pytest.raises(ValueError, match=r"\[RATE_LIMIT\]") as excinfo:
+            await provider.generate_structured(
+                system_prompt="sys", user_message="q", schema_type=_Schema
+            )
+        assert "[PROVIDER_UNAVAILABLE]" not in str(excinfo.value)
+
+    async def test_text_fallback_runs_on_the_no_retry_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The text-mode fallback must not go back to the SDK-default-retry client."""
+        provider = _make_provider()
+        original_client = provider._client
+        scoped_client = MagicMock()
+        original_client.with_options.return_value = scoped_client
+        body = {"error": {"message": "unsupported response_format", "code": "invalid"}}
+        scoped_client.chat.completions.create = AsyncMock(
+            side_effect=_make_api_status_error(400, body)
+        )
+        seen: list[object] = []
+        sentinel = _Schema(value="from-fallback")
+
+        async def fake(self, *args, **kwargs):
+            seen.append(self._client)
+            return sentinel
+
+        monkeypatch.setattr(BaseLLMProvider, "generate_structured", fake)
+        result = await provider.generate_structured(
+            system_prompt="sys", user_message="q", schema_type=_Schema
+        )
+        assert result is sentinel
+        assert seen == [scoped_client]
+        assert provider._client is original_client
+
+    async def test_a_dropped_connection_in_the_text_fallback_is_tagged_retryable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = _make_provider()
+        body = {"error": {"message": "unsupported response_format", "code": "invalid"}}
+        provider._client.chat.completions.create = AsyncMock(
+            side_effect=_make_api_status_error(400, body)
+        )
+        fallback = AsyncMock(
+            side_effect=openai.APIConnectionError(request=httpx.Request("POST", _FAKE_URL))
+        )
+        monkeypatch.setattr(BaseLLMProvider, "generate_structured", fallback)
+        with pytest.raises(ValueError, match=r"\[PROVIDER_UNAVAILABLE\]"):
+            await provider.generate_structured(
+                system_prompt="sys", user_message="q", schema_type=_Schema
+            )
+
+
+class TestIsTransientStatus:
+    @pytest.mark.parametrize(
+        ("status", "expected"),
+        [
+            (400, False),
+            (408, True),
+            (409, True),
+            (429, False),
+            (499, False),
+            (500, True),
+            (501, True),
+            (529, True),
+            (599, True),
+            (600, False),
+        ],
+    )
+    def test_classifies_statuses(self, status: int, expected: bool) -> None:
+        assert is_transient_status(status) is expected

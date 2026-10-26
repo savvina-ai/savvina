@@ -87,6 +87,7 @@ A provider with no saved config shows a grey "not configured" dot on the Setting
 | `LOG_FORMAT` | string | `json` | Log output format. Use `text` for development (human-readable) and `json` for production (one JSON object per line, suitable for log aggregators). |
 | `APP_PORT` | int | `3000` | Port the frontend container is exposed on. Update `CORS_ORIGINS` if you change this. |
 | `DATABASE_URL` | string | **Required** | asyncpg connection URL for the application PostgreSQL database. See [Database Mode](#database-mode) for the correct value for your setup. |
+| `DB_LOCK_TIMEOUT_SECONDS` | int | `30` | Server-side cap, in seconds, on how long a statement waits for a row lock on the application database, set when each connection opens. A request that waits longer is answered `503` with `Retry-After: 5`. `0` disables the cap; negative values are rejected. Environment-only — not a UI setting. Behind PgBouncer in transaction mode, add `ignore_startup_parameters = lock_timeout` to its config, or set this to `0`. |
 | `CORS_ORIGINS` | JSON array | `["http://localhost:3000"]` | Allowed CORS origins as a JSON array string. Example: `["http://localhost:3000","https://analytics.example.com"]` |
 
 ---
@@ -189,7 +190,7 @@ These are stored in the `app_settings` table and edited from the **Settings** pa
 | `db_max_overflow` | `20` | Connections allowed beyond the pool size under load. **Restart required.** |
 | `bcrypt_rounds` | `12` | Password hashing cost factor. Raising it slows every login and registration. |
 
-Read them with `GET /api/v1/settings` and change them with `PUT /api/v1/settings`.
+Read them with `GET /api/v1/settings` and change them with `PUT /api/v1/settings`. The database lock timeout, `DB_LOCK_TIMEOUT_SECONDS` (see [Application Settings](#application-settings)), is environment-only and is not listed here.
 
 ---
 

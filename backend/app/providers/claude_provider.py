@@ -18,7 +18,9 @@ from .base import (
     LLMResponse,
     ModelInfo,
     _raise_if_fetch_error,
+    is_transient_status,
     parse_llm_response,
+    provider_unavailable,
 )
 from .registry import register_provider
 
@@ -165,8 +167,11 @@ class ClaudeProvider(BaseLLMProvider):
     ) -> _BM:
         """Use Anthropic tool-use to constrain the response to the given Pydantic schema."""
         _tool_name = "submit_structured_result"
+        # The app owns retries for generation (the page's backoff); the SDK's own
+        # silent ones would multiply them and outlast the router's timeout.
+        client = self._client.with_options(max_retries=0)
         try:
-            response = await self._client.messages.create(
+            response = await client.messages.create(
                 model=model or self._default_model,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}],
@@ -181,7 +186,21 @@ class ClaudeProvider(BaseLLMProvider):
                 max_tokens=max_tokens,
             )
         except anthropic.APIStatusError as exc:
+            if is_transient_status(exc.status_code):
+                raise provider_unavailable(
+                    f"The provider returned HTTP {exc.status_code}."
+                ) from exc
             raise self._normalize_api_error(exc) from exc
+        except anthropic.APIConnectionError as exc:
+            raise provider_unavailable(
+                "The connection to the provider failed or timed out."
+            ) from exc
+        if response.stop_reason == "max_tokens":
+            raise ValueError(
+                f"The model's reply was cut off at the {max_tokens}-token output limit, so "
+                f"the structured result is incomplete. Use a model with a larger output "
+                f"limit or annotate fewer tables per run."
+            )
         for block in response.content:
             if block.type == "tool_use" and block.name == _tool_name:
                 return schema_type.model_validate(block.input)
