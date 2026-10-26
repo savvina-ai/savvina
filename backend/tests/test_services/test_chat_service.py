@@ -118,7 +118,6 @@ def _make_connection(
     *,
     execution_mode: str = "auto_execute",
     schema_cache: dict | None = None,
-    semantic_model: dict | None = None,
     privacy_settings: dict | None = None,
 ) -> MagicMock:
     conn = MagicMock()
@@ -129,7 +128,6 @@ def _make_connection(
     conn.execution_mode = execution_mode
     # Provide a pre-populated schema cache so tests don't need to introspect
     conn.schema_cache = schema_cache if schema_cache is not None else _SCHEMA_CACHE_DICT
-    conn.semantic_model = semantic_model
     return conn
 
 
@@ -232,6 +230,8 @@ def _make_session(*, id: str = "sess-1", connection_id: str = "conn-1") -> Magic
 
 
 # ── Context manager helpers for patching ───────────────────────────────────────
+
+pytestmark = pytest.mark.usefixtures("stored_semantic_model")
 
 _MODULE = "app.services.chat_service"
 _PIPELINE_MODULE = "app.services.pipeline"

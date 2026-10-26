@@ -11,11 +11,17 @@ in ``chat_service`` has been replaced by ``SemanticModel.model_validate``.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum
 import json
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+# Tables per LLM call during phased generation. Lives here rather than in the
+# generator so the HTTP schema (``GenerateBatchRequest``) can cap its body on it
+# without importing the generator.
+GENERATION_BATCH_SIZE: int = 4
 
 
 class _Base(BaseModel):
@@ -312,6 +318,23 @@ class RelationshipEdge(_Base):
     entity_type: EntityType | None = None  # PRIMARY = PK/dim side, FOREIGN = FK/fact side
 
 
+def relationship_identity(
+    edge: Mapping[str, Any] | RelationshipEdge,
+) -> tuple[str, str, str, str]:
+    """A relationship's four endpoints, from an edge or its row-shaped dict."""
+    if isinstance(edge, Mapping):
+        return (edge["from_table"], edge["from_column"], edge["to_table"], edge["to_column"])
+    return (edge.from_table, edge.from_column, edge.to_table, edge.to_column)
+
+
+def relationship_key(edge: Mapping[str, Any] | RelationshipEdge) -> str:
+    """The provenance-map key for a relationship: its four endpoints, joined. Here, with
+    the edge, so pure code (the generator's ``rename_columns``) can key marks the way
+    ``store`` does without importing the store."""
+    from_table, from_column, to_table, to_column = relationship_identity(edge)
+    return f"{from_table}.{from_column}->{to_table}.{to_column}"
+
+
 # ── Discriminated union: BusinessMetric ────────────────────────────────────────
 
 
@@ -452,6 +475,32 @@ class TablesBatchResponse(_Base):
     """LLM response envelope for one batch of table annotations."""
 
     tables: dict[str, TableSemantic] = Field(default_factory=dict)
+
+    @field_validator("tables", mode="before")
+    @classmethod
+    def _filter_tables(cls, v: Any) -> Any:
+        if not isinstance(v, dict):
+            return {}
+        return {k: tbl for k, tbl in v.items() if isinstance(tbl, dict)}
+
+
+class TableColumnsResponse(_Base):
+    """The columns the LLM annotated for one existing table (the new-column pass)."""
+
+    columns: dict[str, ColumnSemantic] = Field(default_factory=dict)
+
+    @field_validator("columns", mode="before")
+    @classmethod
+    def _filter_columns(cls, v: Any) -> Any:
+        if not isinstance(v, dict):
+            return {}
+        return {k: col for k, col in v.items() if isinstance(col, (dict, BaseModel))}
+
+
+class ColumnsBatchResponse(_Base):
+    """LLM response envelope for the new columns of a few existing tables."""
+
+    tables: dict[str, TableColumnsResponse] = Field(default_factory=dict)
 
     @field_validator("tables", mode="before")
     @classmethod

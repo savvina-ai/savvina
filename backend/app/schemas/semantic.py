@@ -19,10 +19,13 @@ The old "mirror" classes (``SemanticModelResponse``, ``TableSemanticSchema``,
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from ..semantic.drift import DriftApplySummary
 from ..semantic.models import (
+    GENERATION_BATCH_SIZE,
     AggregationType,
     BusinessMetric,
     CardinalityClass,
@@ -31,6 +34,7 @@ from ..semantic.models import (
     FormatHint,
     RelationshipEdge,
     Segment,
+    SemanticModel,
     SemanticType,
     TimeGranularity,
     ValueMapping,
@@ -46,15 +50,81 @@ class DriftReport(BaseModel):
     warnings: list[str]
     warning_count: int
     checked_at: str
+    # "live": compared against a fresh introspection, which also refreshed the schema
+    # cache. "cache": the data source could not be reached, so the comparison used the
+    # schema cached at ``schema_cached_at``; ``refresh_error`` says why.
+    schema_source: Literal["live", "cache"] = "live"
+    schema_cached_at: str | None = None
+    refresh_error: str | None = None
+    # True when a table was added or removed, or a column added, removed or renamed —
+    # what ``POST .../semantic/apply-drift`` acts on.
+    # An unreadable table or a metric naming a missing table is reported in ``warnings``
+    # but is not actionable: apply-drift returns the model unchanged for those alone.
+    has_actionable_changes: bool = False
+
+
+class ApplyDriftResponse(BaseModel):
+    """Returned by ``POST /connections/{id}/semantic/apply-drift``.
+
+    ``semantic_model`` is the model as stored; ``summary`` names what this apply
+    added, removed and renamed (on a ``dry_run``, what it would). The page shows it until
+    dismissed; a real apply's summary is also logged and served by
+    ``GET .../semantic/drift/history``.
+    """
+
+    semantic_model: SemanticModel
+    summary: DriftApplySummary
+
+
+class DriftApplyHistoryEntry(BaseModel):
+    """One logged Apply Drift, from ``GET .../semantic/drift/history``."""
+
+    applied_at: str
+    applied_by: str | None
+    summary: DriftApplySummary
 
 
 class GenerateInitResponse(BaseModel):
-    """Returned by ``POST /connections/{id}/semantic/generate/init``."""
+    """Returned by ``POST /connections/{id}/semantic/generate/init``.
+
+    ``pending_table_keys`` is the work list: a fresh run lists every table, a
+    ``resume=true`` run lists only the ones the interrupted run had not reached.
+    The frontend slices it into batches itself — nothing positional survives on
+    the server.
+    """
 
     connection_id: str
     tables_total: int
     batch_count: int
     batch_size: int
+    pending_table_keys: list[str] = []
+    resumed: bool = False
+
+
+class GenerateBatchRequest(BaseModel):
+    """Body of ``POST /connections/{id}/semantic/generate/batch`` — one batch of
+    tables to annotate, named by key rather than by position."""
+
+    table_keys: list[str] = Field(min_length=1, max_length=GENERATION_BATCH_SIZE)
+
+
+class GenerateBatchResponse(BaseModel):
+    """Returned by ``POST /connections/{id}/semantic/generate/batch``.
+
+    Progress only, never the model: the client drives its own progress bar from
+    the keys it dispatched and reads the finished model from ``/generate/globals``.
+    ``tables_done`` counts the tables this run has reconciled so far.
+    """
+
+    connection_id: str
+    table_keys: list[str]
+    tables_done: int
+    tables_total: int
+    batch_size: int
+    # Keys of this batch the LLM returned no annotation for. They are not stamped,
+    # so they stay pending; the client re-queues them once, and ``/generate/globals``
+    # warns about any table still without one.
+    omitted_table_keys: list[str] = []
 
 
 # ── Semantic suggestion (DB row → API) ────────────────────────────────────────

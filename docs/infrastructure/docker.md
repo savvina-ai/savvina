@@ -223,11 +223,12 @@ FROM --platform=$BUILDPLATFORM python:3.12-slim AS model-cache
 RUN pip install --no-cache-dir fastembed
 ENV FASTEMBED_CACHE_PATH=/app/fastembed_cache
 # Optional HF_TOKEN arrives as a BuildKit secret (never a build arg), so it
-# is not recorded in this stage's config or history. download_model.sh
-# retries three times and then fails the build rather than producing an
-# image without the embedding model.
+# is not recorded in this stage's config or history. An optional ca_bundle
+# secret (CA_BUNDLE) adds a proxy's root CA to the system CA bundle for the
+# model download. download_model.sh retries three times and then fails the build
+# rather than producing an image without the embedding model.
 COPY download_model.sh /download_model.sh
-RUN --mount=type=secret,id=hf_token sh /download_model.sh
+RUN --mount=type=secret,id=hf_token --mount=type=secret,id=ca_bundle sh /download_model.sh
 
 # ── builder ───────────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS builder
@@ -276,6 +277,8 @@ USER appuser
 EXPOSE 8000
 ENTRYPOINT ["./entrypoint.sh"]
 ```
+
+When `CA_BUNDLE` is unset the compose file mounts the empty `docker/empty-ca-bundle`, which the script ignores, so the default build needs no configuration on any host OS. When a bundle is supplied, the script appends it to a temporary copy of the system CA bundle (falling back to certifi's, then to the secret alone with a warning) and points `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` at that combined file, which is removed when the script exits; the image's own trust store is not modified. Those variables replace the default trust store rather than extend it, so a PEM holding only the proxy root still works for hosts the proxy does not intercept.
 
 Key decisions:
 - **Three-stage build** — `model-cache` downloads the HuggingFace model independently; `builder` installs Python deps and copies the model from that stage; `runtime` receives only the finished venv and model cache. No compiler or build tools in production.
@@ -375,7 +378,7 @@ The frontend waits for the backend health check before Nginx starts — this pre
 
 ## HTTPS
 
-The stack itself speaks plain HTTP, which is what you want for `localhost` and trusted LAN use. To serve it over HTTPS, put a TLS-terminating reverse proxy in front of the frontend port and bind the frontend to `127.0.0.1`. Set `BEHIND_TLS_PROXY=true` in `.env` so the backend marks the session cookie `Secure` and sends HSTS; the proxy must disable response buffering and allow read timeouts of at least 300 s (900 s for semantic-model generation) so streamed chat responses are not cut off. A worked Caddy example is in [Deployment → Configure HTTPS](../administration/deployment.md#5-configure-https).
+The stack itself speaks plain HTTP, which is what you want for `localhost` and trusted LAN use. To serve it over HTTPS, put a TLS-terminating reverse proxy in front of the frontend port and bind the frontend to `127.0.0.1`. Set `BEHIND_TLS_PROXY=true` in `.env` so the backend marks the session cookie `Secure` and sends HSTS; the proxy must disable response buffering and allow read timeouts of at least 300 s (900 s for semantic-model generation and apply-drift) so streamed chat responses are not cut off. A worked Caddy example is in [Deployment → Configure HTTPS](../administration/deployment.md#5-configure-https).
 
 ---
 

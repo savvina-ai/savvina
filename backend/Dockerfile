@@ -9,10 +9,12 @@ ENV FASTEMBED_CACHE_PATH=/app/fastembed_cache
 # The optional HuggingFace token arrives as a BuildKit secret, not a build arg:
 # a build arg would be recorded in this stage's config and layer history. The
 # secret file exists only for the duration of this RUN; when no secret is
-# supplied the mount is skipped and the download is anonymous. The script
-# fails the build if the download cannot be completed.
+# supplied the mount is skipped and the download is anonymous. An optional
+# ca_bundle secret is handled the same way: it lets the download trust the CA of
+# a TLS-inspecting proxy on the build network. The script fails the build if the
+# download cannot be completed.
 COPY download_model.sh /download_model.sh
-RUN --mount=type=secret,id=hf_token sh /download_model.sh
+RUN --mount=type=secret,id=hf_token --mount=type=secret,id=ca_bundle sh /download_model.sh
 
 # ── builder ───────────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS builder

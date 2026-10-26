@@ -29,7 +29,7 @@ def make_adapter() -> tuple[PostgreSQLDataSource, MockConnection]:
 
 
 def _introspect_side_effect_with_stats() -> list:
-    """6 fetch calls: schemas, tables, columns, PKs, FKs, pg_stats."""
+    """7 fetch calls: schemas, tables, columns, PKs, FKs, pg_stats, pg_class."""
     return [
         # 1. schemas
         [FakeRecord({"schema_name": "public"})],
@@ -73,6 +73,8 @@ def _introspect_side_effect_with_stats() -> list:
                 }
             )
         ],
+        # 7. pg_class: every relation, to name the ones the role cannot read
+        [FakeRecord({"table_schema": "public", "table_name": "orders"})],
     ]
 
 
@@ -145,7 +147,7 @@ class TestIntrospectOnlyReadsCatalog:
     async def test_sample_values_disabled_means_no_pg_stats_query(self):
         """When include_sample_values=False, pg_stats must NOT be queried."""
         adapter, conn = make_adapter()
-        # Only 5 fetch calls expected (no pg_stats)
+        # Only 6 fetch calls expected (no pg_stats)
         conn.fetch.side_effect = [
             [FakeRecord({"schema_name": "public"})],
             [
@@ -173,6 +175,7 @@ class TestIntrospectOnlyReadsCatalog:
             ],
             [],  # PKs
             [],  # FKs
+            [],  # pg_class relations
         ]
 
         await adapter.introspect(

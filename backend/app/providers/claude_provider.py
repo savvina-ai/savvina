@@ -18,7 +18,10 @@ from .base import (
     LLMResponse,
     ModelInfo,
     _raise_if_fetch_error,
+    is_transient_status,
     parse_llm_response,
+    provider_unavailable,
+    strip_error_marker,
 )
 from .registry import register_provider
 
@@ -50,8 +53,11 @@ class ClaudeProvider(BaseLLMProvider):
         self._default_model = default_model or _DEFAULT_MODEL
 
     @staticmethod
-    def _normalize_api_error(exc: anthropic.APIStatusError) -> ValueError:
-        """Convert an anthropic.APIStatusError into a descriptive ValueError."""
+    def _normalize_api_error(exc: anthropic.APIStatusError, model: str = "") -> ValueError:
+        """Convert an anthropic.APIStatusError into a descriptive ValueError.
+
+        *model* is the model the failed request asked for, so a 404 can name it.
+        """
         api_msg = str(exc.message) if hasattr(exc, "message") else str(exc)
         if exc.status_code == 429:
             msg = api_msg or "Anthropic rate limit exceeded. Please retry later."
@@ -63,6 +69,12 @@ class ClaudeProvider(BaseLLMProvider):
             )
         if exc.status_code == 400:
             return ValueError(f"[BAD_REQUEST] {api_msg}")
+        if exc.status_code == 404:
+            which = f"Model '{model}'" if model else "The requested model"
+            return ValueError(
+                f"[MODEL_NOT_FOUND] {which} is not available on Anthropic, or this API key "
+                f"has no access to it. Click Fetch Models and pick one of the models it returns."
+            )
         return ValueError(f"[PROVIDER_ERROR] Anthropic returned HTTP {exc.status_code}. {api_msg}")
 
     async def generate_response(
@@ -84,7 +96,7 @@ class ClaudeProvider(BaseLLMProvider):
                 temperature=temperature,
             )
         except anthropic.APIStatusError as exc:
-            raise self._normalize_api_error(exc) from exc
+            raise self._normalize_api_error(exc, model or self._default_model) from exc
         raw = response.content[0].text
         usage = response.usage
         input_tokens = usage.input_tokens if usage else None
@@ -134,7 +146,7 @@ class ClaudeProvider(BaseLLMProvider):
                 temperature=temperature,
             )
         except anthropic.APIStatusError as exc:
-            raise self._normalize_api_error(exc) from exc
+            raise self._normalize_api_error(exc, model or self._default_model) from exc
         raw = response.content[0].text
         usage = response.usage
         input_tokens = getattr(usage, "input_tokens", None)
@@ -165,8 +177,11 @@ class ClaudeProvider(BaseLLMProvider):
     ) -> _BM:
         """Use Anthropic tool-use to constrain the response to the given Pydantic schema."""
         _tool_name = "submit_structured_result"
+        # The app owns retries for generation (the page's backoff); the SDK's own
+        # silent ones would multiply them and outlast the router's timeout.
+        client = self._client.with_options(max_retries=0)
         try:
-            response = await self._client.messages.create(
+            response = await client.messages.create(
                 model=model or self._default_model,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}],
@@ -181,7 +196,21 @@ class ClaudeProvider(BaseLLMProvider):
                 max_tokens=max_tokens,
             )
         except anthropic.APIStatusError as exc:
-            raise self._normalize_api_error(exc) from exc
+            if is_transient_status(exc.status_code):
+                raise provider_unavailable(
+                    f"The provider returned HTTP {exc.status_code}."
+                ) from exc
+            raise self._normalize_api_error(exc, model or self._default_model) from exc
+        except anthropic.APIConnectionError as exc:
+            raise provider_unavailable(
+                "The connection to the provider failed or timed out."
+            ) from exc
+        if response.stop_reason == "max_tokens":
+            raise ValueError(
+                f"The model's reply was cut off at the {max_tokens}-token output limit, so "
+                f"the structured result is incomplete. Use a model with a larger output "
+                f"limit or annotate fewer tables per run."
+            )
         for block in response.content:
             if block.type == "tool_use" and block.name == _tool_name:
                 return schema_type.model_validate(block.input)
@@ -196,6 +225,10 @@ class ClaudeProvider(BaseLLMProvider):
                 max_tokens=1,
             )
             return True, ""
+        except anthropic.APIStatusError as exc:
+            logger.warning("ClaudeProvider health check failed: %s", exc, exc_info=True)
+            normalized = self._normalize_api_error(exc, self._default_model)
+            return False, strip_error_marker(str(normalized))
         except Exception as e:
             logger.warning("ClaudeProvider health check failed: %s", e, exc_info=True)
             return False, str(e)

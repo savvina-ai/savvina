@@ -188,7 +188,8 @@ services/
 | `_compact_semantic_model()` | `pipeline` | Strips table DDL; keeps business metrics / time expressions |
 | `_resolve_schema()` | `schema_pruning` | Loads per-user schema from `UserSchemaCache` or introspects |
 | `_select_relevant_tables()` | `schema_pruning` | Schema pruning via cosine similarity + domain-aware score boost |
-| `_filter_semantic_to_schema()` | `schema_pruning` | Drops pruned tables from the `SemanticModel` |
+| `without_hidden_identifiers()` | `semantic_privacy` | Drops free-text semantic items (metrics, segments, derived columns, notes, default filters, base SQL) that name a privacy-hidden identifier |
+| `_filter_semantic_to_schema()` | `schema_pruning` | Drops pruned tables, privacy-hidden columns and their references from the `SemanticModel` |
 | `_filter_semantic_by_relevance()` | `schema_pruning` | Token-score narrowing of semantic model to question |
 | `_validate_and_correct_query()` | `validation` | Orchestrates column check + self-correction attempts |
 | `_attempt_sql_correction()` | `correction` | Self-corrects schema/column validation errors (up to 2 retries) |
@@ -238,9 +239,11 @@ All providers share response parsing logic in `providers/base.py` — `parse_llm
 See [Semantic Model Generation](semantic-model-generation.md) for the full call chain, LLM prompts, and post-processing steps.
 
 - `semantic/models.py` — Pydantic v2 models + enums: `SemanticModel`, `TableSemantic`, `ColumnSemantic`, `BusinessMetric` (discriminated union of `SimpleMetric`, `RatioMetric`, `DerivedMetric`, `CumulativeMetric`, `ConversionMetric`), `DerivedColumn`, `CommonJoin`, `RelationshipEdge`, `Segment`; enums: `SemanticType`, `CardinalityClass`, `RelationshipType`, `MetricType`, `GenerationStatus`
-- `semantic/generator.py` — `SemanticModelGenerator` class: sends schema DDL batches to LLM (`generate_table_batch()`), generates cross-table sections (`generate_globals()`), detects drift (`detect_drift()`), computes schema hash and time expressions
+- `semantic/generator.py` — `SemanticModelGenerator` class: sends schema DDL batches to LLM (`generate_tables()`), generates cross-table sections (`generate_globals()`), annotates columns added to tables the model holds (`generate_new_columns()`, for apply-drift), builds drift warnings (`detect_drift()`), computes schema hash and time expressions
+- `semantic/drift.py` — `compute_drift()`, the one schema-vs-model diff shared by the drift check and apply-drift, and `summarize_model_change()`, the by-name before/after summary an apply returns and logs
 - `semantic/formatter.py` — `SemanticFormatter.format_for_prompt()` converts `SemanticModel` to structured text injected as `## Business Context` in the LLM system prompt
-- `routers/semantic.py` — three-phase generation endpoints (`/generate/init`, `/generate/batch`, `/generate/globals`), model CRUD, and drift check
+- `semantic/store.py` — the only reader/writer of the normalised semantic tables: assembles a `SemanticModel` from rows, reconciles generated output onto them without overwriting hand-edited fields, applies user patches with per-field provenance and an optimistic lock, records history, and keeps the drift baseline of seen columns (`load_known_columns()`, `update_known_columns()`)
+- `routers/semantic.py` — three-phase generation endpoints (`/generate/init`, `/generate/batch`, `/generate/globals`), model CRUD, drift check, apply-drift (with a `dry_run` preview) and its history
 
 ### Query Cache
 
@@ -267,6 +270,9 @@ The application's own state is stored in the `db` PostgreSQL service (port 5434 
 | `query_cache` | Cached question → query pairs with embeddings |
 | `verified_examples` | Thumbs-up approved examples for few-shot prompting |
 | `app_settings` | Persisted application-level settings overrides |
+| `semantic_models`, `semantic_tables`, `semantic_columns`, `semantic_metrics`, `semantic_relationships`, `semantic_global_items` | The semantic layer, one row per entity with per-field edit provenance and a version for optimistic locking |
+| `semantic_model_history` | Append-only audit trail of every semantic-layer change |
+| `semantic_known_columns` | Drift baseline: per table, the live column names the semantic model has seen, so Check Drift can tell a new column from one left out or deleted |
 | `semantic_suggestions` | User-submitted feedback on generated queries for model improvement |
 | `query_usage` | Per-user daily query counts |
 | `user_schema_caches` | Per-user cached schema snapshots with table embeddings |

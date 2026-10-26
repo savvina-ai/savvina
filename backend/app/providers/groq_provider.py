@@ -43,16 +43,7 @@ class GroqProvider(OpenAIProvider):
 
     async def health_check(self) -> tuple[bool, str]:
         """Verify connectivity with a minimal single-token completion request."""
-        try:
-            await self._client.chat.completions.create(
-                model=self._default_model,
-                messages=[{"role": "user", "content": "ping"}],
-                max_tokens=1,
-            )
-            return True, ""
-        except Exception as e:
-            logger.warning("GroqProvider health check failed: %s", e, exc_info=True)
-            return False, str(e)
+        return await self._ping_completion()
 
     @classmethod
     def get_available_models(cls) -> list[str]:

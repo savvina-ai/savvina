@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import logging
@@ -17,10 +18,11 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from ..cache.query_cache import QueryCache
-from ..datasources.models import DataSourceSchema, PrivacySettings, TableInfo
+from ..datasources.models import DataSourceSchema, PrivacySettings, TableInfo, table_key
 from ..models.connection import Connection
 from ..models.table_embedding_cache import TableEmbeddingCache
 from ..models.user_schema_cache import UserSchemaCache
+from ..semantic.generator import edges_in_schema, prune_to_schema
 from ..semantic.models import SemanticModel
 from .schema_utils import (
     _apply_privacy_to_schema,
@@ -47,17 +49,96 @@ class _SchemaResult:
     embeddings_available: bool = False
 
 
-def _filter_semantic_to_schema(semantic: SemanticModel, schema: DataSourceSchema) -> SemanticModel:
-    """Return a copy of semantic model narrowed to tables visible in schema.
+_NARROWED_CACHE_SIZE = 64
+# ``(id(model), schema signature) -> (model, narrowed)``. The model is held so the id
+# cannot alias a later object: a hit requires ``entry[0] is model``. Each entry pins a
+# model, so a superseded model version lingers until evicted (bounded by the cap).
+_narrowed_cache: OrderedDict[tuple[int, tuple], tuple[SemanticModel, SemanticModel]] = OrderedDict()
+# Edges already warned about, so a stale hand-written edge is one log line per process,
+# not one per chat turn. Keyed on the edge text alone, per process across connections:
+# an identical stale edge in two connections is logged once. Cleared at the cap.
+_WARNED_EDGE_DROPS: set[str] = set()
+_WARNED_EDGE_DROPS_CAP = 4096
 
-    Also drops relationships and common_joins that reference pruned tables.
-    Business metrics are kept as-is — they remain useful signal regardless of table scope.
+
+def clear_semantic_filter_caches(*, narrowed_only: bool = False) -> None:
+    """Drop the narrowed-model cache and, unless ``narrowed_only``, the warned edges."""
+    _narrowed_cache.clear()
+    if not narrowed_only:
+        _WARNED_EDGE_DROPS.clear()
+
+
+def _schema_signature(schema: DataSourceSchema) -> tuple:
+    return tuple((table_key(t), tuple(c.name for c in t.columns)) for t in schema.tables)
+
+
+def _filter_semantic_to_schema(
+    semantic: SemanticModel,
+    schema: DataSourceSchema,
+) -> SemanticModel:
+    """Return a copy of semantic model narrowed to the tables AND columns in schema.
+
+    ``schema`` is the privacy-filtered schema the LLM will see
+    (``_apply_privacy_to_schema`` has removed excluded schemas, tables and
+    ``excluded_columns``, so a stale cache carrying a newly excluded column is
+    already narrowed by the time it reaches here). The stored model can hold
+    annotations for tables and columns the privacy settings hide (generation
+    keeps them so un-hiding loses no work), so narrowing by table alone would leak a
+    hidden column's name, description, timestamp role or join to the prompt. Hence:
+
+    - tables are narrowed to the schema and each table's columns to the schema's
+      columns, with references to a dropped column (primary timestamp/date column,
+      partition/cluster columns, hierarchy levels) cleared. This is the strict
+      ``prune_to_schema`` (no ``privacy`` argument), so hidden columns are dropped
+      rather than carried through;
+    - relationships are kept only when both endpoints are real columns of the
+      schema (strict ``edges_in_schema``), so edges on hidden columns go too. An edge
+      dropped although both its tables are visible is a column mismatch (a user edit
+      gone stale, or a hidden column) and is logged, once per edge per process;
+    - common_joins that reference pruned tables are dropped.
+
+    Business metrics, segments and derived columns are kept: they are free SQL and
+    cannot be narrowed structurally. ``semantic_privacy.without_hidden_identifiers``
+    removes the ones that name a hidden identifier, against the *full*
+    privacy-filtered schema, because here ``schema`` may also be narrowed by relevance.
+
+    Memoised on ``(the model instance, the schema's tables and columns)``: the
+    chat path hands every turn the same cached instance, so a repeat question shape
+    costs a lookup instead of a copy per table. The returned instance is shared
+    like the input: callers must not mutate it. Event-loop thread only; not safe
+    under ``to_thread``.
     """
-    visible = {f"{t.schema_name}.{t.name}" for t in schema.tables}
-    filtered_tables = {k: v for k, v in semantic.tables.items() if k in visible}
-    filtered_rels = [
-        r for r in semantic.relationships if r.from_table in visible and r.to_table in visible
-    ]
+    key = (id(semantic), _schema_signature(schema))
+    hit = _narrowed_cache.get(key)
+    if hit is not None and hit[0] is semantic:
+        _narrowed_cache.move_to_end(key)
+        return hit[1]
+    narrowed = _narrow_semantic_to_schema(semantic, schema)
+    _narrowed_cache[key] = (semantic, narrowed)
+    _narrowed_cache.move_to_end(key)
+    while len(_narrowed_cache) > _NARROWED_CACHE_SIZE:
+        _narrowed_cache.popitem(last=False)
+    return narrowed
+
+
+def _narrow_semantic_to_schema(semantic: SemanticModel, schema: DataSourceSchema) -> SemanticModel:
+    visible = {table_key(t) for t in schema.tables}
+    filtered_tables = prune_to_schema(semantic.tables, schema, log=False)
+    filtered_rels = edges_in_schema(semantic.relationships, schema)
+    kept_ids = {id(r) for r in filtered_rels}
+    for r in semantic.relationships:
+        if id(r) not in kept_ids and r.from_table in visible and r.to_table in visible:
+            edge = f"{r.from_table}.{r.from_column} -> {r.to_table}.{r.to_column}"
+            if edge in _WARNED_EDGE_DROPS:
+                continue
+            if len(_WARNED_EDGE_DROPS) >= _WARNED_EDGE_DROPS_CAP:
+                _WARNED_EDGE_DROPS.clear()
+            _WARNED_EDGE_DROPS.add(edge)
+            logger.warning(
+                "Dropped relationship %s from the chat prompt: a column is not in the schema "
+                "the LLM may see (logged once per edge)",
+                edge,
+            )
     filtered_joins = [
         j for j in semantic.common_joins if all(t.strip() in visible for t in j.tables)
     ]
@@ -95,9 +176,9 @@ def _filter_semantic_by_relevance(
     tokens.discard("")
 
     scores: dict[str, int] = {}
-    for table_key, tbl in model.tables.items():
+    for model_key, tbl in model.tables.items():
         score = 0
-        bare = table_key.rpartition(".")[2].lower()
+        bare = model_key.rpartition(".")[2].lower()
         # +2 for table name match
         if bare in tokens or any(part in tokens for part in bare.split("_")):
             score += 2
@@ -121,7 +202,7 @@ def _filter_semantic_by_relevance(
             domain_tokens = set(tbl.domain.lower().replace("_", " ").replace("-", " ").split())
             if domain_tokens & tokens:
                 score += 2
-        scores[table_key] = score
+        scores[model_key] = score
 
     # Select top max_tables by score (ties broken by stable dict order)
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
@@ -151,7 +232,7 @@ def _filter_semantic_by_relevance(
 def _build_table_text(table: TableInfo) -> str:
     """Build embeddable text representing a table for semantic retrieval."""
     col_names = ", ".join(c.name for c in table.columns[:40])  # cap to avoid huge vectors
-    parts = [f"{table.schema_name}.{table.name}"]
+    parts = [table_key(table)]
     if table.description:
         parts.append(table.description)
     if col_names:
@@ -173,10 +254,10 @@ def _pin_mentioned_tables(
     always_include: set[str] = set(privacy.always_include_tables if privacy else [])
     question_lower = question.lower()
     always_keys: set[str] = set()
-    table_map: dict[str, TableInfo] = {f"{t.schema_name}.{t.name}": t for t in schema.tables}
+    table_map: dict[str, TableInfo] = {table_key(t): t for t in schema.tables}
 
     for table in schema.tables:
-        key = f"{table.schema_name}.{table.name}"
+        key = table_key(table)
         if (
             key in always_include
             or table.name in always_include
@@ -205,7 +286,7 @@ def _apply_domain_boost(
     domain_boost: float = _DOMAIN_BOOST
     domain_counts: Counter[str] = Counter()
     for _s, _tbl in candidates[:5]:
-        _key = f"{_tbl.schema_name}.{_tbl.name}"
+        _key = table_key(_tbl)
         _sem_tbl = semantic_model.tables.get(_key)
         if _sem_tbl and _sem_tbl.domain:
             domain_counts[_sem_tbl.domain] += 1
@@ -216,7 +297,7 @@ def _apply_domain_boost(
     dominant_domain = domain_counts.most_common(1)[0][0]
     boosted: list[tuple[float, TableInfo]] = []
     for _s, _tbl in candidates:
-        _key = f"{_tbl.schema_name}.{_tbl.name}"
+        _key = table_key(_tbl)
         _sem_tbl = semantic_model.tables.get(_key)
         if _sem_tbl and _sem_tbl.domain == dominant_domain:
             _s = min(1.0, _s + domain_boost)
@@ -239,8 +320,8 @@ def _expand_fk_tables(
     if not schema.relationships:
         return []
 
-    table_map: dict[str, TableInfo] = {f"{t.schema_name}.{t.name}": t for t in schema.tables}
-    sel_keys: set[str] = {f"{t.schema_name}.{t.name}" for t in selected}
+    table_map: dict[str, TableInfo] = {table_key(t): t for t in schema.tables}
+    sel_keys: set[str] = {table_key(t) for t in selected}
     fk_extra: list[TableInfo] = []
 
     for _hop in range(2):
@@ -316,7 +397,7 @@ async def _select_relevant_tables(
 
     # Tables absent from ANN results (no embedding row) → include for safety
     for table in schema.tables:
-        key = f"{table.schema_name}.{table.name}"
+        key = table_key(table)
         if key not in always_keys and key not in ann_key_set:
             always.append(table)
 
@@ -431,14 +512,10 @@ async def _resolve_schema(
         )
         existing_keys = {row.table_key for row in existing_keys_result}
 
-        missing = [
-            table
-            for table in schema.tables
-            if f"{table.schema_name}.{table.name}" not in existing_keys
-        ]
+        missing = [table for table in schema.tables if table_key(table) not in existing_keys]
         if missing:
             now = datetime.now(UTC)
-            keys = [f"{t.schema_name}.{t.name}" for t in missing]
+            keys = [table_key(t) for t in missing]
             texts = [_build_table_text(t) for t in missing]
             embeddings = await asyncio.gather(
                 *[query_cache.compute_embedding_async(txt) for txt in texts]

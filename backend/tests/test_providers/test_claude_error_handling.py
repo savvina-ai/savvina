@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import anthropic
 import httpx
+from pydantic import BaseModel
 import pytest
 
 from app.providers.claude_provider import ClaudeProvider
@@ -23,6 +24,7 @@ _FAKE_URL = "https://api.anthropic.com/v1/messages"
 def _make_provider() -> ClaudeProvider:
     provider = ClaudeProvider.__new__(ClaudeProvider)
     provider._client = MagicMock()
+    provider._client.with_options.return_value = provider._client
     provider._default_model = "claude-sonnet-4-6"
     return provider
 
@@ -138,3 +140,118 @@ class TestClaudeProviderAPIStatusErrors:
             await provider.generate_response_cached(
                 system_prompt="sys", user_message="q", conversation_history=[]
             )
+
+
+class _StructSchema(BaseModel):
+    value: str = "default"
+
+
+def _tool_response(stop_reason: str, tool_input: dict) -> MagicMock:
+    block = MagicMock()
+    block.type = "tool_use"
+    block.name = "submit_structured_result"
+    block.input = tool_input
+    response = MagicMock()
+    response.content = [block]
+    response.stop_reason = stop_reason
+    return response
+
+
+class TestClaudeGenerateStructuredGuards:
+    async def test_max_tokens_stop_raises(self) -> None:
+        provider = _make_provider()
+        provider._client.messages.create = AsyncMock(
+            return_value=_tool_response("max_tokens", {"value": "x"})
+        )
+        with pytest.raises(ValueError, match="cut off"):
+            await provider.generate_structured(
+                system_prompt="sys", user_message="q", schema_type=_StructSchema, max_tokens=99
+            )
+
+    async def test_complete_tool_input_validates(self) -> None:
+        provider = _make_provider()
+        provider._client.messages.create = AsyncMock(
+            return_value=_tool_response("tool_use", {"value": "x"})
+        )
+        result = await provider.generate_structured(
+            system_prompt="sys", user_message="q", schema_type=_StructSchema
+        )
+        assert result.value == "x"
+
+    async def test_structured_calls_disable_the_sdk_retries(self) -> None:
+        provider = _make_provider()
+        provider._client.messages.create = AsyncMock(
+            return_value=_tool_response("tool_use", {"value": "x"})
+        )
+        await provider.generate_structured(
+            system_prompt="sys", user_message="q", schema_type=_StructSchema
+        )
+        provider._client.with_options.assert_called_once_with(max_retries=0)
+
+    @pytest.mark.parametrize("status", [408, 409, 500, 501, 502, 503, 504, 520, 524, 529])
+    async def test_transient_status_is_tagged_retryable(self, status: int) -> None:
+        provider = _make_provider()
+        provider._client.messages.create = AsyncMock(
+            side_effect=_make_api_status_error(status, "overloaded")
+        )
+        with pytest.raises(ValueError, match=r"\[PROVIDER_UNAVAILABLE\]"):
+            await provider.generate_structured(
+                system_prompt="sys", user_message="q", schema_type=_StructSchema
+            )
+
+    async def test_a_dropped_connection_is_tagged_retryable(self) -> None:
+        provider = _make_provider()
+        provider._client.messages.create = AsyncMock(
+            side_effect=anthropic.APIConnectionError(request=httpx.Request("POST", _FAKE_URL))
+        )
+        with pytest.raises(ValueError, match=r"\[PROVIDER_UNAVAILABLE\]"):
+            await provider.generate_structured(
+                system_prompt="sys", user_message="q", schema_type=_StructSchema
+            )
+
+    @pytest.mark.parametrize(
+        ("status", "marker"),
+        [(429, r"\[RATE_LIMIT\]"), (400, r"\[BAD_REQUEST\]"), (401, r"\[AUTH_ERROR\]")],
+    )
+    async def test_non_transient_status_keeps_its_own_tag(self, status: int, marker: str) -> None:
+        provider = _make_provider()
+        provider._client.messages.create = AsyncMock(
+            side_effect=_make_api_status_error(status, "nope")
+        )
+        with pytest.raises(ValueError, match=marker) as excinfo:
+            await provider.generate_structured(
+                system_prompt="sys", user_message="q", schema_type=_StructSchema
+            )
+        assert "[PROVIDER_UNAVAILABLE]" not in str(excinfo.value)
+
+
+class TestClaudeModelNotFoundAndHealthCheckMessages:
+    async def test_404_raises_model_not_found_naming_the_model(self) -> None:
+        provider = _make_provider()
+        provider._client.messages.create = AsyncMock(
+            side_effect=_make_api_status_error(404, "model: retired-model")
+        )
+        with pytest.raises(ValueError, match=r"^\[MODEL_NOT_FOUND\]") as excinfo:
+            await provider.generate_response("sys", "msg", [], model="retired-model")
+        assert "'retired-model'" in str(excinfo.value)
+
+    async def test_health_check_404_reports_the_default_model_without_the_marker(self) -> None:
+        provider = _make_provider()
+        provider._client.messages.create = AsyncMock(
+            side_effect=_make_api_status_error(404, "model: claude-sonnet-4-6")
+        )
+        ok, detail = await provider.health_check()
+        assert ok is False
+        assert "'claude-sonnet-4-6'" in detail
+        assert "Fetch Models" in detail
+        assert not detail.startswith("[")
+
+    async def test_health_check_401_reports_a_clean_auth_message(self) -> None:
+        provider = _make_provider()
+        provider._client.messages.create = AsyncMock(
+            side_effect=_make_api_status_error(401, "invalid x-api-key")
+        )
+        ok, detail = await provider.health_check()
+        assert ok is False
+        assert "Invalid or expired Anthropic API key" in detail
+        assert not detail.startswith("[")

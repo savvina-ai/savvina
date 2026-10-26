@@ -38,17 +38,22 @@ async def get_connection_or_404(
 
 
 async def lock_and_reread_connection(conn_id: str, db: AsyncSession) -> Connection:
-    """Re-fetch *conn_id* under ``FOR UPDATE``, bypassing the identity-map cache.
+    """Re-fetch *conn_id* under ``FOR NO KEY UPDATE``, bypassing the identity-map cache.
 
-    Call immediately before composing a write to ``Connection.semantic_model``
-    in any handler that read the connection earlier in the same request, so
-    the write merges into the latest committed state rather than a stale
-    snapshot from a concurrent request.
+    Call immediately before composing a write to the semantic store
+    (``semantic/store.py``) in any handler that read the connection earlier in
+    the same request, so the write merges into the latest committed state
+    rather than a stale snapshot from a concurrent request.
+
+    ``FOR NO KEY UPDATE`` (not ``FOR UPDATE``): writers still exclude each other,
+    but the ``FOR KEY SHARE`` lock a foreign-key insert (chat session, cache entry,
+    verified example, suggestion) takes on this row does not conflict, so a long
+    save or apply does not stall chat.
     """
     stmt = (
         select(Connection)
         .where(Connection.id == conn_id, Connection.is_active.is_(True))
-        .with_for_update()
+        .with_for_update(key_share=True)
         .execution_options(populate_existing=True)
     )
     result = await db.execute(stmt)
@@ -58,19 +63,34 @@ async def lock_and_reread_connection(conn_id: str, db: AsyncSession) -> Connecti
     return conn
 
 
-async def _invalidate_connection_caches(connection_id: str, db: AsyncSession) -> None:
-    """Delete QueryCacheEntry, UserSchemaCache, and TableEmbeddingCache rows for
-    *connection_id*.
+async def _invalidate_connection_caches(
+    connection_id: str, db: AsyncSession, *, keep_schema: bool = False
+) -> None:
+    """Delete UserSchemaCache, TableEmbeddingCache, and QueryCacheEntry rows for
+    *connection_id*, in that order.
 
     Call before ``db.commit()`` whenever the semantic model, schema, privacy
     settings, or connection config is mutated so that stale cached queries and
     schema data are not served on the next request.
+
+    ``keep_schema=True`` leaves ``UserSchemaCache`` alone, for a caller that has just
+    stored a live introspection there (apply-drift): deleting it would throw the fresh
+    schema away and leave the page's next schema read on a 404 until a Schema Refresh.
+    A generation batch passes it too: it changes the semantic layer but not the schema,
+    and every batch of the run reads the schema from that cache. CE has a single user,
+    so the row kept is the caller's own.
     """
-    await db.execute(delete(QueryCacheEntry).where(QueryCacheEntry.connection_id == connection_id))
-    await db.execute(delete(UserSchemaCache).where(UserSchemaCache.connection_id == connection_id))
+    # The order ``refresh_user_schema_cache`` writes in (schema cache, then embeddings,
+    # then cached answers): two transactions that lock the same rows in opposite orders
+    # can deadlock, e.g. a generation batch purging while a Schema Refresh flushes.
+    if not keep_schema:
+        await db.execute(
+            delete(UserSchemaCache).where(UserSchemaCache.connection_id == connection_id)
+        )
     await db.execute(
         delete(TableEmbeddingCache).where(TableEmbeddingCache.connection_id == connection_id)
     )
+    await db.execute(delete(QueryCacheEntry).where(QueryCacheEntry.connection_id == connection_id))
 
 
 def cached_json_response(data: dict | list, request: Request) -> Response:

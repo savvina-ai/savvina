@@ -270,6 +270,31 @@ class PostgreSQLDataSource(BaseDataSource):
             """
         )
 
+    async def _fetch_all_relations(self, conn: object) -> set[tuple[str, str]] | None:
+        """Every user table, view and foreign table, whatever the role may see.
+
+        ``information_schema`` lists only what the role holds a privilege on, so a
+        table it cannot read looks dropped. ``pg_class`` lists every relation, which is
+        what tells the two apart. ``None`` when the catalog cannot be read (a hardened
+        server can revoke it): the caller then cannot name unreadable tables.
+        """
+        try:
+            rows = await conn.fetch(
+                r"""
+                SELECT n.nspname AS table_schema, c.relname AS table_name
+                FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                  AND n.nspname NOT LIKE 'pg\_temp\_%'
+                  AND n.nspname NOT LIKE 'pg\_toast\_temp\_%'
+                """
+            )
+        except asyncpg.PostgresError as exc:
+            logger.warning("Cannot list unreadable tables: pg_class read failed: %s", exc)
+            return None
+        return {(row["table_schema"], row["table_name"]) for row in rows}
+
     async def _fetch_columns(self, conn: object) -> list:
         return await conn.fetch(
             """
@@ -405,6 +430,16 @@ class PostgreSQLDataSource(BaseDataSource):
                 if privacy.include_sample_values
                 else {}
             )
+            all_relations = await self._fetch_all_relations(conn)
+
+        # What exists but the role cannot see. An excluded table is left out: the policy
+        # already hides it, and its name has no business in the schema cache.
+        visible_relations = {(row["table_schema"], row["table_name"]) for row in table_rows}
+        unreadable_tables = sorted(
+            f"{schema}.{table}"
+            for schema, table in (all_relations or set()) - visible_relations
+            if not privacy.is_table_excluded(schema, table)
+        )
 
         # Build column lookup per (schema, table)
         columns_by_table: dict[tuple[str, str], list[ColumnInfo]] = {}
@@ -486,6 +521,7 @@ class PostgreSQLDataSource(BaseDataSource):
             schemas=schemas,
             tables=tables,
             relationships=relationships,
+            unreadable_tables=unreadable_tables,
         )
 
     # OVERHEAD: catalog-read (pg_stats) with user-data fallback using TABLESAMPLE

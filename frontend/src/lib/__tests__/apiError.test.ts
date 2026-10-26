@@ -44,6 +44,36 @@ describe('apiErrorMessage', () => {
     );
   });
 
+  it('says a rate limit was hit and which, without guessing the wait', () => {
+    // slowapi's handler answers {"error": "Rate limit exceeded: …"}; the auth routes'
+    // limit is an operator setting and may be per hour.
+    const err = {
+      response: { status: 429, data: { error: 'Rate limit exceeded: 100 per 1 hour' } },
+    };
+    expect(apiErrorMessage(err, 'Unknown error')).toBe(
+      'Too many requests (Rate limit exceeded: 100 per 1 hour) — try again later',
+    );
+    expect(apiErrorMessage({ response: { status: 429, data: {} } }, 'Unknown error')).toBe(
+      'Too many requests — try again later',
+    );
+  });
+
+  it("keeps a 429's own detail", () => {
+    // E.g. an LLM provider throttle the backend maps to 429 with a reason.
+    const err = { response: { status: 429, data: { detail: 'Provider rate limit: retry later' } } };
+    expect(apiErrorMessage(err, 'Unknown error')).toBe('Provider rate limit: retry later');
+  });
+
+  it('reads a string `error` when there is no detail', () => {
+    expect(
+      apiErrorMessage({ response: { status: 503, data: { error: 'Service paused' } } }, 'x'),
+    ).toBe('Service paused');
+    expect(apiErrorMessage({ response: { status: 503, data: { error: '' } } }, 'x')).toBe('x');
+    expect(apiErrorMessage({ response: { status: 503, data: { error: { a: 1 } } } }, 'x')).toBe(
+      'x',
+    );
+  });
+
   it('falls back to String(err) when no fallback is given', () => {
     expect(apiErrorMessage(new Error('network down'))).toContain('network down');
   });

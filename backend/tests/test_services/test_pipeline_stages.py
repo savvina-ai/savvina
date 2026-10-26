@@ -15,7 +15,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.datasources.models import PrivacySettings, QueryResult
+from app.datasources.models import (
+    ColumnInfo,
+    DataSourceSchema,
+    PrivacySettings,
+    QueryResult,
+    TableInfo,
+)
+from app.semantic import store as semantic_store
+from app.semantic.models import ColumnSemantic, DerivedMetric, SemanticModel, TableSemantic
 from app.services.chat_service import (
     _PipelineError,
     _run_shared_pipeline,
@@ -30,6 +38,9 @@ from app.services.execution import (
     _StreamResult,
 )
 from app.services.intent_classifier import QueryIntent
+from app.services.schema_utils import _apply_privacy_to_schema
+
+pytestmark = pytest.mark.usefixtures("stored_semantic_model")
 
 _MODULE = "app.services.chat_service"
 _EXEC_MODULE = "app.services.execution"
@@ -56,7 +67,6 @@ def _make_conn_row(
     source_type: str = "postgresql",
     execution_mode: str = "auto_execute",
     privacy_settings: dict | None = None,
-    semantic_model: dict | None = None,
 ) -> MagicMock:
     conn = MagicMock()
     conn.id = conn_id
@@ -64,7 +74,6 @@ def _make_conn_row(
     conn.config_encrypted = b"encrypted-bytes"
     conn.privacy_settings = privacy_settings
     conn.execution_mode = execution_mode
-    conn.semantic_model = semantic_model
     return conn
 
 
@@ -195,23 +204,269 @@ class TestStageResolveSchema:
 
 
 class TestStagePruneAndFilter:
-    async def test_returns_unpruned_schema_when_no_embeddings(self):
+    async def test_returns_unpruned_schema_when_no_embeddings(self, stored_semantic_model):
         schema = MagicMock()
         sr = _make_schema_result(schema=schema, embeddings_available=False)
-        conn = _make_conn_row(semantic_model=None)
+        conn = _make_conn_row()
         settings = _make_settings(schema_pruning_enabled=True)
+        db = MagicMock()
 
         pruned_schema, semantic_model = await _stage_prune_and_filter(
-            sr, conn, "question", settings, MagicMock(), MagicMock(), "conn-1", "u", None
+            sr, conn, "question", settings, MagicMock(), db, "conn-1", "u", None
         )
 
         assert pruned_schema is schema
         assert semantic_model is None
+        stored_semantic_model.assert_awaited_once_with(db, "conn-1")
+
+    async def test_store_failure_runs_the_turn_without_business_context(
+        self, stored_semantic_model, caplog
+    ):
+        schema = MagicMock()
+        stored_semantic_model.side_effect = semantic_store.SemanticModelUnavailable("db down")
+        sr = _make_schema_result(schema=schema, embeddings_available=False)
+
+        with caplog.at_level("ERROR", logger=_MODULE):
+            result_schema, semantic_model = await _stage_prune_and_filter(
+                sr,
+                _make_conn_row(),
+                "question",
+                _make_settings(),
+                MagicMock(),
+                MagicMock(),
+                "conn-1",
+                "u",
+                None,
+            )
+
+        assert result_schema is schema
+        assert semantic_model is None
+        assert any("conn-1" in r.getMessage() and r.exc_info for r in caplog.records)
+
+    async def test_a_failed_store_read_costs_the_turn_only_its_business_context(
+        self, stored_semantic_model
+    ):
+        """The stage opens no savepoint of its own: ``load_model_cached`` wraps only its
+        cache-miss rebuild, so a cache hit is one statement. When that rebuild fails
+        (``SemanticModelUnavailable``, mocked here), the stage falls back to no model
+        rather than failing the turn."""
+        stored_semantic_model.side_effect = semantic_store.SemanticModelUnavailable(
+            "relation does not exist"
+        )
+        db = MagicMock()
+        db.begin_nested = MagicMock()
+        schema = MagicMock()
+        sr = _make_schema_result(schema=schema, embeddings_available=False)
+
+        result = await _stage_prune_and_filter(
+            sr, _make_conn_row(), "q", _make_settings(), MagicMock(), db, "conn-1", "u", None
+        )
+
+        assert result == (schema, None)
+        db.begin_nested.assert_not_called()
+
+    async def test_any_other_store_failure_fails_the_turn(self, stored_semantic_model):
+        """Only a failed rebuild is confined (by the store's savepoint). Any other error
+        — the unwrapped key read, say — may have aborted the turn's transaction on
+        PostgreSQL, so it propagates here rather than resurfacing later somewhere
+        unrelated."""
+        stored_semantic_model.side_effect = RuntimeError("current transaction is aborted")
+        sr = _make_schema_result(schema=MagicMock(), embeddings_available=False)
+
+        with pytest.raises(RuntimeError, match="current transaction is aborted"):
+            await _stage_prune_and_filter(
+                sr,
+                _make_conn_row(),
+                "q",
+                _make_settings(),
+                MagicMock(),
+                MagicMock(),
+                "conn-1",
+                "u",
+                None,
+            )
+
+    async def test_stage_passes_the_narrowed_schema_to_the_semantic_filter(
+        self, stored_semantic_model
+    ):
+        """The stage's contract with its caller: it receives the schema already narrowed
+        by ``_apply_privacy_to_schema`` (as ``_resolve_schema`` returns it), returns that
+        schema and filters the semantic model against it, so an excluded column leaks
+        into neither. The real stale-cache narrowing is covered by
+        ``TestResolveSchemaNarrowsStaleCache``.
+        """
+        schema = DataSourceSchema(
+            source_type="postgresql",
+            schemas=[],
+            tables=[
+                TableInfo(
+                    catalog=None,
+                    name="orders",
+                    schema_name="public",
+                    table_type="BASE TABLE",
+                    columns=[
+                        ColumnInfo(name="id", data_type="integer", native_type="int4"),
+                        ColumnInfo(name="hidden", data_type="text", native_type="text"),
+                    ],
+                )
+            ],
+        )
+        stored_semantic_model.return_value = SemanticModel(
+            tables={
+                "public.orders": TableSemantic(
+                    display_name="Orders",
+                    columns={
+                        "id": ColumnSemantic(display_name="Id"),
+                        "hidden": ColumnSemantic(display_name="Hidden"),
+                    },
+                )
+            },
+            business_metrics=[
+                DerivedMetric(name="Leak", definition="SUM(hidden)", description=""),
+                DerivedMetric(name="Keep", definition="COUNT(id)", description=""),
+            ],
+        )
+        privacy = PrivacySettings(excluded_columns=["public.orders.hidden"])
+        sr = _make_schema_result(
+            schema=_apply_privacy_to_schema(schema, privacy), embeddings_available=False
+        )
+
+        out_schema, semantic_model = await _stage_prune_and_filter(
+            sr,
+            _make_conn_row(),
+            "question",
+            _make_settings(),
+            MagicMock(),
+            MagicMock(),
+            "conn-1",
+            "u",
+            privacy,
+        )
+
+        assert [c.name for c in out_schema.tables[0].columns] == ["id"]
+        assert list(semantic_model.tables["public.orders"].columns) == ["id"]
+        assert [m.name for m in semantic_model.business_metrics] == ["Keep"]
+
+    async def test_stage_leaves_the_shared_cached_model_untouched(self, stored_semantic_model):
+        """``load_model_cached`` hands every turn the same instance, and the cleaned
+        and narrowed copies of it are memoised and shared across turns too, so the
+        later steps (relevance, compacting for the prompt) must copy, never mutate."""
+        from app.semantic.models import Hierarchy, RelationshipEdge
+        from app.services import schema_pruning, semantic_privacy
+        from app.services.pipeline import _compact_semantic_model
+        from app.services.schema_pruning import _filter_semantic_to_schema
+        from app.services.semantic_privacy import without_hidden_identifiers
+
+        def _table(name: str) -> TableInfo:
+            return TableInfo(
+                catalog=None,
+                name=name,
+                schema_name="public",
+                table_type="BASE TABLE",
+                columns=[ColumnInfo(name="id", data_type="integer", native_type="int4")],
+            )
+
+        names = [f"t{i}" for i in range(12)]
+        schema = DataSourceSchema(
+            source_type="postgresql", schemas=[], tables=[_table(n) for n in names]
+        )
+        stored = SemanticModel(
+            tables={
+                f"public.{n}": TableSemantic(
+                    display_name=n,
+                    primary_timestamp_column="gone",
+                    partition_columns=["id", "gone"],
+                    hierarchies=[Hierarchy(name="H", levels=["id", "gone"])],
+                    columns={
+                        "id": ColumnSemantic(display_name="Id"),
+                        "gone": ColumnSemantic(display_name="Gone"),
+                    },
+                )
+                for n in [*names, "stale"]
+            },
+            relationships=[
+                RelationshipEdge(
+                    from_table="public.t0",
+                    from_column="gone",
+                    to_table="public.t1",
+                    to_column="id",
+                    relationship_type="many_to_one",
+                    join_sql="public.t0.gone = public.t1.id",
+                )
+            ],
+            notes=["n", "the gone column is legacy"],
+        )
+        # The policy hides ``gone``: a column merely dropped would not be scrubbed.
+        privacy = PrivacySettings(excluded_columns=[f"public.{n}.gone" for n in names])
+        # Seed both memos as an earlier turn would; this turn must hit them.
+        cleaned = without_hidden_identifiers(stored, schema, privacy)
+        narrowed = _filter_semantic_to_schema(cleaned, schema)
+        assert cleaned is not stored and narrowed is not cleaned
+        before = [m.model_dump(mode="json") for m in (stored, cleaned, narrowed)]
+        stored_semantic_model.return_value = stored
+        sr = _make_schema_result(schema=schema, embeddings_available=False)
+
+        _schema, filtered = await _stage_prune_and_filter(
+            sr,
+            _make_conn_row(),
+            "t0",
+            _make_settings(),
+            MagicMock(),
+            MagicMock(),
+            "c",
+            "u",
+            privacy,
+        )
+        _compact_semantic_model(filtered)
+
+        assert "public.stale" not in filtered.tables
+        assert filtered.notes == ["n"]
+        # The stage used the seeded instances under the same keys...
+        assert filtered.tables["public.t0"] is narrowed.tables["public.t0"]
+        assert len(semantic_privacy._cleaned_cache) == 1
+        assert len(schema_pruning._narrowed_cache) == 1
+        assert without_hidden_identifiers(stored, schema, privacy) is cleaned
+        assert _filter_semantic_to_schema(cleaned, schema) is narrowed
+        # ...and left all three untouched.
+        assert [m.model_dump(mode="json") for m in (stored, cleaned, narrowed)] == before
+
+    async def test_semantic_model_comes_from_the_store_not_the_blob(self, stored_semantic_model):
+        schema = DataSourceSchema(
+            source_type="postgresql",
+            schemas=[],
+            tables=[
+                TableInfo(
+                    catalog=None,
+                    name="orders",
+                    schema_name="public",
+                    table_type="BASE TABLE",
+                    columns=[ColumnInfo(name="id", data_type="integer", native_type="int4")],
+                )
+            ],
+        )
+        stored_semantic_model.return_value = SemanticModel(
+            tables={
+                "public.orders": TableSemantic(display_name="Orders"),
+                "public.gone": TableSemantic(display_name="Gone"),
+            }
+        )
+        sr = _make_schema_result(schema=schema, embeddings_available=False)
+        conn = _make_conn_row()
+        # A blob that would validate into a different model: it must not be read.
+        conn.semantic_model = {"tables": {"public.blob_only": {"display_name": "Blob"}}}
+        db = MagicMock()
+
+        _, semantic_model = await _stage_prune_and_filter(
+            sr, conn, "question", _make_settings(), MagicMock(), db, "conn-1", "u", None
+        )
+
+        stored_semantic_model.assert_awaited_once_with(db, "conn-1")
+        assert list(semantic_model.tables) == ["public.orders"]
 
     async def test_returns_unpruned_schema_when_pruning_disabled(self):
         schema = MagicMock()
         sr = _make_schema_result(schema=schema, embeddings_available=True)
-        conn = _make_conn_row(semantic_model=None)
+        conn = _make_conn_row()
         settings = _make_settings(schema_pruning_enabled=False)
 
         with patch(f"{_MODULE}._select_relevant_tables") as mock_prune:
@@ -226,7 +481,7 @@ class TestStagePruneAndFilter:
         original_schema = MagicMock()
         pruned = MagicMock()
         sr = _make_schema_result(schema=original_schema, embeddings_available=True)
-        conn = _make_conn_row(semantic_model=None)
+        conn = _make_conn_row()
         settings = _make_settings(schema_pruning_enabled=True)
 
         with patch(

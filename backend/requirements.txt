@@ -19,7 +19,8 @@ PyJWT==2.15.1
 bcrypt==4.2.1
 slowapi==0.1.9
 numpy==2.2.1
-fastembed==0.8.0
+fastembed==0.9.1
+pillow==13.0.0
 pgvector==0.3.6
 json-repair==0.60.1
 aiofiles==24.1.0

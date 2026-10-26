@@ -128,6 +128,7 @@ class TestListConnections:
         assert len(data) == 1
         assert data[0]["id"] == "abc-123"
         assert data[0]["name"] == "Sales DB"
+        assert "semantic_model_updated_at" not in data[0]
 
 
 # ── GET /api/v1/connections/{id} ─────────────────────────────────────────────────
@@ -149,6 +150,7 @@ class TestGetConnection:
         body = resp.json()
         assert body["id"] == "conn-123"
         assert body["name"] == "My DB"
+        assert "semantic_model_updated_at" not in body
 
     async def test_returns_404_for_unknown_connection(self, http_client):
         db = _mock_db(MockResult(single=None))
@@ -204,14 +206,19 @@ class TestTestExistingConnection:
 
 class TestDeleteConnection:
     @pytest.fixture(autouse=True)
-    def patch_evict(self):
+    def stub_deletes(self):
+        # delete_model has its own coverage in tests/test_semantic; here it is a seam,
+        # and ``yield``ing the mock lets tests assert the route awaits it.
         with (
             patch("app.routers.connections._evict_pg_pool", new=AsyncMock()),
             patch("app.routers.connections.decrypt_value", return_value='{"host": "h"}'),
+            patch(
+                "app.routers.connections.semantic_store.delete_model", new=AsyncMock()
+            ) as delete_model,
         ):
-            yield
+            yield delete_model
 
-    async def test_success_returns_204(self, http_client):
+    async def test_success_returns_204(self, http_client, stub_deletes):
         conn = _make_conn()
         # execute calls: (1) get conn, (2) get session ids, (3) del cache, (4) del examples,
         # (5) del UserSchemaCache, (6) del TableEmbeddingCache, (7) del SemanticSuggestion
@@ -228,6 +235,12 @@ class TestDeleteConnection:
         resp = await http_client.delete("/api/v1/connections/conn-123")
         assert resp.status_code == 204
         assert db.execute.call_count == 7
+        # The legacy blob is cleared by store.delete_model, patched out here.
+        # Soft-delete never fires ON DELETE CASCADE, so the semantic rows go explicitly.
+        stub_deletes.assert_awaited_once()
+        args, kwargs = stub_deletes.await_args
+        assert args[1] == "conn-123"
+        assert kwargs["changed_by"] == "admin-1"
 
     async def test_not_found_returns_404(self, http_client):
         db = _mock_db(MockResult(single=None))
@@ -319,12 +332,56 @@ class TestRefreshSchema:
         )
         app.dependency_overrides[get_db] = lambda: db
         with (
-            patch("app.routers.connections.decrypt_value", return_value='{"host":"localhost"}'),
-            patch("app.routers.connections.create_datasource", return_value=adapter),
+            patch("app.services.schema_utils.decrypt_value", return_value='{"host":"localhost"}'),
+            patch("app.services.schema_utils.create_datasource", return_value=adapter),
         ):
             resp = await http_client.post("/api/v1/connections/conn-123/schema/refresh")
         assert resp.status_code == 200
         assert db.execute.call_count == 4
+
+    async def test_an_unchanged_schema_still_flushes_the_derived_caches(self, http_client):
+        """The explicit Refresh always clears embeddings and cached answers, even when
+        the schema hash says nothing changed (``flush="always"``)."""
+        from app.datasources.models import ColumnInfo, DataSourceSchema, TableInfo
+        from app.models.cache import QueryCacheEntry
+        from app.models.table_embedding_cache import TableEmbeddingCache
+        from app.semantic.generator import SemanticModelGenerator
+
+        schema = DataSourceSchema(
+            source_type="postgresql",
+            schemas=[],
+            tables=[
+                TableInfo(
+                    catalog=None,
+                    schema_name="public",
+                    name="orders",
+                    table_type="table",
+                    columns=[ColumnInfo(name="id", data_type="integer", native_type="int4")],
+                )
+            ],
+        )
+        cache = MagicMock()
+        cache.schema_hash = SemanticModelGenerator().compute_schema_hash(schema)
+        adapter = MagicMock()
+        adapter.connect = AsyncMock()
+        adapter.introspect = AsyncMock(return_value=schema)
+        adapter.disconnect = AsyncMock()
+        db = _mock_db(
+            MockResult(single=_make_conn()),  # get_connection_or_404
+            MockResult(single=cache),  # the user's cache, same hash
+            MockResult(),  # delete TableEmbeddingCache
+            MockResult(),  # delete QueryCacheEntry
+        )
+        app.dependency_overrides[get_db] = lambda: db
+        with (
+            patch("app.services.schema_utils.decrypt_value", return_value='{"host":"localhost"}'),
+            patch("app.services.schema_utils.create_datasource", return_value=adapter),
+        ):
+            resp = await http_client.post("/api/v1/connections/conn-123/schema/refresh")
+        assert resp.status_code == 200
+        deleted = [call.args[0].table.name for call in db.execute.await_args_list[2:]]
+        assert deleted == [TableEmbeddingCache.__tablename__, QueryCacheEntry.__tablename__]
+        db.commit.assert_awaited_once()
 
     async def test_introspection_error_returns_400(self, http_client):
         conn = _make_conn()
@@ -335,8 +392,8 @@ class TestRefreshSchema:
         db = _mock_db(MockResult(single=conn))
         app.dependency_overrides[get_db] = lambda: db
         with (
-            patch("app.routers.connections.decrypt_value", return_value='{"host":"localhost"}'),
-            patch("app.routers.connections.create_datasource", return_value=adapter),
+            patch("app.services.schema_utils.decrypt_value", return_value='{"host":"localhost"}'),
+            patch("app.services.schema_utils.create_datasource", return_value=adapter),
         ):
             resp = await http_client.post("/api/v1/connections/conn-123/schema/refresh")
         assert resp.status_code == 400
@@ -582,3 +639,16 @@ class TestGetConnectionConfig:
             )
         assert resp.status_code == 200
         assert captured_config["password"] == "new-pass"
+
+
+# ── Response shape ──────────────────────────────────────────────────────────────
+
+
+class TestConnectionResponseShape:
+    def test_semantic_model_updated_at_is_not_served(self) -> None:
+        """Nothing writes Connection.semantic_model_updated_at since the semantic store;
+        the column goes with the legacy blob, so the API stops serving a stale value."""
+        from app.schemas.connection import ConnectionDetail, ConnectionResponse
+
+        assert "semantic_model_updated_at" not in ConnectionResponse.model_fields
+        assert "semantic_model_updated_at" not in ConnectionDetail.model_fields

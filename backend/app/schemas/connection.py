@@ -66,7 +66,6 @@ class ConnectionResponse(BaseModel):
     source_type: str
     execution_mode: str
     is_active: bool
-    semantic_model_updated_at: datetime | None
     created_at: datetime
 
     model_config = {"from_attributes": True}

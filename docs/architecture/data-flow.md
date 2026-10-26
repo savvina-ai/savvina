@@ -16,12 +16,13 @@ routers/chat.py: process_message()
        │    ├─ UserSchemaCache (DB read)
        │    ├─ adapter.introspect()                  # if cache miss
        │    ├─ _schema_from_dict()                   # deserialise stored JSON
-       │    ├─ _apply_privacy_to_schema()            # strip excluded tables/schemas
+       │    ├─ _apply_privacy_to_schema()            # strip excluded schemas/tables/columns (+ their FKs)
        │    └─ cache.compute_embedding_async()        # build per-table embeddings
        ├─ schema_pruning._select_relevant_tables()   # schema pruning (cosine similarity + domain boost)
        │    ├─ QueryCache.compute_embedding_async()
        │    └─ QueryCache.cosine_similarity()
-       ├─ schema_pruning._filter_semantic_to_schema()  # drop pruned tables from semantic model
+       ├─ semantic_privacy.without_hidden_identifiers() # drop free-text items naming a privacy-hidden identifier
+       ├─ schema_pruning._filter_semantic_to_schema()  # drop pruned tables and privacy-hidden columns from the semantic model
        ├─ schema_pruning._filter_semantic_by_relevance() # token-score narrowing + domain token boost
        ├─ pipeline._generate_query()                 # cache → LLM → validate → store
        │    ├─ QueryCache.lookup()                   # exact + semantic similarity lookup
@@ -292,7 +293,7 @@ Schema introspection is expensive (multiple SQL queries against the user's datab
 
 - Cache hit → `_schema_from_dict()` deserialises the stored JSON back to `DataSourceSchema`
 - Cache miss → `adapter.connect()` + `adapter.introspect(privacy)` + `_schema_to_dict()` stores the result
-- `_apply_privacy_to_schema()` strips excluded schemas/tables before any further use
+- `_apply_privacy_to_schema()` strips excluded schemas/tables, `excluded_columns` (exact `schema.table.column`) and the foreign keys on those columns before any further use
 - If `table_embeddings` are absent, builds them: `_build_table_text(table)` per table → `cache.compute_embedding_async()` → stored on `UserSchemaCache.table_embeddings`
 
 ### Step 5: Intent Classification
@@ -319,13 +320,14 @@ When `schema_pruning_enabled` is true (default), the full schema is narrowed:
 
 ### Step 7: Semantic Model Filtering
 
-**File:** `services/schema_pruning.py` → `_filter_semantic_to_schema()`, `_filter_semantic_by_relevance()`  
+**Files:** `services/semantic_privacy.py` → `without_hidden_identifiers()`; `services/schema_pruning.py` → `_filter_semantic_to_schema()`, `_filter_semantic_by_relevance()`  
 **Model:** `semantic/models.py` → `SemanticModel`
 
-Two-pass filtering of the stored `Connection.semantic_model`:
+Three-pass filtering of the model read by `semantic/store.load_model_cached` (one SELECT of the header's id and `version` per turn; the model is reassembled by `load_model`, inside a SAVEPOINT, only when they moved). The cached instance is shared across turns, so no pass mutates it: each returns its input unchanged or a `model_copy`. The first two are memoised on the model instance and return shared instances, so callers must not mutate their results either:
 
-1. `_filter_semantic_to_schema()` — drops any table keys not present in the privacy-filtered schema (removes excluded tables/schemas)
-2. `_filter_semantic_by_relevance()` — token-score narrowing: scores each table by name overlap + display name + column name tokens against the question; tables whose `domain` tag has tokens overlapping the question receive a +2 score bonus; keeps top-10 plus one-hop FK neighbours
+1. `without_hidden_identifiers()` — against the privacy-filtered *full* schema (before relevance narrowing), drops business metrics, segments, derived columns, common joins, `notes` and per-table `default_filters` entries that mention a name the privacy settings hide (an excluded schema, table or column), and clears a `base_sql` that does. A table or column that is merely gone from the database, with no exclusion, is not hidden: an item still mentioning it is stale, not secret, and is kept. With no privacy settings the model passes through unchanged. Matching is by whole identifier, case-insensitive (a name with other characters, such as a space or hyphen, is matched as a substring). The descriptions of visible tables and columns are not scanned. See [Chat Path](semantic-model-generation.md#chat-path) for the rules
+2. `_filter_semantic_to_schema()` — narrows the model to the privacy-filtered schema: drops table keys not present in it (excluded tables/schemas) and, within each kept table, columns not present in it, with references to them (primary timestamp/date column, partition/cluster columns, hierarchy levels) and the relationships that use them (a dropped edge between two visible tables is logged once per edge per process). Common joins are filtered by table only: one is dropped only when it references a pruned table. The store keeps annotations for privacy-hidden columns, so this is what keeps them out of the prompt
+3. `_filter_semantic_by_relevance()` — token-score narrowing: scores each table by name overlap + display name + column name tokens against the question; tables whose `domain` tag has tokens overlapping the question receive a +2 score bonus; keeps top-10 plus one-hop FK neighbours
 
 ### Step 8: Query Cache Lookup
 
@@ -524,7 +526,9 @@ ConnectionsRouter.refresh_schema()
   6. adapter.disconnect()
   7. Upsert user_schema_caches SET schema_cache = ?, schema_cached_at = ?
      (keyed by connection_id + user_id)
-  8. DELETE FROM query_cache WHERE connection_id = ?
-     (invalidate — cached queries may reference old columns)
+  8. DELETE FROM table_embedding_cache WHERE connection_id = ?
+     DELETE FROM query_cache WHERE connection_id = ?
+     (invalidate — embeddings and cached queries may reference old columns;
+     in this order, the one every cache purge shares)
   9. Return schema as JSON
 ```

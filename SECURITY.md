@@ -11,11 +11,11 @@ Email security@savvina.ai with:
 - Potential impact
 - Any suggested fix if you have one
 
-You will receive a response within 48 hours. We will keep you informed
-of progress toward a fix and public disclosure.
+We acknowledge reports within three business days, keep you informed
+while we work on a fix, and credit you in the release notes unless you
+prefer otherwise.
 
-We ask that you give us reasonable time to address the issue before
-any public disclosure.
+Please give us 90 days before publishing details.
 
 ---
 

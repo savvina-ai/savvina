@@ -80,7 +80,7 @@ If fetching fails (invalid key, network issue), the dropdown falls back to any p
 
 ### Cerebras
 
-- **Default model:** `qwen-3-235b-a22b-instruct-2507`
+- **Default model:** `gpt-oss-120b`
 - Base URL: `https://api.cerebras.ai/v1`
 - Models fetched from the Cerebras models endpoint
 

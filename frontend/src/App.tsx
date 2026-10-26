@@ -17,7 +17,7 @@ const ChatPage = lazy(() => import('./pages/ChatPage'));
 const ConnectionPage = lazy(() => import('./pages/ConnectionPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 const HistoryPage = lazy(() => import('./pages/HistoryPage'));
-const SemanticModelPage = lazy(() => import('./pages/SemanticModelPage'));
+const SemanticModelRoute = lazy(() => import('./pages/SemanticModelRoute'));
 const ProfilePage = lazy(() => import('./pages/ProfilePage'));
 const SharePage = lazy(() => import('./pages/SharePage'));
 const SharedSessionPage = lazy(() => import('./pages/SharedSessionPage'));
@@ -76,7 +76,7 @@ function App() {
             <Route path="settings" element={<SettingsPage />} />
             <Route path="history" element={<HistoryPage />} />
             <Route path="reports" element={<ReportBuilderPage />} />
-            <Route path="semantic/:connectionId" element={<SemanticModelPage />} />
+            <Route path="semantic/:connectionId" element={<SemanticModelRoute />} />
             <Route path="profile" element={<ProfilePage />} />
           </Route>
         </Routes>

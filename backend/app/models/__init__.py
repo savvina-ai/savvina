@@ -12,6 +12,16 @@ from .connection import Connection  # noqa: F401
 from .example import VerifiedExample  # noqa: F401
 from .provider import ProviderConfig  # noqa: F401
 from .query_usage import QueryUsage  # noqa: F401
+from .semantic_store import (  # noqa: F401
+    SemanticColumnRow,
+    SemanticGlobalItemRow,
+    SemanticHistoryRow,
+    SemanticKnownColumnsRow,
+    SemanticMetricRow,
+    SemanticModelRow,
+    SemanticRelationshipRow,
+    SemanticTableRow,
+)
 from .semantic_suggestion import SemanticSuggestion  # noqa: F401
 from .table_embedding_cache import TableEmbeddingCache  # noqa: F401
 from .user import RefreshToken, RevokedAccessToken, User  # noqa: F401

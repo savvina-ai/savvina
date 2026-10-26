@@ -23,14 +23,11 @@ from ..auth.limiter import limiter
 from ..config import get_settings
 from ..database import get_db
 from ..datasources.adapters.postgresql import evict_pool as _evict_pg_pool
-from ..datasources.models import PrivacySettings
 from ..datasources.registry import create_datasource
-from ..models.cache import QueryCacheEntry
 from ..models.chat import ChatMessage, ChatSession
 from ..models.connection import Connection
 from ..models.example import VerifiedExample
 from ..models.semantic_suggestion import SemanticSuggestion
-from ..models.table_embedding_cache import TableEmbeddingCache
 from ..models.user import User
 from ..models.user_schema_cache import UserSchemaCache
 from ..schemas.connection import (
@@ -44,6 +41,8 @@ from ..schemas.connection import (
     PrivacySettingsUpdate,
 )
 from ..schemas.pagination import PaginatedResponse
+from ..semantic import store as semantic_store
+from ..services.schema_utils import SchemaRefreshError, refresh_user_schema_cache
 from ..utils.encryption import decrypt_value, encrypt_value
 from ._utils import _invalidate_connection_caches, cached_json_response, get_connection_or_404
 
@@ -247,6 +246,9 @@ async def delete_connection(
     await db.execute(
         delete(SemanticSuggestion).where(SemanticSuggestion.connection_id == connection_id)
     )
+    # Soft-delete never fires ON DELETE CASCADE, so the semantic rows (and the legacy
+    # blob, which the store clears with them) go explicitly.
+    await semantic_store.delete_model(db, connection_id, changed_by=_user.id)
     if conn.source_type == "postgresql":
         config_dict = json.loads(decrypt_value(conn.config_encrypted, settings.encryption_key))
         await _evict_pg_pool(config_dict)
@@ -282,48 +284,14 @@ async def refresh_schema(
     """Re-introspect the data source and update the schema cache."""
     settings = get_settings()
     conn = await get_connection_or_404(connection_id, db)
-    config_dict = json.loads(decrypt_value(conn.config_encrypted, settings.encryption_key))
-
-    privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
-    adapter = create_datasource(conn.source_type)
     try:
-        await adapter.connect(config_dict)
-        schema = await adapter.introspect(privacy)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Schema refresh failed: {e}") from e
-    finally:
-        await adapter.disconnect()
-
-    from ..semantic.generator import SemanticModelGenerator
-
-    schema_dict = asdict(schema)
-    schema_hash = SemanticModelGenerator().compute_schema_hash(schema)
-    now = datetime.now(UTC)
-    usc = await _get_user_schema_cache(connection_id, current_user.id, db)
-    if usc is None:
-        db.add(
-            UserSchemaCache(
-                connection_id=connection_id,
-                user_id=current_user.id,
-                schema_cache=schema_dict,
-                schema_cached_at=now,
-                schema_hash=schema_hash,
-                created_at=now,
-                updated_at=now,
-            )
+        schema = await refresh_user_schema_cache(
+            conn, current_user.id, db, settings.encryption_key, flush="always"
         )
-    else:
-        usc.schema_cache = schema_dict
-        usc.schema_cached_at = now
-        usc.schema_hash = schema_hash
-        usc.updated_at = now
-    # Flush table embeddings so they are recomputed from the fresh schema on next request
-    await db.execute(
-        delete(TableEmbeddingCache).where(TableEmbeddingCache.connection_id == connection_id)
-    )
-    await db.execute(delete(QueryCacheEntry).where(QueryCacheEntry.connection_id == connection_id))
+    except SchemaRefreshError as e:
+        raise HTTPException(status_code=400, detail=f"Schema refresh failed: {e}") from e
     await db.commit()
-    return schema_dict
+    return asdict(schema)
 
 
 # ── Privacy & execution mode ───────────────────────────────────────────────────

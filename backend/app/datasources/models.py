@@ -40,6 +40,16 @@ class TableInfo:
     metadata: dict = field(default_factory=dict)  # adapter-specific extras (e.g. view_definition)
 
 
+def table_key(table: TableInfo) -> str:
+    """The ``schema.name`` key the semantic store, drift check and generation use for a table.
+
+    One encoding, defined once. A schema or table name that itself contains a dot
+    makes the key ambiguous to split; the readers that must split one
+    (``semantic.drift.policy_hides_table``) try every split rather than guess.
+    """
+    return f"{table.schema_name}.{table.name}"
+
+
 @dataclass
 class SchemaInfo:
     name: str
@@ -53,6 +63,12 @@ class DataSourceSchema:
     tables: list[TableInfo] = field(default_factory=list)
     relationships: list[RelationshipInfo] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
+    # ``table_key`` of each table that exists in the database but that the connection's
+    # role cannot see (no privilege on it, or no USAGE on its schema), so it is absent
+    # from ``tables``. Unreadable is not dropped: whatever persists the semantic model
+    # keeps such a table, and drift does not report it as removed. Empty for an adapter
+    # that cannot tell the two apart, and for a schema cache written before this field.
+    unreadable_tables: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -152,6 +168,15 @@ class PrivacySettings:
             else f"{table_name}.{column_name}"
         )
         return full_name in self.excluded_columns or self.is_column_sensitive(column_name)
+
+    def hides_column(self, table_key: str, column_name: str) -> bool:
+        """Exact ``schema.table.column`` membership in ``excluded_columns``.
+
+        The rule the adapters apply at introspection and ``_apply_privacy_to_schema``
+        applies to a cached schema. Unlike ``is_column_excluded`` it ignores the
+        sensitive-name patterns, which the adapters still introspect.
+        """
+        return f"{table_key}.{column_name}" in self.excluded_columns
 
     @classmethod
     def from_dict(cls, data: dict) -> "PrivacySettings":

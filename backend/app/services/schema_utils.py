@@ -5,13 +5,15 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 import json
 import logging
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 import sqlparse
 from sqlparse.exceptions import SQLParseError
 import sqlparse.sql
@@ -24,10 +26,15 @@ from ..datasources.models import (
     RelationshipInfo,
     SchemaInfo,
     TableInfo,
+    table_key,
 )
 from ..datasources.registry import create_datasource
+from ..models.cache import QueryCacheEntry
 from ..models.connection import Connection
+from ..models.table_embedding_cache import TableEmbeddingCache
 from ..models.user_schema_cache import UserSchemaCache
+from ..semantic.generator import SemanticModelGenerator, policy_hides_table
+from ..utils.encryption import decrypt_value
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,53 +55,137 @@ async def get_or_refresh_schema(
     Used when no pre-existing adapter session is available (e.g. semantic model generation).
     For the chat pipeline path use ``_resolve_schema`` in ``schema_pruning`` instead, which
     reuses the adapter connection already established for query execution.
+
+    A miss is ``refresh_user_schema_cache`` with ``flush="never"``, committed here. It
+    raises ``SchemaRefreshError`` when the source cannot be reached (nothing written).
     """
-    from sqlalchemy import select  # local to avoid circular at module level
-
-    usc_result = await db.execute(
-        select(UserSchemaCache).where(
-            UserSchemaCache.connection_id == conn.id,
-            UserSchemaCache.user_id == user_id,
+    usc = (
+        await db.execute(
+            select(UserSchemaCache).where(
+                UserSchemaCache.connection_id == conn.id,
+                UserSchemaCache.user_id == user_id,
+            )
         )
-    )
-    usc = usc_result.scalar_one_or_none()
-
-    privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
+    ).scalar_one_or_none()
 
     if usc and usc.schema_cache:
         schema = _schema_from_dict(usc.schema_cache)
     else:
-        from ..utils.encryption import decrypt_value
-
-        config_dict = json.loads(decrypt_value(conn.config_encrypted, encryption_key))
-        adapter = create_datasource(conn.source_type)
-        try:
-            await adapter.connect(config_dict)
-            schema = await adapter.introspect(privacy)
-        finally:
-            await adapter.disconnect()
-
-        now = datetime.now(UTC)
-        if usc is None:
-            db.add(
-                UserSchemaCache(
-                    connection_id=conn.id,
-                    user_id=user_id,
-                    schema_cache=_schema_to_dict(schema),
-                    schema_cached_at=now,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
-        else:
-            usc.schema_cache = _schema_to_dict(schema)
-            usc.schema_cached_at = now
-            usc.updated_at = now
+        # No flush: there is nothing stale to flush. A user's row is missing either
+        # because they never loaded this connection — and the chat path writes their
+        # table embeddings only after writing that row — or because
+        # ``_invalidate_connection_caches`` deleted it, which deleted the connection's
+        # embeddings and cached answers in the same transaction.
+        schema = await refresh_user_schema_cache(conn, user_id, db, encryption_key, flush="never")
         await db.commit()
 
+    privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
     if privacy:
         schema = _apply_privacy_to_schema(schema, privacy)
     return schema
+
+
+class SchemaRefreshError(Exception):
+    """The data source could not be connected to or introspected."""
+
+
+# When ``refresh_user_schema_cache`` deletes the caches built from the schema (table
+# embeddings, cached query answers): "changed" when the stored hash differs (or there
+# was no row), "always" for the explicit Refresh, "never" for a first load.
+SchemaCacheFlush = Literal["changed", "always", "never"]
+
+
+async def refresh_user_schema_cache(
+    conn: Connection,
+    user_id: str,
+    db: AsyncSession,
+    encryption_key: str,
+    *,
+    flush: SchemaCacheFlush = "changed",
+) -> DataSourceSchema:
+    """Introspect ``conn`` live and store the result as this user's schema cache.
+
+    Returns the schema as introspected (privacy applied at introspection, not
+    ``_apply_privacy_to_schema``). Table embeddings and cached query answers are
+    built from the schema, so they are flushed per ``flush`` (``SchemaCacheFlush``).
+    Raises ``SchemaRefreshError`` when the source cannot be reached; nothing is
+    written then. The caller commits.
+    """
+    config_dict = json.loads(decrypt_value(conn.config_encrypted, encryption_key))
+    privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
+    adapter = create_datasource(conn.source_type)
+    try:
+        result = await adapter.connect(config_dict)
+        if result is not None and result.success is False:
+            raise SchemaRefreshError(result.message)
+        schema = await adapter.introspect(privacy)
+    except SchemaRefreshError:
+        raise
+    except Exception as exc:
+        raise SchemaRefreshError(str(exc) or repr(exc)) from exc
+    finally:
+        await adapter.disconnect()
+
+    schema_hash = SemanticModelGenerator().compute_schema_hash(schema)
+    changed = await _store_user_schema_cache(db, conn.id, user_id, schema, schema_hash)
+    # Schema cache, then embeddings, then cached answers: the order
+    # ``_invalidate_connection_caches`` deletes in too, because two transactions that
+    # lock the same rows in opposite orders can deadlock. The schema-cache write comes
+    # first even when it is pending in the session: the next execute autoflushes it.
+    if flush == "always" or (flush == "changed" and changed):
+        await db.execute(
+            delete(TableEmbeddingCache).where(TableEmbeddingCache.connection_id == conn.id)
+        )
+        await db.execute(delete(QueryCacheEntry).where(QueryCacheEntry.connection_id == conn.id))
+    return schema
+
+
+async def _store_user_schema_cache(
+    db: AsyncSession,
+    connection_id: str,
+    user_id: str,
+    schema: DataSourceSchema,
+    schema_hash: str,
+) -> bool:
+    """Upsert the user's schema cache row; whether its hash changed (a new row has).
+
+    Select, then insert or update. Two first refreshes for one user and connection
+    (two tabs running Check Drift) both find no row and both insert; the second
+    insert violates ``UniqueConstraint(connection_id, user_id)``. The insert runs in
+    a savepoint so that conflict rolls back only the insert, and the loser updates
+    the winner's row instead of failing the request with a 500.
+    """
+    lookup = select(UserSchemaCache).where(
+        UserSchemaCache.connection_id == connection_id,
+        UserSchemaCache.user_id == user_id,
+    )
+    now = datetime.now(UTC)
+    usc = (await db.execute(lookup)).scalar_one_or_none()
+    if usc is None:
+        try:
+            async with db.begin_nested():
+                db.add(
+                    UserSchemaCache(
+                        connection_id=connection_id,
+                        user_id=user_id,
+                        schema_cache=_schema_to_dict(schema),
+                        schema_cached_at=now,
+                        schema_hash=schema_hash,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            return True
+        except IntegrityError:
+            usc = (await db.execute(lookup)).scalar_one_or_none()
+            if usc is None:
+                raise
+    changed = usc.schema_hash != schema_hash
+    usc.schema_cache = _schema_to_dict(schema)
+    usc.schema_cached_at = now
+    usc.schema_hash = schema_hash
+    usc.updated_at = now
+    return changed
 
 
 def _extract_tables_from_sql(sql: str) -> list[str]:
@@ -183,17 +274,25 @@ def _schema_from_dict(d: dict) -> DataSourceSchema:
         ],
         relationships=[RelationshipInfo(**r) for r in d.get("relationships", [])],
         metadata=d.get("metadata", {}),
+        unreadable_tables=list(d.get("unreadable_tables", [])),
     )
 
 
 def _apply_privacy_to_schema(
     schema: DataSourceSchema, privacy: PrivacySettings
 ) -> DataSourceSchema:
-    """Return a copy of schema with excluded schemas/tables/relationships removed.
+    """Return a copy of schema with excluded schemas, tables, columns and relationships removed.
 
     Ensures _validate_columns_against_schema enforces privacy settings,
     not just format_schema_for_llm. Relationships are filtered so that
-    FK annotations cannot reveal excluded table names to the LLM.
+    FK annotations cannot reveal excluded table or column names to the LLM.
+
+    Columns ``PrivacySettings.hides_column`` names (the adapters' rule at
+    introspection) are removed as well: introspection already
+    omits them, but a schema cache written before a privacy change still carries
+    them, and every consumer of this function — chat validation and pruning,
+    drift, generation — must not see one. The sensitive-name patterns are
+    deliberately not applied here: the adapters still introspect those columns.
     """
     visible = {
         (t.schema_name, t.name)
@@ -203,13 +302,28 @@ def _apply_privacy_to_schema(
     return DataSourceSchema(
         source_type=schema.source_type,
         schemas=[s for s in schema.schemas if s.name not in privacy.excluded_schemas],
-        tables=[t for t in schema.tables if not privacy.is_table_excluded(t.schema_name, t.name)],
+        tables=[
+            replace(
+                t,
+                columns=[c for c in t.columns if not privacy.hides_column(table_key(t), c.name)],
+            )
+            for t in schema.tables
+            if (t.schema_name, t.name) in visible
+        ],
         relationships=[
             r
             for r in schema.relationships
-            if (r.from_schema, r.from_table) in visible and (r.to_schema, r.to_table) in visible
+            if (r.from_schema, r.from_table) in visible
+            and (r.to_schema, r.to_table) in visible
+            and not privacy.hides_column(f"{r.from_schema}.{r.from_table}", r.from_column)
+            and not privacy.hides_column(f"{r.to_schema}.{r.to_table}", r.to_column)
         ],
         metadata=schema.metadata,
+        # Introspection leaves excluded tables out of this list, but a cache written
+        # before a privacy change can still name one.
+        unreadable_tables=[
+            key for key in schema.unreadable_tables if not policy_hides_table(key, privacy)
+        ],
     )
 
 
@@ -378,12 +492,12 @@ def _check_column_references(
     for m in re.finditer(r"\b([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)\b", query, re.IGNORECASE):
         prefix = m.group(1).lower()
         column = m.group(2).lower()
-        table_key = alias_map.get(prefix)
-        if table_key and table_key in table_columns and column not in table_columns[table_key]:
-            available = ", ".join(sorted(table_columns[table_key]))
+        resolved = alias_map.get(prefix)
+        if resolved and resolved in table_columns and column not in table_columns[resolved]:
+            available = ", ".join(sorted(table_columns[resolved]))
             bad.append(
                 f'column "{m.group(2)}" does not exist in table'
-                f' "{table_key.rpartition(".")[2]}" (available: {available})'
+                f' "{resolved.rpartition(".")[2]}" (available: {available})'
             )
     if bad:
         return "Query references columns not found in schema: " + "; ".join(dict.fromkeys(bad))

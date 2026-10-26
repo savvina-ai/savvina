@@ -11,7 +11,6 @@ export function makeConnection(overrides?: Partial<Connection>): Connection {
     execution_mode: 'auto_execute',
     is_active: true,
     schema_cached_at: null,
-    semantic_model_updated_at: null,
     created_at: '2026-01-01T00:00:00Z',
 ...overrides,
   };

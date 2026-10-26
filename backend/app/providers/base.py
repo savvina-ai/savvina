@@ -32,6 +32,35 @@ class ProviderAuthError(Exception):
     """Raised when a provider rejects credentials (HTTP 401/403)."""
 
 
+# A structured call that failed for a reason a later attempt can fix (provider 5xx or
+# overload, dropped connection). The semantic router maps it to 503 and the page
+# retries it with backoff. Set only by generate_structured, which runs with the SDK's
+# own retries off; chat keeps the SDK defaults and its existing error text.
+PROVIDER_UNAVAILABLE_MARK = "[PROVIDER_UNAVAILABLE]"
+
+
+def is_transient_status(status: int) -> bool:
+    """True for a status a later attempt can fix: 408, 409 and any 5xx.
+
+    Matches what the openai/anthropic SDKs retried silently before generate_structured
+    turned their retries off (they also honoured an ``x-should-retry`` header; we do
+    not, the page's retry is capped). 429 is deliberately NOT here: it is tagged
+    [RATE_LIMIT] by each provider's error normaliser.
+    """
+    return status in (408, 409) or 500 <= status < 600
+
+
+def provider_unavailable(detail: str) -> ValueError:
+    return ValueError(f"{PROVIDER_UNAVAILABLE_MARK} {detail} Retrying usually helps.")
+
+
+def strip_error_marker(message: str) -> str:
+    """Drop the leading ``[MARKER] `` the normalisers prefix, for text shown as-is in the UI."""
+    if message.startswith("[") and "] " in message:
+        return message.split("] ", 1)[1]
+    return message
+
+
 def _raise_if_fetch_error(exc: Exception, provider: str) -> None:
     """Re-raise *exc* as a typed provider error for known httpx failure modes.
 

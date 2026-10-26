@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 
@@ -19,7 +20,10 @@ from .base import (
     LLMResponse,
     ModelInfo,
     _raise_if_fetch_error,
+    is_transient_status,
     parse_llm_response,
+    provider_unavailable,
+    strip_error_marker,
 )
 from .registry import register_provider
 
@@ -98,11 +102,12 @@ class OpenAIProvider(BaseLLMProvider):
         self._default_model = default_model or _DEFAULT_MODEL
 
     @staticmethod
-    def _normalize_api_error(exc: openai.APIStatusError) -> ValueError:
+    def _normalize_api_error(exc: openai.APIStatusError, model: str = "") -> ValueError:
         """Convert an openai.APIStatusError into a descriptive ValueError.
 
         Covers Gemini, Groq, Cerebras, Mistral, and any other OpenAI-compatible
-        provider that routes through this class.
+        provider that routes through this class.  *model* is the model the failed
+        request asked for, so a 404 can name it.
         """
         try:
             body = exc.response.json()
@@ -139,6 +144,14 @@ class OpenAIProvider(BaseLLMProvider):
                 f" {api_msg} Try a provider with a larger context window"
                 f" (e.g. Claude, Gemini, OpenAI), or reduce the number of tables."
             )
+        # OpenAI answers an exhausted balance with 429 too, but waiting does not help:
+        # a distinct marker so callers that retry [RATE_LIMIT] do not retry this.
+        # (Gemini's daily and per-minute quotas share code 429, status
+        # RESOURCE_EXHAUSTED and the "exceeded your current quota" message, so they
+        # cannot be told apart here and stay [RATE_LIMIT].)
+        if exc.status_code == 429 and code == "insufficient_quota":
+            hint = api_msg or "The provider account has no remaining quota or credit."
+            return ValueError(f"[QUOTA_EXCEEDED] {hint}")
         if exc.status_code == 429:
             hint = api_msg or "You have exceeded the provider's rate limit or quota."
             return ValueError(f"[RATE_LIMIT] {hint}")
@@ -146,6 +159,14 @@ class OpenAIProvider(BaseLLMProvider):
             return ValueError(
                 f"[AUTH_ERROR] Invalid or expired API key (HTTP {exc.status_code}). "
                 f"Check your provider credentials."
+            )
+        # Cerebras, Groq and OpenAI answer an unknown or retired model with 404 and
+        # code model_not_found; Gemini's OpenAI endpoint only says so in the message.
+        if exc.status_code == 404 and (code == "model_not_found" or "model" in api_msg.lower()):
+            which = f"Model '{model}'" if model else "The requested model"
+            return ValueError(
+                f"[MODEL_NOT_FOUND] {which} is not available on this provider, or this API key "
+                f"has no access to it. Click Fetch Models and pick one of the models it returns."
             )
         return ValueError(f"[PROVIDER_ERROR] Provider returned HTTP {exc.status_code}. {api_msg}")
 
@@ -178,7 +199,7 @@ class OpenAIProvider(BaseLLMProvider):
                 temperature=temperature,
             )
         except openai.APIStatusError as exc:
-            raise self._normalize_api_error(exc) from exc
+            raise self._normalize_api_error(exc, model or self._default_model) from exc
         if not response.choices:
             raise ValueError(
                 "[EMPTY_RESPONSE] The model returned no choices. "
@@ -215,8 +236,11 @@ class OpenAIProvider(BaseLLMProvider):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ]
+        # The app owns retries for generation (the page's backoff); the SDK's own
+        # silent ones would multiply them and outlast the router's timeout.
+        client = self._client.with_options(max_retries=0)
         try:
-            response = await self._client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=model or self._default_model,
                 messages=messages,
                 max_tokens=max_tokens,
@@ -224,21 +248,55 @@ class OpenAIProvider(BaseLLMProvider):
                 response_format={"type": "json_object"},
             )
         except openai.APIStatusError as exc:
+            if is_transient_status(exc.status_code):
+                raise provider_unavailable(
+                    f"The provider returned HTTP {exc.status_code}."
+                ) from exc
             # Fall back to base (text-mode) only for 400 — provider doesn't support json_object.
             # Any other status (429 rate-limit, 401 auth, …) is a real error; surface it.
-            if exc.status_code != 400:
-                raise self._normalize_api_error(exc) from exc
-            return await super().generate_structured(
-                system_prompt,
-                user_message,
-                schema_type,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+            # A 400 that says the prompt itself is too large is a real error too: a
+            # text-mode resend of the same prompt would fail the same way.
+            normalized = self._normalize_api_error(exc, model or self._default_model)
+            if exc.status_code != 400 or str(normalized).startswith("[CONTEXT_EXCEEDED]"):
+                raise normalized from exc
+            # Run the text-mode fallback on the same no-retry client (a shallow copy, so
+            # self is untouched). A 5xx inside it still surfaces as an untagged
+            # [PROVIDER_ERROR] from the shared normaliser (chat uses it too), so the page
+            # will not retry it; the fallback only runs after a 400, which is rare.
+            scoped = copy.copy(self)
+            scoped._client = client
+            try:
+                return await super(OpenAIProvider, scoped).generate_structured(
+                    system_prompt,
+                    user_message,
+                    schema_type,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except openai.APIConnectionError as conn_exc:
+                raise provider_unavailable(
+                    "The connection to the provider failed or timed out."
+                ) from conn_exc
+        except openai.APIConnectionError as exc:
+            raise provider_unavailable(
+                "The connection to the provider failed or timed out."
+            ) from exc
         if not response.choices:
             raise ValueError("OpenAIProvider.generate_structured: no choices in response")
-        raw = response.choices[0].message.content or "{}"
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise ValueError(
+                f"The model's reply was cut off at the {max_tokens}-token output limit, so "
+                f"the structured result is incomplete. Use a model with a larger output "
+                f"limit or annotate fewer tables per run."
+            )
+        raw = choice.message.content
+        if not raw or not raw.strip():
+            raise ValueError(
+                "[EMPTY_RESPONSE] The model returned an empty reply (a content filter or "
+                "a reasoning model that spent its output budget). Try again or switch model."
+            )
         return schema_type.model_validate(json.loads(raw))
 
     async def health_check(self) -> tuple[bool, str]:
@@ -246,6 +304,9 @@ class OpenAIProvider(BaseLLMProvider):
         try:
             await self._client.models.list()
             return True, ""
+        except openai.APIStatusError as exc:
+            logger.warning("OpenAIProvider health check failed: %s", exc, exc_info=True)
+            return False, strip_error_marker(str(self._normalize_api_error(exc)))
         except Exception as e:
             logger.warning("OpenAIProvider health check failed: %s", e, exc_info=True)
             return False, str(e)
@@ -263,6 +324,10 @@ class OpenAIProvider(BaseLLMProvider):
                 max_tokens=1,
             )
             return True, ""
+        except openai.APIStatusError as exc:
+            logger.warning("%s health check failed: %s", self.provider_name, exc, exc_info=True)
+            normalized = self._normalize_api_error(exc, self._default_model)
+            return False, strip_error_marker(str(normalized))
         except Exception as e:
             logger.warning("%s health check failed: %s", self.provider_name, e, exc_info=True)
             return False, str(e)

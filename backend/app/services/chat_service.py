@@ -6,6 +6,7 @@
 Implementation is split across focused sub-modules:
   schema_utils.py   — schema serialization, SQL table extraction, query validation helpers
   schema_pruning.py — schema pruning, relevance filtering, schema resolution
+  semantic_privacy.py — hidden identifiers kept out of the semantic prompt's free text
   correction.py     — self-correction loops (schema, complexity, execution, zero-result)
   validation.py     — query validation pipeline
   pipeline.py       — LLM provider setup, prompt compression, query generation
@@ -42,6 +43,7 @@ from ..schemas.sse import (
     SseEvent,
     StatusEvent,
 )
+from ..semantic import store as semantic_store
 from ..semantic.models import SemanticModel
 from ..utils.encryption import decrypt_value
 from .execution import (
@@ -66,6 +68,7 @@ from .schema_pruning import (
 from .schema_utils import (
     _check_query_complexity,
 )
+from .semantic_privacy import without_hidden_identifiers
 from .validation import _validate_and_correct_query
 
 if TYPE_CHECKING:
@@ -265,9 +268,26 @@ async def _stage_prune_and_filter(
 ) -> tuple[DataSourceSchema, Any]:  # (DataSourceSchema, SemanticModel | None)
     """Stage 3b-4: apply schema pruning and semantic model filtering."""
     schema = sr.schema
-    _raw_semantic: SemanticModel | None = (
-        SemanticModel.model_validate(conn.semantic_model) if conn.semantic_model else None
-    )
+    # The store is the only reader of semantic data; the blob column on ``conn``
+    # is unread (tests/test_semantic/test_blob_is_unread.py). The cached read costs
+    # one small SELECT per turn and rebuilds the model only when its version moved
+    # (inside a SAVEPOINT of its own, so a failed rebuild cannot abort this turn's
+    # transaction on PostgreSQL); the instance is shared across turns, so nothing
+    # below may mutate it: the filters and the prompt compression only build
+    # ``model_copy`` copies, and the domain boost and the prompt formatter only read it.
+    # A failed rebuild (``SemanticModelUnavailable``) costs the turn its business
+    # context, not the turn itself. Anything else — a failure of the unwrapped key
+    # read — may already have aborted the transaction on PostgreSQL, so it propagates
+    # here with its real error rather than failing some later, unrelated statement.
+    _raw_semantic: SemanticModel | None
+    try:
+        _raw_semantic = await semantic_store.load_model_cached(db, connection_id)
+    except semantic_store.SemanticModelUnavailable:
+        logger.exception(
+            "Could not load the semantic model for connection %s; continuing without it",
+            connection_id,
+        )
+        _raw_semantic = None
     if sr.embeddings_available and getattr(settings, "schema_pruning_enabled", True):
         schema = await _select_relevant_tables(
             schema=schema,
@@ -282,6 +302,11 @@ async def _stage_prune_and_filter(
         )
     semantic_model: SemanticModel | None = _raw_semantic
     if semantic_model:
+        # Free-text items naming a hidden identifier go first, against the full
+        # privacy-filtered schema (``schema`` may be narrowed by relevance, and an
+        # absence there is not a secret). Both steps are memoised and return shared
+        # instances: the result is stable across turns, so the narrowing memo hits.
+        semantic_model = without_hidden_identifiers(semantic_model, sr.schema, privacy)
         semantic_model = _filter_semantic_to_schema(semantic_model, schema)
         semantic_model = _filter_semantic_by_relevance(semantic_model, message)
     return schema, semantic_model

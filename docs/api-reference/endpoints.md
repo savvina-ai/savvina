@@ -242,7 +242,7 @@ Get a single connection with full detail including schema cache and privacy sett
 
 ### `DELETE /api/v1/connections/{id}`
 
-Delete a connection and cascade-delete all associated sessions, messages, cache entries, examples, and semantic model.
+Delete a connection and cascade-delete all associated sessions, messages, cache entries, examples, and semantic model (the semantic rows are deleted; their audit history is kept).
 
 **Response `204`:** No content
 **Response `404`:** Connection not found
@@ -363,52 +363,105 @@ Changing the config clears that connection's cached schema and its query cache, 
 
 ### `GET /api/v1/connections/{id}/semantic`
 
-Get the saved semantic model for a connection.
+Get the saved semantic model for a connection, assembled from the semantic store tables. Tables and columns are returned in code-point order of their keys (Python string order, the same on every database), not the order the generator produced them in.
 
-**Response `200`:** `SemanticModelResponse`
+**Response `200`:** `SemanticModel`
 **Response `404`:** No semantic model saved
 
 ---
 
 ### `POST /api/v1/connections/{id}/semantic/generate/init`
 
-Phase 1 of semantic model generation. Introspects the schema and returns the number of table batches to process.
+Phase 1 of semantic model generation. Loads the schema (live introspection if it is not cached), takes the connection row lock, marks the run as started (`generation_status = "tables_partial"`, a fresh run id, the schema hash) and returns the work list. Makes no LLM call. Rate limited to 10/minute. Never destructive: no table or column row is touched; a run reconciles onto whatever rows already exist.
 
-**Query parameter:** `provider` (string, default: `claude`) — provider type name or config UUID
+**Query parameters:**
+- `provider` (string, default: `claude`) — provider type name or config UUID
+- `resume` (bool, default: `false`) — continue an interrupted run instead of starting a new one. Requires a `tables_partial` model whose schema hash still matches; keeps the stored run id so the tables that run already generated stay done
 
-**Response `200`:** `GenerateInitResponse` — `{"batch_count": N, "table_count": M}`
-**Response `400`:** Schema introspection failed or no API key configured
+**Response `200`:** `GenerateInitResponse`
+```json
+{
+  "connection_id": "…",
+  "tables_total": 12,
+  "batch_count": 3,
+  "batch_size": 4,
+  "pending_table_keys": ["public.customers", "public.orders", "…"],
+  "resumed": false
+}
+```
+`pending_table_keys` is the exact list of tables still to send to `/generate/batch`: every table on a fresh run, only the tables the interrupted run had not reached on a resume. The client splits it into batches of `batch_size`; `batch_count` is how many that makes (at least 1).
+
+On a `tables_partial` model that has no schema hash or run id (an interrupted run migrated from the blob era by migration 0003) there is no run to continue: `resume=true` runs a fresh, non-destructive run instead (every table pending, hand edits kept) and answers `resumed: false`.
+
+**Response `400`:** Schema load failed, or `resume=true` and there is no interrupted (`tables_partial`) generation to resume
+**Response `429`:** The per-IP limit was hit — retry with backoff
+**Response `409`:** `resume=true` and the schema changed since the interrupted run — regenerate with a fresh init (`resume=false`, keeps hand edits), or delete the model first (`DELETE …/semantic`, as the UI's Restart from scratch does) to discard them; or the connection was deleted during init
 
 ---
 
 ### `POST /api/v1/connections/{id}/semantic/generate/batch`
 
-Phase 2 — call once per batch. Sends one batch of tables to the LLM and merges the result into the partial model.
+Phase 2 — call once per batch. Sends one batch of tables to the LLM, reconciles the result onto the stored rows and returns the run's progress. Fields a person has edited by hand are skipped. Rate limited to 20/minute. The generator keeps the output grounded in the batch's real tables: a near-miss table or column key (different case, quoting) is mapped to the real one and an invented one is dropped; a column the LLM leaves out is not touched, so its earlier annotation survives. A batch the LLM answered for purges the connection's cached query answers and table embeddings, so chat does not serve SQL written against the previous annotations; the schema cache, which the run reads for every batch, is kept.
 
-**Query parameters:**
-- `batch_idx` (int, required) — zero-based batch index (0 … batch_count-1)
-- `provider` (string, default: `claude`)
+**Query parameter:** `provider` (string, default: `claude`)
 
-**Response `200`:** `SemanticModel` (partial, updated after this batch)
-**Response `400`:** `/generate/init` not called first, or batch_idx out of range
+**Request body:**
+```json
+{"table_keys": ["public.customers", "public.orders"]}
+```
+`table_keys` is 1 to 4 `schema.table` keys, taken from `pending_table_keys`. Batches are identified by their keys, never by position.
+
+**Response `200`:** `GenerateBatchResponse` — progress only, not the model
+```json
+{
+  "connection_id": "…",
+  "table_keys": ["public.customers", "public.orders"],
+  "tables_done": 6,
+  "tables_total": 12,
+  "batch_size": 4,
+  "omitted_table_keys": []
+}
+```
+`omitted_table_keys` are the tables of this batch the LLM returned nothing for. They are not marked done and stay pending; the web client sends them once more, as their own batch. `/generate/globals` names any table still without an annotation in the model's `generation_warnings`.
+
+**Response `400`:** `/generate/init` not called first (or the interrupted run has no run id — call `/generate/init` again), a key that is not a table of the schema, or an over-long table key or column name
+**Response `409`:** The schema changed since init — regenerate with a fresh `/generate/init` (`resume=false`, keeps hand edits); or the state moved on while the batch was running (generation finalised or the model deleted); or a newer `/generate/init` restarted the run — the batch's results are discarded
+**Response `422`:** The LLM call failed or its response could not be used (including an exhausted provider balance, `[QUOTA_EXCEEDED]`, which waiting does not fix), or the request body failed validation (`table_keys` empty or more than 4 entries)
+**Response `429`:** The provider throttled the call (the detail carries `[RATE_LIMIT]`), or the per-IP limit was hit — retry with backoff
+**Response `500`:** An unexpected error
+**Response `503`:** The provider was unavailable (a 5xx or a dropped connection; the detail carries `[PROVIDER_UNAVAILABLE]`): retry with backoff
+**Response `504`:** The batch timed out (180 s)
 
 ---
 
 ### `POST /api/v1/connections/{id}/semantic/generate/globals`
 
-Phase 3 — generate cross-table business metrics, common joins, and derived columns. Call after all batches are complete.
+Phase 3 — generate cross-table business metrics, common joins, derived columns and segments, and finalise the model (`generation_status = "complete"`). Rate limited to 10/minute. Call after all batches are complete, or on its own to finish an interrupted run over the tables already generated.
+
+Tables and columns that are no longer in the database are removed here, together with relationships and other references to them. Before that, a column key stored under a near-miss spelling (quoted, or in another letter case) of a live column the model's baseline has seen is renamed to the live name, keeping its annotation, hand edits, references and relationships, unless this run annotated the column under its real name: then the key is a duplicate and is removed. What the connection's privacy settings hide is kept, not removed, and never reaches the LLM. Hand-edited metrics, segments, derived columns, joins and relationships are carried through; over-long generated names are dropped.
 
 **Query parameter:** `provider` (string, default: `claude`)
 
-**Response `200`:** `SemanticModel` (final, saved to the connection)
-**Response `400`:** Init or batch phases not completed
-**Response `500`:** LLM generation failed
+**Response `200`:** `SemanticModel` (final, as stored — the same model a later `GET` returns)
+**Response `400`:** Init or batch phases not completed, or a value the store cannot hold
+**Response `409`:** The model was deleted or its state changed while globals was generating, or a newer `/generate/init` restarted the run — the globals results are discarded and the new run is left to finish
+**Response `422`:** The LLM call failed or its response could not be used
+**Response `429`:** The provider throttled the call, or the per-IP limit was hit — retry with backoff
+**Response `500`:** An unexpected error
+**Response `503`:** The provider was unavailable (a 5xx or a dropped connection; the detail carries `[PROVIDER_UNAVAILABLE]`): retry with backoff
+**Response `504`:** Timed out (180 s)
+
+An LLM failure fails this call like a batch (`422`, `429` on a throttle, or `503` on a provider outage): the model stays `tables_partial`, and the web client offers **Finish with what's generated** and **Resume**.
+
+A completed model can carry `generation_warnings` from this call: the generator's own warnings (for example a time-series pattern in a metric over a fiscal-period table); one note per hand edit that named a column the table no longer has (a primary timestamp or date column naming it, or a list left empty, is cleared and no longer counts as a hand edit; a list with live entries keeps them and stays a hand edit); and one warning naming every table of the schema that has no annotation (the LLM returned nothing for it, the run was finished before reaching it, or it is new since the run started).
 
 ---
 
 ### `PUT /api/v1/connections/{id}/semantic`
 
-Partially update the semantic model. Only the fields you provide are updated — unmentioned tables/metrics/joins are preserved.
+Partially update the semantic model. Only the fields you provide are updated — unmentioned tables/metrics/joins are preserved. A top-level section that is `null` or omitted is not supplied and is left untouched; an empty list (`[]`) clears it. Inside a table, `null` also means "not supplied" for `display_name` and `default_filters`, and inside a column for `display_name`, `value_mappings`, `is_sensitive`, `is_non_additive` and `semantic_type`; for the other nullable fields (`description`, `grain`, `currency`, …) `null` clears the value.
+
+Every field you change is recorded as hand-edited, so a later regenerate refreshes the rest of the model but leaves it alone. A value identical to what is stored is not recorded as an edit. Changes are written to the model's audit history.
 
 **Request body (all fields optional):**
 ```json
@@ -451,13 +504,15 @@ Partially update the semantic model. Only the fields you provide are updated —
 }
 ```
 
-**Response `200`:** `SemanticModelResponse`
+**Response `200`:** `SemanticModel`
+**Response `400`:** A value the store cannot hold (for example an over-long table key, column name or metric name), or a table or column the model does not have, unless the patch supplies its `display_name`. Nothing is written for a rejected patch.
+**Response `409`:** A concurrent edit changed a table row (optimistic lock) — reload and retry
 
 ---
 
 ### `DELETE /api/v1/connections/{id}/semantic`
 
-Remove the semantic model from a connection. Future queries will not have business context.
+Remove the semantic model from a connection: every semantic row is deleted, hand edits included. Future queries will not have business context.
 
 **Response `204`:** No content
 
@@ -465,12 +520,64 @@ Remove the semantic model from a connection. Future queries will not have busine
 
 ### `GET /api/v1/connections/{id}/semantic/drift`
 
-Report schema drift since the semantic model was generated — tables or columns that have since been added, removed, or changed type, and which the stored model therefore describes incorrectly.
+Report schema drift since the semantic model was generated: tables and columns the model references that no longer exist, tables added since generation, columns added to a table the model holds, column keys stored under a near-miss spelling that Apply Drift renames to the live column (below), tables in the model that still exist but the connection's role cannot read (PostgreSQL only, and only when the role can read `pg_catalog.pg_class`: on MySQL, or when `pg_class` is not readable, such a table looks the same as a dropped one and is reported, and applied, as removed), and business metrics that name a missing table. Type or nullability changes are not reported.
 
-Cheap to call: it diffs the stored model against the *cached* schema and runs no introspection or statistical queries against the source database. Refresh the schema first (`POST /api/v1/connections/{id}/schema/refresh`) if you need drift measured against the live database.
+A column counts as added only when it is in neither the stored table nor the model's baseline of the live columns it has seen (kept per table, written by each generation batch, the globals finalisation and every apply that writes), so a column the LLM left out at generation, or one deleted from the model through `PUT .../semantic`, is not reported. A live column the baseline has seen that the model holds only under a near-miss key (quoted, or differing only in letter case) is reported as a rename: the apply renames the key to the live name, keeping its annotation, hand edits and references, with no LLM call. If the baseline never saw the column, the database renamed it: the column is reported as added and the old key as removed. A table the model holds with no baseline yet (a model from before the baseline existed) is baselined at the first live check outside a generation run. A column added before that first check is not reported; a Regenerate annotates it. A live check also completes an existing entry that lacks the real name of a stored column the privacy settings hide (or a column annotated by hand), so showing that column later renames its stored key instead of reporting the column as added. The baselining is a short write under the connection row lock, taken after the refreshed schema cache is committed, and it is why the check can answer `409` or `503` below.
 
-**Response `200`:** `DriftReport` — `{"connection_id": ..., "warnings": [...], "warning_count": N, "checked_at": "..."}`
+Each call introspects the source database live (catalog views and `pg_stats` only, no statistical queries), stores the result as the caller's schema cache, and diffs the stored model against it, so no separate schema refresh is needed. Table embeddings and cached query answers are flushed only when the caller had no cached schema or its structure (table and column names, types, primary keys) differed from the live one (every model write except an apply or a generation batch clears all users' schema caches, so the first check after such a write usually flushes). If the source cannot be reached, the check falls back to the caller's cached schema and says so in the response. Rate limited to 5 requests per minute.
+
+**Response `200`:** `DriftReport` — `{"connection_id": ..., "warnings": [...], "warning_count": N, "checked_at": "...", "schema_source": "live" | "cache", "schema_cached_at": "..." | null, "refresh_error": "..." | null, "has_actionable_changes": true | false}`. `schema_source` is `"cache"` only on the fallback, with `schema_cached_at` and `refresh_error` saying which cache was used and why. `has_actionable_changes` is true when a table was added or removed, or a column added, removed or renamed — what `POST .../semantic/apply-drift` acts on; an unreadable table or a metric naming a missing table is reported but not actionable.
+**Response `400`:** The source could not be reached and there is no cached schema to fall back to
 **Response `404`:** No semantic model — generate one first
+**Response `409`:** The connection was deleted while the check was completing the baseline
+**Response `503`:** The baseline write waited on the connection row lock past `DB_LOCK_TIMEOUT_SECONDS` (another save or apply on the connection), with `Retry-After: 5`
+
+---
+
+### `POST /api/v1/connections/{id}/semantic/apply-drift`
+
+Apply the schema changes `GET .../semantic/drift` reports to the stored model, without re-annotating the tables that did not change. It runs the same `compute_drift` as the check, on its own live introspection, so it acts on every change the check calls actionable. A stored column key whose spelling no longer matches the live column (for example a quoted `"status"` from a migrated model, or `Status`, beside a live `status`) is either renamed or removed (see **Renamed columns** below). The check reports it as a rename; as a duplicate key when the model also stores `status`; or, when the baseline never saw `status` (the database renamed the column), as a near-miss key of a column the model has not seen, which the apply removes, with `status` reported as a new column. Rate limited to 5/minute — a preview and its apply are two calls.
+
+- **Removed tables** are dropped, with every metric (`related_tables`), join (`tables`) and derived column (`base_tables`) that names them by its stored key (`schema.table`), every segment that applies only to them, and every relationship touching them. A segment that also applies to a surviving table stays and just loses the removed tables from its `applicable_tables`; a segment with no `applicable_tables` applies everywhere and is kept.
+- **Removed columns** are dropped from their table, with the references to them (`primary_timestamp_column`, `primary_date_column`, `partition_columns`, `cluster_columns`, hierarchy levels) — hand-edited ones included, each trim noted in `summary.warnings` — and the relationships that use them. Free SQL (`default_filters`, metric, join, derived-column and segment expressions) is not rewritten.
+- **Renamed columns**: a near-miss key (quoted, or in another letter case) of a live column the model's baseline has seen and the table does not store under its real name is renamed to that name. It keeps its annotation, its hand edits (their marks move with it), the table's references to it (`primary_timestamp_column`, `primary_date_column`, `partition_columns`, `cluster_columns`, hierarchy levels) and the relationships on it; free SQL is not rewritten. A rename makes no LLM call and needs no provider. When two keys spell the same column, the first in sort order is renamed and the other is removed as a duplicate. A near-miss key of a column the model also stores under its real name is a duplicate and is removed; one of a column the baseline never saw is removed, and the column is new.
+- **New tables** are annotated by the LLM in batches, at most 12 per apply (three batches of four, so one request and its cross-table pass stay inside the 900 s proxy timeout). Past the cap the tables are taken in sorted key order, except that those the most recent logged apply reported in `tables_not_annotated` go last, so tables the LLM keeps skipping cannot starve the others. A `summary.warnings` entry names the rest (up to five) and says to run Check Drift and apply again, and the next apply takes them. If the LLM annotated at least one table, one cross-table pass follows, and only the metrics, joins, derived columns and segments it writes that name a newly annotated table (a metric's `related_tables`, a join's `tables`, a derived column's `base_tables`, a segment's `applicable_tables`; a segment with no tables is not added) are added *alongside* the existing ones. Items over unchanged tables alone are not added, so an item you deleted is not re-added. An existing item keeps its payload against a same-named new one. An item removed with its table takes its hand-edit mark with it: a same-named item the LLM writes is stored as a fresh, unmarked item. `is_user_reviewed` is reset, and `generated_at` and `generation_model` updated, only when new tables or new columns were annotated.
+- **New columns** on a table the model holds (the columns the check reports as added) are annotated by the LLM and added to their table. Only the new columns are asked for and taken (the table's DDL and description are sent as context); existing columns are never rewritten, table-level fields (primary timestamp, hierarchies, partition columns) are left alone, and no cross-table pass runs for them. They share the three batches with new tables, which go first. A new-column batch holds at most 4 tables, 25 columns and as much DDL as one prompt carries (20,000 characters); a table with more than 25 new columns gets the first 25 by name. What does not fit is not sent: a `summary.warnings` entry names it, and the next apply takes it. The tables the most recent logged apply reported in `column_tables_failed` go last. A column the LLM leaves out of a table it answered for is recorded as seen and named in a warning (a Regenerate annotates it); a batch that failed, or a table it returned nothing for, leaves its columns new for the next apply. A failure here does not fail the apply: the removals, the renames, the new tables and the batches answered before the failure are applied, the batches after it are not tried, and a warning names the columns left out. The exception is an apply whose only changes are new columns, when no batch has answered yet: a provider throttle (`429`) or outage (`503`) is returned as is, so a client can retry.
+- Relationships, time expressions, notes and the schema hash are recomputed. Foreign-key relationships come from the catalog, so a relationship to a new table appears when the apply annotates that table (not for one in `tables_not_annotated`); hand-edited relationships are carried through. A catalog relationship the model does not have is added only on a newly annotated table or on a new column of a held table; one you deleted on unchanged or renamed columns is not brought back. A new column's relationship arrives with the apply that records the column as seen (annotated, or left out of a table the LLM answered for), not with one whose batch failed or returned nothing for its table, or that did not send the column. It arrives once: if you delete it after that apply, it stays deleted.
+
+Removing and renaming are structural and make no LLM call. Hand edits on surviving tables are kept. A table that another generation run or apply stored while this apply's LLM calls ran is left as stored: it is neither overwritten nor treated as new. The schema is always introspected live — acting on a cached schema could delete what still exists — so an unreachable source is an error rather than a fallback. A table or column the privacy policy hides, and (on PostgreSQL, when the role can read `pg_catalog.pg_class`) a table the connection's role cannot read, are never treated as removed, and a relationship ending on one of them is kept; otherwise — on MySQL, or when `pg_class` is not readable — such a table looks the same as a dropped one and is reported, and applied, as removed. A column the role cannot read (a column-level grant) looks the same as a dropped one on both PostgreSQL and MySQL, because the adapters read columns from `information_schema.columns`, which lists only columns the role holds a privilege on; it is reported, and applied, as removed. A metric that names a removed table by a bare name (`orders` rather than `public.orders`) is kept and reported by the drift check instead. Each call that reaches the source stores the refreshed schema as the caller's schema cache (committed before any LLM call), as the check does. A real apply refreshes the caller's schema cache like a preview does and keeps it; only the query and embedding caches are purged.
+
+The baseline of seen columns is written in the apply's save transaction (or, when the apply saves nothing, with its log entry, or alone when only the baseline changed):
+
+- A new table the apply annotated gets its live columns.
+- A held table keeps the seen columns that are still live (a table with no entry yet starts from its live columns), and gains the live columns it stores and the new columns a batch answered for. A renamed column was seen already and stays seen.
+- A column that left the database leaves the baseline, so it is new again if it comes back. So does one the privacy policy hides, unless the model stores it: a stored hidden column stays seen under its real name, so once shown again it is not new, and a quoted key of it is renamed (a case-only key is not hidden, so it is removed). A hidden or unreadable table keeps its entry.
+- The entries of tables the model no longer holds are deleted.
+
+**Query parameters:** `provider` — provider name or id used to annotate new tables and new columns (default `claude`). `dry_run` — `true` previews: the same assembly runs on the current model with no LLM call and the semantic model is not written; the response's `semantic_model` is the stored model as it is. Like the check, a preview does refresh the caller's schema cache and, when the caller had none or its structure (table and column names, types, primary keys) differed from the live schema, flushes the connection's table embeddings and cached query answers. `summary.dry_run` is `true`, and the new tables the apply would send to the LLM (at most 12, in the order above) are listed, sorted, in `tables_added`, the new columns it would ask for in `columns_added`, and the keys it would rename in `columns_renamed`. `relationships_added` lists the catalog relationships on those new columns between tables the model holds; relationships to new tables and the LLM's items over them are only known on the real apply and are not listed. `summary.warnings` holds the notes on hand edits the apply would trim and the warnings naming the new tables and columns it would leave for a later apply. A preview is never logged.
+
+**Response `200`:** `ApplyDriftResponse` — `{"semantic_model": SemanticModel, "summary": DriftApplySummary}`. `summary` is a by-name diff of the model before and after, so cascades are included. Every list is sorted: `tables_added`, `tables_removed`, `metrics_added`, `metrics_removed`, `joins_added`, `joins_removed` (by `join_pattern`), `derived_columns_added`, `derived_columns_removed`, `segments_added`, `segments_removed`, `relationships_added`, `relationships_removed` (labelled `from_table.from_column → to_table.to_column`). `columns_removed` maps each surviving table to its removed column names (a removed table's columns go with it), `columns_added` each surviving table to the column names the apply added to it (a new table is listed in `tables_added` instead), and `columns_renamed` each surviving table to its renamed keys, each mapped to the live name it now has (a renamed column is in neither of the other two; a relationship on it is listed under its new name, as neither removed nor added). A metric, join, derived column or segment taken out because it named a removed table is listed under `*_removed` even when the LLM writes one of the same name, which is then also listed under `*_added`. `tables_not_annotated` lists only the tables sent to the LLM in this apply that it returned nothing for: they are still missing from the model, and the next drift check reports them again. New tables past the 12-table cap were not sent and are not listed there; the deferred-tables warning in `warnings` names them. `column_tables_failed` lists the tables whose new columns this apply did not get: their batch failed or returned nothing for them, or the previous apply listed them and this one did not reach them. They still lack those columns, the next drift check reports them again, and the next apply sends them last. `warnings` are, in order: the time-column check over the metrics the apply added (a metric using an audit timestamp on a fiscal-period table); the notes on trimmed hand edits; the warnings naming the new tables and columns left for a later apply; and the warnings naming the new columns that were not annotated. A preview carries only the notes and the warnings naming what would be left for a later apply. `changed` is computed: true when any structural list (every list except `warnings`, `tables_not_annotated` and `column_tables_failed`) is non-empty, so a preview of non-empty drift is always `changed` and a summary with only skipped tables or warnings is not; `dry_run` marks a preview. With nothing to apply, the model is returned unchanged with `changed: false` and nothing is logged.
+**Response `400`:** The source could not be reached, the provider cannot be resolved (checked only on a real apply, not a preview, and only when there are new tables to annotate or new columns are the only change; beside removed tables, removed columns or renamed columns, an unresolvable provider leaves the new columns unannotated, with a warning, and the removals and renames are applied), or a generated value the store cannot hold
+**Response `404`:** Connection not found, or no semantic model — generate one first
+**Response `409`:** A generation run is in progress or was interrupted (finish or restart it first), or one started, or the model or connection was deleted, while drift was being applied
+**Response `422`:** The LLM pass for new tables failed, or the provider's quota is exhausted during it (a failed new-column batch is a warning instead)
+**Response `429`:** The provider throttled the LLM pass for new tables, or a new-column batch of an apply whose only changes are new columns before any batch answered (retry later), or the per-IP rate limit was hit
+**Response `500`:** The LLM pass for new tables failed unexpectedly
+**Response `503`:** The provider was unavailable (a 5xx or a dropped connection; the detail carries `[PROVIDER_UNAVAILABLE]`) for the LLM pass for new tables, or for a new-column batch of an apply whose only changes are new columns before any batch answered: the model is unchanged; the route does not retry on its own, so apply again
+**Response `504`:** The LLM pass for new tables timed out
+
+On a `422`, `500`, `503` or `504`, or a provider-throttle `429`, the model is unchanged (the refreshed schema cache is already committed).
+
+---
+
+### `GET /api/v1/connections/{id}/semantic/drift/history`
+
+The connection's logged Apply Drifts, newest first. Every real apply that writes (not a preview, and not a call with no drift to act on) appends its summary to the semantic audit log (`semantic_model_history`) in the same transaction as the save, so an apply is in the log exactly when it happened. An apply that changed nothing but skipped new tables the LLM returned nothing for, or listed tables in `column_tables_failed`, saves nothing and is logged on its own, because the next apply reads that entry to retry those tables last. The log is kept when the model is deleted. An entry whose stored summary can no longer be read is skipped and logged, and the next older entry takes its place, so the response holds `limit` entries whenever the log has that many.
+
+**Query parameters:** `limit` (1–50, default 10).
+
+**Response `200`:** `[{"applied_at": "...", "applied_by": "<user id>" | null, "summary": DriftApplySummary}]`
+**Response `404`:** Connection not found
 
 ---
 
@@ -486,10 +593,11 @@ List pending semantic-model suggestions raised from user feedback on generated q
 
 ### `POST /api/v1/connections/{id}/semantic/suggestions/{suggestion_id}/apply`
 
-Apply one suggestion to the stored semantic model and return the updated model.
+Apply one suggestion to the stored semantic model and return the updated model. The change is recorded as a hand edit, so a later regenerate leaves it alone.
 
-**Response `200`:** `SemanticModelResponse`
-**Response `404`:** Connection or suggestion not found
+**Response `200`:** `SemanticModel`
+**Response `404`:** Connection or suggestion not found, no semantic model, or the suggestion's table or column is not in the model
+**Response `409`:** The suggestion has already been applied (`Suggestion already applied`), or a concurrent edit changed the row
 
 ---
 
@@ -1058,5 +1166,6 @@ Update application settings. Each key is persisted to `app_settings` and survive
 | 422 | Request body failed schema validation (FastAPI/pydantic) |
 | 500 | Server error (LLM failure, unexpected exception) |
 | 502 | Upstream provider unreachable or rejected the credentials (provider model-fetch endpoints) |
+| 503 | Retryable. Any route can answer `503` with `Retry-After: 5` when a database row lock is held by a long operation on the same connection for longer than `DB_LOCK_TIMEOUT_SECONDS` (detail: "This connection is busy with another operation; try again shortly."). The semantic-generation routes also answer `503` when the LLM provider is unavailable. |
 
 Errors return a JSON body: `{"detail": "Human-readable error message"}`
