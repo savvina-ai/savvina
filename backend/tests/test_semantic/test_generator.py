@@ -18,7 +18,11 @@ from app.datasources.models import (
 )
 from app.semantic.drift import SchemaDrift, compute_drift
 from app.semantic.generator import (
+    _TABLE_REFERENCE_FIELDS,
     SemanticModelGenerator,
+    _map_reference_value,
+    _map_table_references,
+    _reference_names,
     drop_dangling_edits,
     edges_in_schema,
     names_any_table,
@@ -961,6 +965,105 @@ def _marks(table: dict[str, list[str]]) -> dict[str, dict[str, list[str]]]:
     }
 
 
+def _drop_b(name: str) -> str | None:
+    return None if name == "b" else name
+
+
+def _upper_b(name: str) -> str:
+    return "B" if name == "b" else name
+
+
+class TestReferenceMappers:
+    """The one shape rule for a table's reference fields, shared by the prune, the
+    dangling-edit trim and the renames: a scalar name, a list of names, or hierarchies."""
+
+    def test_the_names_of_each_shape(self) -> None:
+        assert _reference_names("primary_timestamp_column", "ts") == ["ts"]
+        assert _reference_names("partition_columns", ["a", "b"]) == ["a", "b"]
+        assert _reference_names(
+            "hierarchies", [{"name": "H", "levels": ["y", "m"]}, {"name": "E"}]
+        ) == ["y", "m"]
+
+    def test_a_name_mapped_to_none_leaves_each_shape(self) -> None:
+        assert _map_reference_value("primary_date_column", "b", _drop_b) is None
+        assert _map_reference_value("primary_date_column", "a", _drop_b) == "a"
+        assert _map_reference_value("cluster_columns", ["a", "b"], _drop_b) == ["a"]
+        hierarchies = [{"name": "H", "levels": ["a", "b"]}, {"name": "E", "levels": ["b"]}]
+        assert _map_reference_value("hierarchies", hierarchies, _drop_b) == [
+            {"name": "H", "levels": ["a"]}
+        ]
+
+    def test_a_rename_keeps_every_entry_in_place(self) -> None:
+        assert _map_reference_value("partition_columns", ["b", "a"], _upper_b) == ["B", "a"]
+        assert _map_reference_value(
+            "hierarchies", [{"name": "H", "levels": ["b", "a"], "note": 1}], _upper_b
+        ) == [{"name": "H", "levels": ["B", "a"], "note": 1}]
+
+    def test_the_input_is_not_mutated(self) -> None:
+        hierarchies = [{"name": "H", "levels": ["a", "b"]}]
+        names = ["a", "b"]
+        _map_reference_value("hierarchies", hierarchies, _drop_b)
+        _map_reference_value("partition_columns", names, _drop_b)
+        assert hierarchies == [{"name": "H", "levels": ["a", "b"]}]
+        assert names == ["a", "b"]
+
+    def test_a_table_update_covers_every_reference_field(self) -> None:
+        table = TableSemantic(
+            display_name="T",
+            columns={"a": ColumnSemantic(display_name="A")},
+            primary_timestamp_column="b",
+            primary_date_column="a",
+            partition_columns=["a", "b"],
+            cluster_columns=["b"],
+            hierarchies=[Hierarchy(name="H", levels=["a", "b"]), Hierarchy(name="E", levels=["b"])],
+        )
+        update = _map_table_references(table, _drop_b)
+        assert set(update) == set(_TABLE_REFERENCE_FIELDS)
+        assert update == {
+            "primary_timestamp_column": None,
+            "primary_date_column": "a",
+            "partition_columns": ["a"],
+            "cluster_columns": [],
+            "hierarchies": [Hierarchy(name="H", levels=["a"])],
+        }
+        renamed = table.model_copy(update=_map_table_references(table, _upper_b))
+        assert renamed.primary_timestamp_column == "B"
+        assert renamed.partition_columns == ["a", "B"]
+        assert renamed.hierarchies == [
+            Hierarchy(name="H", levels=["a", "B"]),
+            Hierarchy(name="E", levels=["B"]),
+        ]
+        assert table.partition_columns == ["a", "b"]  # pure
+
+    def test_an_empty_string_name_is_not_a_kept_name(self) -> None:
+        table = TableSemantic(display_name="T", primary_timestamp_column="")
+        # the prune's rule: a name that is not a live column leaves, and "" is not one
+        only_a = _map_table_references(table, lambda name: name if name == "a" else None)
+        assert only_a["primary_timestamp_column"] is None
+        # a rename maps "" to itself
+        assert _map_table_references(table, _upper_b)["primary_timestamp_column"] == ""
+
+    def test_a_rename_keeps_a_hierarchy_without_levels_and_the_prune_drops_it(self) -> None:
+        table = TableSemantic(display_name="T", hierarchies=[Hierarchy(name="E", levels=[])])
+        kept = _map_table_references(table, _upper_b, drop_empty=False)
+        assert kept["hierarchies"] == [Hierarchy(name="E", levels=[])]
+        assert _map_table_references(table, _upper_b)["hierarchies"] == []
+        assert _map_reference_value("hierarchies", [{"name": "E"}], _upper_b, drop_empty=False) == [
+            {"name": "E", "levels": []}
+        ]
+        assert _map_reference_value("hierarchies", [{"name": "E"}], _upper_b) == []
+
+    def test_an_empty_field_is_left_as_it_is(self) -> None:
+        table = TableSemantic(display_name="T")
+        assert _map_table_references(table, _drop_b) == {
+            "primary_timestamp_column": None,
+            "primary_date_column": None,
+            "partition_columns": [],
+            "cluster_columns": [],
+            "hierarchies": [],
+        }
+
+
 class TestDropDanglingEdits:
     _MARKS: ClassVar[dict[str, dict[str, list[str]]]] = _marks(
         {"public.orders": ["description", "primary_timestamp_column", "partition_columns"]}
@@ -1588,12 +1691,64 @@ class TestDetectDriftNewColumns:
             'Column "public.orders.STATUS" referenced in semantic model no longer exists'
         ]
 
-    def test_without_a_baseline_a_quoted_key_of_an_unheld_live_column_is_gone(self) -> None:
-        """No baseline, so the apply drops the key and adds nothing back: the key is gone,
-        named under its stored spelling because ``status`` itself still exists."""
+    @staticmethod
+    def _unseen(key: str, target: str) -> str:
+        return (
+            f'Column key "public.orders.{key}" in the semantic model is a near-miss spelling '
+            f'of "{target}", a column the model has not seen; Apply Drift removes the key'
+        )
+
+    def test_a_near_miss_key_of_a_column_the_baseline_never_saw_is_removed_beside_it(
+        self,
+    ) -> None:
+        """The baseline lacks ``status`` (the column arrived after the entry was written,
+        or the entry predates the recording of hidden names and the column was just
+        un-hidden): the key is not renamed, so the apply removes it and annotates
+        ``status`` afresh. Worded as that, never as a column that no longer exists."""
+        schema = _schema_with_tables(["orders"], extra_columns=["status"])
+        model = SemanticModel(tables={"public.orders": _tbl("id", '"status"')})
+        warnings = self._warnings(schema, model, self._KNOWN)
+        assert warnings == [
+            self._unseen('"status"', "status"),
+            "1 new column(s) added to tables in the semantic model since it was generated: "
+            "public.orders.status",
+        ]
+
+    def test_a_case_only_key_of_a_column_the_baseline_never_saw_is_unseen(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["status"])
+        model = SemanticModel(tables={"public.orders": _tbl("id", "Status")})
+        warnings = self._warnings(schema, model, self._KNOWN)
+        assert warnings == [
+            self._unseen("Status", "status"),
+            "1 new column(s) added to tables in the semantic model since it was generated: "
+            "public.orders.status",
+        ]
+
+    def test_without_a_baseline_a_quoted_key_of_an_unheld_live_column_is_unseen(self) -> None:
+        """No baseline, so nothing is reported new and the apply drops the key: still a
+        near-miss key of a column the model has not seen, not a gone column."""
         schema = _schema_with_tables(["orders"], extra_columns=["status"])
         model = SemanticModel(tables={"public.orders": _tbl("id", '"status"')})
         warnings = SemanticModelGenerator().detect_drift(schema, model)
+        assert warnings == [self._unseen('"status"', "status")]
+
+    def test_an_unseen_near_miss_key_is_worded_after_the_duplicates(self) -> None:
+        """Gone columns, then duplicates, then unseen near-miss keys, then renames, then
+        new columns. ``_column_renames`` walks the gone keys in sort order: ``'"region"'``
+        (its column is unseen, so no rename), then ``'"status"'`` (renamed to ``status``),
+        then ``Status`` (``status`` is taken: a duplicate); ``gone`` is a baseline drop."""
+        schema = _schema_with_tables(["orders"], extra_columns=["status", "region"])
+        model = SemanticModel(
+            tables={"public.orders": _tbl("id", "Status", '"status"', '"region"', "gone")}
+        )
+        known = {"public.orders": {"id", "status", "gone"}}
+        warnings = self._warnings(schema, model, known)
         assert warnings == [
-            'Column "public.orders."status"" referenced in semantic model no longer exists'
+            'Column "public.orders.gone" referenced in semantic model no longer exists',
+            'Column key "public.orders.Status" in the semantic model is a near-miss spelling '
+            'of "status"; Apply Drift removes the duplicate',
+            self._unseen('"region"', "region"),
+            self._rename('"status"', "status"),
+            "1 new column(s) added to tables in the semantic model since it was generated: "
+            "public.orders.region",
         ]

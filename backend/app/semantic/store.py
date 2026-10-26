@@ -1117,7 +1117,8 @@ async def load_header(db: AsyncSession, connection_id: str) -> SemanticHeader | 
 async def load_known_columns(db: AsyncSession, connection_id: str) -> dict[str, frozenset[str]]:
     """Table key → known live column names, for the tables that have a baseline; ``{}``
     when the connection has no model or no baseline yet. A column-only SELECT, one row
-    per table: read once per check, preview or finalisation, up to twice per apply
+    per table: read once per preview or finalisation, once per check (twice when it
+    writes: before and under the lock), up to twice per apply
     (before the LLM calls and under the lock; an apply with no drift stops after the
     first), and never per generation batch.
     A value that is not a list is skipped and a non-string name dropped; neither raises."""
@@ -1160,7 +1161,6 @@ async def update_known_columns(
     connection_id: str,
     updates: Mapping[str, Iterable[str]],
     *,
-    only_missing: bool = False,
     prune: bool = False,
 ) -> None:
     """Set the baseline row of each table in *updates*.
@@ -1170,13 +1170,12 @@ async def update_known_columns(
     tables named are read or written, so the cost follows *updates*, not the schema:
     callers pass only the tables they may change: a generation batch its own tables,
     the finalisation and an apply-drift just the entries that differ
-    (``_baseline_changes``), the drift check just the tables with no entry. With
-    ``only_missing`` an existing row is left alone, which is how the drift check seeds a
-    legacy table; a row whose value is not a list is no entry (``load_known_columns``
-    skips it) and is rewritten. With ``prune`` the rows of every table the connection's
-    ``semantic_tables`` no longer holds are deleted in one statement — call it after
-    any save that removed them (same transaction). A connection with no model changes
-    nothing.
+    (``_baseline_changes``), the drift check just the entries its read completed
+    (``_baseline_changes`` too). A row whose value is not a list is no entry
+    (``load_known_columns`` skips it) and is rewritten like a missing one. With
+    ``prune`` the rows of every table the connection's ``semantic_tables`` no longer
+    holds are deleted in one statement — call it after any save that removed them (same
+    transaction). A connection with no model changes nothing.
 
     Keys and names are fitted (``_fit_values``) like every other JSON write here, so
     the baseline holds what the stored table and column rows hold (NULs stripped);
@@ -1223,7 +1222,7 @@ async def update_known_columns(
                     model_id=model_id, connection_id=connection_id, table_key=key, columns=names
                 )
             )
-        elif not isinstance(row.columns, list) or (not only_missing and row.columns != names):
+        elif not isinstance(row.columns, list) or row.columns != names:
             row.columns = names
     if prune:
         await db.flush()  # the rows added above, and any save before this call, are visible

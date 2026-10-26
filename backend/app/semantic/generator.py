@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -39,6 +39,7 @@ from .models import (
     DerivedColumn,
     EntityType,
     GlobalSectionsResponse,
+    Hierarchy,
     RelationshipEdge,
     RelationshipType,
     Segment,
@@ -367,20 +368,10 @@ def _prune_table(
     # References are checked against the live columns, not the annotated ones: the
     # generator never backfills a column the LLM omitted, and a reference to a real
     # but unannotated column is not dangling.
-    hierarchies = []
-    for hierarchy in table.hierarchies:
-        levels = [level for level in hierarchy.levels if kept(level)]
-        if levels:
-            hierarchies.append(hierarchy.model_copy(update={"levels": levels}))
-    timestamp, date = table.primary_timestamp_column, table.primary_date_column
     return table.model_copy(
         update={
             "columns": columns,
-            "primary_timestamp_column": timestamp if timestamp and kept(timestamp) else None,
-            "primary_date_column": date if date and kept(date) else None,
-            "partition_columns": [c for c in table.partition_columns if kept(c)],
-            "cluster_columns": [c for c in table.cluster_columns if kept(c)],
-            "hierarchies": hierarchies,
+            **_map_table_references(table, lambda name: name if kept(name) else None),
         }
     )
 
@@ -507,6 +498,60 @@ def _unique(names: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(names))
 
 
+def _reference_names(field: str, value: Any) -> list[str]:
+    """Every column name a table's reference *field* (one of ``_TABLE_REFERENCE_FIELDS``)
+    holds in its stored shape, in order: each hierarchy's ``levels`` for ``hierarchies``,
+    a list's entries, else the one name."""
+    if field == "hierarchies":
+        return [level for h in value for level in h.get("levels") or []]
+    if isinstance(value, list):
+        return list(value)
+    return [value]
+
+
+def _map_reference_value(
+    field: str, value: Any, fn: Callable[[str], str | None], *, drop_empty: bool = True
+) -> Any:
+    """*value*, a table's reference *field* (one of ``_TABLE_REFERENCE_FIELDS``) in its
+    stored shape — a name, a list of names, or for ``hierarchies`` a list of dicts with
+    ``levels`` — with each column name replaced by ``fn(name)``. A name ``fn`` maps to
+    ``None`` leaves: a list loses the entry, a hierarchy loses the level and (unless
+    ``drop_empty=False``) is dropped when none remains, a scalar becomes ``None``. The one
+    shape rule for the prune, the dangling-edit trim and the column renames. A rename
+    passes ``drop_empty=False``: it keeps a hierarchy with no levels, as it always did.
+    Pure: new lists and dicts; *value* is not touched."""
+    if field == "hierarchies":
+        out = []
+        for h in value:
+            levels = [new for level in h.get("levels") or [] if (new := fn(level)) is not None]
+            if levels or not drop_empty:
+                out.append({**h, "levels": levels})
+        return out
+    if isinstance(value, list):
+        return [new for name in value if (new := fn(name)) is not None]
+    return fn(value)
+
+
+def _map_table_references(
+    table: TableSemantic, fn: Callable[[str], str | None], *, drop_empty: bool = True
+) -> dict[str, Any]:
+    """A ``model_copy`` update for *table* with each column name of its
+    ``_TABLE_REFERENCE_FIELDS`` replaced by ``fn(name)`` under ``_map_reference_value``'s
+    rule: the fields are dumped to that shape, mapped, and the hierarchies validated back
+    to ``Hierarchy``. A ``None`` field is returned as it is. ``drop_empty`` is passed through:
+    a rename keeps a hierarchy with no levels, as it always did, and the prune drops it.
+    Adding a reference field to the tuple is enough for the prune and the
+    renames to cover it."""
+    update = {
+        field: _map_reference_value(field, value, fn, drop_empty=drop_empty)
+        if value is not None
+        else value
+        for field, value in table.model_dump(include=set(_TABLE_REFERENCE_FIELDS)).items()
+    }
+    update["hierarchies"] = [Hierarchy.model_validate(h) for h in update["hierarchies"]]
+    return update
+
+
 def drop_dangling_edits(
     marks: dict[str, dict[str, list[str]]],
     protected: dict[str, dict[str, dict[str, Any]]],
@@ -561,28 +606,17 @@ def drop_dangling_edits(
         def kept(name: str, _key: str = key, _live: set[str] = live) -> bool:
             return name in _live or policy_hides_column(_key, name, privacy)
 
+        def kept_or_none(name: str, _kept: Callable[[str], bool] = kept) -> str | None:
+            return name if _kept(name) else None
+
         for field in _TABLE_REFERENCE_FIELDS:
             value = values.get(field)
             if not value:
                 continue
-            remaining: list[Any]
-            if field == "hierarchies":
-                dropped = _unique(
-                    level for h in value for level in h.get("levels") or [] if not kept(level)
-                )
-                filtered = (
-                    {**h, "levels": [level for level in h.get("levels") or [] if kept(level)]}
-                    for h in value
-                )
-                remaining = [h for h in filtered if h["levels"]]
-            elif isinstance(value, list):
-                dropped = _unique(c for c in value if not kept(c))
-                remaining = [c for c in value if kept(c)]
-            else:
-                dropped = [] if kept(value) else [value]
-                remaining = []
+            dropped = _unique(name for name in _reference_names(field, value) if not kept(name))
             if not dropped:
                 continue
+            remaining = _map_reference_value(field, value, kept_or_none)
             names = ", ".join(dropped)
             if remaining:
                 out_protected["table"][key][field] = remaining
@@ -603,39 +637,18 @@ def drop_dangling_edits(
 
 
 def _renamed_table(table: TableSemantic, mapping: Mapping[str, str]) -> TableSemantic:
-    """``table`` with each column key of ``mapping`` renamed, its references included."""
+    """``table`` with each column key of ``mapping`` renamed, its references included
+    (``_map_table_references``, so every field of ``_TABLE_REFERENCE_FIELDS`` follows)."""
 
     def new(name: str) -> str:
         return mapping.get(name, name)
 
-    timestamp, date = table.primary_timestamp_column, table.primary_date_column
     return table.model_copy(
         update={
             "columns": {new(name): col for name, col in table.columns.items()},
-            "primary_timestamp_column": new(timestamp) if timestamp else timestamp,
-            "primary_date_column": new(date) if date else date,
-            "partition_columns": [new(c) for c in table.partition_columns],
-            "cluster_columns": [new(c) for c in table.cluster_columns],
-            "hierarchies": [
-                h.model_copy(update={"levels": [new(level) for level in h.levels]})
-                for h in table.hierarchies
-            ],
+            **_map_table_references(table, new, drop_empty=False),
         }
     )
-
-
-def _renamed_reference(field: str, value: Any, mapping: Mapping[str, str]) -> Any:
-    """A table's protected reference ``field`` value with the columns of ``mapping``
-    renamed, in ``drop_dangling_edits``' shapes (a name, a list of names, or a list of
-    hierarchy dicts)."""
-    if field == "hierarchies":
-        return [
-            {**h, "levels": [mapping.get(level, level) for level in h.get("levels") or []]}
-            for h in value
-        ]
-    if isinstance(value, list):
-        return [mapping.get(c, c) for c in value]
-    return mapping.get(value, value)
 
 
 def rename_columns(
@@ -660,8 +673,9 @@ def rename_columns(
     annotation and its user edits:
 
     - the ``ColumnSemantic`` moves to the new key (in place, so the column order holds);
-    - the table's ``primary_timestamp_column``, ``primary_date_column``,
-      ``partition_columns``, ``cluster_columns`` and each hierarchy's ``levels``;
+    - the table's reference fields (``_TABLE_REFERENCE_FIELDS``: the primary timestamp and
+      date columns, the partition and cluster columns, each hierarchy's ``levels``). A
+      hierarchy with no levels is kept as it was; dropping it is ``prune_to_schema``'s;
     - each relationship endpoint on that table, with the edge's marks moved to its new
       ``relationship_key``. A renamed edge whose new key is one another edge already has
       is a duplicate and is dropped with its marks: the edge stored under the real names
@@ -694,7 +708,9 @@ def rename_columns(
         values = out_protected.get("table", {}).get(key, {})
         for field in _TABLE_REFERENCE_FIELDS:
             if value := values.get(field):
-                values[field] = _renamed_reference(field, value, mapping)
+                values[field] = _map_reference_value(
+                    field, value, lambda name, _m=mapping: _m.get(name, name), drop_empty=False
+                )
 
     def end(table: str, column: str) -> str:
         return renames.get(table, {}).get(column, column)
@@ -1959,9 +1975,10 @@ class SemanticModelGenerator:
         whatever it resembles, and is named verbatim: it is a real column name. Any other
         is resolved against the table's live columns with ``resolve_real_key`` (the rule
         ``compute_drift`` uses): a near-miss spelling of a column the model also stores,
-        or of one another key is renamed to, is a duplicate the apply removes; any other
-        key no longer exists, named quote-stripped unless the stripped name is still a
-        live column.
+        or of one another key is renamed to, is a duplicate the apply removes; one of a live
+        column the model does not store and no key is renamed to is a column the model has
+        not seen (with a baseline it is in ``added_columns`` too), and the apply removes
+        the key; any other key no longer exists, named quote-stripped.
 
         With ``privacy``, a stored table or column the policy hides is not reported
         as removed: the store keeps hidden annotations, and ``current_schema`` (with
@@ -1991,6 +2008,7 @@ class SemanticModelGenerator:
             dropped = drift.dropped_columns.get(tbl_key, set())
             missing: set[str] = set()
             duplicates: dict[str, str] = {}
+            unseen: dict[str, str] = {}
             for col in drift.removed_columns.get(tbl_key, ()):
                 if col in dropped:
                     # A key the baseline knew is a real column the database dropped: not a
@@ -1999,28 +2017,40 @@ class SemanticModelGenerator:
                     missing.add(col)
                     continue
                 target = resolve_real_key(col, live, bare_ok=False)
-                if target is not None and (target in table.columns or target in renamed.values()):
-                    duplicates[col] = target
-                else:
+                if target is None:
                     # Only for a key that is not a known drop (a dropped key is a real name,
                     # so real columns ``"a"`` and ``a`` both dropped are two warnings):
                     # normalised then deduplicated, so a blob-era ``"a"`` and ``a`` stored
-                    # side by side, both gone, are one missing column to a reader. A
-                    # stripped name that is still live keeps its stored spelling, so the
-                    # warning never says a live column is gone.
-                    stripped = strip_ident_quotes(col)
-                    missing.add(col if stripped in live else stripped)
+                    # side by side, both gone, are one missing column to a reader. (The
+                    # stripped name is not live, or it would have resolved.)
+                    missing.add(strip_ident_quotes(col))
+                elif target in table.columns or target in renamed.values():
+                    duplicates[col] = target
+                else:
+                    # A near-miss spelling of a live column the table does not store and no
+                    # key is renamed to: with a baseline, one it never saw (otherwise
+                    # ``_column_renames`` renamed this key), so the column is new
+                    # (``added_columns``, worded below) and the apply removes the key;
+                    # without one, nothing is new and the apply still removes the key.
+                    unseen[col] = target
             for col in sorted(missing):
                 warnings.append(
                     f'Column "{tbl_key}.{col}" referenced in semantic model no longer exists'
                 )
             # Near-miss keys (quoted, or differing only in letter case) are named under
-            # their stored spelling: the duplicate's twin keeps its own annotation; a
-            # renamed key carries its annotation to its live name.
+            # their stored spelling: the duplicate's twin keeps its own annotation; an
+            # unseen key's column is annotated afresh; a renamed key carries its
+            # annotation to its live name.
             for col in sorted(duplicates):
                 warnings.append(
                     f'Column key "{tbl_key}.{col}" in the semantic model is a near-miss '
                     f'spelling of "{duplicates[col]}"; Apply Drift removes the duplicate'
+                )
+            for col in sorted(unseen):
+                warnings.append(
+                    f'Column key "{tbl_key}.{col}" in the semantic model is a near-miss '
+                    f'spelling of "{unseen[col]}", a column the model has not seen; Apply '
+                    "Drift removes the key"
                 )
             for col in sorted(renamed):
                 target = renamed[col]

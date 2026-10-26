@@ -169,24 +169,26 @@ def _effective_known_columns(
     schema: DataSourceSchema,
     privacy: PrivacySettings | None,
 ) -> dict[str, frozenset[str]]:
-    """The baseline ``compute_drift`` reads: *known*, plus, for each stored table the live
-    schema holds and *known* has no entry for, what a baseline write would record for it:
-    its live columns and the real names of its stored keys the policy hides
-    (``_held_column_names``).
+    """The baseline ``compute_drift`` reads: *known*, with the entry of each stored table
+    the live schema holds completed to what a baseline write records for it
+    (``_baseline_entries``): a table with no entry gets its live columns, and every entry
+    gains the real names of the table's stored keys the policy hides and its stored live
+    columns.
 
     A table with no entry (a model from before the baseline existed, or a table a user
     added) is baselined at first sight: whatever it holds now is "seen", so no live column
     is reported new on that account, and a column the model holds only under a near-miss
     key is renamed to its live name (``compute_drift``'s ``renamed_columns``), now or,
     for a hidden one, once the policy shows it. A column added before that first sight is
-    not reported either; a Regenerate annotates it.
+    not reported either; a Regenerate annotates it. A table whose entry predates the
+    recording of hidden names gains them the same way, so un-hiding such a column renames
+    its near-miss key too; ``check_drift`` persists what this completed, so the name is
+    on record by the time the policy stops hiding it.
     """
     effective = {key: frozenset(names) for key, names in known.items()}
-    for key, names in _live_columns(schema, set(stored_tables)).items():
-        effective.setdefault(
-            key,
-            frozenset(names) | _held_column_names(key, names, stored_tables[key].columns, privacy),
-        )
+    stored_columns = {key: table.columns for key, table in stored_tables.items()}
+    for key, names in _baseline_entries(known, stored_columns, schema, privacy).items():
+        effective[key] = frozenset(names)
     return effective
 
 
@@ -204,10 +206,12 @@ async def check_drift(
     Compares against a fresh introspection, so a table dropped a minute ago shows up
     without a separate schema refresh, and stores it as the user's schema cache. When
     the data source cannot be reached the check falls back to that cache and says so
-    in the report; with no cache either it fails. On a live check, outside a run, a table
-    the model holds and the live schema shows, but that has no baseline of known columns
-    yet, is baselined at this check: a short write under the connection row lock, after the
-    schema refresh is committed. So a GET can answer 409 (the connection was deleted), and
+    in the report; with no cache either it fails. On a live check, outside a run, the
+    baseline entry of each table the model holds and the live schema shows is completed at
+    this check: a table with none gets its live columns, and an older entry gains the
+    stored names it lacks (the real name of a hidden stored key, a column annotated by
+    hand). A short write under the connection row lock, after the schema refresh is
+    committed. So a GET can answer 409 (the connection was deleted), and
     can wait on a save in progress, answering 503 with ``Retry-After`` once the database's
     lock timeout passes (``db_errors.py``).
 
@@ -258,16 +262,19 @@ async def check_drift(
 
     known = await semantic_store.load_known_columns(db, connection_id)
     effective = _effective_known_columns(known, stored_model.tables, schema, privacy)
-    unbaselined = {key: names for key, names in effective.items() if key not in known}
     if (
-        unbaselined
+        _baseline_changes(known, effective)
         and schema_source == "live"
         and stored_model.generation_status != GenerationStatus.TABLES_PARTIAL
     ):
-        # Persist the first-sight baseline so the next check can tell a new column from
-        # one the model already had. Bookkeeping under the row lock: no version bump, no
-        # history. Not from a cached schema (it is not what the model has seen), and not
-        # under a run in progress (its batches write the baseline themselves).
+        # Persist what the read completed: the first-sight entry of a table with none, and
+        # the names an entry from before they were recorded lacks (the real name of a
+        # stored key the policy hides, a column annotated by hand), so the next check can
+        # tell a new column from one the model already had, and an un-hidden column's
+        # near-miss key is renamed rather than the column reported new. Bookkeeping under
+        # the row lock: no version bump, no history. Not from a cached schema (it is not
+        # what the model has seen), and not under a run in progress (its batches write
+        # the baseline themselves).
         # The refreshed schema cache is committed first, in its own transaction, as
         # ``apply_drift`` does: the refresh always writes the user's schema-cache row and,
         # when the schema changed, deletes the query and embedding cache rows. Every writer
@@ -279,13 +286,18 @@ async def check_drift(
         await _lock_generation(connection_id, db, "check-drift")
         # ``stored_model`` was loaded before the introspection, so a Regenerate another tab
         # started meanwhile is only seen by re-reading the header under the lock; its
-        # batches write the baseline themselves, so the seed is skipped. The report below
-        # still comes from ``stored_model``.
+        # batches write the baseline themselves, so the write is skipped. The baseline is
+        # re-read too: a batch or an apply may have moved it since the read above, and a
+        # row is replaced whole, so what is written must complete the entry as the lock
+        # sees it. The model is still the pre-lock read, and so is the report below.
         header = await semantic_store.load_header(db, connection_id)
         if header is not None and header.generation_status != GenerationStatus.TABLES_PARTIAL:
-            await semantic_store.update_known_columns(
-                db, connection_id, unbaselined, only_missing=True
+            locked = await semantic_store.load_known_columns(db, connection_id)
+            changes = _baseline_changes(
+                locked, _effective_known_columns(locked, stored_model.tables, schema, privacy)
             )
+            if changes:
+                await semantic_store.update_known_columns(db, connection_id, changes)
         # Commit now, with or without a write: releases the connection lock instead of
         # holding it through the diff and the response.
         await db.commit()
@@ -293,7 +305,7 @@ async def check_drift(
     # One diff for the warnings and the flag, the same diff apply-drift acts on.
     drift = compute_drift(schema, stored_model, privacy, effective)
     warnings = SemanticModelGenerator().detect_drift(schema, stored_model, privacy, drift=drift)
-    # Persist the refreshed cache (a no-op on the fallback path, and after the seeding
+    # Persist the refreshed cache (a no-op on the fallback path, and after the baseline
     # commit above).
     await db.commit()
 
@@ -343,7 +355,7 @@ def _live_columns(
 ) -> dict[str, list[str]]:
     """Table key → the live column names of *schema* (of the tables in *keys* when given).
     The shape ``store.update_known_columns`` takes. The routes' schema is policy-filtered,
-    so a hidden column is not here; a baseline writer adds the hidden ones the model
+    so a hidden column is not here; ``_baseline_entries`` adds the hidden ones the model
     stores (``_held_column_names``)."""
     return {
         table_key(table): [c.name for c in table.columns]
@@ -359,10 +371,9 @@ def _held_column_names(
     each of its *stored* column keys that is a *live* column, and the real name
     (``strip_ident_quotes``) of each stored key the policy hides.
 
-    Every baseline writer (a generation batch, the finalisation, an apply, the drift
-    check's seed through ``_effective_known_columns``) records these besides the live
-    columns it records, so the baseline is a superset of the stored live columns and of
-    the real names of the stored hidden keys. The schema the writers see is
+    ``_baseline_entries`` adds these to every entry it builds, for every reader and
+    writer of the baseline, so an entry is a superset of the stored live columns and of
+    the real names of the stored hidden keys. The schema the routes see is
     policy-filtered, so without the second part a hidden column would leave the entry.
     That is right for one the model never annotated: once un-hidden it is reported new.
     One it stores stays seen, so once un-hidden a near-miss key of it (a blob-era
@@ -376,6 +387,38 @@ def _held_column_names(
     return {name for name in stored if name in live_names} | {
         strip_ident_quotes(name) for name in stored if policy_hides_column(key, name, privacy)
     }
+
+
+def _baseline_entries(
+    seen: Mapping[str, Collection[str]],
+    stored_columns: Mapping[str, Collection[str]],
+    schema: DataSourceSchema,
+    privacy: PrivacySettings | None,
+) -> dict[str, set[str]]:
+    """The baseline entry of each table of *stored_columns* that the live *schema* holds:
+    the names *seen* gives it (its live columns when *seen* has no entry for it) plus the
+    names the model stores (``_held_column_names``: its stored live columns, and the real
+    names of its stored keys the policy hides).
+
+    The one builder behind every reader and writer of the baseline, so an entry is always
+    a superset of what the table stores and no writer can leave the hidden names out:
+    ``_effective_known_columns`` (the drift check, the apply and the finalisation read
+    through it) passes the stored baseline as *seen*; a generation batch passes nothing
+    (its tables have seen their live columns, so the stored live columns add nothing and
+    only the hidden names count); the apply and the finalisation pass what each table had
+    seen that is still live. A table absent from the live schema (hidden, unreadable or
+    gone) gets no entry here: the caller keeps or prunes the one it has. Nothing is
+    dropped: a name in *seen* that left the database stays, so a stored key the baseline
+    knew is still a drop to ``compute_drift``; the writers intersect with the live
+    columns themselves, before passing *seen*.
+    """
+    entries: dict[str, set[str]] = {}
+    for key, live in _live_columns(schema, set(stored_columns)).items():
+        base = seen.get(key)
+        entries[key] = set(live if base is None else base) | _held_column_names(
+            key, live, stored_columns[key], privacy
+        )
+    return entries
 
 
 def _baseline_changes(
@@ -1352,26 +1395,29 @@ async def apply_drift(
     # is left to the prune); each new table's live columns (annotated or not, like a
     # generation batch); every column a batch answered for. A new table the LLM returned
     # nothing for is not here: it must stay new.
-    seen = {key: set(names) for key, names in effective.items() if key in current_model.tables}
     # A column that left the database leaves the baseline together with its annotation
     # (the prune in ``_drift_applied_model`` removed it): if it comes back it is new
     # again and is annotated, instead of being silently "seen". A hidden or unreadable
     # table is not in the live schema, so its entry is kept as it is. A column the policy
     # hides is absent from the live columns too, so it leaves the entry here, as in the
-    # finalisation, unless the model stores it (below): once un-hidden, one it never
-    # annotated is reported new and the next apply annotates it.
+    # finalisation, unless the model stores it: ``_baseline_entries`` records it under its
+    # real name, with every live column the model stores however it got there (a
+    # hand-added annotation included), so the baseline is a superset of what the model
+    # stores. Once un-hidden, a hidden column the model never annotated is reported new
+    # and the next apply annotates it.
     live_now = _live_columns(schema)
-    for key in seen:
-        if key in live_now:
-            seen[key] &= set(live_now[key])
-    # What the model stores it has seen, however the column got there (a hand-added
-    # annotation included), hidden columns under their real names
-    # (``_held_column_names``): the baseline is a superset of what the model stores.
-    for key, table in current_model.tables.items():
-        if key in live_now:
-            seen.setdefault(key, set()).update(
-                _held_column_names(key, live_now[key], table.columns, privacy)
-            )
+    # ``effective`` has an entry for every stored live table (``_effective_known_columns``
+    # over the same model and schema), so each one below has a base to complete.
+    seen = {
+        key: set(names) & set(live_now[key]) if key in live_now else set(names)
+        for key, names in effective.items()
+        if key in current_model.tables
+    }
+    seen.update(
+        _baseline_entries(
+            seen, {key: t.columns for key, t in current_model.tables.items()}, schema, privacy
+        )
+    )
     # A new table has seen every live column, whatever row it left behind (a check that
     # seeded it before an earlier apply removed it): that row is overwritten.
     for key, names in _live_columns(schema, set(new_tables)).items():
@@ -2068,10 +2114,9 @@ async def generate_semantic_batch(
         await semantic_store.update_known_columns(
             db,
             connection_id,
-            {
-                key: set(names) | _held_column_names(key, names, stored.get(key, ()), privacy)
-                for key, names in _live_columns(schema, set(batch_tables)).items()
-            },
+            _baseline_entries(
+                {}, {key: stored.get(key, ()) for key in batch_tables}, schema, privacy
+            ),
         )
         if batch_tables:
             # The batch may have rewritten annotations the cached answers were written
@@ -2344,15 +2389,17 @@ async def generate_semantic_globals(
     # from the live columns too, so unlike a table it leaves the entry, unless the model
     # stores it (below): once un-hidden, one it never annotated is reported new and the
     # next apply annotates it.
-    wanted: dict[str, set[str]] = {}
-    for key, names in _live_columns(schema, set(stored.tables)).items():
-        live_names = set(names)
-        kept = live_names & known[key] if key in known else live_names
-        # What the model stores it has seen, however the column got there (a hand-added
-        # annotation, or a near-miss key renamed above, included), hidden columns under
-        # their real names (``_held_column_names``): the baseline is a superset of what
-        # the model stores.
-        wanted[key] = kept | _held_column_names(key, names, stored.tables[key].columns, privacy)
+    live_now = _live_columns(schema, set(stored.tables))
+    # What the model stores it has seen, however the column got there (a hand-added
+    # annotation, or a near-miss key renamed above, included), hidden columns under
+    # their real names: ``_baseline_entries`` adds them, so the baseline is a superset of
+    # what the model stores.
+    wanted = _baseline_entries(
+        {key: set(known[key]) & set(names) for key, names in live_now.items() if key in known},
+        {key: table.columns for key, table in stored.tables.items()},
+        schema,
+        privacy,
+    )
     await semantic_store.update_known_columns(
         db, connection_id, _baseline_changes(known, wanted), prune=True
     )

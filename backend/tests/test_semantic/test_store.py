@@ -3056,20 +3056,6 @@ class TestKnownColumns:
             "public.events": frozenset({"id"}),
         }
 
-    async def test_only_missing_never_replaces_an_entry(self, semantic_db, connection_id) -> None:
-        await self._stored(semantic_db, connection_id)
-        await store.update_known_columns(semantic_db, connection_id, {"public.orders": ["a"]})
-        await store.update_known_columns(
-            semantic_db,
-            connection_id,
-            {"public.orders": ["a", "b"], "public.events": ["id"]},
-            only_missing=True,
-        )
-        assert await store.load_known_columns(semantic_db, connection_id) == {
-            "public.orders": frozenset({"a"}),
-            "public.events": frozenset({"id"}),
-        }
-
     async def test_prune_drops_the_entries_of_tables_the_model_does_not_hold(
         self, semantic_db, connection_id
     ) -> None:
@@ -3177,11 +3163,11 @@ class TestKnownColumns:
             "public.mixed": frozenset({"a"})
         }
 
-    async def test_seeding_rewrites_a_malformed_row_but_keeps_a_valid_one(
+    async def test_a_malformed_row_is_rewritten_and_an_unnamed_one_untouched(
         self, semantic_db, connection_id
     ) -> None:
-        """``load_known_columns`` skips a row whose value is not a list, so for ``only_missing``
-        it is a missing entry: left alone it would be "seeded" forever without effect."""
+        """``load_known_columns`` skips a row whose value is not a list, so it is a missing
+        entry to every reader; a write of that table replaces it."""
         await self._stored(semantic_db, connection_id)
         model_id = await semantic_db.scalar(
             select(SemanticModelRow.id).where(SemanticModelRow.connection_id == connection_id)
@@ -3195,12 +3181,7 @@ class TestKnownColumns:
         await semantic_db.commit()
         assert set(await store.load_known_columns(semantic_db, connection_id)) == {"public.kept"}
 
-        await store.update_known_columns(
-            semantic_db,
-            connection_id,
-            {"public.object": ["b"], "public.kept": ["z"]},
-            only_missing=True,
-        )
+        await store.update_known_columns(semantic_db, connection_id, {"public.object": ["b"]})
 
         assert await store.load_known_columns(semantic_db, connection_id) == {
             "public.object": frozenset({"b"}),

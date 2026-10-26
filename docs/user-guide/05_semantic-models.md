@@ -111,7 +111,7 @@ Things to know:
 
 ### New columns
 
-**Check Drift** reports a column as new only if the model has not seen it before. For each table the model remembers the columns it has seen: those it was generated with and those an apply added. (A column added to the model through the API, `PUT /api/v1/connections/{id}/semantic`, is remembered from the next apply or regenerate.) So:
+**Check Drift** reports a column as new only if the model has not seen it before. For each table the model remembers the columns it has seen: those it was generated with and those an apply added. (A column added to the model through the API, `PUT /api/v1/connections/{id}/semantic`, is remembered from the next **Check Drift**, apply or regenerate.) So:
 - A column the LLM left out when the model was generated is not reported again, and neither is one the model had that was deleted through the API.
 - A column the LLM leaves out while annotating the other new columns of its table is not retried either; the summary names it. **Regenerate** to annotate it.
 - If the LLM returns nothing for a table, its new columns stay new and the next apply retries them.
@@ -119,7 +119,7 @@ Things to know:
 - A column the model has seen but holds under a slightly different spelling (in quotes, or in different letter case, for example from a model migrated from an older version) is renamed: Check Drift reports the rename, and the apply gives the stored entry the column's real name without asking the LLM. Its annotation, your edits, the table settings that name it and its relationships are kept (a relationship on it that you deleted stays deleted). If the model holds two such spellings of one column, the first in sort order is renamed and the other is removed as a duplicate; if it also holds the real name, the other spelling is a duplicate and is removed. **Regenerate** renames the same way, unless it annotates the column under its real name. If the database itself renamed the column (the model never saw the new name), the old entry is removed and the column is new.
 - A model created before this tracking existed starts tracking at its first **Check Drift**, apply or regenerate, so a column added before then is not reported; **Regenerate** to annotate it.
 
-One gap, for changes made through the API: a new column added to the model and deleted again before an apply or regenerate has recorded it is reported as new.
+One gap, for changes made through the API: a new column added to the model and deleted again before a **Check Drift**, apply or regenerate has recorded it is reported as new.
 
 ---
 

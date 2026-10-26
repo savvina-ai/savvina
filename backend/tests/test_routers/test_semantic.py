@@ -414,7 +414,9 @@ class TestCheckDrift:
 
 
 class TestCheckDriftNewColumns:
-    """The check reads the baseline; a table with none is baselined at first sight."""
+    """The check reads the baseline; a table with none is baselined at first sight, and a
+    baselined entry lacking names the read can complete (the real name of a hidden stored
+    key) is completed."""
 
     def setup_method(self) -> None:
         _reset_limiter()
@@ -492,9 +494,9 @@ class TestCheckDriftNewColumns:
         self.known_update.assert_awaited_once()
         args, kwargs = self.known_update.await_args
         assert args[2] == {"public.orders": frozenset({"id", "loyalty_tier"})}
-        assert kwargs == {"only_missing": True}
+        assert kwargs == {}
 
-    async def test_only_the_tables_without_a_baseline_are_written(self, http_client) -> None:
+    async def test_only_the_entries_the_read_completed_are_written(self, http_client) -> None:
         self.known.return_value = {"public.orders": frozenset({"id"})}
         stored = SemanticModel(
             tables={
@@ -514,6 +516,101 @@ class TestCheckDriftNewColumns:
         await self._get(http_client)
         self.known_update.assert_not_awaited()
         self.lock.assert_not_awaited()
+
+    async def test_a_baselined_table_lacking_a_hidden_stored_name_is_completed(
+        self, http_client
+    ) -> None:
+        """An entry written before hidden names were recorded: the check adds the real name
+        of the stored hidden key, so that once un-hidden the key is renamed. Nothing is
+        reported meanwhile (hidden is not drift)."""
+        self.known.return_value = {"public.orders": frozenset({"id"})}
+        conn = _make_conn(privacy_settings={"excluded_columns": ["public.orders.ssn"]})
+        stored = SemanticModel(
+            tables={
+                "public.orders": TableSemantic(
+                    display_name="Orders",
+                    columns={
+                        "id": ColumnSemantic(display_name="Id"),
+                        '"ssn"': ColumnSemantic(display_name="SSN"),
+                    },
+                )
+            }
+        )
+        body = await self._get(
+            http_client, stored=stored, conn=conn, schema=_schema(["orders"], {"orders": ["id"]})
+        )
+        assert body["warnings"] == []
+        assert body["has_actionable_changes"] is False
+        assert self.known_update.await_args.args[2] == {"public.orders": {"id", "ssn"}}
+        assert self.known_update.await_args.kwargs == {}
+
+    async def test_the_completed_entry_then_renames_the_key_once_un_hidden(
+        self, http_client
+    ) -> None:
+        """The baseline the previous check completed holds ``ssn``; the policy no longer
+        hides it, so the quoted key is a rename, not a removal beside a new column."""
+        self.known.return_value = {"public.orders": frozenset({"id", "ssn"})}
+        stored = SemanticModel(
+            tables={
+                "public.orders": TableSemantic(
+                    display_name="Orders",
+                    columns={
+                        "id": ColumnSemantic(display_name="Id"),
+                        '"ssn"': ColumnSemantic(display_name="SSN"),
+                    },
+                )
+            }
+        )
+        body = await self._get(
+            http_client, stored=stored, schema=_schema(["orders"], {"orders": ["id", "ssn"]})
+        )
+        assert any(
+            'Column key "public.orders."ssn"" in the semantic model is a near-miss spelling '
+            'of "ssn"; Apply Drift renames it to "ssn"' in w
+            for w in body["warnings"]
+        )
+        assert not any("new column(s)" in w or "no longer exists" in w for w in body["warnings"])
+        self.known_update.assert_not_awaited()
+
+    async def test_the_entry_written_is_completed_from_the_baseline_read_under_the_lock(
+        self, http_client
+    ) -> None:
+        """The pre-lock read still holds ``old``; the locked one (after a batch or an apply)
+        does not. A row is replaced whole, so the write completes the locked entry: it must
+        not carry ``old`` back in."""
+        self.known.side_effect = [
+            {"public.orders": frozenset({"id", "old"})},
+            {"public.orders": frozenset({"id"})},
+        ]
+        conn = _make_conn(privacy_settings={"excluded_columns": ["public.orders.ssn"]})
+        stored = SemanticModel(
+            tables={
+                "public.orders": TableSemantic(
+                    display_name="Orders",
+                    columns={
+                        "id": ColumnSemantic(display_name="Id"),
+                        '"ssn"': ColumnSemantic(display_name="SSN"),
+                    },
+                )
+            }
+        )
+        await self._get(
+            http_client, stored=stored, conn=conn, schema=_schema(["orders"], {"orders": ["id"]})
+        )
+        assert self.known.await_count == 2
+        assert self.known_update.await_args.args[2] == {"public.orders": {"id", "ssn"}}
+
+    async def test_the_write_is_computed_against_the_baseline_re_read_under_the_lock(
+        self, http_client
+    ) -> None:
+        """A batch or an apply may move the baseline between the pre-lock read and the
+        lock: the second read sees the entry complete, so nothing is written."""
+        self.known.side_effect = [{}, {"public.orders": frozenset({"id", "loyalty_tier"})}]
+        body = await self._get(http_client)
+        assert body["warnings"] == []
+        assert self.known.await_count == 2
+        self.lock.assert_awaited_once()
+        self.known_update.assert_not_awaited()
 
     async def test_a_legacy_near_miss_key_is_reported_as_a_rename_not_a_new_column(
         self, http_client
@@ -599,11 +696,28 @@ class TestCheckDriftNewColumns:
             order.append("header")
             return _locked_header()
 
+        async def known(*_args, **_kwargs) -> dict:
+            order.append("known")
+            return {}
+
         self.header.side_effect = header
-        self.known_update.side_effect = lambda *_a, **_kw: order.append("seed")
+        self.known.side_effect = known
+        self.known_update.side_effect = lambda *_a, **_kw: order.append("write")
         await self._get(http_client, db=db, refresh=refresh)
-        # The seeding commit releases the lock; the last commit finds nothing to write.
-        assert order == ["refresh", "commit", "lock", "header", "seed", "commit", "commit"]
+        # The baseline is read once before the lock for the report and once after the lock
+        # and the header re-read, which is what the write is computed against. The baseline
+        # commit releases the lock; the last commit finds nothing to write.
+        assert order == [
+            "refresh",
+            "known",
+            "commit",
+            "lock",
+            "header",
+            "known",
+            "write",
+            "commit",
+            "commit",
+        ]
 
     async def test_a_run_started_while_the_check_waited_for_the_lock_is_not_baselined(
         self, http_client
@@ -2615,6 +2729,58 @@ class TestHeldColumnNames:
         assert self._held(["id", '"ssn"'], None) == {"id"}
 
 
+class TestBaselineEntries:
+    """What a baseline write records for each stored table the live schema holds: the
+    names it has seen, plus what the model stores (``_held_column_names``)."""
+
+    _PRIVACY = PrivacySettings(excluded_columns=["public.orders.ssn"])
+
+    @staticmethod
+    def _entries(
+        seen: dict[str, set[str]],
+        stored: dict[str, list[str]],
+        privacy: PrivacySettings | None = None,
+    ) -> dict[str, set[str]]:
+        from app.routers.semantic import _baseline_entries
+
+        # ``ssn`` is hidden, so it is not a live column of ``orders``.
+        schema = _schema(["orders", "customers"], columns={"orders": ["id", "status"]})
+        return _baseline_entries(seen, stored, schema, privacy)
+
+    def test_a_table_with_no_entry_gets_its_live_columns(self) -> None:
+        assert self._entries({}, {"public.orders": []}) == {"public.orders": {"id", "status"}}
+
+    def test_an_entry_is_kept_as_given_stale_names_included(self) -> None:
+        """Dropping a name that left the database is the writer's decision, made before
+        it passes *seen*: the read must keep it, so a dropped column stays a drop."""
+        seen = {"public.orders": {"id", "gone"}}
+        assert self._entries(seen, {"public.orders": []}) == {"public.orders": {"id", "gone"}}
+
+    def test_an_empty_entry_stays_empty_and_is_not_replaced_by_the_live_columns(self) -> None:
+        """An entry that has seen nothing is still an entry: only what the model stores is
+        added, never the live columns a missing entry gets."""
+        seen: dict[str, set[str]] = {"public.orders": set()}
+        assert self._entries(seen, {"public.orders": ["status"]}) == {"public.orders": {"status"}}
+
+    def test_a_stored_live_column_the_entry_lacks_is_added(self) -> None:
+        seen = {"public.orders": {"id"}}
+        assert self._entries(seen, {"public.orders": ["status"]}) == {
+            "public.orders": {"id", "status"}
+        }
+
+    def test_a_stored_key_the_policy_hides_is_added_under_its_real_name(self) -> None:
+        seen = {"public.orders": {"id"}}
+        assert self._entries(seen, {"public.orders": ['"ssn"']}, self._PRIVACY) == {
+            "public.orders": {"id", "ssn"}
+        }
+
+    def test_a_stored_table_absent_from_the_live_schema_gets_no_entry(self) -> None:
+        assert self._entries({"public.ghosts": {"id"}}, {"public.ghosts": ["id"]}) == {}
+
+    def test_a_live_table_the_model_does_not_store_gets_no_entry(self) -> None:
+        assert set(self._entries({}, {"public.orders": []})) == {"public.orders"}
+
+
 class TestEffectiveKnownColumns:
     def test_a_stored_key_the_policy_hides_is_seeded_under_its_real_name(self) -> None:
         """A table with no entry is baselined with what a baseline write would record:
@@ -2665,6 +2831,42 @@ class TestEffectiveKnownColumns:
 
         known = {"public.legacy": frozenset({"id"})}
         assert _effective_known_columns(known, {}, _schema(["orders"]), None) == known
+
+    def test_a_baselined_table_gains_the_real_name_of_a_stored_key_the_policy_hides(
+        self,
+    ) -> None:
+        """An entry written before hidden names were recorded lacks ``ssn``. The read
+        completes it (and Check Drift persists it), so once un-hidden the quoted key is
+        renamed to ``ssn`` instead of ``ssn`` being reported new."""
+        from app.routers.semantic import _effective_known_columns
+
+        schema = _schema(["orders"], columns={"orders": ["id"]})  # ``ssn`` is hidden
+        stored = {
+            "public.orders": TableSemantic(
+                display_name="Orders", columns={'"ssn"': ColumnSemantic(display_name="S")}
+            )
+        }
+        privacy = PrivacySettings(excluded_columns=["public.orders.ssn"])
+        known = {"public.orders": frozenset({"id"})}
+        assert _effective_known_columns(known, stored, schema, privacy) == {
+            "public.orders": frozenset({"id", "ssn"})
+        }
+
+    def test_a_baselined_table_gains_a_stored_live_column_its_entry_lacks(self) -> None:
+        """A column annotated by hand (``PUT``) is seen: the baseline is a superset of
+        what the model stores, on read as on write."""
+        from app.routers.semantic import _effective_known_columns
+
+        schema = _schema(["orders"], columns={"orders": ["id", "status"]})
+        stored = {
+            "public.orders": TableSemantic(
+                display_name="Orders", columns={"status": ColumnSemantic(display_name="S")}
+            )
+        }
+        known = {"public.orders": frozenset({"id"})}
+        assert _effective_known_columns(known, stored, schema, None) == {
+            "public.orders": frozenset({"id", "status"})
+        }
 
 
 class TestLiveColumns:
