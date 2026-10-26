@@ -21,7 +21,7 @@ from the blob era's generator order.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
@@ -54,6 +54,8 @@ from .models import (
     Segment,
     SemanticModel,
     TableSemantic,
+    relationship_identity,
+    relationship_key,
 )
 
 if TYPE_CHECKING:
@@ -270,20 +272,6 @@ def _global_item_name(kind: str, payload: dict[str, Any]) -> str:
     if kind == "common_join":
         return str(payload.get("join_pattern", ""))
     return str(payload.get("name", ""))
-
-
-def _relationship_identity(
-    edge: Mapping[str, Any] | RelationshipEdge,
-) -> tuple[str, str, str, str]:
-    if isinstance(edge, Mapping):
-        return (edge["from_table"], edge["from_column"], edge["to_table"], edge["to_column"])
-    return (edge.from_table, edge.from_column, edge.to_table, edge.to_column)
-
-
-def relationship_key(edge: Mapping[str, Any] | RelationshipEdge) -> str:
-    """The provenance-map key for a relationship: its four endpoints, joined."""
-    from_table, from_column, to_table, to_column = _relationship_identity(edge)
-    return f"{from_table}.{from_column}->{to_table}.{to_column}"
 
 
 def _relationship_row_to_dict(row: SemanticRelationshipRow) -> dict[str, Any]:
@@ -1143,6 +1131,28 @@ async def load_known_columns(db: AsyncSession, connection_id: str) -> dict[str, 
         for key, names in result
         if isinstance(names, list)
     }
+
+
+async def load_column_names(
+    db: AsyncSession, connection_id: str, table_keys: Collection[str]
+) -> dict[str, list[str]]:
+    """Table key → the column keys stored for it, for the tables of *table_keys* the
+    model holds with at least one column row; ``{}`` with no model. A column-only SELECT,
+    read once per generation batch for the tables it reconciled, so its baseline write
+    can keep the stored keys the privacy policy hides (``_held_column_names``)."""
+    names: dict[str, list[str]] = {}
+    for chunk in _chunks(sorted(table_keys)):
+        result = await db.execute(
+            select(SemanticTableRow.table_key, SemanticColumnRow.column_name)
+            .join(SemanticColumnRow, SemanticColumnRow.table_id == SemanticTableRow.id)
+            .where(
+                SemanticTableRow.connection_id == connection_id,
+                SemanticTableRow.table_key.in_(chunk),
+            )
+        )
+        for key, column in result:
+            names.setdefault(key, []).append(column)
+    return names
 
 
 async def update_known_columns(
@@ -2145,7 +2155,7 @@ async def apply_user_patch(
         if not _payload_lists_equal(existing_rel, fitted_rels):
             changed = True
             marks = _stored_marks(
-                (_relationship_identity(edge), edge, row.user_edited_fields)
+                (relationship_identity(edge), edge, row.user_edited_fields)
                 for row, edge in zip(existing_rel_rows, existing_rel, strict=True)
             )
             _write_section_history(
@@ -2166,7 +2176,7 @@ async def apply_user_patch(
                         model_id=header.id,
                         connection_id=connection_id,
                         ordinal=ordinal,
-                        user_edited_fields=_item_marks(marks, _relationship_identity(edge), edge),
+                        user_edited_fields=_item_marks(marks, relationship_identity(edge), edge),
                         updated_at=_now(),
                         updated_by=updated_by,
                         **edge,

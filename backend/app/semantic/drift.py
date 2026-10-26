@@ -81,8 +81,8 @@ def strip_ident_quotes(name: str) -> str:
     are stripped from around each dotted part and never from inside one, so a real
     name that contains a quote (``o'brien_flag``) is kept as it is. The one
     normaliser: ``SemanticModelGenerator._strip_quotes`` delegates here, so the drift
-    check, ``resolve_real_key`` (the generator's near-miss remap and the prune's
-    near-miss warning) and ``names_any_table`` read a name alike.
+    check, ``resolve_real_key`` (the generator's near-miss remap, the prune's near-miss
+    warning and the drift's column renames) and ``names_any_table`` read a name alike.
     """
     return ".".join(part.strip().strip(_IDENT_QUOTES) for part in name.strip().split("."))
 
@@ -97,7 +97,7 @@ def resolve_real_key(name: str, real_keys: list[str], *, bare_ok: bool) -> str |
 
     The one resolver: ``SemanticModelGenerator._resolve_real_key`` delegates here, so
     the generator's near-miss remap, the prune's near-miss warning, ``names_any_table``
-    and the drift check's respelled columns (``compute_drift``) match a name alike.
+    and the drift check's renamed columns (``compute_drift``) match a name alike.
     Table names resolve with ``bare_ok``, column names without.
     """
     stripped = strip_ident_quotes(name)
@@ -110,30 +110,42 @@ def resolve_real_key(name: str, real_keys: list[str], *, bare_ok: bool) -> str |
     return matches[0] if len(matches) == 1 else None
 
 
-def respelled_targets(
+def _column_renames(
+    key: str,
     gone: Collection[str],
     stored_columns: Collection[str],
     live_columns: Collection[str],
     seen: Collection[str],
-) -> set[str]:
-    """The live columns held only under a near-miss key in *gone*, a removed key of the
-    table: the columns whose sole annotation the prune drops.
+    privacy: PrivacySettings | None,
+) -> dict[str, str]:
+    """The keys of *gone* (table *key*'s removed column keys) that are renamed to the live
+    column they spell, each mapped to that column's name.
 
-    A key resolves (``resolve_real_key``, against every live column, so an ambiguous
-    spelling names nothing) to a live column the table does not store under its real
-    name (*stored_columns*). A removed key in *seen*, the table's baseline, was a live
-    column once (the baseline only records live names), so the database dropped it: it
-    is not a respelling. The one rule behind ``compute_drift``'s ``respelled_columns``
-    and the finalisation's baseline write.
+    A key is renamed when ``resolve_real_key`` (against every live column, so an
+    ambiguous spelling names nothing) maps it to a live column that the table does not
+    store under its real name (*stored_columns*; if it does, the key is a duplicate the
+    prune drops), that *seen*, the table's baseline, holds (one the baseline never saw is
+    new in its own right: the database renamed a column, and the key is a plain removal),
+    and that *privacy* does not hide. A key in *seen* is never renamed: the baseline
+    records only real column names (live, or hidden by the policy), so it was a live
+    column the database dropped. Of several keys spelling one column, the first in sort
+    order is renamed; the others stay removals, duplicates of the renamed column.
     """
     live_sorted = sorted(live_columns)
-    return {
-        target
-        for col in gone
-        if col not in seen
-        and (target := resolve_real_key(col, live_sorted, bare_ok=False)) is not None
-        and target not in stored_columns
-    }
+    renames: dict[str, str] = {}
+    for col in sorted(gone):
+        if col in seen:
+            continue
+        target = resolve_real_key(col, live_sorted, bare_ok=False)
+        if (
+            target is not None
+            and target not in stored_columns
+            and target in seen
+            and target not in renames.values()
+            and not policy_hides_column(key, target, privacy)
+        ):
+            renames[col] = target
+    return renames
 
 
 @dataclass
@@ -145,42 +157,39 @@ class SchemaDrift:
     names the stored row exactly. The membership rule is ``_prune_table``'s: a key is
     present on an exact match with a live column or when the policy hides it, so a
     near-miss spelling of a live column (quoted, or differing only in letter case) is
-    reported (and removed) verbatim.
+    reported (and removed) verbatim, unless it is renamed (below).
     ``detect_drift`` words each entry for display. The apply removes columns through
     ``prune_to_schema``, not through this map.
+
+    ``renamed_columns`` maps a table key to the near-miss keys the apply renames to the
+    live column they spell, each to that column's name (``'"status"'`` or ``Status`` →
+    ``status``): the table must store no ``status`` and its baseline must have seen it,
+    and the spelling must match that one live column by ``resolve_real_key``, which is
+    quote stripping, then letter case, and never an ambiguous match
+    (``_column_renames`` has the rule). The model already holds the column, under a
+    stale key, so the apply renames the key and whatever names the column by it, and
+    keeps its annotation and user edits (``generator.rename_columns``), with no LLM
+    call. A renamed key is not in ``removed_columns``, nor its column in
+    ``added_columns``; of several keys spelling one column only the first in sort order
+    is renamed and the others stay in ``removed_columns``, duplicates the apply removes.
+    Only a table with a baseline entry can have renames.
 
     ``added_columns`` maps a table key present in both the live schema and the stored
     model to the live column names that are in neither the stored table nor the
     ``known_columns`` baseline (the live columns the model has already seen: one the LLM
-    omitted or the user deleted is known, so it is not new), plus the exception below
-    for a column held only under a near-miss spelling. A table with no baseline entry
-    reports none: nothing says what it has seen. A live column the policy hides is
+    omitted or the user deleted is known, so it is not new). A table with no baseline
+    entry reports none: nothing says what it has seen. A live column the policy hides is
     never reported (the schema the routes pass is already filtered; the check does not
-    rely on it).
-
-    The exception: a live column the model holds only under a near-miss spelling the
-    apply removes (``'"status"'`` or ``Status`` with no ``status`` stored; the spelling
-    must match that one live column by ``resolve_real_key``, which is quote stripping,
-    then letter case, and never an ambiguous match) is new again, so the apply
-    re-annotates it instead of dropping its only annotation. Several such keys
-    resolving to one column are one added name. A removed key the baseline knows was
-    itself a live column (every baseline writer records live names), so its removal is
-    a genuine drop, not a respelling: a database that had ``Status`` and ``status`` and
-    loses ``Status`` does not make ``status`` new. The columns of a new table are not
-    here: the whole table is new.
-
-    ``respelled_columns`` is the subset of ``added_columns`` that is there only by that
-    exception, per table (a table with none has no entry), so ``detect_drift`` can word
-    the near-miss key and its column as one respelling instead of a drop and a new
-    column. A column that is also new by the baseline rule (the baseline never saw it:
-    the database renamed ``Status`` to ``status``) is genuinely new, not respelled, and
-    its near-miss key is just a removal. It adds nothing to ``is_empty``: every entry is
-    in ``added_columns`` already.
+    rely on it). A column whose only key is a near-miss spelling is new too when the
+    baseline never saw it (the database renamed ``Status`` to ``status``): its key is
+    then a plain removal, not a rename. The columns of a new table are not here: the
+    whole table is new.
 
     ``dropped_columns`` is the subset of ``removed_columns`` the table's baseline entry
     contains, per table (only a table with a baseline entry can have one; a table with
     none has no entry). A removed key the baseline knows was a live column (every
-    baseline writer records live names), so its removal is a genuine drop, and
+    baseline writer records only real column names, live or hidden by the policy), so
+    its removal is a genuine drop, and
     ``detect_drift`` words it as one even when it resembles a column still stored. It
     adds nothing to ``is_empty``: every entry is in ``removed_columns`` already.
 
@@ -193,8 +202,8 @@ class SchemaDrift:
     new_table_keys: set[str] = field(default_factory=set)
     removed_table_keys: set[str] = field(default_factory=set)
     removed_columns: dict[str, set[str]] = field(default_factory=dict)
+    renamed_columns: dict[str, dict[str, str]] = field(default_factory=dict)
     added_columns: dict[str, set[str]] = field(default_factory=dict)
-    respelled_columns: dict[str, set[str]] = field(default_factory=dict)
     dropped_columns: dict[str, set[str]] = field(default_factory=dict)
     unreadable_table_keys: set[str] = field(default_factory=set)
 
@@ -205,6 +214,7 @@ class SchemaDrift:
             self.new_table_keys
             or self.removed_table_keys
             or self.removed_columns
+            or self.renamed_columns
             or self.added_columns
         )
 
@@ -230,10 +240,10 @@ def compute_drift(
 
     ``known_columns`` is the store's baseline (``store.load_known_columns``, passed
     through ``_effective_known_columns`` so a legacy table is baselined): it decides
-    which live columns are *new* (``SchemaDrift.added_columns``, and of those the
-    ``respelled_columns``) and which removed keys are genuine drops
+    which live columns are *new* (``SchemaDrift.added_columns``), which near-miss keys
+    are renamed (``renamed_columns``) and which removed keys are genuine drops
     (``dropped_columns``); nothing else reads it. ``None`` tracks nothing, so no column
-    is reported added and no removed key dropped.
+    is reported added, no key renamed and no removed key dropped.
     """
     live_tables = {table_key(t): t for t in schema.tables}
     live_keys = set(live_tables)
@@ -252,8 +262,8 @@ def compute_drift(
         removed_table_keys.add(key)
 
     removed_columns: dict[str, set[str]] = {}
+    renamed_columns: dict[str, dict[str, str]] = {}
     added_columns: dict[str, set[str]] = {}
-    respelled_columns: dict[str, set[str]] = {}
     dropped_columns: dict[str, set[str]] = {}
     for key in stored_keys & live_keys:
         live_cols = {c.name for c in live_tables[key].columns}
@@ -264,46 +274,39 @@ def compute_drift(
             # ``_prune_table.kept``'s rule, so the apply drops nothing the check did not
             # name: present on an exact match (a real name may contain a quote character)
             # or when the policy hides it. A near-miss spelling of a live column
-            # (``'"status"'``, a blob-era key, or ``Status``) is reported, verbatim, and
-            # removed by the apply; below, the baseline decides whether that removal is a
-            # drop and whether its target is new again.
+            # (``'"status"'``, a blob-era key, or ``Status``) is not present; below, the
+            # baseline decides whether it is renamed to that column or removed, and
+            # whether its removal is a drop.
             if col not in live_cols and not policy_hides_column(key, col, privacy)
         }
-        if gone:
-            removed_columns[key] = gone
-        # Only a table the baseline tracks can have new or dropped columns: without an
-        # entry there is no telling a column the model never saw from one it chose not
-        # to hold, or a dropped column from a near-miss key.
+        # Only a table the baseline tracks can have new, renamed or dropped columns:
+        # without an entry there is no telling a column the model never saw from one it
+        # chose not to hold, or a dropped column from a near-miss key.
         seen = known.get(key)
         if seen is not None:
             seen_set = set(seen)
+            if renames := _column_renames(key, gone, stored_cols, live_cols, seen_set, privacy):
+                renamed_columns[key] = renames
+                gone -= set(renames)
             # A removed key the baseline knows was a real column the database dropped.
             if dropped := gone & seen_set:
                 dropped_columns[key] = dropped
-            # A live column held only under a near-miss spelling the apply removes loses
-            # its sole annotation, so it counts as new even though the baseline holds it
-            # (``respelled_targets``). A removed key the baseline holds makes nothing new
-            # here: its near-miss twin is new only if the baseline never saw it
-            # (``unseen`` below) or another near-miss key the baseline does not know
-            # respells it.
-            respelled = respelled_targets(gone, stored_cols, live_cols, seen_set)
-            unseen = live_cols - stored_cols - seen_set
             fresh = {
-                col for col in unseen | respelled if not policy_hides_column(key, col, privacy)
+                col
+                for col in live_cols - stored_cols - seen_set
+                if not policy_hides_column(key, col, privacy)
             }
             if fresh:
                 added_columns[key] = fresh
-            # Added only as a respelling: one the baseline never saw is new in its own
-            # right, whatever near-miss key the model also held.
-            if only_respelled := fresh - unseen:
-                respelled_columns[key] = only_respelled
+        if gone:
+            removed_columns[key] = gone
 
     return SchemaDrift(
         new_table_keys=live_keys - stored_keys,
         removed_table_keys=removed_table_keys,
         removed_columns=removed_columns,
+        renamed_columns=renamed_columns,
         added_columns=added_columns,
-        respelled_columns=respelled_columns,
         dropped_columns=dropped_columns,
         unreadable_table_keys=unreadable_table_keys,
     )
@@ -317,6 +320,7 @@ _STRUCTURAL_FIELDS = (
     "tables_removed",
     "columns_added",
     "columns_removed",
+    "columns_renamed",
     "metrics_added",
     "metrics_removed",
     "joins_added",
@@ -342,9 +346,14 @@ class DriftApplySummary(BaseModel):
     is still a column of the table, which keeps its stored spelling.
     ``columns_added`` lists only tables that exist before and after, like
     ``columns_removed``, under the names the model stores them by (live names, so
-    never quote-stripped): a blob-era ``"status"`` key swapped for the bare ``status``
-    column is listed in both, as the stored spelling and the live one.
-    Relationships are labelled ``from_table.from_column → to_table.to_column``.
+    never quote-stripped). A blob-era ``"status"`` key is usually renamed to the live
+    ``status``: ``columns_renamed`` lists such renames (``SchemaDrift.renamed_columns``),
+    which are in neither of those lists. Only when the baseline never saw ``status`` is
+    the key dropped beside a newly annotated ``status`` column, and then it is listed in
+    both, as the stored spelling and the live one.
+    Relationships are labelled ``from_table.from_column → to_table.to_column``; one whose
+    endpoint was renamed is labelled by its new endpoint on both sides, so it is the same
+    relationship, neither removed nor added.
     ``tables_not_annotated`` are new tables the LLM returned nothing for: they are
     still missing from the model, and the next drift check reports them again.
     ``column_tables_failed`` is to ``columns_added`` what ``tables_not_annotated`` is to
@@ -359,11 +368,11 @@ class DriftApplySummary(BaseModel):
 
     # A preview (``apply-drift?dry_run=true``): nothing was written. ``tables_added``
     # are the tables, and ``columns_added`` the new columns, the apply would send to the
-    # LLM. Relationships appear for the new columns, between held tables: the catalog
-    # edges, missing from the model, on the genuinely new columns (not respellings) the
-    # apply would send. A relationship to a new table, and the LLM's items over the new
-    # tables, appear only on apply. ``warnings`` are the hand-edit notes and the
-    # warnings naming the new tables and columns the apply would defer or cut.
+    # LLM, and ``columns_renamed`` the keys it would rename. Relationships appear for the
+    # new columns, between held tables: the catalog edges, missing from the model, on the
+    # new columns the apply would send. A relationship to a new table, and the LLM's items
+    # over the new tables, appear only on apply. ``warnings`` are the hand-edit notes and
+    # the warnings naming the new tables and columns the apply would defer or cut.
     dry_run: bool = False
     tables_added: list[str] = Field(default_factory=list)
     tables_removed: list[str] = Field(default_factory=list)
@@ -371,6 +380,9 @@ class DriftApplySummary(BaseModel):
     # ``tables_added`` instead; its columns are not listed).
     columns_added: dict[str, list[str]] = Field(default_factory=dict)
     columns_removed: dict[str, list[str]] = Field(default_factory=dict)
+    # Surviving table key → stored column key → the live column name the apply renamed it
+    # to, its annotation, user edits and references carried (no LLM call).
+    columns_renamed: dict[str, dict[str, str]] = Field(default_factory=dict)
     metrics_added: list[str] = Field(default_factory=list)
     metrics_removed: list[str] = Field(default_factory=list)
     joins_added: list[str] = Field(default_factory=list)
@@ -409,8 +421,16 @@ def _added_removed(
     return sorted((a - b) | (out & a)), sorted((b - a) | (out & b))
 
 
-def _edge_label(edge: RelationshipEdge) -> str:
-    return f"{edge.from_table}.{edge.from_column} → {edge.to_table}.{edge.to_column}"
+def _edge_label(
+    edge: RelationshipEdge, renamed: Mapping[str, Mapping[str, str]] | None = None
+) -> str:
+    """``from_table.from_column → to_table.to_column``, an endpoint column in *renamed*
+    (table key → old key → new name) under its new name."""
+
+    def end(table: str, column: str) -> str:
+        return f"{table}.{(renamed or {}).get(table, {}).get(column, column)}"
+
+    return f"{end(edge.from_table, edge.from_column)} → {end(edge.to_table, edge.to_column)}"
 
 
 def summarize_model_change(
@@ -421,6 +441,7 @@ def summarize_model_change(
     column_tables_failed: Sequence[str] = (),
     warnings: Sequence[str] = (),
     removed_items: Mapping[str, Iterable[str]] | None = None,
+    columns_renamed: Mapping[str, Mapping[str, str]] | None = None,
 ) -> DriftApplySummary:
     """Name everything that left or arrived between *before* and *after*.
 
@@ -429,6 +450,12 @@ def summarize_model_change(
     near-miss column spelling the prune dropped — are reported as what they are.
     Global items are identified the way the store keys them: metrics, derived
     columns and segments by name, joins by ``join_pattern``.
+
+    ``columns_renamed`` (table key → old key → new name, ``SchemaDrift.renamed_columns``)
+    are the renames the caller applied. A diff alone would read each as one column
+    removed and another added; with it, a rename *after* shows (the old key gone, the new
+    name arrived) is listed in ``columns_renamed`` instead, and the relationships on it
+    are compared under the new name.
 
     ``removed_items`` (keyed by the store's kinds: ``metric``, ``common_join``,
     ``derived_column``, ``segment``) names the items the caller took out of
@@ -439,9 +466,17 @@ def summarize_model_change(
     tables_added, tables_removed = _added_removed(before.tables, after.tables)
     columns_added: dict[str, list[str]] = {}
     columns_removed: dict[str, list[str]] = {}
+    renamed: dict[str, dict[str, str]] = {}
     for key in sorted(set(before.tables) & set(after.tables)):
         stored = set(before.tables[key].columns)
         live = set(after.tables[key].columns)
+        if pairs := {
+            old: new
+            for old, new in (columns_renamed or {}).get(key, {}).items()
+            if old in stored - live and new in live - stored
+        }:
+            renamed[key] = dict(sorted(pairs.items()))
+            stored = (stored - set(pairs)) | set(pairs.values())
         fresh = live - stored
         if fresh:
             columns_added[key] = sorted(fresh)
@@ -475,13 +510,15 @@ def summarize_model_change(
         taken_out.get("segment", ()),
     )
     rels_added, rels_removed = _added_removed(
-        map(_edge_label, before.relationships), map(_edge_label, after.relationships)
+        (_edge_label(e, renamed) for e in before.relationships),
+        map(_edge_label, after.relationships),
     )
     summary = DriftApplySummary(
         tables_added=tables_added,
         tables_removed=tables_removed,
         columns_added=columns_added,
         columns_removed=columns_removed,
+        columns_renamed=renamed,
         metrics_added=metrics_added,
         metrics_removed=metrics_removed,
         joins_added=joins_added,

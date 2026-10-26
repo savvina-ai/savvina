@@ -3005,6 +3005,20 @@ class TestKnownColumns:
     async def _stored(self, semantic_db, connection_id) -> None:
         await store.save_model(semantic_db, connection_id, _rich_model(), updated_by=None)
 
+    async def test_load_column_names_reads_the_stored_keys_of_the_tables_named(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._stored(semantic_db, connection_id)
+        names = await store.load_column_names(
+            semantic_db, connection_id, {"public.customers", "public.ghosts"}
+        )
+        assert names == {"public.customers": ["id"]}
+
+    async def test_load_column_names_without_a_model_reads_nothing(
+        self, semantic_db, connection_id
+    ) -> None:
+        assert await store.load_column_names(semantic_db, connection_id, {"public.orders"}) == {}
+
     async def test_no_model_loads_nothing_and_a_write_is_a_noop(
         self, semantic_db, connection_id
     ) -> None:

@@ -18,7 +18,7 @@ from app.semantic.drift import (
     strip_ident_quotes,
     summarize_model_change,
 )
-from app.semantic.models import ColumnSemantic, SemanticModel, TableSemantic
+from app.semantic.models import ColumnSemantic, RelationshipEdge, SemanticModel, TableSemantic
 
 
 def _schema(
@@ -168,19 +168,18 @@ class TestStructuralDiff:
         assert drift.removed_columns == {"public.orders": {"status"}}
         assert drift.added_columns == {"public.orders": {"state"}}
 
-    def test_quoted_only_keys_are_removed_and_their_live_column_added_once(self) -> None:
-        """The column is held only under two quoted spellings, which the apply drops: the
-        baseline knows ``status`` (every writer records live names), yet it is new again
-        so the apply re-annotates it rather than leave the table without it. Both
-        spellings collapse to the one live name."""
+    def test_two_near_miss_keys_for_one_column_rename_the_first_in_sort_order(self) -> None:
+        """The column is held only under two quoted spellings of ``status``, which the
+        baseline has seen: one key is renamed to it, and the other is a duplicate the
+        apply removes. Nothing is new."""
         drift = compute_drift(
             _schema(("public", "orders", ["id", "status"])),
-            _model(public_orders=["id", '"status"', "`status`"]),
+            _model(public_orders=["id", "`status`", '"status"']),
             known_columns={"public.orders": {"id", "status"}},
         )
-        assert drift.removed_columns == {"public.orders": {'"status"', "`status`"}}
-        assert drift.added_columns == {"public.orders": {"status"}}
-        assert drift.respelled_columns == {"public.orders": {"status"}}
+        assert drift.renamed_columns == {"public.orders": {'"status"': "status"}}
+        assert drift.removed_columns == {"public.orders": {"`status`"}}
+        assert drift.added_columns == {}
 
     def test_a_quoted_key_beside_its_stored_bare_twin_is_removed_and_nothing_added(
         self,
@@ -194,18 +193,32 @@ class TestStructuralDiff:
         assert drift.removed_columns == {"public.orders": {'"status"'}}
         assert drift.added_columns == {}
 
-    @pytest.mark.parametrize("stored_key", ["Status", '"Status"'])
-    def test_a_case_only_key_is_removed_and_its_live_column_added(self, stored_key: str) -> None:
-        """``Status`` is not the live ``status``, so the apply drops it: the column is new
-        again rather than left without its annotation (quoted or not)."""
+    @pytest.mark.parametrize("stored_key", ['"status"', "Status", '"Status"'])
+    def test_a_near_miss_key_of_a_seen_column_is_renamed_neither_removed_nor_added(
+        self, stored_key: str
+    ) -> None:
+        """A quoted or case-only spelling of the live ``status``, which the baseline has
+        seen and the table does not store under its real name: the apply renames the key,
+        so it is not a removal and ``status`` is not new."""
         drift = compute_drift(
             _schema(("public", "orders", ["id", "status"])),
             _model(public_orders=["id", stored_key]),
             known_columns={"public.orders": {"id", "status"}},
         )
-        assert drift.removed_columns == {"public.orders": {stored_key}}
-        assert drift.added_columns == {"public.orders": {"status"}}
-        assert drift.respelled_columns == {"public.orders": {"status"}}
+        assert drift.renamed_columns == {"public.orders": {stored_key: "status"}}
+        assert drift.removed_columns == {}
+        assert drift.added_columns == {}
+        assert drift.dropped_columns == {}
+
+    def test_a_rename_alone_is_drift_to_apply(self) -> None:
+        """The key must be rewritten, so the diff is not empty."""
+        drift = compute_drift(
+            _schema(("public", "orders", ["id", "status"])),
+            _model(public_orders=["id", '"status"']),
+            known_columns={"public.orders": {"id", "status"}},
+        )
+        assert not drift.is_empty
+        assert not SchemaDrift(renamed_columns={"public.orders": {'"status"': "status"}}).is_empty
 
     def test_a_case_only_key_beside_its_stored_target_is_removed_and_nothing_added(self) -> None:
         drift = compute_drift(
@@ -216,16 +229,18 @@ class TestStructuralDiff:
         assert drift.removed_columns == {"public.orders": {"Status"}}
         assert drift.added_columns == {}
 
-    def test_a_dropped_column_the_baseline_knew_is_not_a_respelling_of_its_case_twin(self) -> None:
+    def test_a_dropped_column_the_baseline_knew_is_not_renamed_to_its_case_twin(self) -> None:
         """The table had ``Status`` and ``status``; the model held only ``Status`` and the
-        baseline saw both. The database dropped ``Status``: that is a drop, so ``status``,
-        which the model saw and chose not to hold, is not new."""
+        baseline saw both. The database dropped ``Status``: that is a drop, not a rename,
+        and ``status``, which the model saw and chose not to hold, is not new."""
         drift = compute_drift(
             _schema(("public", "orders", ["id", "status"])),
             _model(public_orders=["id", "Status"]),
             known_columns={"public.orders": {"id", "Status", "status"}},
         )
         assert drift.removed_columns == {"public.orders": {"Status"}}
+        assert drift.dropped_columns == {"public.orders": {"Status"}}
+        assert drift.renamed_columns == {}
         assert drift.added_columns == {}
 
     def test_a_removed_key_the_baseline_knows_is_a_dropped_column(self) -> None:
@@ -271,8 +286,8 @@ class TestStructuralDiff:
 
     def test_a_case_only_rename_in_the_database_is_a_drop_and_a_new_column(self) -> None:
         """The baseline saw ``Status`` but never ``status``: the database renamed the
-        column, so ``status`` is genuinely new and ``Status`` is just removed, not a
-        respelling of it."""
+        column, so ``status`` is genuinely new and ``Status`` is just removed, not
+        renamed to it."""
         drift = compute_drift(
             _schema(("public", "orders", ["id", "status"])),
             _model(public_orders=["id", "Status"]),
@@ -280,7 +295,19 @@ class TestStructuralDiff:
         )
         assert drift.removed_columns == {"public.orders": {"Status"}}
         assert drift.added_columns == {"public.orders": {"status"}}
-        assert drift.respelled_columns == {}
+        assert drift.renamed_columns == {}
+
+    def test_a_near_miss_key_of_a_column_the_baseline_never_saw_is_a_removal(self) -> None:
+        """A quoted key of a live column the baseline never saw: the column is new in its
+        own right, annotated by the LLM, and the key is a plain removal."""
+        drift = compute_drift(
+            _schema(("public", "orders", ["id", "status"])),
+            _model(public_orders=["id", '"status"']),
+            known_columns={"public.orders": {"id"}},
+        )
+        assert drift.removed_columns == {"public.orders": {'"status"'}}
+        assert drift.added_columns == {"public.orders": {"status"}}
+        assert drift.renamed_columns == {}
 
     def test_an_ambiguous_case_only_key_is_removed_and_adds_nothing(self) -> None:
         """``STATUS`` matches both live ``Status`` and ``status``: the resolver, like the
@@ -291,14 +318,16 @@ class TestStructuralDiff:
             known_columns={"public.orders": {"id", "Status", "status"}},
         )
         assert drift.removed_columns == {"public.orders": {"STATUS"}}
+        assert drift.renamed_columns == {}
         assert drift.added_columns == {}
 
-    def test_a_quoted_only_key_with_no_baseline_entry_reports_no_added_column(self) -> None:
+    def test_a_quoted_only_key_with_no_baseline_entry_is_not_renamed(self) -> None:
         drift = compute_drift(
             _schema(("public", "orders", ["id", "status"])),
             _model(public_orders=["id", '"status"']),
         )
         assert drift.removed_columns == {"public.orders": {'"status"'}}
+        assert drift.renamed_columns == {}
         assert drift.added_columns == {}
 
     def test_a_live_column_the_policy_hides_is_not_added_until_it_is_unhidden(self) -> None:
@@ -316,11 +345,9 @@ class TestStructuralDiff:
         unhidden = compute_drift(schema, model, known_columns=known)
         assert unhidden.added_columns == {"public.orders": {"ssn"}}
 
-    def test_a_near_miss_key_of_a_hidden_column_is_removed_and_respells_nothing(
-        self,
-    ) -> None:
+    def test_a_near_miss_key_of_a_hidden_column_is_removed_not_renamed(self) -> None:
         """The policy match is exact, so ``SSN`` is not hidden and the apply removes it;
-        its target ``ssn`` is hidden, so it is neither added nor respelled."""
+        its target ``ssn`` is hidden, so it is neither added nor a rename target."""
         drift = compute_drift(
             _schema(("public", "orders", ["id", "ssn"])),
             _model(public_orders=["id", "SSN"]),
@@ -329,7 +356,7 @@ class TestStructuralDiff:
         )
         assert drift.removed_columns == {"public.orders": {"SSN"}}
         assert drift.added_columns == {}
-        assert drift.respelled_columns == {}
+        assert drift.renamed_columns == {}
 
 
 class TestPrivacyExclusionsAreNotDrops:
@@ -689,15 +716,60 @@ class TestSummarizeModelChange:
         assert summary.columns_added == {}
 
     def test_a_near_miss_key_swapped_for_its_bare_column_is_both_removed_and_added(self) -> None:
-        """The prune drops a blob-era ``"status"`` key and the apply adds ``status``: the
-        removed list keeps the stored spelling (``status`` is still a column, so the
-        stripped name would read as the column leaving) and the added list names the
-        bare column, so together they read as a spelling swap, not a loss."""
+        """The prune drops a blob-era ``"status"`` key and the apply adds ``status``, a
+        column the baseline never saw (one it saw is a rename, not a swap): the removed
+        list keeps the stored spelling (``status`` is still a column, so the stripped name
+        would read as the column leaving) and the added list names the bare column, so
+        together they read as a spelling swap, not a loss."""
         summary = summarize_model_change(
             _model(public_orders=["id", '"status"']), _model(public_orders=["id", "status"])
         )
         assert summary.columns_removed == {"public.orders": ['"status"']}
         assert summary.columns_added == {"public.orders": ["status"]}
+
+    def test_a_renamed_column_is_listed_as_renamed_only(self) -> None:
+        summary = summarize_model_change(
+            _model(public_orders=["id", '"status"']),
+            _model(public_orders=["id", "status"]),
+            columns_renamed={"public.orders": {'"status"': "status"}},
+        )
+        assert summary.columns_renamed == {"public.orders": {'"status"': "status"}}
+        assert summary.columns_removed == {}
+        assert summary.columns_added == {}
+        assert summary.changed is True
+
+    def test_a_rename_the_after_model_does_not_show_is_not_listed(self) -> None:
+        """Of what was stored: a rename the save did not keep is not reported as made."""
+        model = _model(public_orders=["id", '"status"'])
+        summary = summarize_model_change(
+            model, model, columns_renamed={"public.orders": {'"status"': "status"}}
+        )
+        assert summary.columns_renamed == {}
+        assert summary.changed is False
+
+    def test_an_edge_on_a_renamed_column_is_neither_removed_nor_added(self) -> None:
+        """The rename re-keys the edge's endpoint: the same relationship, not a swap."""
+
+        def with_edge(column: str) -> SemanticModel:
+            model = _model(public_orders=["id", column], public_customers=["id"])
+            edge = {
+                "from_table": "public.orders",
+                "from_column": column,
+                "to_table": "public.customers",
+                "to_column": "id",
+                "join_sql": "x",
+            }
+            return model.model_copy(
+                update={"relationships": [RelationshipEdge.model_validate(edge)]}
+            )
+
+        summary = summarize_model_change(
+            with_edge('"customer_id"'),
+            with_edge("customer_id"),
+            columns_renamed={"public.orders": {'"customer_id"': "customer_id"}},
+        )
+        assert summary.relationships_added == summary.relationships_removed == []
+        assert summary.columns_renamed == {"public.orders": {'"customer_id"': "customer_id"}}
 
     def test_tables_whose_column_batch_failed_are_a_note_not_a_change(self) -> None:
         model = _model(public_orders=["id"])
@@ -709,14 +781,15 @@ class TestSummarizeModelChange:
 
     def test_a_logged_summary_from_before_added_columns_loads_with_empty_defaults(self) -> None:
         """The history route validates logged summaries into today's model: an entry
-        written before ``columns_added`` / ``column_tables_failed`` existed has neither
-        key and must load unchanged."""
+        written before ``columns_added`` / ``columns_renamed`` / ``column_tables_failed``
+        existed has none of those keys and must load unchanged."""
         summary = DriftApplySummary.model_validate(
             {"tables_removed": ["public.a"], "tables_not_annotated": ["public.b"]}
         )
         assert summary.tables_removed == ["public.a"]
         assert summary.tables_not_annotated == ["public.b"]
         assert summary.columns_added == {}
+        assert summary.columns_renamed == {}
         assert summary.column_tables_failed == []
         assert summary.changed is True
 

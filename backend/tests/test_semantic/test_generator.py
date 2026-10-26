@@ -24,6 +24,7 @@ from app.semantic.generator import (
     names_any_table,
     policy_hides_table,
     prune_to_schema,
+    rename_columns,
 )
 from app.semantic.models import (
     AggregationType,
@@ -1115,6 +1116,161 @@ class TestDropDanglingEdits:
         assert "gone_a, gone_b are no longer in the table" in notes[2]
 
 
+class TestRenameColumns:
+    """The drift's renames, applied: each near-miss key becomes its live column's name,
+    and everything that names the column by key follows it."""
+
+    _RENAMES: ClassVar[dict[str, dict[str, str]]] = {"public.orders": {'"Status"': "status"}}
+
+    @staticmethod
+    def _orders() -> TableSemantic:
+        return TableSemantic(
+            display_name="Orders",
+            columns={
+                "id": ColumnSemantic(display_name="Id"),
+                '"Status"': ColumnSemantic(display_name="Hand-written", description="kept"),
+            },
+            primary_timestamp_column='"Status"',
+            primary_date_column='"Status"',
+            partition_columns=["id", '"Status"'],
+            cluster_columns=['"Status"'],
+            hierarchies=[Hierarchy(name="H", levels=["id", '"Status"'])],
+            default_filters=['"Status" = 1'],
+        )
+
+    @staticmethod
+    def _snapshot() -> tuple[dict[str, dict[str, list[str]]], dict[str, dict[str, Any]]]:
+        marks = {
+            "model": {},
+            "table": {"public.orders": ["primary_timestamp_column", "hierarchies"]},
+            "column": {
+                'public.orders."Status"': ["display_name", "description"],
+                "public.orders.id": ["display_name"],
+            },
+            "metric": {},
+            "global_item": {},
+            "relationship": {'public.orders."Status"->public.statuses.code': ["description"]},
+        }
+        protected = {
+            "table": {
+                "public.orders": {
+                    "primary_timestamp_column": '"Status"',
+                    "hierarchies": [{"name": "H", "levels": ["id", '"Status"']}],
+                }
+            },
+            "column": {
+                'public.orders."Status"': {"display_name": "Hand-written", "description": "kept"},
+                "public.orders.id": {"display_name": "Id"},
+            },
+        }
+        return marks, protected
+
+    def _rename(self, relationships: list[RelationshipEdge] | None = None):
+        marks, protected = self._snapshot()
+        return rename_columns(
+            {"public.orders": self._orders()}, relationships or [], marks, protected, self._RENAMES
+        )
+
+    def test_the_column_is_rekeyed_with_its_annotation(self) -> None:
+        tables, _, _, _ = self._rename()
+        columns = tables["public.orders"].columns
+        assert list(columns) == ["id", "status"]
+        assert columns["status"] == ColumnSemantic(display_name="Hand-written", description="kept")
+
+    def test_every_reference_field_follows_the_rename(self) -> None:
+        tables, _, _, _ = self._rename()
+        orders = tables["public.orders"]
+        assert orders.primary_timestamp_column == "status"
+        assert orders.primary_date_column == "status"
+        assert orders.partition_columns == ["id", "status"]
+        assert orders.cluster_columns == ["status"]
+        assert orders.hierarchies == [Hierarchy(name="H", levels=["id", "status"])]
+
+    def test_free_sql_is_not_rewritten(self) -> None:
+        tables, _, _, _ = self._rename()
+        assert tables["public.orders"].default_filters == ['"Status" = 1']
+
+    def test_relationship_endpoints_on_the_table_follow_the_rename(self) -> None:
+        out_of = _edge("public.orders", '"Status"', "public.statuses", "code")
+        into = _edge("public.statuses", "code", "public.orders", '"Status"')
+        other = _edge("public.orders", "id", "public.statuses", "code")
+        _, relationships, _, _ = self._rename([out_of, into, other])
+        assert [(e.from_column, e.to_column) for e in relationships] == [
+            ("status", "code"),
+            ("code", "status"),
+            ("id", "code"),
+        ]
+        # The join SQL is free SQL, written as stored.
+        assert relationships[0].join_sql == out_of.join_sql
+        assert relationships[2] is other
+
+    def test_an_endpoint_of_the_same_name_on_another_table_is_not_renamed(self) -> None:
+        edge = _edge("public.statuses", '"Status"', "public.orders", "id")
+        _, relationships, _, _ = self._rename([edge])
+        assert relationships == [edge]
+
+    def test_a_renamed_edge_that_duplicates_a_held_one_is_dropped(self) -> None:
+        """The edge already stored under the real names wins, as the column stored under
+        its real name does; the near-miss edge's marks go with it."""
+        stale = _edge("public.orders", '"Status"', "public.statuses", "code")
+        real = _edge("public.orders", "status", "public.statuses", "code")
+        for edges in ([stale, real], [real, stale]):
+            _, relationships, marks, _ = self._rename(edges)
+            assert relationships == [real]
+            assert marks["relationship"] == {}
+
+    def test_column_marks_and_protected_values_move_to_the_new_key(self) -> None:
+        _, _, marks, protected = self._rename()
+        assert marks["column"] == {
+            "public.orders.status": ["display_name", "description"],
+            "public.orders.id": ["display_name"],
+        }
+        assert protected["column"] == {
+            "public.orders.status": {"display_name": "Hand-written", "description": "kept"},
+            "public.orders.id": {"display_name": "Id"},
+        }
+
+    def test_a_table_edit_naming_the_column_is_rewritten(self) -> None:
+        _, _, marks, protected = self._rename()
+        assert marks["table"] == {"public.orders": ["primary_timestamp_column", "hierarchies"]}
+        assert protected["table"] == {
+            "public.orders": {
+                "primary_timestamp_column": "status",
+                "hierarchies": [{"name": "H", "levels": ["id", "status"]}],
+            }
+        }
+
+    def test_a_relationship_mark_follows_its_edge(self) -> None:
+        edge = _edge("public.orders", '"Status"', "public.statuses", "code")
+        _, _, marks, _ = self._rename([edge])
+        assert marks["relationship"] == {
+            "public.orders.status->public.statuses.code": ["description"]
+        }
+
+    def test_the_inputs_are_not_mutated(self) -> None:
+        tables = {"public.orders": self._orders()}
+        edges = [_edge("public.orders", '"Status"', "public.statuses", "code")]
+        marks, protected = self._snapshot()
+        before = (
+            {k: t.model_copy(deep=True) for k, t in tables.items()},
+            [e.model_copy() for e in edges],
+            self._snapshot(),
+        )
+        rename_columns(tables, edges, marks, protected, self._RENAMES)
+        assert (tables, edges, (marks, protected)) == before
+
+    def test_no_renames_change_nothing(self) -> None:
+        marks, protected = self._snapshot()
+        tables = {"public.orders": self._orders()}
+        edges = [_edge("public.orders", '"Status"', "public.statuses", "code")]
+        assert rename_columns(tables, edges, marks, protected, {}) == (
+            tables,
+            edges,
+            marks,
+            protected,
+        )
+
+
 class TestDetectDriftBareNamesUnderAnExcludedSchema:
     def test_a_bare_metric_table_under_an_excluded_schema_is_not_drift(self) -> None:
         privacy = PrivacySettings(excluded_schemas=["hr"])
@@ -1269,11 +1425,10 @@ class TestDetectDriftNewColumns:
         return SemanticModelGenerator().detect_drift(schema, model, drift=drift)
 
     @staticmethod
-    def _respelling(key: str, target: str) -> str:
+    def _rename(key: str, target: str) -> str:
         return (
             f'Column key "public.orders.{key}" in the semantic model is a near-miss spelling '
-            f'of "{target}"; Apply Drift removes the key and annotates "{target}" afresh '
-            "(the key's annotation is not kept)"
+            f'of "{target}"; Apply Drift renames it to "{target}", keeping its annotation'
         )
 
     def test_a_new_column_on_a_known_table_is_reported(self) -> None:
@@ -1320,28 +1475,40 @@ class TestDetectDriftNewColumns:
         assert warning.endswith("…")
         assert warning.count("public.orders.c") == 5
 
-    def test_a_quoted_key_held_without_its_bare_twin_is_a_respelling(self) -> None:
-        """The apply drops ``'"status"'`` and annotates ``status`` afresh: one warning says
-        so. The column is neither gone nor new since the model was generated."""
+    def test_a_quoted_key_held_without_its_bare_twin_is_a_rename(self) -> None:
+        """The apply renames ``'"status"'`` to ``status``, annotation and all: one warning
+        says so. The column is neither gone nor new since the model was generated."""
         schema = _schema_with_tables(["orders"], extra_columns=["status"])
         model = SemanticModel(tables={"public.orders": _tbl("id", '"status"')})
         warnings = self._warnings(schema, model, self._KNOWN_STATUS)
-        assert warnings == [self._respelling('"status"', "status")]
+        assert warnings == [self._rename('"status"', "status")]
 
-    def test_a_case_only_key_held_without_its_live_twin_is_a_respelling(self) -> None:
+    def test_a_case_only_key_held_without_its_live_twin_is_a_rename(self) -> None:
         schema = _schema_with_tables(["orders"], extra_columns=["status"])
         model = SemanticModel(tables={"public.orders": _tbl("id", "Status")})
         warnings = self._warnings(schema, model, self._KNOWN_STATUS)
-        assert warnings == [self._respelling("Status", "status")]
+        assert warnings == [self._rename("Status", "status")]
 
-    def test_a_respelling_is_left_out_of_the_new_columns_warning(self) -> None:
+    def test_a_renamed_column_is_left_out_of_the_new_columns_warning(self) -> None:
         schema = _schema_with_tables(["orders"], extra_columns=["status", "region"])
         model = SemanticModel(tables={"public.orders": _tbl("id", '"status"')})
         warnings = self._warnings(schema, model, self._KNOWN_STATUS)
         assert warnings == [
-            self._respelling('"status"', "status"),
+            self._rename('"status"', "status"),
             "1 new column(s) added to tables in the semantic model since it was generated: "
             "public.orders.region",
+        ]
+
+    def test_a_second_near_miss_key_of_a_renamed_column_is_a_duplicate(self) -> None:
+        """Two keys spell ``status``: the first in sort order is renamed, and the other is
+        a duplicate of the column it becomes."""
+        schema = _schema_with_tables(["orders"], extra_columns=["status"])
+        model = SemanticModel(tables={"public.orders": _tbl("id", "Status", '"status"')})
+        warnings = self._warnings(schema, model, self._KNOWN_STATUS)
+        assert warnings == [
+            'Column key "public.orders.Status" in the semantic model is a near-miss spelling '
+            'of "status"; Apply Drift removes the duplicate',
+            self._rename('"status"', "status"),
         ]
 
     def test_a_near_miss_key_beside_its_stored_twin_is_a_duplicate(self) -> None:
@@ -1353,7 +1520,7 @@ class TestDetectDriftNewColumns:
             'of "status"; Apply Drift removes the duplicate'
         ]
 
-    def test_a_dropped_column_the_baseline_knew_is_gone_not_respelled(self) -> None:
+    def test_a_dropped_column_the_baseline_knew_is_gone_not_renamed(self) -> None:
         """The database had ``Status`` and ``status`` and dropped ``Status``: a drop, so
         ``status`` (seen, and not held) is not new either."""
         schema = _schema_with_tables(["orders"], extra_columns=["status"])
@@ -1366,7 +1533,7 @@ class TestDetectDriftNewColumns:
 
     def test_a_case_only_rename_in_the_database_is_a_drop_and_a_new_column(self) -> None:
         """The baseline saw ``Status`` but never ``status``: the database renamed it, so
-        ``Status`` is gone and ``status`` is new, not a respelling."""
+        ``Status`` is gone and ``status`` is new, not a rename target."""
         schema = _schema_with_tables(["orders"], extra_columns=["status"])
         model = SemanticModel(tables={"public.orders": _tbl("id", "Status")})
         known = {"public.orders": {"id", "Status"}}

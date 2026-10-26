@@ -345,7 +345,7 @@ class TestGenerationFlow:
         assert any("public.orders.region" in w for w in body["warnings"])
         assert body["has_actionable_changes"] is True
 
-    async def test_finishing_a_run_does_not_record_a_column_held_only_under_a_near_miss_key(
+    async def test_finishing_a_run_renames_a_column_held_only_under_a_near_miss_key(
         self, http_client, db, flow
     ) -> None:
         llm, set_schema = flow
@@ -366,9 +366,10 @@ class TestGenerationFlow:
         await _globals(http_client)
 
         stored = await store.load_model(db, _CID)
-        assert set(stored.tables["public.customers"].columns) == {"id"}
-        # The prune dropped ``Status`` and its annotation, so ``status`` is not seen.
-        assert (await store.load_known_columns(db, _CID))["public.customers"] == {"id"}
+        # Renamed to the live name, its annotation carried, before the prune could drop it.
+        assert set(stored.tables["public.customers"].columns) == {"id", "status"}
+        assert stored.tables["public.customers"].columns["status"].display_name == "Legacy"
+        assert (await store.load_known_columns(db, _CID))["public.customers"] == {"id", "status"}
 
     async def test_regenerate_keeps_a_hand_edit_and_prunes_a_dropped_column(
         self, http_client, db, flow
@@ -841,12 +842,12 @@ class TestApplyDriftFlow:
         assert report["has_actionable_changes"] is False
         assert report["warnings"] == []
 
-    async def test_a_respelled_column_whose_batch_failed_is_reported_again_and_applied_next_time(
+    async def test_a_near_miss_key_is_reported_as_a_rename_and_renamed_with_no_llm_call(
         self, http_client, db, flow
     ) -> None:
-        """The baseline knows ``status``, held only under a quoted blob-era key. The batch
-        fails: the key is still removed, so ``status`` must leave the baseline, or its
-        annotation would be lost without the check ever naming it again."""
+        """The baseline knows ``status``, held only under a quoted blob-era key with a hand
+        edit. Check Drift words it as a rename; Apply Drift renames it, annotation and
+        mark carried, without asking the LLM; the next check is clean."""
         llm, set_schema = flow
         set_schema({"orders": ["id"], "customers": ["id", "status"]})
         llm.omit_columns = {"public.customers.status"}
@@ -854,27 +855,114 @@ class TestApplyDriftFlow:
         table_id = await db.scalar(
             select(SemanticTableRow.id).where(SemanticTableRow.table_key == "public.customers")
         )
-        db.add(SemanticColumnRow(table_id=table_id, column_name='"status"', display_name="Legacy"))
+        db.add(
+            SemanticColumnRow(
+                table_id=table_id,
+                column_name='"status"',
+                display_name="Legacy",
+                user_edited_fields=["display_name"],
+            )
+        )
         await db.commit()
         live = _schema({"orders": ["id"], "customers": ["id", "status"]})
-        assert (await _check_drift(http_client, live))["has_actionable_changes"] is True
-
-        llm.column_failures = {1: "provider down"}
-        applied = await _apply_drift(http_client, live)
-        assert applied["summary"]["columns_removed"] == {"public.customers": ["status"]}
-        assert applied["summary"]["column_tables_failed"] == ["public.customers"]
-        stored = await store.load_model(db, _CID)
-        assert set(stored.tables["public.customers"].columns) == {"id"}
-        assert (await store.load_known_columns(db, _CID))["public.customers"] == {"id"}
-
         report = await _check_drift(http_client, live)
         assert report["has_actionable_changes"] is True
-        assert any("public.customers.status" in w for w in report["warnings"])
+        assert report["warnings"] == [
+            'Column key "public.customers."status"" in the semantic model is a near-miss '
+            'spelling of "status"; Apply Drift renames it to "status", keeping its annotation'
+        ]
 
-        llm.column_failures = {}
         applied = await _apply_drift(http_client, live)
-        assert applied["summary"]["columns_added"] == {"public.customers": ["status"]}
-        assert (await _check_drift(http_client, live))["has_actionable_changes"] is False
+        assert applied["summary"]["columns_renamed"] == {"public.customers": {'"status"': "status"}}
+        assert applied["summary"]["columns_removed"] == {}
+        assert applied["summary"]["columns_added"] == {}
+        assert llm.column_batches == []
+        stored = await store.load_model(db, _CID)
+        assert set(stored.tables["public.customers"].columns) == {"id", "status"}
+        assert stored.tables["public.customers"].columns["status"].display_name == "Legacy"
+        snapshot = await store.provenance_snapshot(db, _CID)
+        assert snapshot.marks["column"] == {"public.customers.status": ["display_name"]}
+        assert (await store.load_known_columns(db, _CID))["public.customers"] == {"id", "status"}
+
+        report = await _check_drift(http_client, live)
+        assert report["has_actionable_changes"] is False
+        assert report["warnings"] == []
+
+    async def test_a_hidden_near_miss_key_is_renamed_once_its_column_is_unhidden(
+        self, http_client, db, flow
+    ) -> None:
+        """The model holds ``ssn`` only under a quoted blob-era key with a hand edit, and
+        the policy hides ``ssn``. A Regenerate keeps the hidden row, and the baseline keeps
+        ``ssn``. Once un-hidden, Check Drift reports a rename, not a new column, and Apply
+        Drift renames the key with its mark and no LLM call."""
+        llm, set_schema = flow
+        set_schema({"orders": ["id"], "customers": ["id", "ssn"]})
+        llm.omit_columns = {"public.customers.ssn"}
+        await _generate(http_client)
+        table_id = await db.scalar(
+            select(SemanticTableRow.id).where(SemanticTableRow.table_key == "public.customers")
+        )
+        db.add(
+            SemanticColumnRow(
+                table_id=table_id,
+                column_name='"ssn"',
+                display_name="Legacy",
+                user_edited_fields=["display_name"],
+            )
+        )
+        conn = await db.get(Connection, _CID)
+        conn.privacy_settings = {"excluded_columns": ["public.customers.ssn"]}
+        await db.commit()
+        set_schema({"orders": ["id"], "customers": ["id"]})  # ``ssn`` is not introspected
+        await _generate(http_client)
+        assert '"ssn"' in (await store.load_model(db, _CID)).tables["public.customers"].columns
+        assert (await store.load_known_columns(db, _CID))["public.customers"] == {"id", "ssn"}
+
+        conn.privacy_settings = {}
+        await db.commit()
+        live = _schema({"orders": ["id"], "customers": ["id", "ssn"]})
+        report = await _check_drift(http_client, live)
+        assert report["warnings"] == [
+            'Column key "public.customers."ssn"" in the semantic model is a near-miss '
+            'spelling of "ssn"; Apply Drift renames it to "ssn", keeping its annotation'
+        ]
+
+        llm.column_batches = []
+        applied = await _apply_drift(http_client, live)
+        assert applied["summary"]["columns_renamed"] == {"public.customers": {'"ssn"': "ssn"}}
+        assert applied["summary"]["columns_added"] == {}
+        assert llm.column_batches == []
+        stored = await store.load_model(db, _CID)
+        assert stored.tables["public.customers"].columns["ssn"].display_name == "Legacy"
+        marks = (await store.provenance_snapshot(db, _CID)).marks
+        assert marks["column"] == {"public.customers.ssn": ["display_name"]}
+        assert (await _check_drift(http_client, live))["warnings"] == []
+
+    async def test_a_hidden_column_the_model_never_annotated_is_new_once_unhidden(
+        self, http_client, db, flow
+    ) -> None:
+        """Nothing stored keeps it seen: the Regenerate under the policy drops it from the
+        baseline, and Check Drift reports it as new once the policy shows it again."""
+        llm, set_schema = flow
+        set_schema({"orders": ["id"], "customers": ["id", "ssn"]})
+        llm.omit_columns = {"public.customers.ssn"}
+        await _generate(http_client)
+        conn = await db.get(Connection, _CID)
+        conn.privacy_settings = {"excluded_columns": ["public.customers.ssn"]}
+        await db.commit()
+        set_schema({"orders": ["id"], "customers": ["id"]})
+        await _generate(http_client)
+        assert (await store.load_known_columns(db, _CID))["public.customers"] == {"id"}
+
+        conn.privacy_settings = {}
+        await db.commit()
+        report = await _check_drift(
+            http_client, _schema({"orders": ["id"], "customers": ["id", "ssn"]})
+        )
+        assert report["warnings"] == [
+            "1 new column(s) added to tables in the semantic model since it was generated: "
+            "public.customers.ssn"
+        ]
 
     async def test_a_throttle_on_the_second_batch_keeps_the_first_and_the_next_apply_sends_the_rest(
         self, http_client, db, flow

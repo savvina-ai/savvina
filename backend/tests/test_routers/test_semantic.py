@@ -21,7 +21,13 @@ from fastapi import HTTPException
 import pytest
 
 from app.database import get_db
-from app.datasources.models import ColumnInfo, DataSourceSchema, SchemaInfo, TableInfo
+from app.datasources.models import (
+    ColumnInfo,
+    DataSourceSchema,
+    PrivacySettings,
+    SchemaInfo,
+    TableInfo,
+)
 from app.main import app
 from app.semantic import store as semantic_store
 from app.semantic.generator import SemanticModelGenerator as _RealGenerator
@@ -509,12 +515,12 @@ class TestCheckDriftNewColumns:
         self.known_update.assert_not_awaited()
         self.lock.assert_not_awaited()
 
-    async def test_a_legacy_near_miss_key_is_reported_as_a_respelling_not_a_new_column(
+    async def test_a_legacy_near_miss_key_is_reported_as_a_rename_not_a_new_column(
         self, http_client
     ) -> None:
-        """No baseline: the live ``status`` is seeded as seen, yet the model holds it only
-        as ``"Status"``, a key Apply Drift removes, so the check must word it as the
-        respelling it is (Apply Drift annotates ``status`` afresh), not as a new column."""
+        """No baseline: the live ``status`` is seeded as seen, and the model holds it only
+        as ``"Status"``, so the check words it as the rename Apply Drift makes, not as a
+        new column."""
         stored = SemanticModel(
             tables={
                 "public.orders": TableSemantic(
@@ -533,7 +539,7 @@ class TestCheckDriftNewColumns:
         )
         assert any(
             'Column key "public.orders."Status"" in the semantic model is a near-miss spelling '
-            'of "status"' in w
+            'of "status"; Apply Drift renames it to "status"' in w
             for w in body["warnings"]
         )
         assert not any("new column(s)" in w for w in body["warnings"])
@@ -637,6 +643,29 @@ class TestCheckDriftNewColumns:
         self.known.return_value = {}
         await self._get(http_client, conn=conn, schema=schema)
         assert self.known_update.await_args.args[2] == {"public.orders": frozenset({"id"})}
+
+    async def test_a_hidden_key_the_model_stores_is_seeded_under_its_real_name(
+        self, http_client
+    ) -> None:
+        """So once un-hidden, the quoted key is renamed to ``ssn`` instead of ``ssn`` being
+        reported new."""
+        conn = _make_conn(privacy_settings={"excluded_columns": ["public.orders.ssn"]})
+        stored = SemanticModel(
+            tables={
+                "public.orders": TableSemantic(
+                    display_name="Orders",
+                    columns={
+                        "id": ColumnSemantic(display_name="Id"),
+                        '"ssn"': ColumnSemantic(display_name="SSN"),
+                    },
+                )
+            }
+        )
+        body = await self._get(
+            http_client, conn=conn, stored=stored, schema=_schema(["orders"], {"orders": ["id"]})
+        )
+        assert body["warnings"] == []
+        assert self.known_update.await_args.args[2] == {"public.orders": frozenset({"id", "ssn"})}
 
 
 class TestCheckDriftSeedingLock:
@@ -985,9 +1014,15 @@ class TestGenerateBatch:
 
     @pytest.fixture(autouse=True)
     def _known_update(self):
-        """The baseline write is mocked in every batch test; ``self.known_update`` is it."""
-        with patch(f"{_STORE}.update_known_columns", new=AsyncMock(return_value=None)) as mocked:
+        """The baseline write and the stored column keys it reads are mocked in every batch
+        test; ``self.known_update`` and ``self.column_names`` are they (no column stored by
+        default)."""
+        with (
+            patch(f"{_STORE}.update_known_columns", new=AsyncMock(return_value=None)) as mocked,
+            patch(f"{_STORE}.load_column_names", new=AsyncMock(return_value={})) as names,
+        ):
             self.known_update = mocked
+            self.column_names = names
             yield
 
     @pytest.fixture(autouse=True)
@@ -1418,7 +1453,31 @@ class TestGenerateBatch:
         assert args[1] == "conn-123"
         # The live columns, annotated or not: ``generated`` annotates none of them, and
         # ``customers`` is not in the batch.
-        assert args[2] == {"public.orders": ["id", "status"]}
+        assert args[2] == {"public.orders": {"id", "status"}}
+
+    async def test_a_batch_records_the_real_name_of_a_stored_key_the_policy_hides(
+        self, http_client
+    ) -> None:
+        """The reconciled table keeps the row the policy hides; the baseline keeps its
+        real name, so the column is renamed, not re-annotated, once un-hidden."""
+        generated = {"public.orders": TableSemantic(display_name="Orders")}
+        conn = _make_conn(privacy_settings={"excluded_columns": ["public.orders.ssn"]})
+        self.column_names.return_value = {"public.orders": ["id", '"ssn"']}
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches()
+        with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:
+            self._wire(
+                mock_load,
+                mock_gen,
+                generated,
+                schema=_schema(["orders"], columns={"orders": ["id", "status"]}),
+            )
+            mock_load.return_value = (mock_load.return_value[0], conn)
+            app.dependency_overrides[get_db] = lambda: _mock_db(MockResult(single=_make_conn()))
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+
+        assert resp.status_code == 200
+        assert self.column_names.await_args.args[1:] == ("conn-123", {"public.orders"})
+        assert self.known_update.await_args.args[2] == {"public.orders": {"id", "status", "ssn"}}
 
     async def test_a_table_the_llm_omitted_gets_no_baseline_entry(self, http_client) -> None:
         generated = {"public.orders": TableSemantic(display_name="Orders")}
@@ -2344,11 +2403,12 @@ class TestGenerateGlobals:
         assert "public.payroll" in save.await_args.args[2].tables
         assert self.known_update.await_args.args[2] == {"public.orders": {"id"}}
 
-    async def test_a_column_the_policy_hides_leaves_the_tables_baseline_entry(
+    async def test_a_hidden_column_stays_in_the_baseline_only_if_the_model_stores_it(
         self, http_client
     ) -> None:
-        """The schema the route sees never introspected the hidden column, so the entry
-        loses it whether or not the stored table holds an annotation for it."""
+        """The schema the route sees never introspected the hidden column. One the model
+        never annotated leaves the entry, so it is reported new once un-hidden; one it
+        stores stays seen under its real name."""
         partial = self._partial(
             tables={
                 "public.orders": {
@@ -2378,12 +2438,9 @@ class TestGenerateGlobals:
         )
 
         assert resp.status_code == 200
-        # The save keeps the annotation the policy hides; only the baseline loses the name.
+        # The save keeps the annotation the policy hides, and the baseline its name.
         assert "ssn" in save.await_args.args[2].tables["public.customers"].columns
-        assert self.known_update.await_args.args[2] == {
-            "public.orders": {"id"},
-            "public.customers": {"id"},
-        }
+        assert self.known_update.await_args.args[2] == {"public.orders": {"id"}}
 
     @staticmethod
     def _orders_holding(*column_keys: str) -> SemanticModel:
@@ -2398,27 +2455,65 @@ class TestGenerateGlobals:
             }
         )
 
+    async def test_a_hidden_quoted_key_is_recorded_under_its_real_name(self, http_client) -> None:
+        resp, save, _ = await self._run(
+            http_client,
+            model=self._orders_holding("id", '"ssn"'),
+            schema=_schema(["orders"]),  # ``ssn`` is hidden
+            conn=_make_conn(privacy_settings={"excluded_columns": ["public.orders.ssn"]}),
+            known={"public.orders": frozenset({"id"})},
+        )
+
+        assert resp.status_code == 200
+        assert '"ssn"' in save.await_args.args[2].tables["public.orders"].columns
+        assert self.known_update.await_args.args[2] == {"public.orders": {"id", "ssn"}}
+
     @pytest.mark.parametrize("near_miss", ['"Status"', "Status"], ids=["quoted", "case-only"])
-    async def test_a_column_held_only_under_a_near_miss_key_is_not_recorded_as_seen(
+    async def test_a_column_the_run_did_not_annotate_is_renamed_from_its_near_miss_key(
         self, http_client, near_miss
     ) -> None:
-        """The prune drops the near-miss key and with it the column's only annotation,
-        so the baseline must not claim ``status`` as seen: the next check reports it."""
+        """The run left ``status`` unannotated and the model holds it only under a
+        near-miss key: the key is renamed to ``status`` with its annotation and its hand
+        edits, before the prune could drop it, and the baseline keeps ``status``."""
         resp, save, _ = await self._run(
             http_client,
             model=self._orders_holding("id", near_miss),
             schema=_schema(["orders"], columns={"orders": ["id", "status"]}),
+            provenance={
+                **_no_provenance(),
+                "table": {"public.orders": ["primary_timestamp_column"]},
+                "column": {f"public.orders.{near_miss}": ["display_name"]},
+            },
+            protected={
+                "table": {"public.orders": {"primary_timestamp_column": near_miss}},
+                "column": {f"public.orders.{near_miss}": {"display_name": near_miss}},
+            },
             known={"public.orders": frozenset({"id", "status"})},
         )
 
         assert resp.status_code == 200
-        assert set(save.await_args.args[2].tables["public.orders"].columns) == {"id"}
-        assert self.known_update.await_args.args[2] == {"public.orders": {"id"}}
+        columns = save.await_args.args[2].tables["public.orders"].columns
+        assert set(columns) == {"id", "status"}
+        assert columns["status"].display_name == near_miss
+        kwargs = save.await_args.kwargs
+        assert kwargs["provenance"]["column"] == {"public.orders.status": ["display_name"]}
+        assert kwargs["protected"]["column"] == {
+            "public.orders.status": {"display_name": near_miss}
+        }
+        # The hand-set reference follows the rename instead of being cleared as dangling.
+        assert kwargs["provenance"]["table"] == {"public.orders": ["primary_timestamp_column"]}
+        assert kwargs["protected"]["table"] == {
+            "public.orders": {"primary_timestamp_column": "status"}
+        }
+        # ``status`` stays seen: the baseline already says so, so nothing is written.
+        assert self.known_update.await_args.args[2] == {}
 
-    async def test_a_seeded_table_does_not_record_a_column_held_only_under_a_near_miss_key(
+    async def test_a_seeded_table_renames_a_column_held_only_under_a_near_miss_key(
         self, http_client
     ) -> None:
-        resp, _, _ = await self._run(
+        """No baseline entry: the table is seeded with its live columns, so ``status`` is
+        seen and its near-miss key renamed, as Check Drift would report it."""
+        resp, save, _ = await self._run(
             http_client,
             model=self._orders_holding("id", '"Status"'),
             schema=_schema(["orders"], columns={"orders": ["id", "status"]}),
@@ -2426,11 +2521,14 @@ class TestGenerateGlobals:
         )
 
         assert resp.status_code == 200
-        assert self.known_update.await_args.args[2] == {"public.orders": {"id"}}
+        assert set(save.await_args.args[2].tables["public.orders"].columns) == {"id", "status"}
+        assert self.known_update.await_args.args[2] == {"public.orders": {"id", "status"}}
 
-    async def test_a_column_held_under_both_a_near_miss_key_and_its_real_name_is_recorded(
+    async def test_a_near_miss_key_beside_its_annotated_real_name_is_dropped_as_a_duplicate(
         self, http_client
     ) -> None:
+        """The run annotated ``status`` (or it was stored already): the near-miss key is a
+        duplicate, dropped by the prune, not renamed over the stored column."""
         resp, save, _ = await self._run(
             http_client,
             model=self._orders_holding("id", "status", '"Status"'),
@@ -2439,7 +2537,9 @@ class TestGenerateGlobals:
         )
 
         assert resp.status_code == 200
-        assert set(save.await_args.args[2].tables["public.orders"].columns) == {"id", "status"}
+        columns = save.await_args.args[2].tables["public.orders"].columns
+        assert set(columns) == {"id", "status"}
+        assert columns["status"].display_name == "status"
         # ``status`` keeps its annotation and the baseline entry already says so: no write.
         assert self.known_update.await_args.args[2] == {}
 
@@ -2483,13 +2583,61 @@ class TestBaselineChanges:
         assert _baseline_changes(known, wanted) == {"b": {"x"}, "c": {"z"}}
 
 
+class TestHeldColumnNames:
+    """What a baseline write records because the model stores it."""
+
+    _PRIVACY = PrivacySettings(excluded_columns=["public.orders.ssn"])
+
+    @staticmethod
+    def _held(stored: list[str], privacy: PrivacySettings | None) -> set[str]:
+        from app.routers.semantic import _held_column_names
+
+        return _held_column_names("public.orders", ["id", "status"], stored, privacy)
+
+    def test_a_stored_live_column_is_held_and_an_unstored_one_is_not(self) -> None:
+        assert self._held(["id"], None) == {"id"}
+
+    def test_a_stored_key_that_left_the_database_is_not_held(self) -> None:
+        assert self._held(["id", "gone"], None) == {"id"}
+
+    @pytest.mark.parametrize("stored_key", ["ssn", '"ssn"'], ids=["real-name", "quoted"])
+    def test_a_stored_key_the_policy_hides_is_held_under_its_real_name(
+        self, stored_key: str
+    ) -> None:
+        assert self._held(["id", stored_key], self._PRIVACY) == {"id", "ssn"}
+
+    def test_a_case_only_key_of_a_hidden_column_is_not_held(self) -> None:
+        """The policy's match is exact (quotes aside), so ``SSN`` is not hidden: the prune
+        drops it as a gone key, and the baseline does not record it."""
+        assert self._held(["id", "SSN"], self._PRIVACY) == {"id"}
+
+    def test_without_a_policy_nothing_is_hidden(self) -> None:
+        assert self._held(["id", '"ssn"'], None) == {"id"}
+
+
 class TestEffectiveKnownColumns:
+    def test_a_stored_key_the_policy_hides_is_seeded_under_its_real_name(self) -> None:
+        """A table with no entry is baselined with what a baseline write would record:
+        its live columns and the real name of each stored key the policy hides."""
+        from app.routers.semantic import _effective_known_columns
+
+        schema = _schema(["orders"], columns={"orders": ["id"]})  # ``ssn`` is hidden
+        stored = {
+            "public.orders": TableSemantic(
+                display_name="Orders", columns={'"ssn"': ColumnSemantic(display_name="S")}
+            )
+        }
+        privacy = PrivacySettings(excluded_columns=["public.orders.ssn"])
+        assert _effective_known_columns({}, stored, schema, privacy) == {
+            "public.orders": frozenset({"id", "ssn"})
+        }
+
     def test_a_stored_table_with_no_entry_gets_its_live_columns(self) -> None:
         from app.routers.semantic import _effective_known_columns
 
         schema = _schema(["orders"], columns={"orders": ["id", "status"]})
         stored = {"public.orders": TableSemantic(display_name="Orders")}
-        assert _effective_known_columns({}, stored, schema) == {
+        assert _effective_known_columns({}, stored, schema, None) == {
             "public.orders": frozenset({"id", "status"})
         }
 
@@ -2499,24 +2647,24 @@ class TestEffectiveKnownColumns:
         schema = _schema(["orders"], columns={"orders": ["id", "status"]})
         stored = {"public.orders": TableSemantic(display_name="Orders")}
         known = {"public.orders": frozenset()}
-        assert _effective_known_columns(known, stored, schema) == known
+        assert _effective_known_columns(known, stored, schema, None) == known
 
     def test_a_stored_table_missing_from_the_live_schema_gets_no_entry(self) -> None:
         from app.routers.semantic import _effective_known_columns
 
         stored = {"public.ghosts": TableSemantic(display_name="Ghosts")}
-        assert _effective_known_columns({}, stored, _schema(["orders"])) == {}
+        assert _effective_known_columns({}, stored, _schema(["orders"]), None) == {}
 
     def test_a_live_table_the_model_does_not_hold_gets_no_entry(self) -> None:
         from app.routers.semantic import _effective_known_columns
 
-        assert _effective_known_columns({}, {}, _schema(["orders"])) == {}
+        assert _effective_known_columns({}, {}, _schema(["orders"]), None) == {}
 
     def test_entries_of_tables_that_are_not_stored_pass_through(self) -> None:
         from app.routers.semantic import _effective_known_columns
 
         known = {"public.legacy": frozenset({"id"})}
-        assert _effective_known_columns(known, {}, _schema(["orders"])) == known
+        assert _effective_known_columns(known, {}, _schema(["orders"]), None) == known
 
 
 class TestLiveColumns:
@@ -2803,17 +2951,17 @@ class TestDriftAppliedModelNewColumns:
             log=False,
         ).model
 
-    def test_a_near_miss_key_is_replaced_by_the_annotated_real_column(self) -> None:
+    def test_a_near_miss_key_is_renamed_with_its_annotation(self) -> None:
         model = self._apply(
-            {"id": "Id", '"status"': "Stale"},
+            {"id": "Id", '"status"': "Hand-written"},
             known={"public.orders": ["id", "status"]},
             catalog=[],
-            new_columns={"public.orders": {"status": ColumnSemantic(display_name="Status")}},
+            new_columns={},
             recorded={},
         )
         columns = model.tables["public.orders"].columns
         assert set(columns) == {"id", "status"}
-        assert columns["status"].display_name == "Status"
+        assert columns["status"].display_name == "Hand-written"
 
     def test_a_supplied_column_the_model_holds_keeps_its_stored_annotation(self) -> None:
         model = self._apply(
@@ -2825,15 +2973,17 @@ class TestDriftAppliedModelNewColumns:
         )
         assert model.tables["public.orders"].columns["id"].display_name == "Stored"
 
-    def test_a_deleted_edge_on_a_respelled_column_is_not_re_added(self) -> None:
+    def test_a_deleted_edge_on_a_renamed_column_is_not_re_added(self) -> None:
+        """The model held ``customer_id`` already, under a stale key: a catalog edge on it
+        that the model lacks is one the user deleted."""
         model = self._apply(
             {"id": "Id", '"customer_id"': "Customer"},
             known={"public.orders": ["id", "customer_id", "status", "region_id"]},
             catalog=[TestApplyDrift._edge("public.orders", "customer_id", "public.customers")],
-            new_columns={"public.orders": {"customer_id": ColumnSemantic(display_name="Cust")}},
+            new_columns={},
             recorded={"public.orders": {"customer_id"}},
         )
-        assert "customer_id" in model.tables["public.orders"].columns
+        assert model.tables["public.orders"].columns["customer_id"].display_name == "Customer"
         assert model.relationships == []
 
     def test_an_edge_on_a_recorded_new_column_is_added_though_the_llm_omitted_it(self) -> None:
@@ -5030,6 +5180,32 @@ class TestApplyDrift:
         save.assert_awaited_once()
         assert self.known_update.await_args.args[2]["public.orders"] == {"id"}
 
+    async def test_a_hidden_key_the_model_stores_stays_in_the_baseline(self, http_client) -> None:
+        """Under its real name, so once un-hidden the quoted key is renamed to ``ssn``
+        rather than ``ssn`` being reported new."""
+        conn = _make_conn(privacy_settings={"excluded_columns": ["public.orders.ssn"]})
+        _, save, _, _ = await self._run(
+            http_client,
+            conn=conn,
+            model=self._complete(
+                tables={
+                    "public.orders": {
+                        "display_name": "Orders",
+                        "columns": {"id": {"display_name": "Id"}, '"ssn"': {"display_name": "S"}},
+                    },
+                    "public.coupons": {
+                        "display_name": "Coupons",
+                        "columns": {"id": {"display_name": "Id"}},
+                    },
+                }
+            ),
+            schema=_schema(["orders"], {"orders": ["id"]}),  # coupons removed
+            known=self._SEEN,
+        )
+        save.assert_awaited_once()
+        assert '"ssn"' in save.await_args.args[2].tables["public.orders"].columns
+        assert self.known_update.await_args.args[2]["public.orders"] == {"id", "ssn"}
+
     async def test_a_hidden_table_keeps_its_baseline_entry(self, http_client) -> None:
         conn = _make_conn(privacy_settings={"excluded_tables": ["public.coupons"]})
         await self._run(
@@ -5353,10 +5529,10 @@ class TestApplyDrift:
         assert "region_id" not in saved.tables["public.orders"].columns
         assert "public.orders" not in self.known_update.await_args.args[2]
 
-    async def test_a_deleted_fk_on_a_respelled_column_is_not_re_added(self, http_client) -> None:
-        """The model held ``customer_id`` under a quoted key: a missing edge on it is the
-        user's deletion, though the column is annotated again under its real name."""
-        resp, _, _, _ = await self._run(
+    async def test_a_deleted_fk_on_a_renamed_column_is_not_re_added(self, http_client) -> None:
+        """The model held ``customer_id`` under a quoted key: the key is renamed, and a
+        missing edge on the column is the user's deletion."""
+        resp, _, gen, _ = await self._run(
             http_client,
             model=self._fk_model(["id", '"customer_id"']),
             schema=_schema(
@@ -5364,115 +5540,252 @@ class TestApplyDrift:
                 {"orders": ["id", "customer_id"], "customers": ["id"]},
             ),
             known=self._FK_KNOWN,
-            generated_columns={
-                "public.orders": {"customer_id": ColumnSemantic(display_name="Customer")}
-            },
             fresh_edges=[self._edge("public.orders", "customer_id", "public.customers")],
         )
         assert resp.status_code == 200
         summary = resp.json()["summary"]
-        assert summary["columns_added"] == {"public.orders": ["customer_id"]}
+        assert summary["columns_renamed"] == {"public.orders": {'"customer_id"': "customer_id"}}
+        assert summary["columns_added"] == {}
         assert summary["relationships_added"] == []
+        gen.generate_new_columns.assert_not_awaited()
 
-    # ── respelled columns: held only under a near-miss key the prune removes ──
+    # ── renamed columns: a near-miss key of a live column the baseline has seen ──
 
-    @pytest.mark.parametrize("near_miss", ['"status"', "Status"], ids=["quoted", "case-only"])
-    async def test_a_respelled_column_whose_batch_failed_leaves_the_baseline(
-        self, http_client, near_miss: str
+    @staticmethod
+    def _orders_holding(column_key: str) -> SemanticModel:
+        """``orders`` holding ``id`` and *column_key* (labelled "Hand-written"), and
+        ``coupons`` holding ``id``."""
+        return TestApplyDrift._complete(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "columns": {
+                        "id": {"display_name": "Id"},
+                        column_key: {"display_name": "Hand-written"},
+                    },
+                },
+                "public.coupons": {
+                    "display_name": "Coupons",
+                    "columns": {"id": {"display_name": "Id"}},
+                },
+            }
+        )
+
+    _STATUS_SEEN: ClassVar[dict[str, frozenset[str]]] = {
+        "public.coupons": frozenset({"id"}),
+        "public.orders": frozenset({"id", "status"}),
+    }
+
+    async def test_a_preview_lists_a_rename_not_a_removal_and_an_addition(
+        self, http_client
     ) -> None:
-        """The baseline knows ``status``, but the prune drops its only annotation (the
-        near-miss key). Left in the baseline it would never be reported again, and its
-        annotation would be lost silently: it leaves, so the next apply asks for it."""
         resp, save, _, _ = await self._run(
             http_client,
-            model=self._complete(
-                tables={
-                    "public.orders": {
-                        "display_name": "Orders",
-                        "columns": {"id": {"display_name": "Id"}, near_miss: {"display_name": "S"}},
-                    },
-                    "public.coupons": {
-                        "display_name": "Coupons",
-                        "columns": {"id": {"display_name": "Id"}},
-                    },
-                }
-            ),
+            model=self._orders_holding('"status"'),
             schema=_schema(["orders", "coupons"], {"orders": ["id", "status"], "coupons": ["id"]}),
-            known={**self._SEEN, "public.orders": frozenset({"id", "status"})},
-            generated_columns=RuntimeError("provider down"),
+            known=self._STATUS_SEEN,
+            dry_run=True,
         )
         assert resp.status_code == 200
         summary = resp.json()["summary"]
-        # The near-miss key is still removed (a removal is not held back by the failure),
-        # listed quote-stripped.
-        assert summary["columns_removed"] == {"public.orders": [near_miss.strip('"')]}
-        assert summary["column_tables_failed"] == ["public.orders"]
-        save.assert_awaited_once()
-        assert set(save.await_args.args[2].tables["public.orders"].columns) == {"id"}
-        assert self.known_update.await_args.args[2]["public.orders"] == {"id"}
+        assert summary["columns_renamed"] == {"public.orders": {'"status"': "status"}}
+        assert summary["columns_removed"] == {}
+        assert summary["columns_added"] == {}
+        assert summary["changed"] is True
+        save.assert_not_awaited()
 
-    async def test_a_deferred_respelled_column_leaves_the_baseline(self, http_client) -> None:
+    @pytest.mark.parametrize("near_miss", ['"status"', "Status"], ids=["quoted", "case-only"])
+    async def test_a_rename_keeps_the_annotation_and_edits_with_no_llm_call_or_provider(
+        self, http_client, near_miss: str
+    ) -> None:
+        """A rename is structural, like a removal: no provider is resolved, no LLM call is
+        made, and the column keeps its annotation and its hand edits under the live name.
+        The model stays reviewed: nothing the LLM wrote was added."""
+        resp, save, gen, resolve = await self._run(
+            http_client,
+            model=self._orders_holding(near_miss),
+            schema=_schema(["orders", "coupons"], {"orders": ["id", "status"], "coupons": ["id"]}),
+            provenance={
+                **_no_provenance(),
+                "column": {f"public.orders.{near_miss}": ["display_name"]},
+            },
+            protected={
+                "table": {},
+                "column": {f"public.orders.{near_miss}": {"display_name": "Hand-written"}},
+            },
+            known=self._STATUS_SEEN,
+            provider_error=self._NO_PROVIDER,
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["columns_renamed"] == {"public.orders": {near_miss: "status"}}
+        assert summary["columns_removed"] == summary["columns_added"] == {}
+        resolve.assert_not_awaited()
+        gen.generate_new_columns.assert_not_awaited()
+        save.assert_awaited_once()
+        saved = save.await_args.args[2]
+        assert saved.tables["public.orders"].columns["status"].display_name == "Hand-written"
+        assert near_miss not in saved.tables["public.orders"].columns
+        assert saved.is_user_reviewed is True
+        kwargs = save.await_args.kwargs
+        assert kwargs["provenance"]["column"] == {"public.orders.status": ["display_name"]}
+        assert kwargs["protected"]["column"] == {
+            "public.orders.status": {"display_name": "Hand-written"}
+        }
+        self.record.assert_awaited_once()
+
+    async def test_the_baseline_after_a_rename_holds_the_live_name(self, http_client) -> None:
+        """A legacy table (no entry) is baselined with its live columns, ``status``
+        included, and the rename keeps it there: the column is stored under that name."""
+        resp, _, _, _ = await self._run(
+            http_client,
+            model=self._orders_holding('"status"'),
+            schema=_schema(["orders", "coupons"], {"orders": ["id", "status"], "coupons": ["id"]}),
+            known={"public.coupons": frozenset({"id"})},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["summary"]["columns_renamed"] == {
+            "public.orders": {'"status"': "status"}
+        }
+        assert self.known_update.await_args.args[2] == {"public.orders": {"id", "status"}}
+
+    async def test_a_rename_beside_a_new_column_without_a_provider_is_saved_with_a_warning(
+        self, http_client
+    ) -> None:
+        """The rename is something else to save, so the unresolvable provider fails only
+        the column phase: the rename is applied and the new column is named in a warning."""
+        resp, save, gen, _ = await self._run(
+            http_client,
+            model=self._orders_holding('"status"'),
+            schema=_schema(
+                ["orders", "coupons"], {"orders": ["id", "status", "region"], "coupons": ["id"]}
+            ),
+            known=self._STATUS_SEEN,
+            provider_error=self._NO_PROVIDER,
+        )
+        assert resp.status_code == 200
+        gen.generate_new_columns.assert_not_awaited()
+        summary = resp.json()["summary"]
+        assert summary["columns_renamed"] == {"public.orders": {'"status"': "status"}}
+        assert summary["columns_added"] == {}
+        assert any(
+            "provider could not be used" in w and "public.orders.region" in w
+            for w in summary["warnings"]
+        )
+        save.assert_awaited_once()
+        assert set(save.await_args.args[2].tables["public.orders"].columns) == {"id", "status"}
+
+    async def test_a_throttled_column_phase_beside_a_rename_is_a_warning(self, http_client) -> None:
+        """The rename is something else to save, so a 429 from the new-column batch does
+        not propagate: the rename is applied and the column waits for the next apply."""
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=self._orders_holding('"status"'),
+            schema=_schema(
+                ["orders", "coupons"], {"orders": ["id", "status", "region"], "coupons": ["id"]}
+            ),
+            known=self._STATUS_SEEN,
+            generated_columns=ValueError("[RATE_LIMIT] slow down"),
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["columns_renamed"] == {"public.orders": {'"status"': "status"}}
+        assert summary["column_tables_failed"] == ["public.orders"]
+        assert any("[RATE_LIMIT]" in w and "public.orders.region" in w for w in summary["warnings"])
+        save.assert_awaited_once()
+        columns = save.await_args.args[2].tables["public.orders"].columns
+        assert "status" in columns
+        assert '"status"' not in columns
+        assert "region" not in columns
+
+    async def test_a_rename_is_applied_when_the_batch_budget_is_spent(self, http_client) -> None:
+        """New tables take every batch, so the new column ``region`` waits for a later
+        apply; a rename needs no batch and is applied all the same."""
         names = [f"t{i}" for i in range(3 * GENERATION_BATCH_SIZE)]
         resp, save, gen, _ = await self._run(
             http_client,
-            model=self._complete(
-                tables={
-                    "public.orders": {
-                        "display_name": "Orders",
-                        "columns": {
-                            "id": {"display_name": "Id"},
-                            '"status"': {"display_name": "S"},
-                        },
-                    },
-                    "public.coupons": {
-                        "display_name": "Coupons",
-                        "columns": {"id": {"display_name": "Id"}},
-                    },
-                }
-            ),
+            model=self._orders_holding('"status"'),
             schema=_schema(
-                ["orders", "coupons", *names], {"orders": ["id", "status"], "coupons": ["id"]}
+                ["orders", "coupons", *names],
+                {"orders": ["id", "status", "region"], "coupons": ["id"]},
             ),
-            known={**self._SEEN, "public.orders": frozenset({"id", "status"})},
+            known=self._STATUS_SEEN,
             generated={},
         )
         assert resp.status_code == 200
         gen.generate_new_columns.assert_not_awaited()
+        summary = resp.json()["summary"]
+        assert summary["columns_renamed"] == {"public.orders": {'"status"': "status"}}
+        assert any(
+            w.startswith("The new columns of 1 more table were not annotated by this apply")
+            and "public.orders" in w
+            for w in summary["warnings"]
+        )
         save.assert_awaited_once()
-        assert self.known_update.await_args.args[2]["public.orders"] == {"id"}
+        columns = save.await_args.args[2].tables["public.orders"].columns
+        assert "status" in columns
+        assert "region" not in columns
 
-    async def test_a_respelled_column_an_answered_batch_omitted_stays_seen(
+    async def test_a_marked_edge_on_a_renamed_column_is_rekeyed_not_swapped(
         self, http_client
     ) -> None:
-        """Like any column an answered table left out: named in the warning, not retried."""
-        resp, _, _, _ = await self._run(
+        """The model holds ``customer_id`` under a quoted key, with a hand-edited edge on
+        that key; the catalog has the edge under the real name. The edge follows the
+        rename, keeps its mark under the new key, and the summary shows no relationship
+        change."""
+        stale = self._edge("public.orders", '"customer_id"', "public.customers")
+        model = self._fk_model(["id", '"customer_id"']).model_copy(
+            update={"relationships": [stale.model_copy(update={"description": "Hand"})]}
+        )
+        resp, save, _, _ = await self._run(
             http_client,
-            model=self._complete(
-                tables={
-                    "public.orders": {
-                        "display_name": "Orders",
-                        "columns": {
-                            "id": {"display_name": "Id"},
-                            '"status"': {"display_name": "S"},
-                        },
-                    },
-                    "public.coupons": {
-                        "display_name": "Coupons",
-                        "columns": {"id": {"display_name": "Id"}},
-                    },
-                }
+            model=model,
+            schema=_schema(
+                ["orders", "customers"],
+                {"orders": ["id", "customer_id"], "customers": ["id"]},
             ),
+            provenance={
+                **_no_provenance(),
+                "relationship": {semantic_store.relationship_key(stale): ["description"]},
+            },
+            known=self._FK_KNOWN,
+            fresh_edges=[self._edge("public.orders", "customer_id", "public.customers")],
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["columns_renamed"] == {"public.orders": {'"customer_id"': "customer_id"}}
+        assert summary["relationships_added"] == summary["relationships_removed"] == []
+        saved = save.await_args.args[2]
+        assert [(e.from_column, e.description) for e in saved.relationships] == [
+            ("customer_id", "Hand")
+        ]
+        renamed_key = semantic_store.relationship_key(saved.relationships[0])
+        assert save.await_args.kwargs["provenance"]["relationship"] == {
+            renamed_key: ["description"]
+        }
+
+    async def test_a_renamed_column_is_not_sent_to_the_llm_beside_a_new_one(
+        self, http_client
+    ) -> None:
+        """Only the new column is asked for; the renamed one keeps its annotation."""
+        resp, save, gen, _ = await self._run(
+            http_client,
+            model=self._orders_holding('"status"'),
             schema=_schema(
                 ["orders", "coupons"], {"orders": ["id", "status", "region"], "coupons": ["id"]}
             ),
-            known={**self._SEEN, "public.orders": frozenset({"id", "status"})},
+            known=self._STATUS_SEEN,
             generated_columns={"public.orders": {"region": ColumnSemantic(display_name="R")}},
         )
         assert resp.status_code == 200
-        assert any(
-            "public.orders.status" in w and "treated as seen" in w
-            for w in resp.json()["summary"]["warnings"]
-        )
+        assert gen.generate_new_columns.await_args.kwargs["columns_by_table"] == {
+            "public.orders": ["region"]
+        }
+        summary = resp.json()["summary"]
+        assert summary["columns_renamed"] == {"public.orders": {'"status"': "status"}}
+        assert summary["columns_added"] == {"public.orders": ["region"]}
+        columns = save.await_args.args[2].tables["public.orders"].columns
+        assert columns["status"].display_name == "Hand-written"
         assert self.known_update.await_args.args[2]["public.orders"] == {"id", "status", "region"}
 
     # ── concurrency, review flag, failures ──

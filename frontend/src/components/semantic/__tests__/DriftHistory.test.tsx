@@ -14,6 +14,7 @@ const EMPTY: DriftApplySummary = {
   tables_removed: [],
   columns_added: {},
   columns_removed: {},
+  columns_renamed: {},
   metrics_added: [],
   metrics_removed: [],
   joins_added: [],

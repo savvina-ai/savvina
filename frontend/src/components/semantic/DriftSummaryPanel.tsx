@@ -151,8 +151,8 @@ export default function DriftSummaryPanel({
         </p>
       )}
 
-      {/* A new column's annotation is the LLM's too. The catalog edges on a genuinely new
-          column (not a respelling) are listed, but only between tables the model already
+      {/* A new column's annotation is the LLM's too. The catalog edges on a new column (a
+          renamed one is not new) are listed, but only between tables the model already
           holds: an edge to a new table appears only on apply. */}
       {preview && Object.keys(summary.columns_added).length > 0 && (
         <p className="mt-2 text-xs text-muted-foreground">

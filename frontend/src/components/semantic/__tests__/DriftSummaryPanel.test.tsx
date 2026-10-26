@@ -16,6 +16,7 @@ const EMPTY: DriftApplySummary = {
   tables_removed: [],
   columns_added: {},
   columns_removed: {},
+  columns_renamed: {},
   metrics_added: [],
   metrics_removed: [],
   joins_added: [],
@@ -221,6 +222,35 @@ describe('DriftSummaryPanel', () => {
       columns_added: { 'public.orders': ['loyalty_tier'] },
     };
     expect(summaryRows(summary)[0].label).toBe('Will add 1 column');
+  });
+
+  it('lists renamed columns as old key to live name, between the removals and the additions', () => {
+    const summary: DriftApplySummary = {
+      ...EMPTY,
+      changed: true,
+      columns_removed: { 'public.orders': ['legacy'] },
+      columns_renamed: { 'public.orders': { '"status"': 'status', Region: 'region' } },
+      columns_added: { 'public.orders': ['tier'] },
+    };
+    expect(summaryRows(summary)).toEqual([
+      { key: 'columns_removed', label: 'Removed 1 column', names: ['public.orders.legacy'] },
+      {
+        key: 'columns_renamed',
+        label: 'Renamed 2 columns',
+        names: ['public.orders."status" → status', 'public.orders.Region → region'],
+      },
+      { key: 'columns_added', label: 'Added 1 column', names: ['public.orders.tier'] },
+    ]);
+  });
+
+  it('words a preview of a rename as a plan', () => {
+    const summary: DriftApplySummary = {
+      ...EMPTY,
+      dry_run: true,
+      changed: true,
+      columns_renamed: { 'public.orders': { '"status"': 'status' } },
+    };
+    expect(summaryRows(summary).map((r) => r.label)).toEqual(['Will rename 1 column']);
   });
 
   it('does not call a failed new-column batch nothing to apply', () => {

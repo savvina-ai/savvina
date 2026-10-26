@@ -56,8 +56,8 @@ class DriftReport(BaseModel):
     schema_source: Literal["live", "cache"] = "live"
     schema_cached_at: str | None = None
     refresh_error: str | None = None
-    # True when a table was added or removed, or a column added or removed — what
-    # ``POST .../semantic/apply-drift`` acts on.
+    # True when a table was added or removed, or a column added, removed or renamed —
+    # what ``POST .../semantic/apply-drift`` acts on.
     # An unreadable table or a metric naming a missing table is reported in ``warnings``
     # but is not actionable: apply-drift returns the model unchanged for those alone.
     has_actionable_changes: bool = False
@@ -67,7 +67,7 @@ class ApplyDriftResponse(BaseModel):
     """Returned by ``POST /connections/{id}/semantic/apply-drift``.
 
     ``semantic_model`` is the model as stored; ``summary`` names what this apply
-    added and removed (on a ``dry_run``, what it would). The page shows it until
+    added, removed and renamed (on a ``dry_run``, what it would). The page shows it until
     dismissed; a real apply's summary is also logged and served by
     ``GET .../semantic/drift/history``.
     """

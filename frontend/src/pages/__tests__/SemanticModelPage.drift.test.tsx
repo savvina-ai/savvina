@@ -308,6 +308,7 @@ const SUMMARY = {
   tables_removed: ['ecommerce.coupons'],
   columns_added: {},
   columns_removed: {},
+  columns_renamed: {},
   metrics_added: [],
   metrics_removed: ['Coupon uses'],
   joins_added: [],
@@ -603,6 +604,41 @@ describe('SemanticModelPage — Apply Drift', () => {
     } as never);
     await previewFromBanner();
 
+    expect(await screen.findByRole('button', { name: 'Apply these changes' })).toBeEnabled();
+  });
+
+  it('lets a preview that only renames columns apply without a provider', async () => {
+    vi.mocked(semanticApi.getDrift).mockResolvedValue(DRIFTED as never);
+    vi.mocked(semanticApi.applyDrift).mockResolvedValue({
+      semantic_model: MODEL,
+      summary: {
+        ...PREVIEW,
+        tables_removed: [],
+        metrics_removed: [],
+        columns_renamed: { 'ecommerce.orders': { '"status"': 'status' } },
+      },
+    } as never);
+    await previewFromBanner();
+
+    // A rename makes no LLM call.
+    expect(await screen.findByRole('button', { name: 'Apply these changes' })).toBeEnabled();
+  });
+
+  it('lets a preview that adds columns beside a renamed column apply without a provider', async () => {
+    vi.mocked(semanticApi.getDrift).mockResolvedValue(DRIFTED as never);
+    vi.mocked(semanticApi.applyDrift).mockResolvedValue({
+      semantic_model: MODEL,
+      summary: {
+        ...PREVIEW,
+        tables_removed: [],
+        metrics_removed: [],
+        columns_added: { 'ecommerce.orders': ['region'] },
+        columns_renamed: { 'ecommerce.orders': { '"status"': 'status' } },
+      },
+    } as never);
+    await previewFromBanner();
+
+    // The rename applies and the backend warns the new column was not annotated.
     expect(await screen.findByRole('button', { name: 'Apply these changes' })).toBeEnabled();
   });
 

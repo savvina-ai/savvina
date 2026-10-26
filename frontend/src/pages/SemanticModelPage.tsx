@@ -1049,14 +1049,16 @@ export default function SemanticModelPageV2() {
       : previewReasonOnceChecked;
   // New tables and new columns are annotated by the LLM. Without a provider the backend
   // fails an apply that adds tables, or one whose only changes are new columns (it has
-  // nothing else to do), with a 400. New columns beside a removed table or column do not
-  // block it: the removals apply and the summary warns that the columns were not annotated.
+  // nothing else to do), with a 400. New columns beside a removed table, a removed column
+  // or a renamed column do not block it: those apply with no LLM call, and the summary
+  // warns that the new columns were not annotated.
   const needsProvider =
     driftPreview !== null &&
     (driftPreview.tables_added.length > 0 ||
       (Object.keys(driftPreview.columns_added).length > 0 &&
         driftPreview.tables_removed.length === 0 &&
-        Object.keys(driftPreview.columns_removed).length === 0));
+        Object.keys(driftPreview.columns_removed).length === 0 &&
+        Object.keys(driftPreview.columns_renamed).length === 0));
   const applyDisabledReason =
     previewDisabledReason ??
     (needsProvider && !selectedProvider ? 'Configure an LLM provider in Settings first' : null);
@@ -1420,11 +1422,13 @@ export default function SemanticModelPageV2() {
                     Removes deleted tables, with the metrics, joins and derived columns that
                     list them, segments that apply only to them, and relationships over them,
                     and deleted columns, with the relationships and references that used them.
-                    Annotates new tables and the new columns of existing ones, and adds new
-                    cross-table items beside the existing ones. Hidden tables are kept, and
-                    so are tables the connection cannot read when PostgreSQL can tell them
-                    apart from dropped ones. You will see what it removes and which tables and
-                    columns it annotates before anything is applied.
+                    Renames a column stored under a near-miss spelling to its real name,
+                    keeping its annotation and your edits. Annotates new tables and the new
+                    columns of existing ones, and adds new cross-table items beside the
+                    existing ones. Hidden tables are kept, and so are tables the connection
+                    cannot read when PostgreSQL can tell them apart from dropped ones. You
+                    will see what it removes and renames, and which tables and columns it
+                    annotates, before anything is applied.
                   </p>
                   <button
                     ref={previewButtonRef}

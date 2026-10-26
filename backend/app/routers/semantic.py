@@ -48,7 +48,7 @@ from ..semantic.drift import (
     DriftApplySummary,
     compute_drift,
     policy_hides_column,
-    respelled_targets,
+    strip_ident_quotes,
     summarize_model_change,
 )
 from ..semantic.generator import (
@@ -57,6 +57,7 @@ from ..semantic.generator import (
     edges_in_schema,
     names_any_table,
     prune_to_schema,
+    rename_columns,
 )
 from ..semantic.models import (
     GENERATION_BATCH_SIZE,
@@ -166,19 +167,26 @@ def _effective_known_columns(
     known: Mapping[str, Collection[str]],
     stored_tables: Mapping[str, TableSemantic],
     schema: DataSourceSchema,
+    privacy: PrivacySettings | None,
 ) -> dict[str, frozenset[str]]:
     """The baseline ``compute_drift`` reads: *known*, plus, for each stored table the live
-    schema holds and *known* has no entry for, that table's live columns.
+    schema holds and *known* has no entry for, what a baseline write would record for it:
+    its live columns and the real names of its stored keys the policy hides
+    (``_held_column_names``).
 
     A table with no entry (a model from before the baseline existed, or a table a user
     added) is baselined at first sight: whatever it holds now is "seen", so no live column
-    is reported new on that account, except one the model holds only under a near-miss key
-    (``compute_drift``'s respelling rule). A column added before that first sight is not
-    reported either; a Regenerate annotates it.
+    is reported new on that account, and a column the model holds only under a near-miss
+    key is renamed to its live name (``compute_drift``'s ``renamed_columns``), now or,
+    for a hidden one, once the policy shows it. A column added before that first sight is
+    not reported either; a Regenerate annotates it.
     """
     effective = {key: frozenset(names) for key, names in known.items()}
     for key, names in _live_columns(schema, set(stored_tables)).items():
-        effective.setdefault(key, frozenset(names))
+        effective.setdefault(
+            key,
+            frozenset(names) | _held_column_names(key, names, stored_tables[key].columns, privacy),
+        )
     return effective
 
 
@@ -249,7 +257,7 @@ async def check_drift(
         schema = _apply_privacy_to_schema(schema, privacy)
 
     known = await semantic_store.load_known_columns(db, connection_id)
-    effective = _effective_known_columns(known, stored_model.tables, schema)
+    effective = _effective_known_columns(known, stored_model.tables, schema, privacy)
     unbaselined = {key: names for key, names in effective.items() if key not in known}
     if (
         unbaselined
@@ -334,11 +342,39 @@ def _live_columns(
     schema: DataSourceSchema, keys: Collection[str] | None = None
 ) -> dict[str, list[str]]:
     """Table key → the live column names of *schema* (of the tables in *keys* when given).
-    The shape ``store.update_known_columns`` takes."""
+    The shape ``store.update_known_columns`` takes. The routes' schema is policy-filtered,
+    so a hidden column is not here; a baseline writer adds the hidden ones the model
+    stores (``_held_column_names``)."""
     return {
         table_key(table): [c.name for c in table.columns]
         for table in schema.tables
         if keys is None or table_key(table) in keys
+    }
+
+
+def _held_column_names(
+    key: str, live: Collection[str], stored: Collection[str], privacy: PrivacySettings | None
+) -> set[str]:
+    """The column names table *key*'s baseline must hold because the model stores them:
+    each of its *stored* column keys that is a *live* column, and the real name
+    (``strip_ident_quotes``) of each stored key the policy hides.
+
+    Every baseline writer (a generation batch, the finalisation, an apply, the drift
+    check's seed through ``_effective_known_columns``) records these besides the live
+    columns it records, so the baseline is a superset of the stored live columns and of
+    the real names of the stored hidden keys. The schema the writers see is
+    policy-filtered, so without the second part a hidden column would leave the entry.
+    That is right for one the model never annotated: once un-hidden it is reported new.
+    One it stores stays seen, so once un-hidden a near-miss key of it (a blob-era
+    ``'"ssn"'``) is renamed to ``ssn`` rather than ``ssn`` being reported new.
+
+    Only a key the policy itself keeps is covered: ``policy_hides_column`` matches the
+    key or its quote-stripped form exactly, so a case-only ``SSN`` of a hidden ``ssn`` is
+    not hidden, the prune drops it like any gone key, and it is not recorded here.
+    """
+    live_names = set(live)
+    return {name for name in stored if name in live_names} | {
+        strip_ident_quotes(name) for name in stored if policy_hides_column(key, name, privacy)
     }
 
 
@@ -385,24 +421,18 @@ def _with_new_columns(
 def _drift_new_columns(
     drift: SchemaDrift, recorded: Mapping[str, Collection[str]]
 ) -> dict[str, set[str]]:
-    """The columns whose catalog edges an apply may add: the columns *drift* reports as
-    genuinely new (``added_columns`` less the respelled ones) that the apply *records*
-    as seen, per table.
+    """The columns whose catalog edges an apply may add: the columns *drift* reports as new
+    (``added_columns``) that the apply *records* as seen, per table.
 
-    A respelled column is one the model already held under a near-miss key, so a
-    catalog edge on it that the model lacks is one the user deleted, not one they never
-    saw; as a respelling it never qualifies, recorded or not. A new column the apply
-    does not record (its batch failed, or it was deferred or cut) stays new for the next
-    apply, so its edge waits for the apply that records it: added once, so that a later
-    deletion sticks. The same holds for a respelled column the apply does not record: it
-    leaves the baseline, so the next apply reports it as genuinely new, and a catalog
-    edge on it, even one the user had deleted, arrives once with the apply that records
-    it; a deletion after that sticks.
+    A new column the apply does not record (its batch failed, or it was deferred or cut)
+    stays new for the next apply, so its edge waits for the apply that records it: added
+    once, so that a later deletion sticks. A renamed column (``renamed_columns``) is not
+    new: the model held it already, under a near-miss key, so a catalog edge on it that
+    the model lacks is one the user deleted, not one they never saw.
     """
     out: dict[str, set[str]] = {}
     for key, columns in drift.added_columns.items():
-        fresh = columns - drift.respelled_columns.get(key, set())
-        settled = fresh & set(recorded.get(key, ()))
+        settled = columns & set(recorded.get(key, ()))
         if settled:
             out[key] = settled
     return out
@@ -434,10 +464,10 @@ def _rebuild_relationships(
     rule the LLM items follow. Globals passes ``None`` and rebuilds every catalog edge,
     as a Regenerate should.
 
-    ``new_columns`` (table key → column names) widens that rule: a catalog edge on one of
-    those columns is added too; an edge on any other column of a held table still is
-    not. Callers pass the genuinely new columns (not respellings) an apply records as
-    seen, from ``_drift_applied_model`` (``_drift_new_columns``). It only matters when
+    ``new_columns`` (table key → column names) widens that rule: a catalog edge on one
+    of those columns is added too; an edge on any other column of a held table still is
+    not. Callers pass the new columns an apply records as seen, from
+    ``_drift_applied_model`` (``_drift_new_columns``). It only matters when
     ``new_tables`` is not ``None``: ``new_tables=None`` already rebuilds every catalog
     edge.
 
@@ -693,11 +723,13 @@ def _drift_applied_model(
     run passes ``log=False``: the hand-edit trims and near-miss drops it previews did
     not happen, so they must not be logged as if they had.
 
+    The drift's ``renamed_columns`` are applied first (``rename_columns``): each near-miss
+    key becomes its live column's name, with its annotation, its user-edit marks and
+    protected values, its table's references and its relationship endpoints, so the
+    hand-edit trims, the prune and the edge rebuild below see it under its live name.
+
     ``new_columns`` are the LLM annotations of new columns of tables the model already
-    holds, added additively (``_with_new_columns``). A column whose stored annotation
-    sat under a near-miss key (quoted or case-only) is added under its real name: that
-    is the name drift reported and the LLM annotated, while the prune drops the
-    near-miss key and its annotation.
+    holds, added additively (``_with_new_columns``).
 
     ``recorded_columns`` (table key → column names) are the new columns this apply
     records as seen: the apply passes the columns its column phase settled (annotated,
@@ -705,17 +737,14 @@ def _drift_applied_model(
     apply would send. Catalog FK edges on existing tables follow them, not the
     annotations:
 
-    - an edge on a genuinely new column (``drift``'s added columns, not its respelled
-      ones) arrives with the apply that records the column, whether or not the LLM
-      annotated it, so an omitted column still gets its edge;
+    - an edge on a new column (``drift``'s added columns) arrives with the apply that
+      records the column, whether or not the LLM annotated it, so an omitted column
+      still gets its edge;
     - a column whose batch failed, or that was deferred or cut, is not recorded, so
       its edge arrives with the apply that later records it, and a deletion after that
       sticks, since the column is no longer new;
-    - a respelled column does not bring back a deleted edge on this apply, recorded or
-      not: the model held the column already, so a missing edge is the user's deletion.
-      One this apply does not record leaves the baseline, though, so a later apply finds
-      it genuinely new and adds the edge once (the item above); a deletion after that
-      sticks.
+    - a renamed column never brings back a deleted edge: the model held the column
+      already, so a missing edge is the user's deletion.
 
     The dry run, given the columns it would send, shows these edges between held
     tables; an edge to a new table appears only on apply, like every relationship to
@@ -727,24 +756,32 @@ def _drift_applied_model(
     ``generation_model``, ``is_user_reviewed``, ``generation_warnings``) are left to
     the caller.
     """
+    tables, relationships, marks, protected = rename_columns(
+        current_model.tables,
+        current_model.relationships,
+        snapshot.marks,
+        snapshot.protected,
+        drift.renamed_columns,
+    )
+    renamed = current_model.model_copy(update={"tables": tables, "relationships": relationships})
     provenance, protected, edit_notes = drop_dangling_edits(
-        snapshot.marks, snapshot.protected, schema, privacy, log=log
+        marks, protected, schema, privacy, log=log
     )
 
     # Removed tables and columns leave here; hidden and unreadable ones stay.
-    pruned = prune_to_schema(current_model.tables, schema, privacy, log=log, keep_unreadable=True)
+    pruned = prune_to_schema(renamed.tables, schema, privacy, log=log, keep_unreadable=True)
     pruned = _with_new_columns(pruned, new_columns or {})
     merged_tables = {**pruned, **new_tables}
     metrics, joins, derived_columns, segments = _without_removed_tables(
-        current_model, drift.removed_table_keys
+        renamed, drift.removed_table_keys
     )
     removed_items = {
-        "metric": {m.name for m in current_model.business_metrics} - {m.name for m in metrics},
-        "common_join": {j.join_pattern for j in current_model.common_joins}
+        "metric": {m.name for m in renamed.business_metrics} - {m.name for m in metrics},
+        "common_join": {j.join_pattern for j in renamed.common_joins}
         - {j.join_pattern for j in joins},
-        "derived_column": {d.name for d in current_model.derived_columns}
+        "derived_column": {d.name for d in renamed.derived_columns}
         - {d.name for d in derived_columns},
-        "segment": {s.name for s in current_model.segments} - {s.name for s in segments},
+        "segment": {s.name for s in renamed.segments} - {s.name for s in segments},
     }
     # A removed item's marks leave with it. ``save_model`` stamps marks by name, so a
     # mark left behind would land on a same-named item the LLM adds below: frozen
@@ -802,7 +839,7 @@ def _drift_applied_model(
         segments = segments + [s for s in llm_segments if s.name not in have_segments]
 
     relationships = _rebuild_relationships(
-        current_model.relationships,
+        renamed.relationships,
         relationship_edges,
         provenance,
         schema,
@@ -813,7 +850,7 @@ def _drift_applied_model(
         new_columns=_drift_new_columns(drift, recorded_columns),
     )
 
-    model = current_model.model_copy(
+    model = renamed.model_copy(
         update={
             "tables": merged_tables,
             "business_metrics": metrics,
@@ -846,6 +883,11 @@ async def apply_drift(
     - Removed columns: dropped from their table, with the references to them
       (``prune_to_schema``'s rule, the same one a regenerate applies) and any hand
       edit naming them (``drop_dangling_edits``).
+    - Renamed columns: a near-miss key (quoted, or in another letter case) of a live
+      column the baseline has seen and the table does not store under its real name
+      (``compute_drift``'s ``renamed_columns``) is renamed to that name, keeping its
+      annotation, its hand edits, its table's references and its relationships
+      (``rename_columns``). No LLM call: the model already holds the column.
     - New tables: annotated by the LLM (in batches, at most ``_DRIFT_MAX_NEW_TABLES``
       per apply so one request stays inside the proxy timeout; a warning names the
       rest, which the next apply takes), then — if it annotated any — one globals
@@ -858,8 +900,7 @@ async def apply_drift(
       An item removed above is not "existing": a same-named LLM item replaces it,
       without its marks, and the summary reports it as removed and added.
     - New columns on a table the model holds: a live column neither stored nor in the
-      baseline (``known_columns``: the live columns the model has seen), or one held
-      only under a near-miss key the prune removes (``compute_drift``). Annotated by the
+      baseline (``known_columns``: the live columns the model has seen). Annotated by the
       LLM alone (the table is sent as context; only the new columns are asked for and
       taken) and added to their table. Existing columns are never rewritten. They share
       the apply's batch budget (``_DRIFT_MAX_BATCHES``) with new tables (new tables
@@ -872,25 +913,25 @@ async def apply_drift(
       the rest of the drift, and every batch answered before the failure, is still
       applied — except that a throttle or an unavailable provider (429, 503)
       propagates when there is nothing else to save: no new or removed table, no
-      removed column and no batch answered yet. The provider is resolved up front only
-      when there are new tables or nothing but new columns (an unresolvable one is a
-      400 then); beside removals alone, failing to resolve it fails this phase like a
-      failed call, and the removals are applied. A new column does not trigger the
-      globals pass, and an apply that annotates one marks the model unreviewed.
+      removed or renamed column and no batch answered yet. The provider is resolved up
+      front only when there are new tables or nothing but new columns (an unresolvable
+      one is a 400 then); beside removals or renames alone, failing to resolve it fails
+      this phase like a failed call, and the removals and renames are applied. A new
+      column does not trigger the globals pass, and an apply that annotates one marks
+      the model unreviewed.
     - Relationships, time expressions, notes and the schema hash are recomputed. A
       catalog FK edge the model lacks is added only when it touches a newly annotated
-      table or a genuinely new column (not a near-miss respelling) that this apply
-      records as seen, annotated or omitted; any other missing edge is one the user
-      deleted, and stays deleted. One exception: a respelled column no batch answered
-      for leaves the baseline, so a later apply finds it genuinely new and adds a
-      catalog edge on it with the apply that records it, once, even one the user had
-      deleted; deleting it again sticks.
+      table or a new column that this apply records as seen, annotated or omitted (a
+      renamed column is not new); any other missing edge is one the user deleted, and
+      stays deleted.
 
     The baseline is written in the same transaction (``update_known_columns`` with
     ``prune``): each new table annotated gets its live columns, each held table keeps
     what it had seen plus the columns a batch answered for and every live column it
     stores, and loses the columns that left the live schema (dropped, or hidden by the
-    policy) and the respelled ones no batch answered for, so those are reported again.
+    policy), except that a hidden column it stores stays, under its real name
+    (``_held_column_names``). A renamed column was seen already and is stored under its
+    live name, so it stays seen.
 
     No LLM call when no table or column was added. The schema is always a **live**
     introspection: acting on a cached one could delete what still exists, so an
@@ -899,17 +940,18 @@ async def apply_drift(
     A run in progress or interrupted (``tables_partial``) is a 409: pruning under it
     would race its batches.
 
-    ``dry_run=true`` is the preview: the same assembly (``_drift_applied_model``) on
-    the unlocked read the drift was computed from, no LLM call, nothing written but
-    the refreshed schema cache (which every call commits). New tables are listed by
-    name in ``tables_added`` — exactly the ones the apply would send, in its order
+    ``dry_run=true`` is the preview: the same assembly (``_drift_applied_model``) on the
+    unlocked read the drift was computed from, no LLM call, nothing written but the
+    refreshed schema cache (which every call commits). New tables are listed by name in
+    ``tables_added`` — exactly the ones the apply would send, in its order
     (``_new_tables_in_send_order``) — and new columns in ``columns_added``: exactly the
-    ones the apply would ask for (``_plan_column_batches``). ``relationships_added``
-    includes the catalog edges on the new columns it would send, between held tables;
-    relationships to new tables and the LLM's items over them appear only on apply.
-    The preview's ``warnings`` are the hand-edit notes and the warnings naming the new
-    tables (past ``_DRIFT_MAX_NEW_TABLES``) and the new columns (past the batch budget
-    or the column cap) the apply would defer or cut.
+    ones the apply would ask for (``_plan_column_batches``); renamed columns are in
+    ``columns_renamed``, as on apply. ``relationships_added`` includes the catalog edges
+    on the new columns it would send, between held tables; relationships to new tables
+    and the LLM's items over them appear only on apply. The preview's ``warnings`` are
+    the hand-edit notes and the warnings naming the new tables (past
+    ``_DRIFT_MAX_NEW_TABLES``) and the new columns (past the batch budget or the column
+    cap) the apply would defer or cut.
 
     Answers with the stored model (on a dry run, the model as it is) and
     ``summarize_model_change`` of the result against the model it was built from —
@@ -954,13 +996,16 @@ async def apply_drift(
     if privacy:
         schema = _apply_privacy_to_schema(schema, privacy)
 
-    # The baseline decides which live columns are new. A table with no entry is baselined
-    # in memory here, so a legacy table has no new columns, except a column held only
-    # under a near-miss key (``compute_drift``'s respelling rule). ``check_drift``
-    # persists that baseline, and so does an apply that writes.
+    # The baseline decides which live columns are new and which near-miss keys are
+    # renamed. A table with no entry is baselined in memory here, so a legacy table has no
+    # new columns. ``check_drift`` persists that baseline, and so does an apply that
+    # writes.
     known = await semantic_store.load_known_columns(db, connection_id)
     drift = compute_drift(
-        schema, stored_model, privacy, _effective_known_columns(known, stored_model.tables, schema)
+        schema,
+        stored_model,
+        privacy,
+        _effective_known_columns(known, stored_model.tables, schema, privacy),
     )
     # The refreshed schema cache (an upsert plus cache deletes, which take row locks) is
     # committed now rather than held open through the LLM calls: a rollback below must
@@ -995,7 +1040,12 @@ async def apply_drift(
     # With nothing else to save, a throttle or an unavailable provider fails the request
     # with its status (``_TRANSIENT_STATUSES``) unless an earlier column batch answered;
     # beside other changes it is a warning (see the column phase below).
-    only_columns = not (drift.new_table_keys or drift.removed_table_keys or drift.removed_columns)
+    only_columns = not (
+        drift.new_table_keys
+        or drift.removed_table_keys
+        or drift.removed_columns
+        or drift.renamed_columns
+    )
 
     if dry_run:
         # No lock: nothing is written, and a write landing after the read is re-diffed
@@ -1026,7 +1076,11 @@ async def apply_drift(
         if cut_columns:
             notes.append(_cut_columns_warning(cut_columns, preview=True))
         summary = summarize_model_change(
-            stored_model, preview.model, warnings=notes, removed_items=preview.removed_items
+            stored_model,
+            preview.model,
+            warnings=notes,
+            removed_items=preview.removed_items,
+            columns_renamed=drift.renamed_columns,
         )
         return ApplyDriftResponse(
             semantic_model=stored_model,
@@ -1055,8 +1109,8 @@ async def apply_drift(
         # an unresolvable one fails the request (400) before the model is touched.
         llm_provider, configured_model, provider_name = await _resolve_provider(provider, db)
     elif column_batches:
-        # New columns beside removals only: an unresolvable provider fails the column
-        # phase like a failed call, and the removals are still applied.
+        # New columns beside removals or renames only: an unresolvable provider fails the
+        # column phase like a failed call, and the removals and renames are still applied.
         try:
             llm_provider, configured_model, provider_name = await _resolve_provider(provider, db)
         except HTTPException as exc:
@@ -1102,18 +1156,18 @@ async def apply_drift(
                 provider=provider_name,
             )
             llm_items = (metrics, joins, derived, segments)
-    # Unlike the phases above, a failure here is not fatal: the removals, the new tables
-    # and the tables an earlier batch answered for are applied without the remaining new
-    # columns (named in the warnings and in ``column_tables_failed``), so one bad batch
-    # cannot hold back the rest of the drift. The exception is an apply with nothing else
-    # to save, not even an answered batch, where a throttle or an unavailable provider
-    # propagates with its status (``_TRANSIENT_STATUSES``): the user sees it and can
-    # apply again, instead of a 200 that changed nothing. The batches after a failed one
+    # Unlike the phases above, a failure here is not fatal: the removals, the renames, the
+    # new tables and the tables an earlier batch answered for are applied without the
+    # remaining new columns (named in the warnings and in ``column_tables_failed``), so one
+    # bad batch cannot hold back the rest of the drift. The exception is an apply with
+    # nothing else to save, not even an answered batch, where a throttle or an unavailable
+    # provider propagates with its status (``_TRANSIENT_STATUSES``): the user sees it and
+    # can apply again, instead of a 200 that changed nothing. The batches after a failed one
     # are not tried: the provider is likely still failing, and every try costs up to the
     # generation timeout; with no provider resolved, none is tried. A table the batch
-    # returned *nothing* for is failed too (per table, without ending the phase): an
-    # empty answer is a soft failure, not evidence that its columns need no annotation,
-    # and must not mark them as seen for good.
+    # returned *nothing* for is failed too (per table, without ending the phase): an empty
+    # answer is a soft failure, not evidence that its columns need no annotation, and must
+    # not mark them as seen for good.
     answered: dict[str, set[str]] = {}  # table key → the columns a batch answered for
     no_answer: set[str] = set()  # tables a batch that returned got nothing for
     failed_batch: dict[str, list[str]] = {}  # the batch whose call failed, if one did
@@ -1189,7 +1243,7 @@ async def apply_drift(
     # not applied — or logged — twice. Against the baseline as the lock sees it, too: a
     # generation batch or another apply may have moved it while the LLM ran.
     known = await semantic_store.load_known_columns(db, connection_id)
-    effective = _effective_known_columns(known, current_model.tables, schema)
+    effective = _effective_known_columns(known, current_model.tables, schema, privacy)
     drift = compute_drift(schema, current_model, privacy, effective)
     if drift.is_empty:
         # Every table sent to the LLM is stored by now too (``new_tables`` is empty).
@@ -1303,19 +1357,21 @@ async def apply_drift(
     # (the prune in ``_drift_applied_model`` removed it): if it comes back it is new
     # again and is annotated, instead of being silently "seen". A hidden or unreadable
     # table is not in the live schema, so its entry is kept as it is. A column the policy
-    # hides is absent from the live columns too, but unlike a table it does leave the
-    # entry, as in the finalisation: once un-hidden, one the model stores an annotation
-    # for is not new (drift also checks the stored table), while one it never annotated
-    # is reported new and the next apply annotates it.
+    # hides is absent from the live columns too, so it leaves the entry here, as in the
+    # finalisation, unless the model stores it (below): once un-hidden, one it never
+    # annotated is reported new and the next apply annotates it.
     live_now = _live_columns(schema)
     for key in seen:
         if key in live_now:
             seen[key] &= set(live_now[key])
     # What the model stores it has seen, however the column got there (a hand-added
-    # annotation included): the baseline is a superset of the stored live columns.
+    # annotation included), hidden columns under their real names
+    # (``_held_column_names``): the baseline is a superset of what the model stores.
     for key, table in current_model.tables.items():
         if key in live_now:
-            seen.setdefault(key, set()).update(set(table.columns) & set(live_now[key]))
+            seen.setdefault(key, set()).update(
+                _held_column_names(key, live_now[key], table.columns, privacy)
+            )
     # A new table has seen every live column, whatever row it left behind (a check that
     # seeded it before an earlier apply removed it): that row is overwritten.
     for key, names in _live_columns(schema, set(new_tables)).items():
@@ -1323,13 +1379,6 @@ async def apply_drift(
     for key, names in answered.items():
         if key in current_model.tables:
             seen.setdefault(key, set()).update(names)
-    # A respelled column is in the baseline already, but the prune just dropped its only
-    # annotation (the near-miss key). Unless a batch answered for it, it leaves the
-    # baseline: still seen, it would never be reported again, and its annotation would
-    # be lost without a word. Next time it is new, and asked for again. One a batch
-    # answered but left out stays seen, named in the warning like any other.
-    for key, names in drift.respelled_columns.items():
-        seen[key] -= names - answered.get(key, set())
     moved = _baseline_changes(known, seen)  # all the store is asked to write
     header_update: dict[str, Any] = {"generation_warnings": gen_warnings}
     if new_tables or new_columns:
@@ -1353,6 +1402,7 @@ async def apply_drift(
             column_tables_failed=column_tables_failed,
             warnings=gen_warnings,
             removed_items=assembly.removed_items,
+            columns_renamed=drift.renamed_columns,
         )
 
     summary = summary_of(final)
@@ -1903,7 +1953,7 @@ async def generate_semantic_batch(
     has edited) and returns the run's progress — not the model.
     """
     user_id: str = current_user.id
-    schema, _conn = await _load_schema_for_connection(connection_id, current_user, db)
+    schema, conn = await _load_schema_for_connection(connection_id, current_user, db)
 
     header = await semantic_store.load_header(db, connection_id)
     if header is None or header.generation_status != GenerationStatus.TABLES_PARTIAL:
@@ -2009,9 +2059,19 @@ async def generate_semantic_batch(
         )
         # The model has now seen every live column of these tables the privacy policy
         # leaves visible, annotated or not: one the LLM omitted is not a "new column"
-        # to the next drift check.
+        # to the next drift check. A column the policy hides is seen too when the
+        # reconciled rows hold it, under its real name (``_held_column_names``).
+        privacy = (
+            PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
+        )
+        stored = await semantic_store.load_column_names(db, connection_id, set(batch_tables))
         await semantic_store.update_known_columns(
-            db, connection_id, _live_columns(schema, set(batch_tables))
+            db,
+            connection_id,
+            {
+                key: set(names) | _held_column_names(key, names, stored.get(key, ()), privacy)
+                for key, names in _live_columns(schema, set(batch_tables)).items()
+            },
         )
         if batch_tables:
             # The batch may have rewritten annotations the cached answers were written
@@ -2058,7 +2118,10 @@ async def generate_semantic_globals(
     tables are stored, which is what makes "Finish with what's generated" work.
     Tables and columns that are no longer in the schema are pruned here
     (``prune_to_schema``), as they are by ``/apply-drift``: a regenerate never
-    blanks the model, so this is where a full run drops them.
+    blanks the model, so this is where a full run drops them. A column key the drift
+    renames (a near-miss spelling of a live column the model has seen, which this run
+    did not annotate under its real name) is renamed first, as ``/apply-drift`` renames
+    it, so its annotation and hand edits are kept rather than pruned.
     """
     user_id: str = current_user.id
     schema, conn = await _load_schema_for_connection(connection_id, current_user, db)
@@ -2155,13 +2218,30 @@ async def generate_semantic_globals(
                 "finish the new run"
             ),
         )
+    # A near-miss key of a live column the baseline has seen, held while the table stores
+    # no column of that name, is renamed to it with its annotation, marks and references:
+    # ``compute_drift``'s rule, read through the same effective baseline as Check Drift and
+    # Apply Drift. A column this run annotated under its real name is stored, so its
+    # near-miss key is a duplicate the prune below drops.
+    known = await semantic_store.load_known_columns(db, connection_id)
+    renames = compute_drift(
+        schema,
+        current_model,
+        privacy,
+        _effective_known_columns(known, current_model.tables, schema, privacy),
+    ).renamed_columns
+    tables, relationships, marks, protected = rename_columns(
+        current_model.tables,
+        current_model.relationships,
+        snapshot.marks,
+        snapshot.protected,
+        renames,
+    )
     # A hand edit that names a column the table no longer has would be written back
     # over the pruned row as a dangling reference, with a mark that stops every later
     # regenerate from replacing it. Drop the dangling names first (a list keeps its live
     # entries and its mark; a scalar or an emptied list is cleared), and tell the user.
-    provenance, protected, edit_notes = drop_dangling_edits(
-        snapshot.marks, snapshot.protected, schema, privacy
-    )
+    provenance, protected, edit_notes = drop_dangling_edits(marks, protected, schema, privacy)
     gen_warnings = [*gen_warnings, *edit_notes]
 
     # One bad LLM item must not fail the whole finalisation in save_model.
@@ -2186,12 +2266,13 @@ async def generate_semantic_globals(
         j for j in current_model.common_joins if f"common_join:{j.join_pattern}" in edited_items
     ]
 
-    # ``current_model.tables``, not the pre-LLM snapshot: a batch that landed during
-    # the globals call is in the stored rows. Pruned by schema membership, not by run
-    # stamp, so finishing a partial run keeps every real table it annotated. A table
-    # the connection's role cannot read is absent from ``schema`` too, but it exists:
-    # ``keep_unreadable`` stops a narrower role from deleting its annotations.
-    pruned = prune_to_schema(current_model.tables, schema, privacy, keep_unreadable=True)
+    # ``current_model.tables`` (with the renames above), not the pre-LLM snapshot: a batch
+    # that landed during the globals call is in the stored rows. Pruned by schema
+    # membership, not by run stamp, so finishing a partial run keeps every real table it
+    # annotated. A table the connection's role cannot read is absent from ``schema`` too,
+    # but it exists: ``keep_unreadable`` stops a narrower role from deleting its
+    # annotations.
+    pruned = prune_to_schema(tables, schema, privacy, keep_unreadable=True)
     # Every table of the schema should have a row by now. One without is a table the
     # LLM returned nothing for (twice, after the client's re-queue), one a "Finish
     # with what's generated" never reached, or one created since the run started; the
@@ -2209,7 +2290,7 @@ async def generate_semantic_globals(
     # edge to a hidden endpoint is not carried and returns from the FK once un-hidden
     # (``_rebuild_relationships``; "Finalisation" in semantic-model-generation.md).
     pruned_relationships = _rebuild_relationships(
-        current_model.relationships,
+        relationships,
         relationship_edges,
         provenance,
         schema,
@@ -2257,32 +2338,21 @@ async def generate_semantic_globals(
     # sent, or the LLM left it out) is seeded with its live columns, so a column added
     # since it was annotated is not reported; one with an entry keeps what it had seen
     # that is still live, so a column that left the database is new again if it returns.
-    # In both cases a live column whose only annotation was a near-miss key the prune
-    # removed is not seen: the next check reports it as new and the next apply annotates
-    # it. The entries of tables the save removed are pruned. A hidden or unreadable
-    # table is not in the live schema, so its entry is not rewritten, and the prune
-    # keeps it because the saved model still holds the table. A column the policy hides
-    # is absent from the live columns too, but unlike a table it does leave the entry:
-    # once un-hidden, one the model stores an annotation for is not new (drift also
-    # checks the stored table), while one it never annotated is reported new and the
+    # The entries of tables the save removed are pruned. A hidden or unreadable table is
+    # not in the live schema, so its entry is not rewritten, and the prune keeps it
+    # because the saved model still holds the table. A column the policy hides is absent
+    # from the live columns too, so unlike a table it leaves the entry, unless the model
+    # stores it (below): once un-hidden, one it never annotated is reported new and the
     # next apply annotates it.
-    known = await semantic_store.load_known_columns(db, connection_id)
     wanted: dict[str, set[str]] = {}
     for key, names in _live_columns(schema, set(stored.tables)).items():
         live_names = set(names)
-        stored_columns = set(stored.tables[key].columns)
         kept = live_names & known[key] if key in known else live_names
-        # ``current_model`` still holds the keys the prune removed; ``compute_drift``'s rule
-        # names the live columns that were held only under one of them.
-        removed = {
-            col
-            for col in current_model.tables[key].columns
-            if col not in live_names and not policy_hides_column(key, col, privacy)
-        }
-        respelled = respelled_targets(removed, stored_columns, live_names, known.get(key, ()))
         # What the model stores it has seen, however the column got there (a hand-added
-        # annotation included): the baseline is a superset of the stored live columns.
-        wanted[key] = (kept - respelled) | (live_names & stored_columns)
+        # annotation, or a near-miss key renamed above, included), hidden columns under
+        # their real names (``_held_column_names``): the baseline is a superset of what
+        # the model stores.
+        wanted[key] = kept | _held_column_names(key, names, stored.tables[key].columns, privacy)
     await semantic_store.update_known_columns(
         db, connection_id, _baseline_changes(known, wanted), prune=True
     )

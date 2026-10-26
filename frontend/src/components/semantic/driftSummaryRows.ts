@@ -7,28 +7,43 @@
 import type { DriftApplySummary } from '@/types';
 
 type ColumnKey = 'columns_added' | 'columns_removed';
+type RenameKey = 'columns_renamed';
 type ListKey = Exclude<
   keyof DriftApplySummary,
-  'changed' | 'dry_run' | ColumnKey | 'tables_not_annotated' | 'column_tables_failed' | 'warnings'
+  | 'changed'
+  | 'dry_run'
+  | ColumnKey
+  | RenameKey
+  | 'tables_not_annotated'
+  | 'column_tables_failed'
+  | 'warnings'
 >;
+type Change = 'remove' | 'rename' | 'add';
 
-// Removals first: they are what the user cannot get back without a regenerate.
-const ROWS: { key: ListKey | ColumnKey; added: boolean; noun: string }[] = [
-  { key: 'tables_removed', added: false, noun: 'table' },
-  { key: 'columns_removed', added: false, noun: 'column' },
-  { key: 'metrics_removed', added: false, noun: 'metric' },
-  { key: 'joins_removed', added: false, noun: 'join' },
-  { key: 'derived_columns_removed', added: false, noun: 'derived column' },
-  { key: 'segments_removed', added: false, noun: 'segment' },
-  { key: 'relationships_removed', added: false, noun: 'relationship' },
-  { key: 'tables_added', added: true, noun: 'table' },
-  { key: 'columns_added', added: true, noun: 'column' },
-  { key: 'metrics_added', added: true, noun: 'metric' },
-  { key: 'joins_added', added: true, noun: 'join' },
-  { key: 'derived_columns_added', added: true, noun: 'derived column' },
-  { key: 'segments_added', added: true, noun: 'segment' },
-  { key: 'relationships_added', added: true, noun: 'relationship' },
+// Removals first: they are what the user cannot get back without a regenerate. Renames
+// next: they lose nothing, but change the names the model uses. Additions last.
+const ROWS: { key: ListKey | ColumnKey | RenameKey; change: Change; noun: string }[] = [
+  { key: 'tables_removed', change: 'remove', noun: 'table' },
+  { key: 'columns_removed', change: 'remove', noun: 'column' },
+  { key: 'metrics_removed', change: 'remove', noun: 'metric' },
+  { key: 'joins_removed', change: 'remove', noun: 'join' },
+  { key: 'derived_columns_removed', change: 'remove', noun: 'derived column' },
+  { key: 'segments_removed', change: 'remove', noun: 'segment' },
+  { key: 'relationships_removed', change: 'remove', noun: 'relationship' },
+  { key: 'columns_renamed', change: 'rename', noun: 'column' },
+  { key: 'tables_added', change: 'add', noun: 'table' },
+  { key: 'columns_added', change: 'add', noun: 'column' },
+  { key: 'metrics_added', change: 'add', noun: 'metric' },
+  { key: 'joins_added', change: 'add', noun: 'join' },
+  { key: 'derived_columns_added', change: 'add', noun: 'derived column' },
+  { key: 'segments_added', change: 'add', noun: 'segment' },
+  { key: 'relationships_added', change: 'add', noun: 'relationship' },
 ];
+
+const VERBS: Record<'preview' | 'applied', Record<Change, string>> = {
+  preview: { remove: 'Will remove', rename: 'Will rename', add: 'Will add' },
+  applied: { remove: 'Removed', rename: 'Renamed', add: 'Added' },
+};
 
 export const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
 
@@ -38,19 +53,26 @@ export interface SummaryRow {
   names: string[];
 }
 
-/** The non-empty categories of `summary`, removals first, labelled for display. */
+/**
+ * The non-empty categories of `summary`, removals first, labelled for display. A renamed
+ * column is named `table.old → new`.
+ */
 export function summaryRows(summary: DriftApplySummary): SummaryRow[] {
-  const [addVerb, removeVerb] = summary.dry_run
-    ? ['Will add', 'Will remove']
-    : ['Added', 'Removed'];
-  return ROWS.map(({ key, added, noun }) => {
-    const names =
-      key === 'columns_added' || key === 'columns_removed'
-        ? Object.entries(summary[key]).flatMap(([table, cols]) =>
-            cols.map((c) => `${table}.${c}`),
-          )
-        : summary[key];
-    return { key, label: `${added ? addVerb : removeVerb} ${plural(names.length, noun)}`, names };
+  const verbs = VERBS[summary.dry_run ? 'preview' : 'applied'];
+  return ROWS.map(({ key, change, noun }) => {
+    let names: string[];
+    if (key === 'columns_renamed') {
+      names = Object.entries(summary[key]).flatMap(([table, renames]) =>
+        Object.entries(renames).map(([old, live]) => `${table}.${old} → ${live}`),
+      );
+    } else if (key === 'columns_added' || key === 'columns_removed') {
+      names = Object.entries(summary[key]).flatMap(([table, cols]) =>
+        cols.map((c) => `${table}.${c}`),
+      );
+    } else {
+      names = summary[key];
+    }
+    return { key, label: `${verbs[change]} ${plural(names.length, noun)}`, names };
   }).filter((r) => r.names.length > 0);
 }
 

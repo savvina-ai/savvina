@@ -341,7 +341,7 @@ export interface DriftReport {
   schema_source: 'live' | 'cache';
   schema_cached_at: string | null;
   refresh_error: string | null;
-  /** True when a table or column was added or removed — what Apply Drift acts on. */
+  /** True when a table or column was added or removed, or a column renamed — what Apply Drift acts on. */
   has_actionable_changes: boolean;
 }
 
@@ -349,11 +349,11 @@ export interface DriftReport {
 export interface DriftApplySummary {
   /**
    * A preview: nothing was written. `tables_added` are the tables, and `columns_added`
-   * the new columns, the apply would send to the LLM. `relationships_added` includes the
-   * catalog edges, missing from the model, on the genuinely new columns (not respellings
-   * of a stored key) the apply would send, between tables the model already holds. A
-   * relationship to a new table, and the LLM's items over the new tables, appear only on
-   * apply.
+   * the new columns, the apply would send to the LLM, and `columns_renamed` the keys it
+   * would rename. `relationships_added` includes the catalog edges, missing from the
+   * model, on the new columns the apply would send, between tables the model already
+   * holds. A relationship to a new table, and the LLM's items over the new tables, appear
+   * only on apply.
    */
   dry_run: boolean;
   changed: boolean;
@@ -367,6 +367,13 @@ export interface DriftApplySummary {
   columns_added: Record<string, string[]>;
   /** Surviving table key → removed column names. */
   columns_removed: Record<string, string[]>;
+  /**
+   * Surviving table key → stored column key → the live column name it was renamed to: a
+   * near-miss spelling (quoted, or in another letter case) of a column the model had
+   * seen, renamed with its annotation, hand edits and references, with no LLM call. A
+   * renamed column is in neither `columns_added` nor `columns_removed`.
+   */
+  columns_renamed: Record<string, Record<string, string>>;
   metrics_added: string[];
   metrics_removed: string[];
   joins_added: string[];

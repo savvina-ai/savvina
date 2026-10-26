@@ -11,6 +11,7 @@ in ``chat_service`` has been replaced by ``SemanticModel.model_validate``.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum
 import json
 from typing import Annotated, Any, Literal
@@ -315,6 +316,23 @@ class RelationshipEdge(_Base):
     is_required: bool = False
     description: str | None = None
     entity_type: EntityType | None = None  # PRIMARY = PK/dim side, FOREIGN = FK/fact side
+
+
+def relationship_identity(
+    edge: Mapping[str, Any] | RelationshipEdge,
+) -> tuple[str, str, str, str]:
+    """A relationship's four endpoints, from an edge or its row-shaped dict."""
+    if isinstance(edge, Mapping):
+        return (edge["from_table"], edge["from_column"], edge["to_table"], edge["to_column"])
+    return (edge.from_table, edge.from_column, edge.to_table, edge.to_column)
+
+
+def relationship_key(edge: Mapping[str, Any] | RelationshipEdge) -> str:
+    """The provenance-map key for a relationship: its four endpoints, joined. Here, with
+    the edge, so pure code (the generator's ``rename_columns``) can key marks the way
+    ``store`` does without importing the store."""
+    from_table, from_column, to_table, to_column = relationship_identity(edge)
+    return f"{from_table}.{from_column}->{to_table}.{to_column}"
 
 
 # ── Discriminated union: BusinessMetric ────────────────────────────────────────

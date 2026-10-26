@@ -47,6 +47,7 @@ from .models import (
     TablesBatchResponse,
     TableSemantic,
     TimeGranularity,
+    relationship_key,
 )
 
 if TYPE_CHECKING:
@@ -321,9 +322,13 @@ _FISCAL_DIMENSION_PREFIXES: tuple[str, ...] = ("fiscal_", "budget_", "calendar_"
 def _warn_near_miss(kind: str, name: str, target: str | None, where: str) -> None:
     """Warn that a dropped stored ``name`` was a near-miss spelling of live ``target``.
 
-    No remap: a migrated row's user-edit marks are keyed by the old spelling, so a
+    No remap here: a migrated row's user-edit marks are keyed by the old spelling, so a
     remap would keep the value but silently lose the marks, and the next regenerate
-    would overwrite the edit anyway.
+    would overwrite the edit anyway. The saves that prune (``/apply-drift``,
+    ``/generate/globals``) first rename the column keys the drift renames
+    (``SchemaDrift.renamed_columns``), marks included (``rename_columns``), so a key
+    their prune drops is one the drift does not rename: a duplicate of a stored column,
+    say.
     """
     if target is None:
         return
@@ -416,10 +421,13 @@ def prune_to_schema(
     **Near-miss spellings are dropped, not remapped.** Rows backfilled from an old
     blob can carry an LLM spelling (``public.Orders``, ``"OrderID"``) that the
     generator later grounds to the real key. Such a row is dropped like any other
-    absent key — a remap would keep its value but lose its user-edit marks, which
+    absent key — a remap here would keep its value but lose its user-edit marks, which
     are keyed by the old spelling — and, when ``log``, a warning names the key it
     would have matched (``_resolve_real_key``'s rules). ``log=False`` is for a
-    second call over the same model, so the warnings are not duplicated.
+    second call over the same model, so the warnings are not duplicated. The saves that
+    prune (``/apply-drift``, ``/generate/globals``) first rename the column keys the
+    drift renames, marks included (``rename_columns``), so this sees such a column
+    under its real name and keeps it.
 
     ``default_filters`` are free SQL and are NOT rewritten: a filter naming a
     dropped column stays as written.
@@ -592,6 +600,126 @@ def drop_dangling_edits(
         if key in out_marks["table"] and not out_marks["table"][key]:
             del out_marks["table"][key]
     return out_marks, out_protected, notes
+
+
+def _renamed_table(table: TableSemantic, mapping: Mapping[str, str]) -> TableSemantic:
+    """``table`` with each column key of ``mapping`` renamed, its references included."""
+
+    def new(name: str) -> str:
+        return mapping.get(name, name)
+
+    timestamp, date = table.primary_timestamp_column, table.primary_date_column
+    return table.model_copy(
+        update={
+            "columns": {new(name): col for name, col in table.columns.items()},
+            "primary_timestamp_column": new(timestamp) if timestamp else timestamp,
+            "primary_date_column": new(date) if date else date,
+            "partition_columns": [new(c) for c in table.partition_columns],
+            "cluster_columns": [new(c) for c in table.cluster_columns],
+            "hierarchies": [
+                h.model_copy(update={"levels": [new(level) for level in h.levels]})
+                for h in table.hierarchies
+            ],
+        }
+    )
+
+
+def _renamed_reference(field: str, value: Any, mapping: Mapping[str, str]) -> Any:
+    """A table's protected reference ``field`` value with the columns of ``mapping``
+    renamed, in ``drop_dangling_edits``' shapes (a name, a list of names, or a list of
+    hierarchy dicts)."""
+    if field == "hierarchies":
+        return [
+            {**h, "levels": [mapping.get(level, level) for level in h.get("levels") or []]}
+            for h in value
+        ]
+    if isinstance(value, list):
+        return [mapping.get(c, c) for c in value]
+    return mapping.get(value, value)
+
+
+def rename_columns(
+    tables: Mapping[str, TableSemantic],
+    relationships: Sequence[RelationshipEdge],
+    marks: dict[str, dict[str, list[str]]],
+    protected: dict[str, dict[str, dict[str, Any]]],
+    renames: Mapping[str, Mapping[str, str]],
+) -> tuple[
+    dict[str, TableSemantic],
+    list[RelationshipEdge],
+    dict[str, dict[str, list[str]]],
+    dict[str, dict[str, dict[str, Any]]],
+]:
+    """``tables``, ``relationships``, ``marks`` and ``protected`` with each column key of
+    ``renames`` rekeyed to its new name.
+
+    ``renames`` is ``SchemaDrift.renamed_columns`` of a diff against ``tables``: table key
+    → old key → new name, where the old key is a column of that table and the new name
+    is not. A renamed column is the column the live schema has, stored under a stale
+    spelling, so everything that names it by key follows the rename, and it keeps its
+    annotation and its user edits:
+
+    - the ``ColumnSemantic`` moves to the new key (in place, so the column order holds);
+    - the table's ``primary_timestamp_column``, ``primary_date_column``,
+      ``partition_columns``, ``cluster_columns`` and each hierarchy's ``levels``;
+    - each relationship endpoint on that table, with the edge's marks moved to its new
+      ``relationship_key``. A renamed edge whose new key is one another edge already has
+      is a duplicate and is dropped with its marks: the edge stored under the real names
+      wins, as a column stored under its real name does;
+    - the column's marks and protected values (keyed ``"table.column"``), and a table's
+      protected values for the reference fields above (its marks name fields, not
+      columns, and stay as they are).
+
+    Free SQL (``default_filters``, metric, segment and derived-column expressions, join
+    patterns, a relationship's ``join_sql``) is not rewritten, as ``prune_to_schema`` does
+    not rewrite it either. Nor are a metric's ``non_additive_dimension`` and ``entity``:
+    they name a column without its table, so a rename cannot be scoped to them.
+
+    Runs before ``drop_dangling_edits`` and ``prune_to_schema``, so both see a renamed
+    column under its live name and leave it alone. Pure: the returned containers are new
+    and the inputs are never mutated; a table with no rename and an edge with no renamed
+    endpoint are the input's objects.
+    """
+    out_tables = dict(tables)
+    out_marks = {kind: {k: list(v) for k, v in entries.items()} for kind, entries in marks.items()}
+    out_protected = {
+        kind: {k: dict(v) for k, v in entries.items()} for kind, entries in protected.items()
+    }
+    for key, mapping in renames.items():
+        out_tables[key] = _renamed_table(tables[key], mapping)
+        for old, new in mapping.items():
+            for entries in (out_marks.get("column"), out_protected.get("column")):
+                if entries is not None and f"{key}.{old}" in entries:
+                    entries[f"{key}.{new}"] = entries.pop(f"{key}.{old}")
+        values = out_protected.get("table", {}).get(key, {})
+        for field in _TABLE_REFERENCE_FIELDS:
+            if value := values.get(field):
+                values[field] = _renamed_reference(field, value, mapping)
+
+    def end(table: str, column: str) -> str:
+        return renames.get(table, {}).get(column, column)
+
+    held = {relationship_key(e) for e in relationships}
+    out_relationships: list[RelationshipEdge] = []
+    for edge in relationships:
+        moved = edge.model_copy(
+            update={
+                "from_column": end(edge.from_table, edge.from_column),
+                "to_column": end(edge.to_table, edge.to_column),
+            }
+        )
+        if moved == edge:
+            out_relationships.append(edge)
+            continue
+        old_key, new_key = relationship_key(edge), relationship_key(moved)
+        edge_marks = out_marks.get("relationship", {}).pop(old_key, None)
+        if new_key in held:
+            continue
+        held.add(new_key)
+        if edge_marks is not None:
+            out_marks["relationship"][new_key] = edge_marks
+        out_relationships.append(moved)
+    return out_tables, out_relationships, out_marks, out_protected
 
 
 class SemanticModelGenerator:
@@ -1824,16 +1952,16 @@ class SemanticModelGenerator:
         otherwise it is computed here without a baseline, so no column is reported added
         and no removed key counts as a drop.
 
-        Each removed column key is worded by what the apply does to it. A key in the
-        diff's ``dropped_columns`` (the baseline knew it as a live column) no longer
-        exists, whatever it resembles, and is named verbatim: it is a real column name.
-        Any other is resolved against the table's live columns with ``resolve_real_key``
-        (the rule ``compute_drift`` uses): a near-miss spelling of a column in
-        ``respelled_columns`` is a respelling (the apply removes the key and annotates
-        the column afresh), so that column is not also listed as new; a near-miss
-        spelling of a column the model also stores is a duplicate the apply removes;
-        any other key no longer exists, named quote-stripped unless the stripped name is
-        still a live column.
+        Each removed or renamed column key is worded by what the apply does to it. A key
+        in the diff's ``renamed_columns`` is a near-miss spelling the apply renames to its
+        live column, keeping its annotation; that column is not listed as new. A key in
+        ``dropped_columns`` (the baseline knew it as a live column) no longer exists,
+        whatever it resembles, and is named verbatim: it is a real column name. Any other
+        is resolved against the table's live columns with ``resolve_real_key`` (the rule
+        ``compute_drift`` uses): a near-miss spelling of a column the model also stores,
+        or of one another key is renamed to, is a duplicate the apply removes; any other
+        key no longer exists, named quote-stripped unless the stripped name is still a
+        live column.
 
         With ``privacy``, a stored table or column the policy hides is not reported
         as removed: the store keeps hidden annotations, and ``current_schema`` (with
@@ -1859,11 +1987,10 @@ class SemanticModelGenerator:
                 )
                 continue
             live = live_columns.get(tbl_key, [])
-            respelled = drift.respelled_columns.get(tbl_key, set())
+            renamed = drift.renamed_columns.get(tbl_key, {})
             dropped = drift.dropped_columns.get(tbl_key, set())
             missing: set[str] = set()
             duplicates: dict[str, str] = {}
-            respellings: dict[str, str] = {}
             for col in drift.removed_columns.get(tbl_key, ()):
                 if col in dropped:
                     # A key the baseline knew is a real column the database dropped: not a
@@ -1872,9 +1999,7 @@ class SemanticModelGenerator:
                     missing.add(col)
                     continue
                 target = resolve_real_key(col, live, bare_ok=False)
-                if target is not None and target in respelled:
-                    respellings[col] = target
-                elif target is not None and target in table.columns:
+                if target is not None and (target in table.columns or target in renamed.values()):
                     duplicates[col] = target
                 else:
                     # Only for a key that is not a known drop (a dropped key is a real name,
@@ -1891,18 +2016,18 @@ class SemanticModelGenerator:
                 )
             # Near-miss keys (quoted, or differing only in letter case) are named under
             # their stored spelling: the duplicate's twin keeps its own annotation; a
-            # respelling loses its annotation to a fresh one.
+            # renamed key carries its annotation to its live name.
             for col in sorted(duplicates):
                 warnings.append(
                     f'Column key "{tbl_key}.{col}" in the semantic model is a near-miss '
                     f'spelling of "{duplicates[col]}"; Apply Drift removes the duplicate'
                 )
-            for col in sorted(respellings):
-                target = respellings[col]
+            for col in sorted(renamed):
+                target = renamed[col]
                 warnings.append(
                     f'Column key "{tbl_key}.{col}" in the semantic model is a near-miss '
-                    f'spelling of "{target}"; Apply Drift removes the key and annotates '
-                    f'"{target}" afresh (the key\'s annotation is not kept)'
+                    f'spelling of "{target}"; Apply Drift renames it to "{target}", keeping '
+                    "its annotation"
                 )
 
         if drift.unreadable_table_keys:
@@ -1924,7 +2049,7 @@ class SemanticModelGenerator:
         new_columns = [
             f"{tbl}.{col}"
             for tbl in sorted(drift.added_columns)
-            for col in sorted(drift.added_columns[tbl] - drift.respelled_columns.get(tbl, set()))
+            for col in sorted(drift.added_columns[tbl])
         ]
         if new_columns:
             sample = ", ".join(new_columns[:5]) + (", …" if len(new_columns) > 5 else "")
