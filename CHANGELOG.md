@@ -2,6 +2,192 @@
 
 <!-- version list -->
 
+## v2.2.0 (2026-10-26)
+
+### Bug Fixes
+
+- **api**: Stop serving the never-updated semantic_model_updated_at on connections and drop it from
+  the client types ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **backend**: Answer 503 when an LLM provider is unavailable or a row-lock wait passes
+  DB_LOCK_TIMEOUT_SECONDS, and retry both on the semantic page
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **deps**: Fastembed 0.9.1 and pillow 13.0.0 clear the 37 pillow advisories that failed the
+  dependency audit ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **frontend**: Bump vite to 8.3.5 and follow-redirects to 1.16.2 so the dependency audit passes
+  again ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **privacy**: Strip excluded columns and their foreign keys in _apply_privacy_to_schema so chat
+  validation and pruning never see a stale hidden column, and drop the chat filter's private copy of
+  that rule ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **providers**: Cerebras default becomes gpt-oss-120b and a 404 for an unknown model, like every
+  API error in a health check, is worded for the user instead of dumping the SDK exception
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Apply Drift and Regenerate rename a near-miss column key to its live name instead of
+  re-annotating it ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Bound indexed Text identities by bytes so a long join pattern cannot fail a save or
+  the backfill, and drop unstorable generated items through the store's own rule
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Check Drift completes an older baseline with stored hidden names so un-hiding a
+  column renames its key, a near-miss key of an unseen column is worded as one, and one builder and
+  one reference mapper replace the duplicated baseline and reference-field code
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Close the three 2026-10-15 review passes on the semantic store, generation and LLM
+  error mapping ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Fit history entity keys to their column so a 512-character table key plus column
+  name cannot fail a reconcile or PUT ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Keep generated tables when finishing an interrupted run, and stamp the schema hash
+  on regenerate ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Keep tables the connection's role cannot read instead of pruning them as dropped
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Make /generate/batch send a run-less tables_partial header back to /generate/init
+  instead of stamping tables with no run id ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Make the table-field writer private so every content write goes through the header
+  version bump, tighten the protected-values guard, and correct the privacy docs
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Steer schema-changed errors to Regenerate, keep privacy-hidden items out of drift
+  and generation prompts, and skip soft-deleted connections in the backfill
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Treat a bare table name the privacy policy excludes as hidden, not drift
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic-ui**: Make the regenerate dialog describe batched generation accurately
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic-ui**: One generation mutation keyed per connection, runs blocked while edits are
+  unsaved, editors paused during a run or apply, a fresh reseed after a failed run, and one retry of
+  tables a batch omitted ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+### Documentation
+
+- **security**: Match the disclosure terms savvina-prod and the trust center publish
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Describe the normalised semantic store, resumable generation and how hand edits and
+  privacy-hidden items are kept ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+### Features
+
+- **build**: Add optional CA_BUNDLE secret so the model download works behind a TLS-inspecting proxy
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Add generation run state and a reconcile that preserves hand edits to the semantic
+  store ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Add key-addressed table generation grounded in the batch's real schema, plus the
+  batch request and response schemas ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Add migration 0002 creating the normalised semantic tables, with a test that checks
+  it against the ORM ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Add migration 0003 that backfills the normalised semantic tables from each
+  connection's JSON blob ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Add ORM rows for the normalised semantic store and an in-memory SQLite test fixture
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Add the semantic store's save, load and delete over the normalised tables, fitting
+  values to PostgreSQL column limits ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Apply Drift annotates columns added to tables the model already holds
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Apply Drift syncs the stored semantic model to schema drift without a full
+  regenerate ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Apply user edits through the semantic store with per-field provenance, an audit
+  trail and optimistic locking ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Check Drift compares against a live introspection, falls back to the user's cached
+  schema when the source cannot be reached, and Schema Refresh shares the same refresh helper
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Keep hand-edited fields and relationships through a full rebuild of the semantic
+  store ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Make phased generation resumable and key-addressed on the semantic store, pruning
+  tables and columns that left the schema but keeping what the privacy policy hides
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Read the chat path's semantic model from the store, keep privacy-hidden columns out
+  of prompts, and stop reading the legacy blob
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Serve read, update, delete, drift and suggestion apply from the semantic store
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic-ui**: Key-addressed generation with a Resume/Finish/Restart banner, confirmed restart,
+  and Save locked during runs and kept off stale drafts after failures
+  ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+### Performance Improvements
+
+- **chat**: Serve the semantic model from a per-process cache keyed on the header version, and bump
+  that version on every content write ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+- **semantic**: Read provenance marks and protected values in one pass under the globals lock
+  instead of scanning every row twice ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+### Refactoring
+
+- **semantic**: Clear the legacy blob inside store.delete_model so both delete routes stop carrying
+  their own copy of it ([#21](https://github.com/savvina-ai/savvina/pull/21),
+  [`8bfe55d`](https://github.com/savvina-ai/savvina/commit/8bfe55d31310f9b6042c1d7af42c5b1e615988b8))
+
+
 ## v2.1.2 (2026-10-08)
 
 ### Bug Fixes
