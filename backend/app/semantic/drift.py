@@ -11,7 +11,7 @@ cannot read — as information, not as a change.)
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -81,10 +81,59 @@ def strip_ident_quotes(name: str) -> str:
     are stripped from around each dotted part and never from inside one, so a real
     name that contains a quote (``o'brien_flag``) is kept as it is. The one
     normaliser: ``SemanticModelGenerator._strip_quotes`` delegates here, so the drift
-    check, the generator's near-miss remap (and the prune's near-miss warning) and
-    ``names_any_table`` read a name alike.
+    check, ``resolve_real_key`` (the generator's near-miss remap and the prune's
+    near-miss warning) and ``names_any_table`` read a name alike.
     """
     return ".".join(part.strip().strip(_IDENT_QUOTES) for part in name.strip().split("."))
+
+
+def resolve_real_key(name: str, real_keys: list[str], *, bare_ok: bool) -> str | None:
+    """Map a near-miss ``name`` onto exactly one entry of ``real_keys``, else ``None``.
+
+    Tried in order, the first rule that matches anything decides (ambiguity at that
+    rule means ``None``): quote-stripped exact match, case-insensitive match, and —
+    when ``bare_ok`` and the name has no dot — a case-insensitive match against the
+    part after the last dot of each real key (a bare table name).
+
+    The one resolver: ``SemanticModelGenerator._resolve_real_key`` delegates here, so
+    the generator's near-miss remap, the prune's near-miss warning, ``names_any_table``
+    and the drift check's respelled columns (``compute_drift``) match a name alike.
+    Table names resolve with ``bare_ok``, column names without.
+    """
+    stripped = strip_ident_quotes(name)
+    if stripped in real_keys:
+        return stripped
+    lowered = stripped.lower()
+    matches = [k for k in real_keys if k.lower() == lowered]
+    if not matches and bare_ok and "." not in stripped:
+        matches = [k for k in real_keys if k.rsplit(".", 1)[-1].lower() == lowered]
+    return matches[0] if len(matches) == 1 else None
+
+
+def respelled_targets(
+    gone: Collection[str],
+    stored_columns: Collection[str],
+    live_columns: Collection[str],
+    seen: Collection[str],
+) -> set[str]:
+    """The live columns held only under a near-miss key in *gone*, a removed key of the
+    table: the columns whose sole annotation the prune drops.
+
+    A key resolves (``resolve_real_key``, against every live column, so an ambiguous
+    spelling names nothing) to a live column the table does not store under its real
+    name (*stored_columns*). A removed key in *seen*, the table's baseline, was a live
+    column once (the baseline only records live names), so the database dropped it: it
+    is not a respelling. The one rule behind ``compute_drift``'s ``respelled_columns``
+    and the finalisation's baseline write.
+    """
+    live_sorted = sorted(live_columns)
+    return {
+        target
+        for col in gone
+        if col not in seen
+        and (target := resolve_real_key(col, live_sorted, bare_ok=False)) is not None
+        and target not in stored_columns
+    }
 
 
 @dataclass
@@ -95,9 +144,45 @@ class SchemaDrift:
     **verbatim** — a key stored as ``"status"`` stays ``"status"`` — so each entry
     names the stored row exactly. The membership rule is ``_prune_table``'s: a key is
     present on an exact match with a live column or when the policy hides it, so a
-    quoted spelling of a live column is reported (and removed) as the duplicate it is.
+    near-miss spelling of a live column (quoted, or differing only in letter case) is
+    reported (and removed) verbatim.
     ``detect_drift`` words each entry for display. The apply removes columns through
     ``prune_to_schema``, not through this map.
+
+    ``added_columns`` maps a table key present in both the live schema and the stored
+    model to the live column names that are in neither the stored table nor the
+    ``known_columns`` baseline (the live columns the model has already seen: one the LLM
+    omitted or the user deleted is known, so it is not new), plus the exception below
+    for a column held only under a near-miss spelling. A table with no baseline entry
+    reports none: nothing says what it has seen. A live column the policy hides is
+    never reported (the schema the routes pass is already filtered; the check does not
+    rely on it).
+
+    The exception: a live column the model holds only under a near-miss spelling the
+    apply removes (``'"status"'`` or ``Status`` with no ``status`` stored; the spelling
+    must match that one live column by ``resolve_real_key``, which is quote stripping,
+    then letter case, and never an ambiguous match) is new again, so the apply
+    re-annotates it instead of dropping its only annotation. Several such keys
+    resolving to one column are one added name. A removed key the baseline knows was
+    itself a live column (every baseline writer records live names), so its removal is
+    a genuine drop, not a respelling: a database that had ``Status`` and ``status`` and
+    loses ``Status`` does not make ``status`` new. The columns of a new table are not
+    here: the whole table is new.
+
+    ``respelled_columns`` is the subset of ``added_columns`` that is there only by that
+    exception, per table (a table with none has no entry), so ``detect_drift`` can word
+    the near-miss key and its column as one respelling instead of a drop and a new
+    column. A column that is also new by the baseline rule (the baseline never saw it:
+    the database renamed ``Status`` to ``status``) is genuinely new, not respelled, and
+    its near-miss key is just a removal. It adds nothing to ``is_empty``: every entry is
+    in ``added_columns`` already.
+
+    ``dropped_columns`` is the subset of ``removed_columns`` the table's baseline entry
+    contains, per table (only a table with a baseline entry can have one; a table with
+    none has no entry). A removed key the baseline knows was a live column (every
+    baseline writer records live names), so its removal is a genuine drop, and
+    ``detect_drift`` words it as one even when it resembles a column still stored. It
+    adds nothing to ``is_empty``: every entry is in ``removed_columns`` already.
 
     ``unreadable_table_keys`` are stored tables the live schema lists in
     ``unreadable_tables``: they exist, but the connection's role cannot read them.
@@ -108,18 +193,27 @@ class SchemaDrift:
     new_table_keys: set[str] = field(default_factory=set)
     removed_table_keys: set[str] = field(default_factory=set)
     removed_columns: dict[str, set[str]] = field(default_factory=dict)
+    added_columns: dict[str, set[str]] = field(default_factory=dict)
+    respelled_columns: dict[str, set[str]] = field(default_factory=dict)
+    dropped_columns: dict[str, set[str]] = field(default_factory=dict)
     unreadable_table_keys: set[str] = field(default_factory=set)
 
     @property
     def is_empty(self) -> bool:
         """Whether there is nothing for apply-drift to do."""
-        return not (self.new_table_keys or self.removed_table_keys or self.removed_columns)
+        return not (
+            self.new_table_keys
+            or self.removed_table_keys
+            or self.removed_columns
+            or self.added_columns
+        )
 
 
 def compute_drift(
     schema: DataSourceSchema,
     stored_model: SemanticModel,
     privacy: PrivacySettings | None = None,
+    known_columns: Mapping[str, Collection[str]] | None = None,
 ) -> SchemaDrift:
     """Diff *schema* (the live, privacy-filtered introspection) against *stored_model*.
 
@@ -133,11 +227,19 @@ def compute_drift(
     **Nor is one the role cannot read** — see ``SchemaDrift.unreadable_table_keys``.
     ``unreadable_tables`` never overlaps ``schema.tables`` (the adapter lists exactly
     the relations it could not read), so such a table is never *new* either.
+
+    ``known_columns`` is the store's baseline (``store.load_known_columns``, passed
+    through ``_effective_known_columns`` so a legacy table is baselined): it decides
+    which live columns are *new* (``SchemaDrift.added_columns``, and of those the
+    ``respelled_columns``) and which removed keys are genuine drops
+    (``dropped_columns``); nothing else reads it. ``None`` tracks nothing, so no column
+    is reported added and no removed key dropped.
     """
     live_tables = {table_key(t): t for t in schema.tables}
     live_keys = set(live_tables)
     stored_keys = set(stored_model.tables)
     unreadable = set(schema.unreadable_tables)
+    known = known_columns or {}
 
     removed_table_keys: set[str] = set()
     unreadable_table_keys: set[str] = set()
@@ -150,34 +252,70 @@ def compute_drift(
         removed_table_keys.add(key)
 
     removed_columns: dict[str, set[str]] = {}
+    added_columns: dict[str, set[str]] = {}
+    respelled_columns: dict[str, set[str]] = {}
+    dropped_columns: dict[str, set[str]] = {}
     for key in stored_keys & live_keys:
         live_cols = {c.name for c in live_tables[key].columns}
+        stored_cols = set(stored_model.tables[key].columns)
         gone = {
             col
-            for col in stored_model.tables[key].columns
+            for col in stored_cols
             # ``_prune_table.kept``'s rule, so the apply drops nothing the check did not
             # name: present on an exact match (a real name may contain a quote character)
-            # or when the policy hides it. A quoted spelling of a live column
-            # (``'"status"'`` beside ``status``) is a blob-era duplicate key: reported,
-            # verbatim, and removed by the apply.
+            # or when the policy hides it. A near-miss spelling of a live column
+            # (``'"status"'``, a blob-era key, or ``Status``) is reported, verbatim, and
+            # removed by the apply; below, the baseline decides whether that removal is a
+            # drop and whether its target is new again.
             if col not in live_cols and not policy_hides_column(key, col, privacy)
         }
         if gone:
             removed_columns[key] = gone
+        # Only a table the baseline tracks can have new or dropped columns: without an
+        # entry there is no telling a column the model never saw from one it chose not
+        # to hold, or a dropped column from a near-miss key.
+        seen = known.get(key)
+        if seen is not None:
+            seen_set = set(seen)
+            # A removed key the baseline knows was a real column the database dropped.
+            if dropped := gone & seen_set:
+                dropped_columns[key] = dropped
+            # A live column held only under a near-miss spelling the apply removes loses
+            # its sole annotation, so it counts as new even though the baseline holds it
+            # (``respelled_targets``). A removed key the baseline holds makes nothing new
+            # here: its near-miss twin is new only if the baseline never saw it
+            # (``unseen`` below) or another near-miss key the baseline does not know
+            # respells it.
+            respelled = respelled_targets(gone, stored_cols, live_cols, seen_set)
+            unseen = live_cols - stored_cols - seen_set
+            fresh = {
+                col for col in unseen | respelled if not policy_hides_column(key, col, privacy)
+            }
+            if fresh:
+                added_columns[key] = fresh
+            # Added only as a respelling: one the baseline never saw is new in its own
+            # right, whatever near-miss key the model also held.
+            if only_respelled := fresh - unseen:
+                respelled_columns[key] = only_respelled
 
     return SchemaDrift(
         new_table_keys=live_keys - stored_keys,
         removed_table_keys=removed_table_keys,
         removed_columns=removed_columns,
+        added_columns=added_columns,
+        respelled_columns=respelled_columns,
+        dropped_columns=dropped_columns,
         unreadable_table_keys=unreadable_table_keys,
     )
 
 
-# The lists whose non-emptiness means the model changed. ``warnings`` and
-# ``tables_not_annotated`` describe the apply, not a change to the model.
+# The lists whose non-emptiness means the model changed. ``warnings``,
+# ``tables_not_annotated`` and ``column_tables_failed`` describe the apply, not a change
+# to the model.
 _STRUCTURAL_FIELDS = (
     "tables_added",
     "tables_removed",
+    "columns_added",
     "columns_removed",
     "metrics_added",
     "metrics_removed",
@@ -197,25 +335,41 @@ class DriftApplySummary(BaseModel):
     is also logged as a ``drift_apply`` history row (``store.record_drift_apply``).
 
     Every list is sorted. ``changed`` is computed from the structural lists (not from
-    ``warnings`` or ``tables_not_annotated``), so a summary with ``changed: false`` can
-    still carry skipped tables and warnings. ``columns_removed`` lists only tables that survived (a
-    removed table's columns go with it) and its names are quote-stripped for
-    display, except a stripped name that is still a column of the table, which keeps
-    its stored spelling. Relationships are labelled ``from_table.from_column → to_table.to_column``.
+    ``warnings``, ``tables_not_annotated`` or ``column_tables_failed``), so a summary
+    with ``changed: false`` can still carry skipped tables and warnings.
+    ``columns_removed`` lists only tables that survived (a removed table's columns go
+    with it) and its names are quote-stripped for display, except a stripped name that
+    is still a column of the table, which keeps its stored spelling.
+    ``columns_added`` lists only tables that exist before and after, like
+    ``columns_removed``, under the names the model stores them by (live names, so
+    never quote-stripped): a blob-era ``"status"`` key swapped for the bare ``status``
+    column is listed in both, as the stored spelling and the live one.
+    Relationships are labelled ``from_table.from_column → to_table.to_column``.
     ``tables_not_annotated`` are new tables the LLM returned nothing for: they are
     still missing from the model, and the next drift check reports them again.
+    ``column_tables_failed`` is to ``columns_added`` what ``tables_not_annotated`` is to
+    ``tables_added``: the retry-order note naming the tables whose new columns the apply
+    did not get (the field's comment says which). One difference: columns the LLM
+    answered for a table but omitted are recorded as seen (``update_known_columns``) and
+    warned about, not retried.
     ``warnings`` are, on a real apply, the model's ``generation_warnings`` from it;
-    on a preview, ``drop_dangling_edits``' notes on the hand edits it would trim and,
-    past ``_DRIFT_MAX_NEW_TABLES``, the warning naming the new tables it would defer.
+    on a preview, ``drop_dangling_edits``' notes on the hand edits it would trim and the
+    warnings naming the new tables and columns it would defer or cut.
     """
 
     # A preview (``apply-drift?dry_run=true``): nothing was written. ``tables_added``
-    # are the tables the apply would send to the LLM; relationships to them and the
-    # LLM's items over them appear only on apply, and ``warnings`` are the hand-edit
-    # notes and, past ``_DRIFT_MAX_NEW_TABLES``, the deferred-tables warning.
+    # are the tables, and ``columns_added`` the new columns, the apply would send to the
+    # LLM. Relationships appear for the new columns, between held tables: the catalog
+    # edges, missing from the model, on the genuinely new columns (not respellings) the
+    # apply would send. A relationship to a new table, and the LLM's items over the new
+    # tables, appear only on apply. ``warnings`` are the hand-edit notes and the
+    # warnings naming the new tables and columns the apply would defer or cut.
     dry_run: bool = False
     tables_added: list[str] = Field(default_factory=list)
     tables_removed: list[str] = Field(default_factory=list)
+    # Surviving table key → the columns the apply added to it (a new table is named in
+    # ``tables_added`` instead; its columns are not listed).
+    columns_added: dict[str, list[str]] = Field(default_factory=dict)
     columns_removed: dict[str, list[str]] = Field(default_factory=dict)
     metrics_added: list[str] = Field(default_factory=list)
     metrics_removed: list[str] = Field(default_factory=list)
@@ -228,6 +382,12 @@ class DriftApplySummary(BaseModel):
     relationships_added: list[str] = Field(default_factory=list)
     relationships_removed: list[str] = Field(default_factory=list)
     tables_not_annotated: list[str] = Field(default_factory=list)
+    # Tables whose new columns this apply did not get: their batch failed (an error or a
+    # timeout) or returned nothing for them, or an earlier apply's mark was kept because
+    # this one did not reach them. They still lack those columns, the next drift check
+    # reports them again, and the next apply sends them last
+    # (``_column_tables_in_send_order``).
+    column_tables_failed: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
     @computed_field  # type: ignore[prop-decorator]
@@ -258,6 +418,7 @@ def summarize_model_change(
     after: SemanticModel,
     *,
     tables_not_annotated: Sequence[str] = (),
+    column_tables_failed: Sequence[str] = (),
     warnings: Sequence[str] = (),
     removed_items: Mapping[str, Iterable[str]] | None = None,
 ) -> DriftApplySummary:
@@ -276,10 +437,15 @@ def summarize_model_change(
     """
     taken_out = removed_items or {}
     tables_added, tables_removed = _added_removed(before.tables, after.tables)
+    columns_added: dict[str, list[str]] = {}
     columns_removed: dict[str, list[str]] = {}
     for key in sorted(set(before.tables) & set(after.tables)):
+        stored = set(before.tables[key].columns)
         live = set(after.tables[key].columns)
-        gone = set(before.tables[key].columns) - live
+        fresh = live - stored
+        if fresh:
+            columns_added[key] = sorted(fresh)
+        gone = stored - live
         if gone:
             # Quote-stripped for display, unless that is the name of a column that
             # survives (a blob-era ``"id"`` key dropped beside ``id``): then the stored
@@ -314,6 +480,7 @@ def summarize_model_change(
     summary = DriftApplySummary(
         tables_added=tables_added,
         tables_removed=tables_removed,
+        columns_added=columns_added,
         columns_removed=columns_removed,
         metrics_added=metrics_added,
         metrics_removed=metrics_removed,
@@ -326,6 +493,7 @@ def summarize_model_change(
         relationships_added=rels_added,
         relationships_removed=rels_removed,
         tables_not_annotated=sorted(tables_not_annotated),
+        column_tables_failed=sorted(column_tables_failed),
         warnings=list(warnings),
     )
     return summary

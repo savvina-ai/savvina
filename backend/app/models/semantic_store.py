@@ -15,7 +15,18 @@ from datetime import UTC, datetime
 from typing import Any
 import uuid
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    PrimaryKeyConstraint,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -89,6 +100,30 @@ class SemanticModelRow(_Provenanced, Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now
     )
+
+
+class SemanticKnownColumnsRow(Base):
+    """The live column names the model has seen for one table (``store.update_known_columns``).
+
+    Not ``_Provenanced`` and not part of ``SemanticModel``: bookkeeping that never bumps
+    a version, never writes history and is never rebuilt by ``save_model`` (which
+    rebuilds table and column rows). A table with no row has no baseline yet. Rows of a
+    table the model no longer holds are removed by ``update_known_columns(prune=True)``.
+    """
+
+    __tablename__ = "semantic_known_columns"
+    __table_args__ = (
+        PrimaryKeyConstraint("connection_id", "table_key"),
+        Index("ix_semantic_known_columns_model", "model_id"),
+    )
+
+    model_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("semantic_models.id", ondelete="CASCADE"), nullable=False
+    )
+    connection_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    table_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Sorted column names, replaced whole per table (bounded by the table's width).
+    columns: Mapped[list[str]] = mapped_column(_JSON, nullable=False, default=list)
 
 
 class SemanticTableRow(_Provenanced, Base):

@@ -23,6 +23,7 @@ from app.models.semantic_store import (
     SemanticColumnRow,
     SemanticGlobalItemRow,
     SemanticHistoryRow,
+    SemanticKnownColumnsRow,
     SemanticMetricRow,
     SemanticModelRow,
     SemanticRelationshipRow,
@@ -39,6 +40,7 @@ _TABLES = (
     SemanticRelationshipRow,
     SemanticGlobalItemRow,
     SemanticHistoryRow,
+    SemanticKnownColumnsRow,
     SemanticSuggestion,
 )
 

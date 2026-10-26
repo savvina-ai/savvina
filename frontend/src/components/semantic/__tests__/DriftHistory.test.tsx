@@ -12,6 +12,7 @@ const EMPTY: DriftApplySummary = {
   changed: false,
   tables_added: [],
   tables_removed: [],
+  columns_added: {},
   columns_removed: {},
   metrics_added: [],
   metrics_removed: [],
@@ -24,6 +25,7 @@ const EMPTY: DriftApplySummary = {
   relationships_added: [],
   relationships_removed: [],
   tables_not_annotated: [],
+  column_tables_failed: [],
   warnings: [],
 };
 

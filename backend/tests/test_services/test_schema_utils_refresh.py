@@ -118,6 +118,18 @@ class TestRefreshUserSchemaCache:
         assert db.execute.await_count == 3  # lookup + table embeddings + query cache
         assert cache.schema_hash == SemanticModelGenerator().compute_schema_hash(_schema())
 
+    async def test_the_flush_deletes_the_embeddings_before_the_cached_answers(self) -> None:
+        """The order ``_invalidate_connection_caches`` deletes in too: two transactions
+        that lock the same rows in opposite orders can deadlock."""
+        cache = MagicMock()
+        cache.schema_hash = "stale"
+        db = _db(cache)
+
+        await _refresh(db, _adapter())
+
+        deleted = [call.args[0].table.name for call in db.execute.await_args_list[1:]]
+        assert deleted == ["table_embedding_cache", "query_cache"]
+
     async def test_a_first_refresh_creates_the_cache_and_flushes(self) -> None:
         db = _db(None)
 

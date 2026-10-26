@@ -71,7 +71,10 @@ export default function DriftSummaryPanel({
   const applied = !preview && rows.length > 0;
   const description = summaryDescription(summary);
   // Unchanged and nothing skipped: the model already matches the live schema.
-  const nothingToApply = !summary.changed && summary.tables_not_annotated.length === 0;
+  const nothingToApply =
+    !summary.changed &&
+    summary.tables_not_annotated.length === 0 &&
+    summary.column_tables_failed.length === 0;
   return (
     <div
       ref={panelRef}
@@ -145,6 +148,17 @@ export default function DriftSummaryPanel({
           New tables are annotated by the LLM when you apply. Relationships to them, and the
           metrics, joins and other items the LLM writes over them, appear only then and are
           not listed here.
+        </p>
+      )}
+
+      {/* A new column's annotation is the LLM's too. The catalog edges on a genuinely new
+          column (not a respelling) are listed, but only between tables the model already
+          holds: an edge to a new table appears only on apply. */}
+      {preview && Object.keys(summary.columns_added).length > 0 && (
+        <p className="mt-2 text-xs text-muted-foreground">
+          New columns are annotated by the LLM when you apply. The preview lists the
+          relationships the database catalog adds on them between tables the model already
+          holds.
         </p>
       )}
 

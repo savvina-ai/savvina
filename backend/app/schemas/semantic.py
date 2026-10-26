@@ -56,7 +56,7 @@ class DriftReport(BaseModel):
     schema_source: Literal["live", "cache"] = "live"
     schema_cached_at: str | None = None
     refresh_error: str | None = None
-    # True when a table was added or removed, or a column removed — what
+    # True when a table was added or removed, or a column added or removed — what
     # ``POST .../semantic/apply-drift`` acts on.
     # An unreadable table or a metric naming a missing table is reported in ``warnings``
     # but is not actionable: apply-drift returns the model unchanged for those alone.

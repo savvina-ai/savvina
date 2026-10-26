@@ -6,7 +6,7 @@
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import event, func, select, update
 from sqlalchemy.dialects import postgresql
 
 from app.database import Base
@@ -16,6 +16,7 @@ from app.models.semantic_store import (
     SemanticColumnRow,
     SemanticGlobalItemRow,
     SemanticHistoryRow,
+    SemanticKnownColumnsRow,
     SemanticMetricRow,
     SemanticModelRow,
     SemanticRelationshipRow,
@@ -146,6 +147,38 @@ class TestMigrationMatchesOrm:
             assert not idx_diff, f"{table_name}: index mismatch {idx_diff}"
             orm_index_names |= orm_indexes.keys()
         assert set(indexes) == orm_index_names
+
+    def test_0004_creates_the_known_columns_table_the_orm_declares(self) -> None:
+        tables: dict[str, dict[str, tuple]] = {}
+        indexes: dict[str, tuple] = {}
+
+        def fake_create_table(name, *columns, **_kw):
+            tables[name] = {c.name: _column_shape(c) for c in columns}
+
+        def fake_create_index(name, table, columns, unique=False, **kw):
+            indexes[name] = _index_shape(table, columns, unique, kw.get("postgresql_where"))
+
+        module = load_migration("0004_semantic_known_columns.py")
+        with (
+            patch("alembic.op.create_table", fake_create_table),
+            patch("alembic.op.create_index", fake_create_index),
+        ):
+            module.upgrade()
+
+        assert set(tables) == {"semantic_known_columns"}
+        orm_table = Base.metadata.tables["semantic_known_columns"]
+        assert tables["semantic_known_columns"] == {
+            c.name: _column_shape(c) for c in orm_table.columns
+        }
+        assert indexes == {
+            i.name: _index_shape(
+                "semantic_known_columns",
+                (c.name for c in i.columns),
+                i.unique,
+                i.dialect_options["postgresql"]["where"],
+            )
+            for i in orm_table.indexes
+        }
 
 
 def _rich_model() -> SemanticModel:
@@ -2966,3 +2999,224 @@ class TestDriftApplyLog:
             await semantic_db.commit()
         page = await store.list_drift_applies(semantic_db, connection_id, limit=1, offset=1)
         assert [r.summary["tables_removed"] for r in page] == [["public.b"]]
+
+
+class TestKnownColumns:
+    async def _stored(self, semantic_db, connection_id) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by=None)
+
+    async def test_no_model_loads_nothing_and_a_write_is_a_noop(
+        self, semantic_db, connection_id
+    ) -> None:
+        assert await store.load_known_columns(semantic_db, connection_id) == {}
+        await store.update_known_columns(semantic_db, connection_id, {"a.b": ["x"]})
+        assert await store.load_known_columns(semantic_db, connection_id) == {}
+
+    async def test_a_model_with_no_baseline_loads_nothing(self, semantic_db, connection_id) -> None:
+        await self._stored(semantic_db, connection_id)
+        assert await store.load_known_columns(semantic_db, connection_id) == {}
+
+    async def test_update_sets_and_replaces_an_entry(self, semantic_db, connection_id) -> None:
+        await self._stored(semantic_db, connection_id)
+        await store.update_known_columns(
+            semantic_db, connection_id, {"public.orders": ["b", "a", "a"]}
+        )
+        assert await store.load_known_columns(semantic_db, connection_id) == {
+            "public.orders": frozenset({"a", "b"})
+        }
+        await store.update_known_columns(semantic_db, connection_id, {"public.orders": ["c"]})
+        assert await store.load_known_columns(semantic_db, connection_id) == {
+            "public.orders": frozenset({"c"})
+        }
+
+    async def test_an_update_touches_only_the_tables_it_names(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._stored(semantic_db, connection_id)
+        await store.update_known_columns(
+            semantic_db, connection_id, {"public.orders": ["a"], "public.events": ["id"]}
+        )
+        await store.update_known_columns(semantic_db, connection_id, {"public.orders": ["b"]})
+        assert await store.load_known_columns(semantic_db, connection_id) == {
+            "public.orders": frozenset({"b"}),
+            "public.events": frozenset({"id"}),
+        }
+
+    async def test_only_missing_never_replaces_an_entry(self, semantic_db, connection_id) -> None:
+        await self._stored(semantic_db, connection_id)
+        await store.update_known_columns(semantic_db, connection_id, {"public.orders": ["a"]})
+        await store.update_known_columns(
+            semantic_db,
+            connection_id,
+            {"public.orders": ["a", "b"], "public.events": ["id"]},
+            only_missing=True,
+        )
+        assert await store.load_known_columns(semantic_db, connection_id) == {
+            "public.orders": frozenset({"a"}),
+            "public.events": frozenset({"id"}),
+        }
+
+    async def test_prune_drops_the_entries_of_tables_the_model_does_not_hold(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._stored(semantic_db, connection_id)
+        await store.update_known_columns(
+            semantic_db, connection_id, {"public.orders": ["a"], "public.gone": ["a"]}
+        )
+        await store.update_known_columns(semantic_db, connection_id, {}, prune=True)
+        assert set(await store.load_known_columns(semantic_db, connection_id)) == {"public.orders"}
+
+    async def test_connections_do_not_share_a_baseline(self, semantic_db, connection_id) -> None:
+        other = "22222222-2222-2222-2222-222222222222"
+        semantic_db.add(
+            Connection(id=other, name="other", source_type="postgresql", config_encrypted=b"")
+        )
+        await semantic_db.commit()
+        await self._stored(semantic_db, connection_id)
+        await store.save_model(semantic_db, other, _rich_model(), updated_by=None)
+        await store.update_known_columns(semantic_db, connection_id, {"public.orders": ["a"]})
+        await store.update_known_columns(semantic_db, other, {"public.orders": ["z"]})
+        # A prune for one connection leaves the other's rows (and its stored tables) alone.
+        await store.update_known_columns(semantic_db, connection_id, {}, prune=True)
+        assert await store.load_known_columns(semantic_db, connection_id) == {
+            "public.orders": frozenset({"a"})
+        }
+        assert await store.load_known_columns(semantic_db, other) == {
+            "public.orders": frozenset({"z"})
+        }
+
+    async def test_the_baseline_survives_a_full_save_and_a_reconcile(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._stored(semantic_db, connection_id)
+        await store.update_known_columns(semantic_db, connection_id, {"public.orders": ["a"]})
+        # ``save_model`` deletes and rebuilds every table row; the baseline is not one.
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by=None)
+        await store.reconcile_tables(
+            semantic_db,
+            connection_id,
+            {"public.orders": TableSemantic(display_name="O")},
+            updated_by=None,
+        )
+        assert await store.load_known_columns(semantic_db, connection_id) == {
+            "public.orders": frozenset({"a"})
+        }
+
+    async def test_deleting_the_model_deletes_its_baseline(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._stored(semantic_db, connection_id)
+        await store.update_known_columns(semantic_db, connection_id, {"public.orders": ["a"]})
+        await store.delete_model(semantic_db, connection_id, changed_by=None)
+        assert await store.load_known_columns(semantic_db, connection_id) == {}
+
+    async def test_nul_characters_are_stripped_from_the_names(
+        self, semantic_db, connection_id
+    ) -> None:
+        """PostgreSQL JSONB rejects ``\\u0000``; the stored column names are stripped too."""
+        await self._stored(semantic_db, connection_id)
+        await store.update_known_columns(
+            semantic_db, connection_id, {"public.orders": ["a\x00b", "ab"]}
+        )
+        assert await store.load_known_columns(semantic_db, connection_id) == {
+            "public.orders": frozenset({"ab"})
+        }
+
+    async def test_keys_that_fit_to_one_table_union_their_names(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._stored(semantic_db, connection_id)
+        await store.update_known_columns(
+            semantic_db, connection_id, {"public.orders": ["a"], "public.ord\x00ers": ["b"]}
+        )
+        assert await store.load_known_columns(semantic_db, connection_id) == {
+            "public.orders": frozenset({"a", "b"})
+        }
+
+    async def test_an_over_long_table_key_is_rejected_before_any_write(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._stored(semantic_db, connection_id)
+        limit = SemanticKnownColumnsRow.__table__.c.table_key.type.length
+        with pytest.raises(ValueError, match="table_key"):
+            await store.update_known_columns(
+                semantic_db, connection_id, {"public.orders": ["a"], "t" * (limit + 1): ["a"]}
+            )
+        assert await store.load_known_columns(semantic_db, connection_id) == {}
+
+    async def test_a_malformed_value_is_skipped_or_cleaned_never_raised(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._stored(semantic_db, connection_id)
+        model_id = await semantic_db.scalar(
+            select(SemanticModelRow.id).where(SemanticModelRow.connection_id == connection_id)
+        )
+        # Written straight to the rows: ``update_known_columns`` can never produce these.
+        for key, columns in (("public.mixed", ["a", 1]), ("public.object", {"x": 1})):
+            semantic_db.add(
+                SemanticKnownColumnsRow(
+                    model_id=model_id, connection_id=connection_id, table_key=key, columns=columns
+                )
+            )
+        await semantic_db.commit()
+        assert await store.load_known_columns(semantic_db, connection_id) == {
+            "public.mixed": frozenset({"a"})
+        }
+
+    async def test_seeding_rewrites_a_malformed_row_but_keeps_a_valid_one(
+        self, semantic_db, connection_id
+    ) -> None:
+        """``load_known_columns`` skips a row whose value is not a list, so for ``only_missing``
+        it is a missing entry: left alone it would be "seeded" forever without effect."""
+        await self._stored(semantic_db, connection_id)
+        model_id = await semantic_db.scalar(
+            select(SemanticModelRow.id).where(SemanticModelRow.connection_id == connection_id)
+        )
+        for key, columns in (("public.object", {"x": 1}), ("public.kept", ["a"])):
+            semantic_db.add(
+                SemanticKnownColumnsRow(
+                    model_id=model_id, connection_id=connection_id, table_key=key, columns=columns
+                )
+            )
+        await semantic_db.commit()
+        assert set(await store.load_known_columns(semantic_db, connection_id)) == {"public.kept"}
+
+        await store.update_known_columns(
+            semantic_db,
+            connection_id,
+            {"public.object": ["b"], "public.kept": ["z"]},
+            only_missing=True,
+        )
+
+        assert await store.load_known_columns(semantic_db, connection_id) == {
+            "public.object": frozenset({"b"}),
+            "public.kept": frozenset({"a"}),
+        }
+
+    async def test_an_unchanged_entry_issues_no_write(self, semantic_db, connection_id) -> None:
+        await self._stored(semantic_db, connection_id)
+        await store.update_known_columns(semantic_db, connection_id, {"public.orders": ["a"]})
+        # The setup INSERT must reach the database before the listener attaches, or it
+        # would be recorded as a write of the calls under test.
+        await semantic_db.flush()
+        version = select(SemanticModelRow.version).where(
+            SemanticModelRow.connection_id == connection_id
+        )
+        before = await semantic_db.scalar(version)
+        writes: list[str] = []
+
+        def record(_conn, _cursor, statement, *_args) -> None:
+            if statement.lstrip().upper().startswith(("INSERT", "UPDATE")):
+                writes.append(statement)
+
+        engine = semantic_db.bind.sync_engine
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            # The same entry again: compared, not written.
+            await store.update_known_columns(semantic_db, connection_id, {"public.orders": ["a"]})
+            await store.update_known_columns(semantic_db, connection_id, {}, prune=True)
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+        assert writes == []
+        # The baseline is bookkeeping: it never bumps the version the model cache keys on.
+        assert await semantic_db.scalar(version) == before

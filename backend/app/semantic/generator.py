@@ -6,19 +6,26 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 import hashlib
 import json
 import logging
 from typing import TYPE_CHECKING, Any
 
-from ..datasources.models import ColumnInfo, DataSourceSchema, PrivacySettings, table_key
+from ..datasources.models import (
+    ColumnInfo,
+    DataSourceSchema,
+    PrivacySettings,
+    TableInfo,
+    table_key,
+)
 from .drift import (
     SchemaDrift,
     compute_drift,
     policy_hides_column,
     policy_hides_table,
+    resolve_real_key,
     strip_ident_quotes,
 )
 from .models import (
@@ -26,6 +33,8 @@ from .models import (
     AggregationType,
     BusinessMetric,
     CardinalityClass,
+    ColumnsBatchResponse,
+    ColumnSemantic,
     CommonJoin,
     DerivedColumn,
     EntityType,
@@ -46,16 +55,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Prompt for a single batch of tables (tables section only, no global metrics/joins).
-_BATCH_TABLES_PROMPT = """\
-You are a data analyst examining a database schema. Analyze the tables below and \
-generate semantic annotations.
-
-DATABASE SCHEMA:
-{schema_ddl}
-
-{column_stats_summary}
-For each table and column, provide:
+# The per-column instructions of both annotation prompts (items 1-8; the table-level
+# items 9-11 stay in ``_BATCH_TABLES_PROMPT``). One constant: a new column is
+# annotated to the same standard as one from the full generation.
+_COLUMN_FIELD_ITEMS = """\
 1. A human-friendly display name
 2. A business description explaining what this data represents
 3. semantic_type: One of: identifier, status_flag, monetary, percentage, \
@@ -67,7 +70,22 @@ meaning of each value
 6. currency: ISO code if monetary (EUR, USD, GBP...), null otherwise
 7. unit: Physical unit if measurement (kg, km, seconds, items...), null otherwise
 8. default_aggregation: Prescribed aggregation for numeric/count columns — one of: \
-sum, count, count_distinct, average, max, min, median. Omit for non-numeric columns.
+sum, count, count_distinct, average, max, min, median. Omit for non-numeric columns."""
+
+# Prompt for a single batch of tables (tables section only, no global metrics/joins).
+_BATCH_TABLES_PROMPT = (
+    """\
+You are a data analyst examining a database schema. Analyze the tables below and \
+generate semantic annotations.
+
+DATABASE SCHEMA:
+{schema_ddl}
+
+{column_stats_summary}
+For each table and column, provide:
+"""
+    + _COLUMN_FIELD_ITEMS
+    + """
 9. Suggest default filters that should typically be applied
 10. grain: One sentence describing the row-level granularity, \
 e.g. "one row per order" or "one row per customer per day".
@@ -102,6 +120,49 @@ Respond ONLY with valid JSON:
     }}
   }}
 }}"""
+)
+
+# Prompt for the columns added to tables the model already annotates. The tables are
+# context; only the listed columns are annotated, so nothing already stored is rewritten.
+_NEW_COLUMNS_PROMPT = (
+    """\
+You are a data analyst examining a database schema. The tables below already have \
+semantic annotations; new columns were added to them. Annotate ONLY the columns listed \
+under NEW COLUMNS. The rest of each table is context.
+
+DATABASE SCHEMA:
+{schema_ddl}
+
+NEW COLUMNS (annotate only these):
+{targets}
+
+For each new column, provide:
+"""
+    + _COLUMN_FIELD_ITEMS
+    + """
+
+IMPORTANT: Omit any JSON field whose value is null, false, or empty ([] / {{}}).
+Do NOT emit: "currency": null, "unit": null, "is_sensitive": false, "value_mappings": [].
+Only emit fields that carry meaningful values.
+
+Respond ONLY with valid JSON:
+{{
+  "tables": {{
+    "schema.table_name": {{
+      "columns": {{
+        "new_column_name": {{
+          "display_name": "Human Name",
+          "description": "What this column means",
+          "semantic_type": "monetary",
+          "default_aggregation": "sum",
+          "value_mappings": [{{"raw_value": "A", "display_value": "Active"}}],
+          "is_sensitive": true
+        }}
+      }}
+    }}
+  }}
+}}"""
+)
 
 # Prompt for cross-table business metrics, joins, derived columns (global sections only).
 _GLOBAL_SECTIONS_PROMPT = """\
@@ -912,29 +973,123 @@ class SemanticModelGenerator:
         self._enrich_fiscal_table_annotations(result.tables, schema)
         return result.tables
 
+    async def generate_new_columns(
+        self,
+        schema: DataSourceSchema,
+        provider: BaseLLMProvider,
+        model: str | None,
+        columns_by_table: Mapping[str, Sequence[str]],
+        table_context: Mapping[str, TableSemantic],
+        relationship_edges: list[RelationshipEdge],
+    ) -> dict[str, dict[str, ColumnSemantic]]:
+        """Annotate only the named new columns of tables the model already holds.
+
+        ``columns_by_table`` maps a table key to the column names to annotate;
+        ``table_context`` carries each table's stored annotation (its description is shown
+        to the LLM after the new column names, collapsed to one line). Tables missing from
+        ``schema`` and names the table does not have are dropped before the call; if nothing
+        is left no LLM call is made. The prompt shows the whole table as context but asks
+        only for the named columns, and the result is grounded to the schema (near-miss
+        names remapped, invented ones dropped), given the fiscal audit-timestamp rule
+        ``generate_tables`` applies, and filtered to the requested names, so a column the
+        LLM re-describes is ignored. The caller packs a batch so its DDL fits
+        ``_MAX_DDL_CHARS`` (``table_ddl_sizes``).
+
+        Returns ``table key → {column name → ColumnSemantic}``, holding only the tables
+        with at least one requested column annotated: a table the LLM answered nothing
+        usable for is absent. Raises ``ValueError`` on LLM failure; its message keeps the
+        provider's, error mark included, so the router can tell a throttle or an outage
+        from any other failure.
+        """
+        batch = [t for t in schema.tables if table_key(t) in columns_by_table]
+        live = {table_key(t): {c.name for c in t.columns} for t in batch}
+        wanted: dict[str, set[str]] = {}
+        for key, cols in columns_by_table.items():
+            if names := set(cols) & live.get(key, set()):
+                wanted[key] = names
+        if not wanted:
+            return {}
+        batch = [t for t in batch if table_key(t) in wanted]
+
+        batch_schema_obj = DataSourceSchema(
+            source_type=schema.source_type,
+            schemas=schema.schemas,
+            tables=batch,
+            relationships=schema.relationships,
+            metadata=schema.metadata,
+        )
+        targets: list[str] = []
+        for key in sorted(wanted):
+            line = f"- {key}: {', '.join(sorted(wanted[key]))}"
+            # A stored description is user-editable and may hold newlines, colons or
+            # parentheses: collapsed to one line after the columns, it cannot break the
+            # list or be read as a column name.
+            context = table_context.get(key)
+            if context and (about := " ".join((context.description or "").split())):
+                line += f" (table: {about})"
+            targets.append(line)
+
+        # Filter FK edges to only those relevant to this batch
+        batch_edges = [
+            e for e in relationship_edges if e.from_table in wanted or e.to_table in wanted
+        ]
+        relationships_summary = self._format_relationships_for_prompt(batch_edges)
+
+        sys_prompt = (
+            "You are a data modelling expert. You ALWAYS respond with valid JSON and nothing else."
+        )
+        prompt = _NEW_COLUMNS_PROMPT.format(
+            schema_ddl=self._schema_to_ddl(batch_schema_obj),
+            targets="\n".join(targets),
+        )
+        if relationships_summary:
+            prompt = (
+                f"DETECTED RELATIONSHIPS (formal foreign keys):\n{relationships_summary}\n\n"
+                + prompt
+            )
+
+        try:
+            result = await provider.generate_structured(
+                system_prompt=sys_prompt,
+                user_message=prompt,
+                schema_type=ColumnsBatchResponse,
+                model=model,
+                temperature=0.0,
+                max_tokens=min(65536, provider.max_output_tokens),
+            )
+        except Exception as e:
+            raise ValueError(f"LLM call failed in generate_new_columns: {e}") from e
+
+        # Grounding and the fiscal rule work on tables: wrap each reply's columns in a
+        # throwaway table. Ground first so fiscal enrichment sees the remapped keys.
+        replies = {
+            key: TableSemantic(display_name=key, columns=entry.columns)
+            for key, entry in result.tables.items()
+        }
+        self._ground_tables_to_schema(replies, batch_schema_obj)
+        # The rule ``generate_tables`` applies, so a new ``created_at`` on a fiscal-period
+        # table is not described as a business date.
+        self._enrich_fiscal_table_annotations(replies, schema)
+        out: dict[str, dict[str, ColumnSemantic]] = {}
+        for key, names in wanted.items():
+            reply = replies.get(key)
+            if reply is None:
+                continue
+            if kept := {name: col for name, col in reply.columns.items() if name in names}:
+                out[key] = kept
+        return out
+
     @staticmethod
     def _strip_quotes(name: str) -> str:
         """``drift.strip_ident_quotes`` — the one identifier normaliser; kept under this
         name for its callers."""
         return strip_ident_quotes(name)
 
-    @classmethod
-    def _resolve_real_key(cls, name: str, real_keys: list[str], *, bare_ok: bool) -> str | None:
-        """Map a near-miss ``name`` onto exactly one entry of ``real_keys``, else ``None``.
-
-        Tried in order, the first rule that matches anything decides (ambiguity at that
-        rule means ``None``): quote-stripped exact match, case-insensitive match, and —
-        when ``bare_ok`` and the name has no dot — a case-insensitive match against the
-        part after the last dot of each real key (a bare table name).
-        """
-        stripped = cls._strip_quotes(name)
-        if stripped in real_keys:
-            return stripped
-        lowered = stripped.lower()
-        matches = [k for k in real_keys if k.lower() == lowered]
-        if not matches and bare_ok and "." not in stripped:
-            matches = [k for k in real_keys if k.rsplit(".", 1)[-1].lower() == lowered]
-        return matches[0] if len(matches) == 1 else None
+    @staticmethod
+    def _resolve_real_key(name: str, real_keys: list[str], *, bare_ok: bool) -> str | None:
+        """``drift.resolve_real_key`` — the one near-miss resolver; kept under this name
+        for its callers."""
+        return resolve_real_key(name, real_keys, bare_ok=bare_ok)
 
     def _ground_tables_to_schema(
         self,
@@ -1665,7 +1820,20 @@ class SemanticModelGenerator:
         The table/column half is ``semantic/drift.compute_drift`` — the same diff
         ``apply_drift`` acts on, so the check cannot report what the apply would not
         remove. ``drift`` is that diff when the caller already computed it (the drift
-        route does, for ``has_actionable_changes``); otherwise it is computed here.
+        route does, for ``has_actionable_changes``, over the known-columns baseline);
+        otherwise it is computed here without a baseline, so no column is reported added
+        and no removed key counts as a drop.
+
+        Each removed column key is worded by what the apply does to it. A key in the
+        diff's ``dropped_columns`` (the baseline knew it as a live column) no longer
+        exists, whatever it resembles, and is named verbatim: it is a real column name.
+        Any other is resolved against the table's live columns with ``resolve_real_key``
+        (the rule ``compute_drift`` uses): a near-miss spelling of a column in
+        ``respelled_columns`` is a respelling (the apply removes the key and annotates
+        the column afresh), so that column is not also listed as new; a near-miss
+        spelling of a column the model also stores is a duplicate the apply removes;
+        any other key no longer exists, named quote-stripped unless the stripped name is
+        still a live column.
 
         With ``privacy``, a stored table or column the policy hides is not reported
         as removed: the store keeps hidden annotations, and ``current_schema`` (with
@@ -1680,31 +1848,62 @@ class SemanticModelGenerator:
         if drift is None:
             drift = compute_drift(current_schema, stored_model, privacy)
 
-        live_columns = {table_key(t): {c.name for c in t.columns} for t in current_schema.tables}
-        for tbl_key in stored_model.tables:
+        live_columns = {
+            table_key(t): sorted(c.name for c in t.columns) for t in current_schema.tables
+        }
+        for tbl_key, table in stored_model.tables.items():
             if tbl_key in drift.removed_table_keys:
                 warnings.append(
                     f'Table "{tbl_key}" referenced in semantic model '
                     f"no longer exists in the database"
                 )
-            else:
-                gone = drift.removed_columns.get(tbl_key, ())
-                live = live_columns.get(tbl_key, set())
-                # Normalised then deduplicated: ``"a"`` and ``a`` stored side by side,
-                # both gone, are one missing column to a reader.
-                missing = {strip_ident_quotes(c) for c in gone if strip_ident_quotes(c) not in live}
-                for col in sorted(missing):
-                    warnings.append(
-                        f'Column "{tbl_key}.{col}" referenced in semantic model no longer exists'
-                    )
-                # A quoted spelling of a column that exists is a blob-era duplicate key,
-                # not a missing column: named under its stored spelling.
-                for col in sorted(c for c in gone if strip_ident_quotes(c) in live):
-                    warnings.append(
-                        f'Column key "{tbl_key}.{col}" in the semantic model is a quoted '
-                        f'spelling of "{strip_ident_quotes(col)}"; '
-                        "Apply Drift removes the duplicate"
-                    )
+                continue
+            live = live_columns.get(tbl_key, [])
+            respelled = drift.respelled_columns.get(tbl_key, set())
+            dropped = drift.dropped_columns.get(tbl_key, set())
+            missing: set[str] = set()
+            duplicates: dict[str, str] = {}
+            respellings: dict[str, str] = {}
+            for col in drift.removed_columns.get(tbl_key, ()):
+                if col in dropped:
+                    # A key the baseline knew is a real column the database dropped: not a
+                    # near-miss spelling of anything, even of a column still stored, and
+                    # named as the database named it, quotes included.
+                    missing.add(col)
+                    continue
+                target = resolve_real_key(col, live, bare_ok=False)
+                if target is not None and target in respelled:
+                    respellings[col] = target
+                elif target is not None and target in table.columns:
+                    duplicates[col] = target
+                else:
+                    # Only for a key that is not a known drop (a dropped key is a real name,
+                    # so real columns ``"a"`` and ``a`` both dropped are two warnings):
+                    # normalised then deduplicated, so a blob-era ``"a"`` and ``a`` stored
+                    # side by side, both gone, are one missing column to a reader. A
+                    # stripped name that is still live keeps its stored spelling, so the
+                    # warning never says a live column is gone.
+                    stripped = strip_ident_quotes(col)
+                    missing.add(col if stripped in live else stripped)
+            for col in sorted(missing):
+                warnings.append(
+                    f'Column "{tbl_key}.{col}" referenced in semantic model no longer exists'
+                )
+            # Near-miss keys (quoted, or differing only in letter case) are named under
+            # their stored spelling: the duplicate's twin keeps its own annotation; a
+            # respelling loses its annotation to a fresh one.
+            for col in sorted(duplicates):
+                warnings.append(
+                    f'Column key "{tbl_key}.{col}" in the semantic model is a near-miss '
+                    f'spelling of "{duplicates[col]}"; Apply Drift removes the duplicate'
+                )
+            for col in sorted(respellings):
+                target = respellings[col]
+                warnings.append(
+                    f'Column key "{tbl_key}.{col}" in the semantic model is a near-miss '
+                    f'spelling of "{target}"; Apply Drift removes the key and annotates '
+                    f'"{target}" afresh (the key\'s annotation is not kept)'
+                )
 
         if drift.unreadable_table_keys:
             names = sorted(drift.unreadable_table_keys)
@@ -1720,6 +1919,18 @@ class SemanticModelGenerator:
             warnings.append(
                 f"{len(drift.new_table_keys)} new table(s) added since semantic model "
                 f"was generated: {sample}"
+            )
+
+        new_columns = [
+            f"{tbl}.{col}"
+            for tbl in sorted(drift.added_columns)
+            for col in sorted(drift.added_columns[tbl] - drift.respelled_columns.get(tbl, set()))
+        ]
+        if new_columns:
+            sample = ", ".join(new_columns[:5]) + (", …" if len(new_columns) > 5 else "")
+            warnings.append(
+                f"{len(new_columns)} new column(s) added to tables in the semantic model "
+                f"since it was generated: {sample}"
             )
 
         current_tables = {table_key(t) for t in current_schema.tables}
@@ -1854,36 +2065,10 @@ class SemanticModelGenerator:
     def _schema_to_ddl(self, schema: DataSourceSchema) -> str:
         """Produce a compact CREATE TABLE DDL string from a DataSourceSchema.
 
-        Sample values per column are capped at 3 and truncated to 60 characters
-        each to keep the payload manageable.  If the total DDL would exceed
-        ``_MAX_DDL_CHARS``, tables are included in order until the limit is
-        reached and a truncation notice is appended.
+        If the total DDL would exceed ``_MAX_DDL_CHARS``, tables are included in order
+        until the limit is reached and a truncation notice is appended.
         """
-        table_blocks: list[str] = []
-        for table in schema.tables:
-            fq = table_key(table)
-            block_lines: list[str] = [f"-- Table: {fq}"]
-            if table.description:
-                block_lines.append(f"-- {table.description}")
-            block_lines.append(f"CREATE TABLE {fq} (")
-            col_lines: list[str] = []
-            for col in table.columns:
-                parts = [f"  {col.name} {col.native_type}"]
-                if not col.nullable:
-                    parts.append("NOT NULL")
-                if col.is_primary_key:
-                    parts.append("PRIMARY KEY")
-                annotations: list[str] = []
-                if col.description:
-                    annotations.append(col.description)
-                col_line = " ".join(parts)
-                if annotations:
-                    col_line += f"  -- {'; '.join(annotations)}"
-                col_lines.append(col_line)
-            block_lines.append(",\n".join(col_lines))
-            block_lines.append(");")
-            block_lines.append("")
-            table_blocks.append("\n".join(block_lines))
+        table_blocks = [self._table_ddl_block(table) for table in schema.tables]
 
         parts: list[str] = []
         total = 0
@@ -1903,3 +2088,44 @@ class SemanticModelGenerator:
                 f"the {self._MAX_DDL_CHARS:,}-character limit for LLM generation."
             )
         return ddl
+
+    @staticmethod
+    def _table_ddl_block(table: TableInfo) -> str:
+        """One table's ``CREATE TABLE`` block, as ``_schema_to_ddl`` renders it."""
+        fq = table_key(table)
+        block_lines: list[str] = [f"-- Table: {fq}"]
+        if table.description:
+            block_lines.append(f"-- {table.description}")
+        block_lines.append(f"CREATE TABLE {fq} (")
+        col_lines: list[str] = []
+        for col in table.columns:
+            parts = [f"  {col.name} {col.native_type}"]
+            if not col.nullable:
+                parts.append("NOT NULL")
+            if col.is_primary_key:
+                parts.append("PRIMARY KEY")
+            annotations: list[str] = []
+            if col.description:
+                annotations.append(col.description)
+            col_line = " ".join(parts)
+            if annotations:
+                col_line += f"  -- {'; '.join(annotations)}"
+            col_lines.append(col_line)
+        block_lines.append(",\n".join(col_lines))
+        block_lines.append(");")
+        block_lines.append("")
+        return "\n".join(block_lines)
+
+    def table_ddl_sizes(self, schema: DataSourceSchema, keys: Iterable[str]) -> dict[str, int]:
+        """Table key → the characters ``_schema_to_ddl`` counts for that table against
+        ``_MAX_DDL_CHARS`` (its block; the joining newlines are not counted), for the keys
+        the schema holds. ``_schema_to_ddl`` drops every table past the limit, so a batch
+        whose sizes sum to at most ``_MAX_DDL_CHARS`` is rendered whole. A table whose
+        size alone exceeds the limit fits no batch: wherever it is sent its DDL is
+        omitted (as it would be for ``generate_tables``)."""
+        wanted = set(keys)
+        return {
+            table_key(t): len(self._table_ddl_block(t))
+            for t in schema.tables
+            if table_key(t) in wanted
+        }

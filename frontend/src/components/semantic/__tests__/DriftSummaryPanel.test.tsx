@@ -6,7 +6,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import DriftSummaryPanel from '../DriftSummaryPanel';
-import { summaryRows } from '../driftSummaryRows';
+import { summaryDescription, summaryRows } from '../driftSummaryRows';
 import type { DriftApplySummary } from '@/types';
 
 const EMPTY: DriftApplySummary = {
@@ -14,6 +14,7 @@ const EMPTY: DriftApplySummary = {
   changed: false,
   tables_added: [],
   tables_removed: [],
+  columns_added: {},
   columns_removed: {},
   metrics_added: [],
   metrics_removed: [],
@@ -26,6 +27,7 @@ const EMPTY: DriftApplySummary = {
   relationships_added: [],
   relationships_removed: [],
   tables_not_annotated: [],
+  column_tables_failed: [],
   warnings: [],
 };
 
@@ -194,6 +196,65 @@ describe('DriftSummaryPanel', () => {
   it('takes a title', () => {
     render(<DriftSummaryPanel summary={EMPTY} title="Applied yesterday" />);
     expect(screen.getByText('Applied yesterday')).toBeInTheDocument();
+  });
+
+  it('lists the columns added to existing tables', () => {
+    const summary: DriftApplySummary = {
+      ...EMPTY,
+      changed: true,
+      columns_added: { 'public.orders': ['loyalty_tier', 'region'] },
+    };
+    expect(summaryRows(summary)).toEqual([
+      {
+        key: 'columns_added',
+        label: 'Added 2 columns',
+        names: ['public.orders.loyalty_tier', 'public.orders.region'],
+      },
+    ]);
+  });
+
+  it('words a preview of new columns as a plan', () => {
+    const summary: DriftApplySummary = {
+      ...EMPTY,
+      dry_run: true,
+      changed: true,
+      columns_added: { 'public.orders': ['loyalty_tier'] },
+    };
+    expect(summaryRows(summary)[0].label).toBe('Will add 1 column');
+  });
+
+  it('does not call a failed new-column batch nothing to apply', () => {
+    // Unchanged, but a column batch failed: the warnings say columns are missing, so the
+    // panel must not say the model matches the live schema.
+    const summary: DriftApplySummary = { ...EMPTY, column_tables_failed: ['public.orders'] };
+    expect(summaryDescription(summary)).toBe('New columns on 1 table not annotated');
+    render(<DriftSummaryPanel summary={summary} onDismiss={() => {}} />);
+    expect(screen.queryByText(/Nothing to apply/)).not.toBeInTheDocument();
+  });
+
+  it('says a preview of new columns annotates them on apply, with the catalog relationships it adds', () => {
+    render(
+      <DriftSummaryPanel
+        summary={{
+          ...EMPTY,
+          changed: true,
+          dry_run: true,
+          columns_added: { 'public.orders': ['customer_id'] },
+          relationships_added: ['public.orders.customer_id → public.customers.id'],
+        }}
+      />,
+    );
+    expect(screen.getByText(/New columns are annotated by the LLM when you apply/)).toBeInTheDocument();
+    expect(screen.getByText(/relationships the database catalog adds on them between tables the model already holds/)).toBeInTheDocument();
+  });
+
+  it('adds no new-column note to a real apply', () => {
+    render(
+      <DriftSummaryPanel
+        summary={{ ...EMPTY, changed: true, columns_added: { 'public.orders': ['region'] } }}
+      />,
+    );
+    expect(screen.queryByText(/annotated by the LLM when you apply/)).not.toBeInTheDocument();
   });
 
   it('labels the non-empty rows for reuse', () => {

@@ -306,6 +306,7 @@ const SUMMARY = {
   changed: true,
   tables_added: [],
   tables_removed: ['ecommerce.coupons'],
+  columns_added: {},
   columns_removed: {},
   metrics_added: [],
   metrics_removed: ['Coupon uses'],
@@ -318,6 +319,7 @@ const SUMMARY = {
   relationships_added: [],
   relationships_removed: [],
   tables_not_annotated: [],
+  column_tables_failed: [],
   warnings: [],
 };
 
@@ -554,6 +556,54 @@ describe('SemanticModelPage — Apply Drift', () => {
     expect(apply).toBeDisabled();
     expect(apply).toHaveAttribute('title', 'Configure an LLM provider in Settings first');
     expect(screen.getByRole('region', { name: 'Apply Drift will:' })).toHaveFocus();
+  });
+
+  it('needs a provider to apply a preview that only adds columns', async () => {
+    vi.mocked(semanticApi.getDrift).mockResolvedValue(DRIFTED as never);
+    vi.mocked(semanticApi.applyDrift).mockResolvedValue({
+      semantic_model: MODEL,
+      summary: {
+        ...PREVIEW,
+        tables_removed: [],
+        metrics_removed: [],
+        columns_added: { 'ecommerce.orders': ['region'] },
+      },
+    } as never);
+    await previewFromBanner();
+
+    // Nothing else to apply: the backend answers 400 without a provider, so the page says so first.
+    const apply = await screen.findByRole('button', { name: 'Apply these changes' });
+    expect(apply).toBeDisabled();
+    expect(apply).toHaveAttribute('title', 'Configure an LLM provider in Settings first');
+  });
+
+  it('lets a preview that adds columns beside a removed column apply without a provider', async () => {
+    vi.mocked(semanticApi.getDrift).mockResolvedValue(DRIFTED as never);
+    vi.mocked(semanticApi.applyDrift).mockResolvedValue({
+      semantic_model: MODEL,
+      summary: {
+        ...PREVIEW,
+        tables_removed: [],
+        metrics_removed: [],
+        columns_added: { 'ecommerce.orders': ['region'] },
+        columns_removed: { 'ecommerce.orders': ['discount'] },
+      },
+    } as never);
+    await previewFromBanner();
+
+    // The removal applies and the backend warns the new column was not annotated.
+    expect(await screen.findByRole('button', { name: 'Apply these changes' })).toBeEnabled();
+  });
+
+  it('lets a preview that adds columns beside a removed table apply without a provider', async () => {
+    vi.mocked(semanticApi.getDrift).mockResolvedValue(DRIFTED as never);
+    vi.mocked(semanticApi.applyDrift).mockResolvedValue({
+      semantic_model: MODEL,
+      summary: { ...PREVIEW, columns_added: { 'ecommerce.orders': ['region'] } },
+    } as never);
+    await previewFromBanner();
+
+    expect(await screen.findByRole('button', { name: 'Apply these changes' })).toBeEnabled();
   });
 
   it('holds Preview & apply over unsaved edits', async () => {

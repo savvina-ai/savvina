@@ -807,8 +807,9 @@ export default function SemanticModelPageV2() {
 
   // Apply Drift writes the model like a run does, so the editor is paused the same way
   // (`anyGenerationPending`) and the result re-seeds the draft. It can take as long as a
-  // small run — one LLM call per GENERATION_BATCH_SIZE new tables, then a globals pass —
-  // so it is keyed like `generation` and a page mounted mid-apply stays inert too.
+  // small run — one LLM call per GENERATION_BATCH_SIZE new tables, then a globals pass,
+  // and new-column batches that share the backend's cap of 3 annotation batches with the
+  // new tables — so it is keyed like `generation` and a page mounted mid-apply stays inert too.
   const applyDrift = useMutation({
     mutationKey: ['semantic-apply-drift', connectionId],
     mutationFn: () => semanticApi.applyDrift(connectionId!, selectedProvider || undefined),
@@ -1046,12 +1047,19 @@ export default function SemanticModelPageV2() {
     !isDirty && !driftWaitReason && driftChecking
       ? 'Wait for the drift check to finish'
       : previewReasonOnceChecked;
-  // New tables are annotated by the LLM, so an apply that adds one needs a provider.
+  // New tables and new columns are annotated by the LLM. Without a provider the backend
+  // fails an apply that adds tables, or one whose only changes are new columns (it has
+  // nothing else to do), with a 400. New columns beside a removed table or column do not
+  // block it: the removals apply and the summary warns that the columns were not annotated.
+  const needsProvider =
+    driftPreview !== null &&
+    (driftPreview.tables_added.length > 0 ||
+      (Object.keys(driftPreview.columns_added).length > 0 &&
+        driftPreview.tables_removed.length === 0 &&
+        Object.keys(driftPreview.columns_removed).length === 0));
   const applyDisabledReason =
     previewDisabledReason ??
-    ((driftPreview?.tables_added.length ?? 0) > 0 && !selectedProvider
-      ? 'Configure an LLM provider in Settings first'
-      : null);
+    (needsProvider && !selectedProvider ? 'Configure an LLM provider in Settings first' : null);
   // A report against the cached schema cannot be previewed or applied: both introspect
   // the live database, which that check could not reach.
   const previewButtonReason =
@@ -1412,10 +1420,11 @@ export default function SemanticModelPageV2() {
                     Removes deleted tables, with the metrics, joins and derived columns that
                     list them, segments that apply only to them, and relationships over them,
                     and deleted columns, with the relationships and references that used them.
-                    Annotates new tables and adds new cross-table items beside the existing
-                    ones. Hidden tables are kept, and so are tables the connection cannot read
-                    when PostgreSQL can tell them apart from dropped ones. You will see what
-                    it removes and which tables it annotates before anything is applied.
+                    Annotates new tables and the new columns of existing ones, and adds new
+                    cross-table items beside the existing ones. Hidden tables are kept, and
+                    so are tables the connection cannot read when PostgreSQL can tell them
+                    apart from dropped ones. You will see what it removes and which tables and
+                    columns it annotates before anything is applied.
                   </p>
                   <button
                     ref={previewButtonRef}

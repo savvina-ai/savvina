@@ -16,6 +16,7 @@ from .semantic_store import (  # noqa: F401
     SemanticColumnRow,
     SemanticGlobalItemRow,
     SemanticHistoryRow,
+    SemanticKnownColumnsRow,
     SemanticMetricRow,
     SemanticModelRow,
     SemanticRelationshipRow,

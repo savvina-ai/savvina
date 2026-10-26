@@ -341,20 +341,30 @@ export interface DriftReport {
   schema_source: 'live' | 'cache';
   schema_cached_at: string | null;
   refresh_error: string | null;
-  /** True when a table was added or removed, or a column removed — what Apply Drift acts on. */
+  /** True when a table or column was added or removed — what Apply Drift acts on. */
   has_actionable_changes: boolean;
 }
 
 /** Mirrors `DriftApplySummary` in backend/app/semantic/drift.py. Every list is sorted. */
 export interface DriftApplySummary {
   /**
-   * A preview: nothing was written. `tables_added` are what the apply would send to the
-   * LLM; relationships to them and the LLM's items over them appear only on apply.
+   * A preview: nothing was written. `tables_added` are the tables, and `columns_added`
+   * the new columns, the apply would send to the LLM. `relationships_added` includes the
+   * catalog edges, missing from the model, on the genuinely new columns (not respellings
+   * of a stored key) the apply would send, between tables the model already holds. A
+   * relationship to a new table, and the LLM's items over the new tables, appear only on
+   * apply.
    */
   dry_run: boolean;
   changed: boolean;
   tables_added: string[];
   tables_removed: string[];
+  /**
+   * Surviving table key → the columns added to it. On an apply, the ones the LLM
+   * annotated and the model now stores; on a preview, the new columns the apply would
+   * send to the LLM.
+   */
+  columns_added: Record<string, string[]>;
   /** Surviving table key → removed column names. */
   columns_removed: Record<string, string[]>;
   metrics_added: string[];
@@ -370,6 +380,12 @@ export interface DriftApplySummary {
   relationships_removed: string[];
   /** New tables the LLM returned nothing for; still missing from the model. */
   tables_not_annotated: string[];
+  /**
+   * Tables whose new columns this apply did not get: their batch failed or returned
+   * nothing for them, or an earlier apply's mark was kept because this one did not
+   * reach them. They still lack those columns and the next apply sends them last.
+   */
+  column_tables_failed: string[];
   warnings: string[];
 }
 

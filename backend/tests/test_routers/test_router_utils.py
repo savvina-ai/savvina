@@ -13,7 +13,11 @@ from .conftest import MockResult, _mock_db
 
 
 def _tables_deleted(db) -> set[str]:
-    return {call.args[0].table.name for call in db.execute.await_args_list}
+    return set(_tables_deleted_in_order(db))
+
+
+def _tables_deleted_in_order(db) -> list[str]:
+    return [call.args[0].table.name for call in db.execute.await_args_list]
 
 
 class TestInvalidateConnectionCaches:
@@ -28,6 +32,23 @@ class TestInvalidateConnectionCaches:
         db = _mock_db(MockResult(), MockResult())
         await _invalidate_connection_caches("conn-1", db, keep_schema=True)
         assert _tables_deleted(db) == {"query_cache", "table_embedding_cache"}
+
+    async def test_deletes_in_the_order_the_schema_refresh_writes(self) -> None:
+        """``refresh_user_schema_cache`` writes the schema cache, then deletes the table
+        embeddings, then the cached answers. Two transactions that lock the same rows in
+        opposite orders can deadlock, so the purge takes them in that order too."""
+        db = _mock_db(MockResult(), MockResult(), MockResult())
+        await _invalidate_connection_caches("conn-1", db)
+        assert _tables_deleted_in_order(db) == [
+            "user_schema_caches",
+            "table_embedding_cache",
+            "query_cache",
+        ]
+
+    async def test_keep_schema_deletes_in_the_order_the_schema_refresh_writes(self) -> None:
+        db = _mock_db(MockResult(), MockResult())
+        await _invalidate_connection_caches("conn-1", db, keep_schema=True)
+        assert _tables_deleted_in_order(db) == ["table_embedding_cache", "query_cache"]
 
 
 class TestLockAndRereadConnection:

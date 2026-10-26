@@ -16,7 +16,7 @@ from app.datasources.models import (
     SchemaInfo,
     TableInfo,
 )
-from app.semantic.drift import SchemaDrift
+from app.semantic.drift import SchemaDrift, compute_drift
 from app.semantic.generator import (
     SemanticModelGenerator,
     drop_dangling_edits,
@@ -27,6 +27,7 @@ from app.semantic.generator import (
 )
 from app.semantic.models import (
     AggregationType,
+    ColumnsBatchResponse,
     ColumnSemantic,
     Hierarchy,
     RelationshipEdge,
@@ -146,6 +147,39 @@ async def _generate(
     )
 
 
+def _columns_provider(tables: dict[str, dict[str, ColumnSemantic]]) -> MagicMock:
+    # Round-trip through dicts like a real LLM response.
+    response = ColumnsBatchResponse.model_validate(
+        {
+            "tables": {
+                key: {"columns": {c: col.model_dump(mode="json") for c, col in cols.items()}}
+                for key, cols in tables.items()
+            }
+        }
+    )
+    provider = MagicMock()
+    provider.max_output_tokens = 8000
+    provider.generate_structured = AsyncMock(return_value=response)
+    return provider
+
+
+async def _generate_new_columns(
+    schema: DataSourceSchema,
+    provider: MagicMock,
+    columns_by_table: dict[str, list[str]],
+    context: dict[str, TableSemantic] | None = None,
+    edges: list[RelationshipEdge] | None = None,
+) -> dict[str, dict[str, ColumnSemantic]]:
+    return await SemanticModelGenerator().generate_new_columns(
+        schema=schema,
+        provider=provider,
+        model=None,
+        columns_by_table=columns_by_table,
+        table_context=context or {},
+        relationship_edges=edges or [],
+    )
+
+
 class TestGenerateTablesByKey:
     async def test_generates_only_the_named_tables(self) -> None:
         schema = _schema_with_tables(["orders", "customers", "items"])
@@ -251,6 +285,215 @@ class TestGenerateTablesByKey:
                 relationship_edges=[],
             )
         assert "[RATE_LIMIT]" in str(excinfo.value)
+
+
+class TestGenerateNewColumns:
+    async def test_returns_only_the_requested_new_columns(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["loyalty_tier"])
+        provider = _columns_provider(
+            {
+                "public.orders": {
+                    "loyalty_tier": ColumnSemantic(display_name="Tier"),
+                    # The LLM re-describes an existing column: ignored.
+                    "id": ColumnSemantic(display_name="Rewritten"),
+                }
+            }
+        )
+        out = await _generate_new_columns(schema, provider, {"public.orders": ["loyalty_tier"]})
+        assert set(out) == {"public.orders"}
+        assert set(out["public.orders"]) == {"loyalty_tier"}
+        assert out["public.orders"]["loyalty_tier"].display_name == "Tier"
+
+    async def test_a_table_with_no_requested_column_answered_is_left_out(self) -> None:
+        schema = _schema_with_tables(["orders", "customers"], extra_columns=["loyalty_tier"])
+        provider = _columns_provider(
+            {
+                "public.orders": {"loyalty_tier": ColumnSemantic(display_name="Tier")},
+                "public.customers": {"id": ColumnSemantic(display_name="Rewritten")},
+            }
+        )
+        out = await _generate_new_columns(
+            schema,
+            provider,
+            {"public.orders": ["loyalty_tier"], "public.customers": ["loyalty_tier"]},
+        )
+        assert set(out) == {"public.orders"}
+
+    async def test_the_prompt_names_the_new_columns_and_carries_the_table_context(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["loyalty_tier"])
+        provider = _columns_provider({})
+        context = {
+            "public.orders": TableSemantic(display_name="Orders", description="Customer purchases")
+        }
+        await _generate_new_columns(schema, provider, {"public.orders": ["loyalty_tier"]}, context)
+        kwargs = provider.generate_structured.await_args.kwargs
+        assert kwargs["schema_type"] is ColumnsBatchResponse
+        prompt = kwargs["user_message"]
+        assert "- public.orders: loyalty_tier (table: Customer purchases)\n" in prompt
+
+    async def test_the_prompt_ddl_holds_only_the_requested_tables(self) -> None:
+        schema = _schema_with_tables(["orders", "customers"], extra_columns=["loyalty_tier"])
+        provider = _columns_provider({})
+        await _generate_new_columns(schema, provider, {"public.orders": ["loyalty_tier"]})
+        prompt = provider.generate_structured.await_args.kwargs["user_message"]
+        assert "CREATE TABLE public.orders (" in prompt
+        assert "CREATE TABLE public.customers" not in prompt
+
+    async def test_a_description_with_a_newline_and_a_colon_stays_on_its_target_line(
+        self,
+    ) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["loyalty_tier", "region"])
+        provider = _columns_provider({})
+        context = {
+            "public.orders": TableSemantic(
+                display_name="Orders", description="Purchases:\n  one row per order (EU)"
+            )
+        }
+        await _generate_new_columns(
+            schema, provider, {"public.orders": ["loyalty_tier", "region"]}, context
+        )
+        prompt = provider.generate_structured.await_args.kwargs["user_message"]
+        targets = prompt.split("NEW COLUMNS (annotate only these):\n", 1)[1]
+        targets = targets.split("\n\nFor each new column", 1)[0]
+        assert targets == (
+            "- public.orders: loyalty_tier, region (table: Purchases: one row per order (EU))"
+        )
+
+    async def test_a_whitespace_only_description_is_left_off_the_target_line(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["loyalty_tier"])
+        provider = _columns_provider({})
+        context = {"public.orders": TableSemantic(display_name="Orders", description="  \n ")}
+        await _generate_new_columns(schema, provider, {"public.orders": ["loyalty_tier"]}, context)
+        prompt = provider.generate_structured.await_args.kwargs["user_message"]
+        assert "- public.orders: loyalty_tier\n" in prompt
+        assert "(table:" not in prompt
+
+    async def test_a_name_the_table_does_not_have_is_left_out_of_the_targets(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["loyalty_tier"])
+        provider = _columns_provider({})
+        await _generate_new_columns(
+            schema, provider, {"public.orders": ["loyalty_tier", "not_a_column"]}
+        )
+        prompt = provider.generate_structured.await_args.kwargs["user_message"]
+        assert "- public.orders: loyalty_tier\n" in prompt
+        assert "not_a_column" not in prompt
+
+    async def test_only_edges_touching_the_batch_reach_the_prompt(self) -> None:
+        schema = _schema_with_tables(
+            ["orders", "customers", "items", "tags"], extra_columns=["loyalty_tier"]
+        )
+
+        def edge(a: str, b: str) -> RelationshipEdge:
+            return RelationshipEdge(
+                from_table=f"public.{a}",
+                from_column="id",
+                to_table=f"public.{b}",
+                to_column="id",
+                join_sql=f"public.{a}.id = public.{b}.id",
+            )
+
+        provider = _columns_provider({})
+        await _generate_new_columns(
+            schema,
+            provider,
+            {"public.orders": ["loyalty_tier"]},
+            edges=[edge("orders", "customers"), edge("items", "tags")],
+        )
+        prompt = provider.generate_structured.await_args.kwargs["user_message"]
+        relationships = prompt.split("\n\n", 1)[0]
+        assert relationships.startswith("DETECTED RELATIONSHIPS")
+        assert "public.orders.id → public.customers.id" in relationships
+        assert "public.items.id" not in prompt
+
+    async def test_a_bare_table_key_in_the_reply_is_remapped_to_the_real_one(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["loyalty_tier"])
+        provider = _columns_provider(
+            {"orders": {"loyalty_tier": ColumnSemantic(display_name="Tier")}}
+        )
+        out = await _generate_new_columns(schema, provider, {"public.orders": ["loyalty_tier"]})
+        assert set(out) == {"public.orders"}
+        assert out["public.orders"]["loyalty_tier"].display_name == "Tier"
+
+    async def test_a_reply_for_a_table_outside_the_batch_is_dropped(self) -> None:
+        schema = _schema_with_tables(["orders", "customers"], extra_columns=["loyalty_tier"])
+        provider = _columns_provider(
+            {
+                "public.orders": {"loyalty_tier": ColumnSemantic(display_name="Tier")},
+                "public.customers": {"loyalty_tier": ColumnSemantic(display_name="Other")},
+            }
+        )
+        out = await _generate_new_columns(schema, provider, {"public.orders": ["loyalty_tier"]})
+        assert set(out) == {"public.orders"}
+
+    async def test_a_table_outside_the_schema_makes_no_llm_call(self) -> None:
+        provider = MagicMock()
+        provider.generate_structured = AsyncMock()
+        out = await _generate_new_columns(
+            _schema_with_tables(["orders"]), provider, {"public.ghost": ["x"]}
+        )
+        assert out == {}
+        provider.generate_structured.assert_not_awaited()
+
+    async def test_a_column_the_table_does_not_have_is_not_asked_for(self) -> None:
+        provider = MagicMock()
+        provider.generate_structured = AsyncMock()
+        out = await _generate_new_columns(
+            _schema_with_tables(["orders"]), provider, {"public.orders": ["not_a_column"]}
+        )
+        assert out == {}
+        provider.generate_structured.assert_not_awaited()
+
+    async def test_a_near_miss_column_name_is_remapped_to_the_real_one(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["loyalty_tier"])
+        provider = _columns_provider(
+            {"public.orders": {"Loyalty_Tier": ColumnSemantic(display_name="Tier")}}
+        )
+        out = await _generate_new_columns(schema, provider, {"public.orders": ["loyalty_tier"]})
+        assert set(out["public.orders"]) == {"loyalty_tier"}
+
+    async def test_an_llm_failure_raises_value_error(self) -> None:
+        provider = MagicMock()
+        provider.max_output_tokens = 8000
+        provider.generate_structured = AsyncMock(side_effect=RuntimeError("[RATE_LIMIT] slow"))
+        schema = _schema_with_tables(["orders"], extra_columns=["loyalty_tier"])
+        with pytest.raises(ValueError, match="generate_new_columns") as excinfo:
+            await _generate_new_columns(schema, provider, {"public.orders": ["loyalty_tier"]})
+        assert "[RATE_LIMIT]" in str(excinfo.value)
+
+    async def test_the_fiscal_audit_timestamp_rule_applies_to_a_new_created_at(self) -> None:
+        schema = _schema_with_tables(
+            ["Facts"], extra_columns=["fiscal_year", "fiscal_quarter", "created_at"]
+        )
+        provider = _columns_provider(
+            {"public.Facts": {"created_at": ColumnSemantic(display_name="Created")}}
+        )
+        out = await _generate_new_columns(schema, provider, {"public.Facts": ["created_at"]})
+        description = out["public.Facts"]["created_at"].description
+        assert description is not None and "NOT a business period date" in description
+
+    def test_the_new_and_table_prompts_share_the_column_field_instructions(self) -> None:
+        from app.semantic.generator import (
+            _BATCH_TABLES_PROMPT,
+            _COLUMN_FIELD_ITEMS,
+            _NEW_COLUMNS_PROMPT,
+        )
+
+        assert _COLUMN_FIELD_ITEMS in _BATCH_TABLES_PROMPT
+        assert _COLUMN_FIELD_ITEMS in _NEW_COLUMNS_PROMPT
+
+    def test_table_ddl_sizes_count_each_requested_table_as_the_ddl_limit_does(self) -> None:
+        schema = _schema_with_tables(["orders", "customers"], extra_columns=["a_long_column_name"])
+        gen = SemanticModelGenerator()
+        sizes = gen.table_ddl_sizes(schema, ["public.orders", "public.ghost"])
+        assert set(sizes) == {"public.orders"}
+        assert sizes["public.orders"] == len(gen._table_ddl_block(schema.tables[0]))
+        # A batch whose sizes sum to the limit renders whole; one character less and
+        # ``_schema_to_ddl`` drops the last table.
+        both = gen.table_ddl_sizes(schema, ["public.orders", "public.customers"])
+        gen._MAX_DDL_CHARS = sum(both.values())
+        assert "omitted" not in gen._schema_to_ddl(schema)
+        gen._MAX_DDL_CHARS -= 1
+        assert "1 additional table(s) omitted" in gen._schema_to_ddl(schema)
 
 
 class TestGroundTablesToSchema:
@@ -928,8 +1171,8 @@ class TestDetectDriftNamesAQuotedDuplicate:
         )
         warnings = SemanticModelGenerator().detect_drift(schema, stored)
         assert warnings == [
-            'Column key "public.orders."status"" in the semantic model is a quoted spelling '
-            'of "status"; Apply Drift removes the duplicate'
+            'Column key "public.orders."status"" in the semantic model is a near-miss '
+            'spelling of "status"; Apply Drift removes the duplicate'
         ]
 
     def test_a_quoted_key_of_a_gone_column_is_still_reported_gone(self) -> None:
@@ -1006,3 +1249,184 @@ class TestNamesAnyTable:
 
     def test_a_unique_bare_name_counts(self) -> None:
         assert names_any_table(["orders"], {"public.orders"}, self._KEYS) is True
+
+
+class TestDetectDriftNewColumns:
+    """With a baseline (``compute_drift``'s ``known_columns``), Check Drift names the live
+    columns the model has never seen, and words each removed near-miss key by what the
+    apply does to it."""
+
+    _KNOWN: ClassVar[dict[str, set[str]]] = {"public.orders": {"id"}}
+    # What every baseline writer records for a table with live ``id`` and ``status``.
+    _KNOWN_STATUS: ClassVar[dict[str, set[str]]] = {"public.orders": {"id", "status"}}
+
+    @staticmethod
+    def _warnings(
+        schema: DataSourceSchema, model: SemanticModel, known: dict[str, set[str]]
+    ) -> list[str]:
+        """``detect_drift`` over the diff against *known*, as the drift route passes it."""
+        drift = compute_drift(schema, model, None, known)
+        return SemanticModelGenerator().detect_drift(schema, model, drift=drift)
+
+    @staticmethod
+    def _respelling(key: str, target: str) -> str:
+        return (
+            f'Column key "public.orders.{key}" in the semantic model is a near-miss spelling '
+            f'of "{target}"; Apply Drift removes the key and annotates "{target}" afresh '
+            "(the key's annotation is not kept)"
+        )
+
+    def test_a_new_column_on_a_known_table_is_reported(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["loyalty_tier", "region"])
+        model = SemanticModel(tables={"public.orders": _tbl("id")})
+        warnings = self._warnings(schema, model, self._KNOWN)
+        assert warnings == [
+            "2 new column(s) added to tables in the semantic model since it was generated: "
+            "public.orders.loyalty_tier, public.orders.region"
+        ]
+
+    def test_a_column_the_baseline_knows_is_not_reported(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["notes"])
+        model = SemanticModel(tables={"public.orders": _tbl("id")})
+        known = {"public.orders": {"id", "notes"}}
+        assert self._warnings(schema, model, known) == []
+
+    def test_no_new_column_no_warning(self) -> None:
+        schema = _schema_with_tables(["orders"])
+        model = SemanticModel(tables={"public.orders": _tbl("id")})
+        assert self._warnings(schema, model, self._KNOWN) == []
+
+    def test_without_a_baseline_no_column_is_reported_new(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["loyalty_tier"])
+        model = SemanticModel(tables={"public.orders": _tbl("id")})
+        assert SemanticModelGenerator().detect_drift(schema, model) == []
+
+    def test_a_passed_drift_is_the_one_worded(self) -> None:
+        """A diff of its own has no baseline and would report no new column: the caller's
+        drift, which names one, is what the warnings word."""
+        schema = _schema_with_tables(["orders"], extra_columns=["loyalty_tier"])
+        model = SemanticModel(tables={"public.orders": _tbl("id")})
+        drift = SchemaDrift(added_columns={"public.orders": {"loyalty_tier"}})
+        assert SemanticModelGenerator().detect_drift(schema, model, drift=drift) == [
+            "1 new column(s) added to tables in the semantic model since it was generated: "
+            "public.orders.loyalty_tier"
+        ]
+
+    def test_the_warning_lists_at_most_five_names(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=[f"c{i}" for i in range(7)])
+        model = SemanticModel(tables={"public.orders": _tbl("id")})
+        [warning] = self._warnings(schema, model, self._KNOWN)
+        assert "7 new column(s)" in warning
+        assert warning.endswith("…")
+        assert warning.count("public.orders.c") == 5
+
+    def test_a_quoted_key_held_without_its_bare_twin_is_a_respelling(self) -> None:
+        """The apply drops ``'"status"'`` and annotates ``status`` afresh: one warning says
+        so. The column is neither gone nor new since the model was generated."""
+        schema = _schema_with_tables(["orders"], extra_columns=["status"])
+        model = SemanticModel(tables={"public.orders": _tbl("id", '"status"')})
+        warnings = self._warnings(schema, model, self._KNOWN_STATUS)
+        assert warnings == [self._respelling('"status"', "status")]
+
+    def test_a_case_only_key_held_without_its_live_twin_is_a_respelling(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["status"])
+        model = SemanticModel(tables={"public.orders": _tbl("id", "Status")})
+        warnings = self._warnings(schema, model, self._KNOWN_STATUS)
+        assert warnings == [self._respelling("Status", "status")]
+
+    def test_a_respelling_is_left_out_of_the_new_columns_warning(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["status", "region"])
+        model = SemanticModel(tables={"public.orders": _tbl("id", '"status"')})
+        warnings = self._warnings(schema, model, self._KNOWN_STATUS)
+        assert warnings == [
+            self._respelling('"status"', "status"),
+            "1 new column(s) added to tables in the semantic model since it was generated: "
+            "public.orders.region",
+        ]
+
+    def test_a_near_miss_key_beside_its_stored_twin_is_a_duplicate(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["status"])
+        model = SemanticModel(tables={"public.orders": _tbl("id", "status", "Status")})
+        warnings = self._warnings(schema, model, self._KNOWN_STATUS)
+        assert warnings == [
+            'Column key "public.orders.Status" in the semantic model is a near-miss spelling '
+            'of "status"; Apply Drift removes the duplicate'
+        ]
+
+    def test_a_dropped_column_the_baseline_knew_is_gone_not_respelled(self) -> None:
+        """The database had ``Status`` and ``status`` and dropped ``Status``: a drop, so
+        ``status`` (seen, and not held) is not new either."""
+        schema = _schema_with_tables(["orders"], extra_columns=["status"])
+        model = SemanticModel(tables={"public.orders": _tbl("id", "Status")})
+        known = {"public.orders": {"id", "Status", "status"}}
+        warnings = self._warnings(schema, model, known)
+        assert warnings == [
+            'Column "public.orders.Status" referenced in semantic model no longer exists'
+        ]
+
+    def test_a_case_only_rename_in_the_database_is_a_drop_and_a_new_column(self) -> None:
+        """The baseline saw ``Status`` but never ``status``: the database renamed it, so
+        ``Status`` is gone and ``status`` is new, not a respelling."""
+        schema = _schema_with_tables(["orders"], extra_columns=["status"])
+        model = SemanticModel(tables={"public.orders": _tbl("id", "Status")})
+        known = {"public.orders": {"id", "Status"}}
+        warnings = self._warnings(schema, model, known)
+        assert warnings == [
+            'Column "public.orders.Status" referenced in semantic model no longer exists',
+            "1 new column(s) added to tables in the semantic model since it was generated: "
+            "public.orders.status",
+        ]
+
+    def test_a_dropped_column_beside_its_stored_case_twin_is_gone_not_a_duplicate(
+        self,
+    ) -> None:
+        """The table had ``Status`` and ``status`` and the model held both. The database
+        dropped ``Status``: the baseline knew it as a real column, so it is gone, not a
+        near-miss spelling of ``status``."""
+        schema = _schema_with_tables(["orders"], extra_columns=["status"])
+        model = SemanticModel(tables={"public.orders": _tbl("id", "Status", "status")})
+        known = {"public.orders": {"id", "Status", "status"}}
+        warnings = self._warnings(schema, model, known)
+        assert warnings == [
+            'Column "public.orders.Status" referenced in semantic model no longer exists'
+        ]
+
+    def test_a_dropped_quoted_column_is_named_verbatim(self) -> None:
+        """The baseline recorded ``'"weird"'`` as a live column, so that is its real name:
+        not quote-stripped like a blob-era key."""
+        schema = _schema_with_tables(["orders"])
+        model = SemanticModel(tables={"public.orders": _tbl("id", '"weird"')})
+        known = {"public.orders": {"id", '"weird"'}}
+        warnings = self._warnings(schema, model, known)
+        assert warnings == [
+            'Column "public.orders."weird"" referenced in semantic model no longer exists'
+        ]
+
+    def test_two_dropped_columns_that_differ_only_by_quotes_are_two_warnings(self) -> None:
+        schema = _schema_with_tables(["orders"])
+        model = SemanticModel(tables={"public.orders": _tbl("id", '"a"', "a")})
+        known = {"public.orders": {"id", '"a"', "a"}}
+        warnings = self._warnings(schema, model, known)
+        assert warnings == [
+            'Column "public.orders."a"" referenced in semantic model no longer exists',
+            'Column "public.orders.a" referenced in semantic model no longer exists',
+        ]
+
+    def test_an_ambiguous_case_only_key_is_gone(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["Status", "status"])
+        model = SemanticModel(tables={"public.orders": _tbl("id", "STATUS")})
+        known = {"public.orders": {"id", "Status", "status"}}
+        warnings = self._warnings(schema, model, known)
+        assert warnings == [
+            'Column "public.orders.STATUS" referenced in semantic model no longer exists'
+        ]
+
+    def test_without_a_baseline_a_quoted_key_of_an_unheld_live_column_is_gone(self) -> None:
+        """No baseline, so the apply drops the key and adds nothing back: the key is gone,
+        named under its stored spelling because ``status`` itself still exists."""
+        schema = _schema_with_tables(["orders"], extra_columns=["status"])
+        model = SemanticModel(tables={"public.orders": _tbl("id", '"status"')})
+        warnings = SemanticModelGenerator().detect_drift(schema, model)
+        assert warnings == [
+            'Column "public.orders."status"" referenced in semantic model no longer exists'
+        ]

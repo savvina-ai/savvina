@@ -466,6 +466,32 @@ class TablesBatchResponse(_Base):
         return {k: tbl for k, tbl in v.items() if isinstance(tbl, dict)}
 
 
+class TableColumnsResponse(_Base):
+    """The columns the LLM annotated for one existing table (the new-column pass)."""
+
+    columns: dict[str, ColumnSemantic] = Field(default_factory=dict)
+
+    @field_validator("columns", mode="before")
+    @classmethod
+    def _filter_columns(cls, v: Any) -> Any:
+        if not isinstance(v, dict):
+            return {}
+        return {k: col for k, col in v.items() if isinstance(col, (dict, BaseModel))}
+
+
+class ColumnsBatchResponse(_Base):
+    """LLM response envelope for the new columns of a few existing tables."""
+
+    tables: dict[str, TableColumnsResponse] = Field(default_factory=dict)
+
+    @field_validator("tables", mode="before")
+    @classmethod
+    def _filter_tables(cls, v: Any) -> Any:
+        if not isinstance(v, dict):
+            return {}
+        return {k: tbl for k, tbl in v.items() if isinstance(tbl, dict)}
+
+
 _VALID_METRIC_TYPES: frozenset[str] = frozenset(
     {"simple", "derived", "ratio", "cumulative", "conversion"}
 )

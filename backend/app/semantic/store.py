@@ -30,13 +30,14 @@ from typing import TYPE_CHECKING, Any, Literal
 import uuid
 
 from pydantic import TypeAdapter
-from sqlalchemy import String, delete, event, func, null, select, update
+from sqlalchemy import String, delete, event, exists, func, null, select, update
 
 from ..models.connection import Connection
 from ..models.semantic_store import (
     SemanticColumnRow,
     SemanticGlobalItemRow,
     SemanticHistoryRow,
+    SemanticKnownColumnsRow,
     SemanticMetricRow,
     SemanticModelRow,
     SemanticRelationshipRow,
@@ -1123,6 +1124,108 @@ async def load_header(db: AsyncSession, connection_id: str) -> SemanticHeader | 
         generation_progress=GenerationProgress.model_validate(progress) if progress else None,
         generation_run_id=header.generation_run_id,
     )
+
+
+async def load_known_columns(db: AsyncSession, connection_id: str) -> dict[str, frozenset[str]]:
+    """Table key → known live column names, for the tables that have a baseline; ``{}``
+    when the connection has no model or no baseline yet. A column-only SELECT, one row
+    per table: read once per check, preview or finalisation, up to twice per apply
+    (before the LLM calls and under the lock; an apply with no drift stops after the
+    first), and never per generation batch.
+    A value that is not a list is skipped and a non-string name dropped; neither raises."""
+    result = await db.execute(
+        select(SemanticKnownColumnsRow.table_key, SemanticKnownColumnsRow.columns).where(
+            SemanticKnownColumnsRow.connection_id == connection_id
+        )
+    )
+    return {
+        key: frozenset(name for name in names if isinstance(name, str))
+        for key, names in result
+        if isinstance(names, list)
+    }
+
+
+async def update_known_columns(
+    db: AsyncSession,
+    connection_id: str,
+    updates: Mapping[str, Iterable[str]],
+    *,
+    only_missing: bool = False,
+    prune: bool = False,
+) -> None:
+    """Set the baseline row of each table in *updates*.
+
+    A row is replaced whole (the caller passes the union it wants) and only when it
+    differs; an unchanged entry issues no write. Without ``prune``, only the rows of the
+    tables named are read or written, so the cost follows *updates*, not the schema:
+    callers pass only the tables they may change: a generation batch its own tables,
+    the finalisation and an apply-drift just the entries that differ
+    (``_baseline_changes``), the drift check just the tables with no entry. With
+    ``only_missing`` an existing row is left alone, which is how the drift check seeds a
+    legacy table; a row whose value is not a list is no entry (``load_known_columns``
+    skips it) and is rewritten. With ``prune`` the rows of every table the connection's
+    ``semantic_tables`` no longer holds are deleted in one statement — call it after
+    any save that removed them (same transaction). A connection with no model changes
+    nothing.
+
+    Keys and names are fitted (``_fit_values``) like every other JSON write here, so
+    the baseline holds what the stored table and column rows hold (NULs stripped);
+    an over-long table key raises ``ValueError`` before the session is touched.
+
+    Bookkeeping, not content: no version bump, no history row, no cache purge. The
+    caller must hold the connection row lock (``lock_and_reread_connection``), which
+    serialises the writers of one connection, so there is no upsert race to guard
+    against.
+    """
+    # Keys that fit to the same string (they differ only by a NUL) name one table:
+    # their columns are unioned, not replaced by the last one's.
+    fitted: dict[str, set[str]] = {}
+    for raw_key, names in updates.items():
+        values = _fit_values(
+            SemanticKnownColumnsRow, {"table_key": raw_key, "columns": list(names)}
+        )
+        fitted.setdefault(values["table_key"], set()).update(values["columns"])
+    model_id = await db.scalar(
+        select(SemanticModelRow.id).where(SemanticModelRow.connection_id == connection_id)
+    )
+    if model_id is None:
+        return
+    keys = list(fitted)
+    existing: dict[str, SemanticKnownColumnsRow] = {}
+    for chunk in _chunks(keys):
+        # populate_existing: a re-read under a row lock must see other transactions'
+        # committed state, not an identity-mapped instance.
+        rows = await db.scalars(
+            select(SemanticKnownColumnsRow)
+            .where(
+                SemanticKnownColumnsRow.connection_id == connection_id,
+                SemanticKnownColumnsRow.table_key.in_(chunk),
+            )
+            .execution_options(populate_existing=True)
+        )
+        existing.update({row.table_key: row for row in rows})
+    for key, name_set in fitted.items():
+        names = sorted(name_set)
+        row = existing.get(key)
+        if row is None:
+            db.add(
+                SemanticKnownColumnsRow(
+                    model_id=model_id, connection_id=connection_id, table_key=key, columns=names
+                )
+            )
+        elif not isinstance(row.columns, list) or (not only_missing and row.columns != names):
+            row.columns = names
+    if prune:
+        await db.flush()  # the rows added above, and any save before this call, are visible
+        await db.execute(
+            delete(SemanticKnownColumnsRow).where(
+                SemanticKnownColumnsRow.connection_id == connection_id,
+                ~exists().where(
+                    SemanticTableRow.connection_id == SemanticKnownColumnsRow.connection_id,
+                    SemanticTableRow.table_key == SemanticKnownColumnsRow.table_key,
+                ),
+            )
+        )
 
 
 async def count_tables_in_run(db: AsyncSession, connection_id: str) -> int:

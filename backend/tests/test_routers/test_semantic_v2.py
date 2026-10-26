@@ -8,11 +8,13 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from app.database import get_db
 from app.datasources.models import ColumnInfo, DataSourceSchema, SchemaInfo, TableInfo
 from app.main import app
 from app.semantic import store as semantic_store
-from app.semantic.models import SemanticModel
+from app.semantic.models import GenerationStatus, SemanticModel
 
 from .conftest import MockResult, _make_conn, _mock_db
 
@@ -96,6 +98,21 @@ class TestCheckDrift:
         from app.auth.limiter import limiter
 
         limiter._storage.reset()
+
+    @pytest.fixture(autouse=True)
+    def _baseline_store(self):
+        """There is no baseline, so every live table goes through the seeding path; the store
+        calls and the lock are mocked so the one-result db queue is never reached."""
+        with (
+            patch(f"{_STORE}.load_known_columns", new=AsyncMock(return_value={})),
+            patch(
+                f"{_STORE}.load_header",
+                new=AsyncMock(return_value=MagicMock(generation_status=GenerationStatus.COMPLETE)),
+            ),
+            patch(f"{_STORE}.update_known_columns", new=AsyncMock()),
+            patch("app.routers.semantic._lock_generation", new=AsyncMock()),
+        ):
+            yield
 
     async def test_no_semantic_model_returns_404(self, http_client) -> None:
         conn = _make_conn()

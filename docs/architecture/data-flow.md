@@ -526,7 +526,9 @@ ConnectionsRouter.refresh_schema()
   6. adapter.disconnect()
   7. Upsert user_schema_caches SET schema_cache = ?, schema_cached_at = ?
      (keyed by connection_id + user_id)
-  8. DELETE FROM query_cache WHERE connection_id = ?
-     (invalidate — cached queries may reference old columns)
+  8. DELETE FROM table_embedding_cache WHERE connection_id = ?
+     DELETE FROM query_cache WHERE connection_id = ?
+     (invalidate — embeddings and cached queries may reference old columns;
+     in this order, the one every cache purge shares)
   9. Return schema as JSON
 ```

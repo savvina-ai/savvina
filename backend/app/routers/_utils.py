@@ -66,8 +66,8 @@ async def lock_and_reread_connection(conn_id: str, db: AsyncSession) -> Connecti
 async def _invalidate_connection_caches(
     connection_id: str, db: AsyncSession, *, keep_schema: bool = False
 ) -> None:
-    """Delete QueryCacheEntry, UserSchemaCache, and TableEmbeddingCache rows for
-    *connection_id*.
+    """Delete UserSchemaCache, TableEmbeddingCache, and QueryCacheEntry rows for
+    *connection_id*, in that order.
 
     Call before ``db.commit()`` whenever the semantic model, schema, privacy
     settings, or connection config is mutated so that stale cached queries and
@@ -76,9 +76,13 @@ async def _invalidate_connection_caches(
     ``keep_schema=True`` leaves ``UserSchemaCache`` alone, for a caller that has just
     stored a live introspection there (apply-drift): deleting it would throw the fresh
     schema away and leave the page's next schema read on a 404 until a Schema Refresh.
-    CE has a single user, so the row kept is the caller's own.
+    A generation batch passes it too: it changes the semantic layer but not the schema,
+    and every batch of the run reads the schema from that cache. CE has a single user,
+    so the row kept is the caller's own.
     """
-    await db.execute(delete(QueryCacheEntry).where(QueryCacheEntry.connection_id == connection_id))
+    # The order ``refresh_user_schema_cache`` writes in (schema cache, then embeddings,
+    # then cached answers): two transactions that lock the same rows in opposite orders
+    # can deadlock, e.g. a generation batch purging while a Schema Refresh flushes.
     if not keep_schema:
         await db.execute(
             delete(UserSchemaCache).where(UserSchemaCache.connection_id == connection_id)
@@ -86,6 +90,7 @@ async def _invalidate_connection_caches(
     await db.execute(
         delete(TableEmbeddingCache).where(TableEmbeddingCache.connection_id == connection_id)
     )
+    await db.execute(delete(QueryCacheEntry).where(QueryCacheEntry.connection_id == connection_id))
 
 
 def cached_json_response(data: dict | list, request: Request) -> Response:

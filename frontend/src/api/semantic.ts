@@ -74,7 +74,13 @@ export const semanticApi = {
   delete: (connectionId: string) =>
     apiClient.delete(`/api/v1/connections/${connectionId}/semantic`).then(r => r.data),
 
-  /** 404s when there is no semantic model, or when no schema has been cached yet. */
+  /**
+   * 404s when the connection or its semantic model does not exist. 400 when the data
+   * source is unreachable and no schema has been cached yet. 409 when the connection was
+   * deleted during the check; 503 (with `Retry-After`) when the check waited on a save in
+   * progress past the database's lock timeout. 429 when rate limited (5/minute: every
+   * check runs a live introspection).
+   */
   getDrift: (connectionId: string) =>
     apiClient
       .get<DriftReport>(`/api/v1/connections/${connectionId}/semantic/drift`)
@@ -82,7 +88,16 @@ export const semanticApi = {
 
   /**
    * Applies what `getDrift` reported, or with `dryRun` previews it: same summary, nothing
-   * written, no LLM call. 400 when the database is unreachable, 409 during a run.
+   * written but the refreshed schema cache, no LLM call. 404 when the connection or its
+   * semantic model does not exist. 400 when the database is unreachable, when the provider
+   * cannot be resolved for new tables or for an apply whose only changes are new columns,
+   * or when the store rejects the result of the apply. 409 during a run, or when the
+   * connection or model was deleted meanwhile. 429 when rate limited (5/minute, a preview
+   * and its apply are two calls). 503 when the call waited on a save past the lock
+   * timeout. A failed new-table (or globals) LLM call answers with its own error: the
+   * provider's 429 or 503, 504 on a timeout, 422 or 500. An apply whose only changes are
+   * new columns, and no batch has answered yet, fails with the provider's 429 or 503 too;
+   * any other failed new-column batch is a warning in the summary.
    */
   applyDrift: (connectionId: string, provider?: string, dryRun = false) =>
     apiClient

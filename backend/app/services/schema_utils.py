@@ -128,6 +128,10 @@ async def refresh_user_schema_cache(
 
     schema_hash = SemanticModelGenerator().compute_schema_hash(schema)
     changed = await _store_user_schema_cache(db, conn.id, user_id, schema, schema_hash)
+    # Schema cache, then embeddings, then cached answers: the order
+    # ``_invalidate_connection_caches`` deletes in too, because two transactions that
+    # lock the same rows in opposite orders can deadlock. The schema-cache write comes
+    # first even when it is pending in the session: the next execute autoflushes it.
     if flush == "always" or (flush == "changed" and changed):
         await db.execute(
             delete(TableEmbeddingCache).where(TableEmbeddingCache.connection_id == conn.id)

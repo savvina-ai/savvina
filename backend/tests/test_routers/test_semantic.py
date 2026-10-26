@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from datetime import UTC, datetime
 import json
@@ -14,6 +14,7 @@ import logging
 import math
 from pathlib import Path
 import re
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
@@ -27,6 +28,7 @@ from app.semantic.generator import SemanticModelGenerator as _RealGenerator
 from app.semantic.models import (
     GENERATION_BATCH_SIZE,
     AggregationType,
+    ColumnSemantic,
     CommonJoin,
     DerivedColumn,
     GenerationProgress,
@@ -210,11 +212,28 @@ class TestDeleteSemanticModel:
 # ── GET /api/v1/connections/{id}/semantic/drift ─────────────────────────────────
 
 
+def _locked_header(status: GenerationStatus = GenerationStatus.COMPLETE) -> MagicMock:
+    """The model header a check re-reads under the connection lock."""
+    return MagicMock(generation_status=status)
+
+
 class TestCheckDrift:
     """Check Drift introspects live, so a drop shows up without a separate refresh."""
 
     def setup_method(self) -> None:
         _reset_limiter()
+
+    @pytest.fixture(autouse=True)
+    def _baseline_store(self):
+        """There is no baseline, so every live table goes through the seeding path; the store
+        calls and the lock are mocked so the one-result db queue is never reached."""
+        with (
+            patch(f"{_STORE}.load_known_columns", new=AsyncMock(return_value={})),
+            patch(f"{_STORE}.load_header", new=AsyncMock(return_value=_locked_header())),
+            patch(f"{_STORE}.update_known_columns", new=AsyncMock()),
+            patch("app.routers.semantic._lock_generation", new=AsyncMock()),
+        ):
+            yield
 
     async def test_compares_against_a_live_introspection(self, http_client):
         db = _mock_db(MockResult(single=_make_conn()))  # get_connection_or_404
@@ -386,6 +405,270 @@ class TestCheckDrift:
         assert resp.status_code == 404
         # No model, no reason to touch the data source.
         refresh.assert_not_awaited()
+
+
+class TestCheckDriftNewColumns:
+    """The check reads the baseline; a table with none is baselined at first sight."""
+
+    def setup_method(self) -> None:
+        _reset_limiter()
+
+    @pytest.fixture(autouse=True)
+    def _baseline_store(self):
+        self.known = AsyncMock(return_value={})
+        self.header = AsyncMock(return_value=_locked_header())
+        self.known_update = AsyncMock()
+        self.lock = AsyncMock()
+        with (
+            patch(f"{_STORE}.load_known_columns", new=self.known),
+            patch(f"{_STORE}.load_header", new=self.header),
+            patch(f"{_STORE}.update_known_columns", new=self.known_update),
+            patch("app.routers.semantic._lock_generation", new=self.lock),
+        ):
+            yield
+
+    async def _get(
+        self,
+        http_client,
+        *,
+        schema: DataSourceSchema | None = None,
+        stored: SemanticModel | None = None,
+        conn=None,
+        status: GenerationStatus = GenerationStatus.COMPLETE,
+        db=None,
+        refresh: Callable[..., Awaitable[DataSourceSchema]] | None = None,
+    ):
+        """GET the drift report; ``status`` applies only to the default stored model, and
+        *refresh* replaces the mocked live introspection."""
+        db = db or _mock_db(MockResult(single=conn or _make_conn()))  # get_connection_or_404
+        app.dependency_overrides[get_db] = lambda: db
+        stored = stored or SemanticModel(
+            generation_status=status,
+            tables={
+                "public.orders": TableSemantic(
+                    display_name="Orders", columns={"id": ColumnSemantic(display_name="Id")}
+                )
+            },
+        )
+        live = schema or _schema(["orders"], {"orders": ["id", "loyalty_tier"]})
+        with (
+            patch(f"{_STORE}.load_model", new=AsyncMock(return_value=stored)),
+            patch(
+                "app.routers.semantic.refresh_user_schema_cache",
+                new=refresh or AsyncMock(return_value=live),
+            ),
+        ):
+            resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
+        assert resp.status_code == 200
+        return resp.json()
+
+    async def test_a_column_the_baseline_has_not_seen_is_reported_and_actionable(
+        self, http_client
+    ) -> None:
+        self.known.return_value = {"public.orders": frozenset({"id"})}
+        body = await self._get(http_client)
+        assert any(
+            "1 new column(s)" in w and "public.orders.loyalty_tier" in w for w in body["warnings"]
+        )
+        assert body["has_actionable_changes"] is True
+        self.known_update.assert_not_awaited()
+
+    async def test_a_column_the_baseline_has_seen_is_not_reported(self, http_client) -> None:
+        self.known.return_value = {"public.orders": frozenset({"id", "loyalty_tier"})}
+        body = await self._get(http_client)
+        assert body["warnings"] == []
+        assert body["has_actionable_changes"] is False
+
+    async def test_a_table_with_no_baseline_is_baselined_not_reported(self, http_client) -> None:
+        body = await self._get(http_client)
+        assert body["warnings"] == []
+        assert body["has_actionable_changes"] is False
+        self.known_update.assert_awaited_once()
+        args, kwargs = self.known_update.await_args
+        assert args[2] == {"public.orders": frozenset({"id", "loyalty_tier"})}
+        assert kwargs == {"only_missing": True}
+
+    async def test_only_the_tables_without_a_baseline_are_written(self, http_client) -> None:
+        self.known.return_value = {"public.orders": frozenset({"id"})}
+        stored = SemanticModel(
+            tables={
+                "public.orders": TableSemantic(display_name="Orders"),
+                "public.customers": TableSemantic(display_name="Customers"),
+            }
+        )
+        await self._get(
+            http_client,
+            stored=stored,
+            schema=_schema(["orders", "customers"], {"orders": ["id"], "customers": ["id"]}),
+        )
+        assert self.known_update.await_args.args[2] == {"public.customers": frozenset({"id"})}
+
+    async def test_nothing_is_written_when_every_table_has_a_baseline(self, http_client) -> None:
+        self.known.return_value = {"public.orders": frozenset({"id", "loyalty_tier"})}
+        await self._get(http_client)
+        self.known_update.assert_not_awaited()
+        self.lock.assert_not_awaited()
+
+    async def test_a_legacy_near_miss_key_is_reported_as_a_respelling_not_a_new_column(
+        self, http_client
+    ) -> None:
+        """No baseline: the live ``status`` is seeded as seen, yet the model holds it only
+        as ``"Status"``, a key Apply Drift removes, so the check must word it as the
+        respelling it is (Apply Drift annotates ``status`` afresh), not as a new column."""
+        stored = SemanticModel(
+            tables={
+                "public.orders": TableSemantic(
+                    display_name="Orders",
+                    columns={
+                        "id": ColumnSemantic(display_name="Id"),
+                        '"Status"': ColumnSemantic(display_name="Status"),
+                    },
+                )
+            }
+        )
+        body = await self._get(
+            http_client,
+            stored=stored,
+            schema=_schema(["orders"], {"orders": ["id", "status"]}),
+        )
+        assert any(
+            'Column key "public.orders."Status"" in the semantic model is a near-miss spelling '
+            'of "status"' in w
+            for w in body["warnings"]
+        )
+        assert not any("new column(s)" in w for w in body["warnings"])
+        assert body["has_actionable_changes"] is True
+
+    async def test_an_interrupted_run_is_not_baselined(self, http_client) -> None:
+        db = _mock_db(MockResult(single=_make_conn()))
+        await self._get(http_client, status=GenerationStatus.TABLES_PARTIAL, db=db)
+        self.known_update.assert_not_awaited()
+        self.lock.assert_not_awaited()
+        db.commit.assert_awaited_once()
+
+    async def test_a_cached_schema_is_not_baselined(self, http_client) -> None:
+        """The cache is not what the model has *seen*: a column it lacks must stay new."""
+        from datetime import UTC, datetime
+
+        from app.services.schema_utils import SchemaRefreshError, _schema_to_dict
+
+        usc = MagicMock()
+        usc.schema_cache = _schema_to_dict(_schema(["orders"]))
+        usc.schema_cached_at = datetime(2026, 9, 24, 7, 16, tzinfo=UTC)
+        db = _mock_db(MockResult(single=_make_conn()), MockResult(single=usc))
+        app.dependency_overrides[get_db] = lambda: db
+        stored = SemanticModel(tables={"public.orders": TableSemantic(display_name="Orders")})
+        with (
+            patch(f"{_STORE}.load_model", new=AsyncMock(return_value=stored)),
+            patch(
+                "app.routers.semantic.refresh_user_schema_cache",
+                new=AsyncMock(side_effect=SchemaRefreshError("connection refused")),
+            ),
+        ):
+            resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
+        assert resp.status_code == 200
+        assert resp.json()["schema_source"] == "cache"
+        self.known_update.assert_not_awaited()
+        self.lock.assert_not_awaited()
+
+    async def test_the_schema_refresh_is_committed_before_the_seeding_lock(
+        self, http_client
+    ) -> None:
+        """The refresh writes the schema-cache row and, when the schema changed, deletes cache
+        rows; every writer that takes this lock then purges the same rows (a save, a
+        suggestion apply, a model delete, a generation batch, a finalisation, an apply).
+        Holding them while waiting for the lock can deadlock, so the refresh is committed
+        first (as ``apply_drift`` does), then the lock, then the seed."""
+        order: list[str] = []
+
+        async def refresh(*_args, **_kwargs) -> DataSourceSchema:
+            order.append("refresh")
+            return _schema(["orders"], {"orders": ["id", "loyalty_tier"]})
+
+        db = _mock_db(MockResult(single=_make_conn()))
+        db.commit.side_effect = lambda: order.append("commit")
+        self.lock.side_effect = lambda *_a, **_kw: order.append("lock")
+
+        async def header(*_args, **_kwargs) -> MagicMock:
+            order.append("header")
+            return _locked_header()
+
+        self.header.side_effect = header
+        self.known_update.side_effect = lambda *_a, **_kw: order.append("seed")
+        await self._get(http_client, db=db, refresh=refresh)
+        # The seeding commit releases the lock; the last commit finds nothing to write.
+        assert order == ["refresh", "commit", "lock", "header", "seed", "commit", "commit"]
+
+    async def test_a_run_started_while_the_check_waited_for_the_lock_is_not_baselined(
+        self, http_client
+    ) -> None:
+        """The model was loaded before the introspection; the header re-read under the lock
+        sees a Regenerate another tab started in between, whose batches write the baseline."""
+        self.header.return_value = _locked_header(GenerationStatus.TABLES_PARTIAL)
+        db = _mock_db(MockResult(single=_make_conn()))
+        body = await self._get(http_client, db=db)
+        self.lock.assert_awaited_once()
+        self.known_update.assert_not_awaited()
+        # The lock is still released, and the report is the one the check computed.
+        assert db.commit.await_count == 3
+        assert body["warnings"] == []
+
+    async def test_a_model_deleted_while_the_check_waited_for_the_lock_is_not_baselined(
+        self, http_client
+    ) -> None:
+        self.header.return_value = None
+        await self._get(http_client)
+        self.known_update.assert_not_awaited()
+
+    async def test_the_seeding_lock_is_the_generation_lock_of_this_connection(
+        self, http_client
+    ) -> None:
+        await self._get(http_client)
+        self.lock.assert_awaited_once()
+        assert self.lock.await_args.args[0] == "conn-123"
+        assert self.lock.await_args.args[2] == "check-drift"
+
+    async def test_a_hidden_column_is_neither_reported_nor_baselined(self, http_client) -> None:
+        conn = _make_conn(privacy_settings={"excluded_columns": ["public.orders.ssn"]})
+        schema = _schema(["orders"], {"orders": ["id", "ssn"]})
+        self.known.return_value = {"public.orders": frozenset({"id"})}
+        body = await self._get(http_client, conn=conn, schema=schema)
+        assert body["warnings"] == []
+        self.known.return_value = {}
+        await self._get(http_client, conn=conn, schema=schema)
+        assert self.known_update.await_args.args[2] == {"public.orders": frozenset({"id"})}
+
+
+class TestCheckDriftSeedingLock:
+    """The seeding write takes the real generation lock, so a vanished connection is a 409."""
+
+    def setup_method(self) -> None:
+        _reset_limiter()
+
+    async def test_a_connection_deleted_during_the_check_is_409_and_seeds_nothing(
+        self, http_client
+    ) -> None:
+        # get_connection_or_404 finds the connection; the lock's re-read does not.
+        db = _mock_db(MockResult(single=_make_conn()), MockResult(single=None))
+        app.dependency_overrides[get_db] = lambda: db
+        stored = SemanticModel(tables={"public.orders": TableSemantic(display_name="Orders")})
+        known_update = AsyncMock()
+        with (
+            patch(f"{_STORE}.load_model", new=AsyncMock(return_value=stored)),
+            patch(f"{_STORE}.load_known_columns", new=AsyncMock(return_value={})),
+            patch(f"{_STORE}.update_known_columns", new=known_update),
+            patch(
+                "app.routers.semantic.refresh_user_schema_cache",
+                new=AsyncMock(return_value=_schema(["orders"])),
+            ),
+        ):
+            resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
+        assert resp.status_code == 409
+        assert "Connection was deleted during check-drift" in resp.json()["detail"]
+        # The refreshed cache was committed before the lock; the failed lock rolled back.
+        db.commit.assert_awaited_once()
+        db.rollback.assert_awaited_once()
+        known_update.assert_not_awaited()
 
 
 # ── Phased generation ───────────────────────────────────────────────────────────
@@ -699,6 +982,23 @@ _BATCH_URL = "/api/v1/connections/conn-123/semantic/generate/batch"
 class TestGenerateBatch:
     def setup_method(self) -> None:
         _reset_limiter()
+
+    @pytest.fixture(autouse=True)
+    def _known_update(self):
+        """The baseline write is mocked in every batch test; ``self.known_update`` is it."""
+        with patch(f"{_STORE}.update_known_columns", new=AsyncMock(return_value=None)) as mocked:
+            self.known_update = mocked
+            yield
+
+    @pytest.fixture(autouse=True)
+    def _invalidate(self):
+        """The cache purge is mocked in every batch test; ``self.invalidate`` is it."""
+        with patch(
+            "app.routers.semantic._invalidate_connection_caches",
+            new=AsyncMock(return_value=None),
+        ) as mocked:
+            self.invalidate = mocked
+            yield
 
     def _provider(self):
         return (MagicMock(), "model-x", "claude")
@@ -1098,6 +1398,149 @@ class TestGenerateBatch:
         db.rollback.assert_awaited()
         db.commit.assert_not_awaited()
 
+    async def test_a_batch_records_the_live_columns_of_the_tables_it_reconciled(
+        self, http_client
+    ) -> None:
+        generated = {"public.orders": TableSemantic(display_name="Orders")}
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches()
+        with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:
+            self._wire(
+                mock_load,
+                mock_gen,
+                generated,
+                schema=_schema(["orders", "customers"], columns={"orders": ["id", "status"]}),
+            )
+            app.dependency_overrides[get_db] = lambda: _mock_db(MockResult(single=_make_conn()))
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+
+        assert resp.status_code == 200
+        args = self.known_update.await_args.args
+        assert args[1] == "conn-123"
+        # The live columns, annotated or not: ``generated`` annotates none of them, and
+        # ``customers`` is not in the batch.
+        assert args[2] == {"public.orders": ["id", "status"]}
+
+    async def test_a_table_the_llm_omitted_gets_no_baseline_entry(self, http_client) -> None:
+        generated = {"public.orders": TableSemantic(display_name="Orders")}
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches()
+        with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:
+            self._wire(mock_load, mock_gen, generated)
+            app.dependency_overrides[get_db] = lambda: _mock_db(MockResult(single=_make_conn()))
+            resp = await http_client.post(
+                _BATCH_URL, json={"table_keys": ["public.orders", "public.customers"]}
+            )
+
+        assert resp.status_code == 200
+        # It stays pending, so the model has not seen it yet.
+        assert set(self.known_update.await_args.args[2]) == {"public.orders"}
+
+    async def test_a_batch_whose_reconcile_conflicts_records_nothing(self, http_client) -> None:
+        reconcile = AsyncMock(side_effect=semantic_store.SemanticStoreConflict("superseded"))
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches(reconcile=reconcile)
+        with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:
+            self._wire(mock_load, mock_gen, {"public.orders": TableSemantic(display_name="O")})
+            db = _mock_db(MockResult(single=_make_conn()))
+            app.dependency_overrides[get_db] = lambda: db
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+
+        assert resp.status_code == 409
+        self.known_update.assert_not_awaited()
+        db.commit.assert_not_awaited()
+
+    async def test_a_batch_from_a_superseded_run_records_nothing(self, http_client) -> None:
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches(
+            headers=[
+                _header(GenerationStatus.TABLES_PARTIAL, "h", run_id="run-1"),
+                _header(GenerationStatus.TABLES_PARTIAL, "h", run_id="run-2"),
+            ],
+        )
+        with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:
+            self._wire(mock_load, mock_gen, {"public.orders": TableSemantic(display_name="O")})
+            app.dependency_overrides[get_db] = lambda: _mock_db(MockResult(single=_make_conn()))
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+
+        assert resp.status_code == 409
+        self.known_update.assert_not_awaited()
+
+    async def test_a_baseline_write_value_error_is_400_not_500(self, http_client) -> None:
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches()
+        with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:
+            self._wire(mock_load, mock_gen, {"public.orders": TableSemantic(display_name="O")})
+            self.known_update.side_effect = ValueError("table_key 'x...' is 600 characters")
+            db = _mock_db(MockResult(single=_make_conn()))
+            app.dependency_overrides[get_db] = lambda: db
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+        assert resp.status_code == 400
+        assert "600 characters" in resp.json()["detail"]
+        db.rollback.assert_awaited()
+        db.commit.assert_not_awaited()
+
+    async def test_a_batch_purges_the_cached_answers_but_keeps_the_schema_cache(
+        self, http_client
+    ) -> None:
+        order: list[str] = []
+        reconcile = AsyncMock(side_effect=lambda *_a, **_k: order.append("reconcile"))
+        self.known_update.side_effect = lambda *_a, **_k: order.append("baseline")
+        self.invalidate.side_effect = lambda *_a, **_k: order.append("purge")
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches(reconcile=reconcile)
+        with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:
+            self._wire(mock_load, mock_gen, {"public.orders": TableSemantic(display_name="O")})
+            db = _mock_db(MockResult(single=_make_conn()))
+            db.commit.side_effect = lambda: order.append("commit")
+            app.dependency_overrides[get_db] = lambda: db
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+
+        assert resp.status_code == 200
+        # Purged in the batch's own transaction, after its writes succeeded.
+        assert order == ["reconcile", "baseline", "purge", "commit"]
+        self.invalidate.assert_awaited_once_with("conn-123", db, keep_schema=True)
+
+    async def test_a_batch_that_conflicts_purges_nothing(self, http_client) -> None:
+        reconcile = AsyncMock(side_effect=semantic_store.SemanticStoreConflict("superseded"))
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches(reconcile=reconcile)
+        with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:
+            self._wire(mock_load, mock_gen, {"public.orders": TableSemantic(display_name="O")})
+            app.dependency_overrides[get_db] = lambda: _mock_db(MockResult(single=_make_conn()))
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+
+        assert resp.status_code == 409
+        self.invalidate.assert_not_awaited()
+
+    async def test_a_batch_whose_store_write_fails_purges_nothing(self, http_client) -> None:
+        reconcile = AsyncMock(side_effect=ValueError("table_key 'x...' is 600 characters"))
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches(reconcile=reconcile)
+        with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:
+            self._wire(mock_load, mock_gen, {"public.orders": TableSemantic(display_name="O")})
+            app.dependency_overrides[get_db] = lambda: _mock_db(MockResult(single=_make_conn()))
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+
+        assert resp.status_code == 400
+        self.invalidate.assert_not_awaited()
+
+    async def test_a_batch_whose_baseline_write_fails_purges_nothing(self, http_client) -> None:
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches()
+        with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:
+            self._wire(mock_load, mock_gen, {"public.orders": TableSemantic(display_name="O")})
+            self.known_update.side_effect = ValueError("table_key 'x...' is 600 characters")
+            app.dependency_overrides[get_db] = lambda: _mock_db(MockResult(single=_make_conn()))
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+
+        assert resp.status_code == 400
+        self.invalidate.assert_not_awaited()
+
+    async def test_a_batch_the_llm_answered_nothing_for_purges_nothing(self, http_client) -> None:
+        """Every table stays pending and no annotation changed, so the cached answers
+        still match the model."""
+        p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches()
+        with p_load as mock_load, p_prov, p_gen as mock_gen, p_hdr, p_rec, p_adv:
+            self._wire(mock_load, mock_gen, {})
+            app.dependency_overrides[get_db] = lambda: _mock_db(MockResult(single=_make_conn()))
+            resp = await http_client.post(_BATCH_URL, json={"table_keys": ["public.orders"]})
+
+        assert resp.status_code == 200
+        assert resp.json()["omitted_table_keys"] == ["public.orders"]
+        self.invalidate.assert_not_awaited()
+
     async def test_progress_value_error_is_400_not_500(self, http_client) -> None:
         advance = AsyncMock(side_effect=ValueError("malformed progress"))
         p_load, p_prov, p_gen, p_hdr, p_rec, p_adv = self._patches(advance=advance)
@@ -1165,6 +1608,7 @@ class TestGenerateGlobals:
         fresh_edges: list[RelationshipEdge] | None = None,
         conn: MagicMock | None = None,
         headers: tuple | None = None,
+        known: dict[str, frozenset[str]] | None = None,
     ):
         """POST /generate/globals with the store and LLM mocked; returns (resp, save, gen).
 
@@ -1172,7 +1616,10 @@ class TestGenerateGlobals:
         returns (or raises): the route answers with ``save_model``'s result.
         ``headers`` is what ``load_header`` returns before the LLM call and after the
         lock; by default the model's own status with run id ``run-1`` both times.
+        ``known`` is the baseline the finalisation reads (none by default) and
+        ``self.known_update`` the write it makes.
         """
+        self.known_update = AsyncMock(return_value=None)
         if headers is None:
             same = _header(model.generation_status, "h")
             headers = (same, same)
@@ -1199,6 +1646,8 @@ class TestGenerateGlobals:
                 new=AsyncMock(return_value=(model, _snapshot(provenance, protected))),
             ),
             patch(f"{_STORE}.save_model", new=save),
+            patch(f"{_STORE}.load_known_columns", new=AsyncMock(return_value=known or {})),
+            patch(f"{_STORE}.update_known_columns", new=self.known_update),
             ExitStack() as stack,
         ):
             # Entered last, so an extra patch overrides a default one above.
@@ -1786,10 +2235,661 @@ class TestGenerateGlobals:
         [note] = resp.json()["generation_warnings"]
         assert "public.orders.primary_timestamp_column" in note
 
+    async def test_finalising_baselines_unreached_tables_and_drops_gone_columns_and_tables(
+        self, http_client
+    ) -> None:
+        partial = self._partial(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "columns": {"id": {"display_name": "Id"}},
+                },
+                "public.unchanged": {"display_name": "Unchanged", "columns": {}},
+                "public.events": {"display_name": "Events", "columns": {}},
+                "public.stale": {"display_name": "Stale", "columns": {}},
+            }
+        )
+        schema = _schema(["orders", "unchanged", "events"])
+        resp, save, _ = await self._run(
+            http_client,
+            model=partial,
+            schema=schema,
+            known={
+                # ``old`` left the database: the entry loses it.
+                "public.orders": frozenset({"id", "old"}),
+                "public.unchanged": frozenset({"id"}),
+                # ``stale`` is no longer stored: its entry is not rewritten, the prune drops it.
+                "public.stale": frozenset({"id"}),
+            },
+        )
+
+        assert resp.status_code == 200
+        assert set(save.await_args.args[2].tables) == {
+            "public.orders",
+            "public.unchanged",
+            "public.events",
+        }
+        args, kwargs = self.known_update.await_args
+        assert args[1] == "conn-123"
+        assert args[2]["public.orders"] == {"id"}
+        # A stored table the run never reached: seeded with its live columns.
+        assert args[2]["public.events"] == {"id"}
+        # Only what changed is written: a table whose entry is already right is not in it.
+        assert "public.unchanged" not in args[2]
+        assert "public.stale" not in args[2]
+        assert kwargs == {"prune": True}
+
+    async def test_a_hand_added_column_the_baseline_lacks_is_recorded(self, http_client) -> None:
+        partial = self._partial(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "columns": {"id": {"display_name": "Id"}, "extra": {"display_name": "Hand"}},
+                }
+            }
+        )
+        resp, _, _ = await self._run(
+            http_client,
+            model=partial,
+            schema=_schema(["orders"], columns={"orders": ["id", "extra"]}),
+            known={"public.orders": frozenset({"id"})},
+        )
+
+        assert resp.status_code == 200
+        # What the model stores it has seen: the column is not "new" at the next check.
+        assert self.known_update.await_args.args[2] == {"public.orders": {"id", "extra"}}
+
+    async def test_an_unreadable_table_is_left_out_of_the_baseline_write(self, http_client) -> None:
+        """An unreadable table is absent from the live schema but stays stored, so the
+        finalisation neither rewrites its entry nor lets the prune delete it."""
+        partial = self._partial(
+            tables={
+                "public.orders": {"display_name": "Orders", "columns": {}},
+                "public.payroll": {"display_name": "Payroll", "columns": {}},
+            }
+        )
+        schema = _schema(["orders"])
+        schema.unreadable_tables = ["public.payroll"]
+        resp, save, _ = await self._run(
+            http_client,
+            model=partial,
+            schema=schema,
+            known={"public.payroll": frozenset({"id", "salary"})},
+        )
+
+        assert resp.status_code == 200
+        assert "public.payroll" in save.await_args.args[2].tables
+        assert self.known_update.await_args.args[2] == {"public.orders": {"id"}}
+
+    async def test_a_table_the_policy_hides_is_left_out_of_the_baseline_write(
+        self, http_client
+    ) -> None:
+        """A table the privacy policy hides is absent from the live schema but stays
+        stored, so the finalisation neither rewrites its entry nor lets the prune delete it."""
+        partial = self._partial(
+            tables={
+                "public.orders": {"display_name": "Orders", "columns": {}},
+                "public.payroll": {"display_name": "Payroll", "columns": {}},
+            }
+        )
+        resp, save, _ = await self._run(
+            http_client,
+            model=partial,
+            schema=_schema(["orders"]),  # what the loader returns with payroll excluded
+            conn=_make_conn(privacy_settings={"excluded_tables": ["public.payroll"]}),
+            known={"public.payroll": frozenset({"id", "salary"})},
+        )
+
+        assert resp.status_code == 200
+        assert "public.payroll" in save.await_args.args[2].tables
+        assert self.known_update.await_args.args[2] == {"public.orders": {"id"}}
+
+    async def test_a_column_the_policy_hides_leaves_the_tables_baseline_entry(
+        self, http_client
+    ) -> None:
+        """The schema the route sees never introspected the hidden column, so the entry
+        loses it whether or not the stored table holds an annotation for it."""
+        partial = self._partial(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "columns": {"id": {"display_name": "Id"}},
+                },
+                "public.customers": {
+                    "display_name": "Customers",
+                    "columns": {
+                        "id": {"display_name": "Id"},
+                        "ssn": {"display_name": "Hand-annotated"},
+                    },
+                },
+            }
+        )
+        resp, save, _ = await self._run(
+            http_client,
+            model=partial,
+            schema=_schema(["orders", "customers"]),  # ``ssn`` was never introspected
+            conn=_make_conn(
+                privacy_settings={"excluded_columns": ["public.orders.ssn", "public.customers.ssn"]}
+            ),
+            known={
+                "public.orders": frozenset({"id", "ssn"}),
+                "public.customers": frozenset({"id", "ssn"}),
+            },
+        )
+
+        assert resp.status_code == 200
+        # The save keeps the annotation the policy hides; only the baseline loses the name.
+        assert "ssn" in save.await_args.args[2].tables["public.customers"].columns
+        assert self.known_update.await_args.args[2] == {
+            "public.orders": {"id"},
+            "public.customers": {"id"},
+        }
+
+    @staticmethod
+    def _orders_holding(*column_keys: str) -> SemanticModel:
+        """A partial model whose ``orders`` stores the given column keys (live: ``id``,
+        ``status``)."""
+        return TestGenerateGlobals._partial(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "columns": {key: {"display_name": key} for key in column_keys},
+                }
+            }
+        )
+
+    @pytest.mark.parametrize("near_miss", ['"Status"', "Status"], ids=["quoted", "case-only"])
+    async def test_a_column_held_only_under_a_near_miss_key_is_not_recorded_as_seen(
+        self, http_client, near_miss
+    ) -> None:
+        """The prune drops the near-miss key and with it the column's only annotation,
+        so the baseline must not claim ``status`` as seen: the next check reports it."""
+        resp, save, _ = await self._run(
+            http_client,
+            model=self._orders_holding("id", near_miss),
+            schema=_schema(["orders"], columns={"orders": ["id", "status"]}),
+            known={"public.orders": frozenset({"id", "status"})},
+        )
+
+        assert resp.status_code == 200
+        assert set(save.await_args.args[2].tables["public.orders"].columns) == {"id"}
+        assert self.known_update.await_args.args[2] == {"public.orders": {"id"}}
+
+    async def test_a_seeded_table_does_not_record_a_column_held_only_under_a_near_miss_key(
+        self, http_client
+    ) -> None:
+        resp, _, _ = await self._run(
+            http_client,
+            model=self._orders_holding("id", '"Status"'),
+            schema=_schema(["orders"], columns={"orders": ["id", "status"]}),
+            known={},
+        )
+
+        assert resp.status_code == 200
+        assert self.known_update.await_args.args[2] == {"public.orders": {"id"}}
+
+    async def test_a_column_held_under_both_a_near_miss_key_and_its_real_name_is_recorded(
+        self, http_client
+    ) -> None:
+        resp, save, _ = await self._run(
+            http_client,
+            model=self._orders_holding("id", "status", '"Status"'),
+            schema=_schema(["orders"], columns={"orders": ["id", "status"]}),
+            known={"public.orders": frozenset({"id", "status"})},
+        )
+
+        assert resp.status_code == 200
+        assert set(save.await_args.args[2].tables["public.orders"].columns) == {"id", "status"}
+        # ``status`` keeps its annotation and the baseline entry already says so: no write.
+        assert self.known_update.await_args.args[2] == {}
+
+    async def test_the_baseline_is_written_before_the_commit(self, http_client) -> None:
+        db = _mock_db(MockResult(single=_make_conn()), MockResult(), MockResult(), MockResult())
+
+        async def write_before_commit(*_args, **_kwargs) -> None:
+            db.commit.assert_not_awaited()
+
+        known_update = AsyncMock(side_effect=write_before_commit)
+        resp, _, _ = await self._run(
+            http_client,
+            model=self._partial(),
+            schema=_schema(["orders"]),
+            db=db,
+            extra_patches=(patch(f"{_STORE}.update_known_columns", new=known_update),),
+        )
+
+        assert resp.status_code == 200
+        known_update.assert_awaited_once()
+        db.commit.assert_awaited_once()
+
+    async def test_a_failed_save_records_nothing(self, http_client) -> None:
+        resp, _, _ = await self._run(
+            http_client,
+            model=self._partial(),
+            schema=_schema(["orders"]),
+            save=AsyncMock(side_effect=ValueError("from_table 'x...' is 600 characters")),
+        )
+
+        assert resp.status_code == 400
+        self.known_update.assert_not_awaited()
+
+
+class TestBaselineChanges:
+    def test_only_new_and_different_entries_are_returned(self) -> None:
+        from app.routers.semantic import _baseline_changes
+
+        known = {"a": frozenset({"x"}), "b": frozenset({"x", "y"})}
+        wanted = {"a": ["x"], "b": ["x"], "c": ["z"]}
+        assert _baseline_changes(known, wanted) == {"b": {"x"}, "c": {"z"}}
+
+
+class TestEffectiveKnownColumns:
+    def test_a_stored_table_with_no_entry_gets_its_live_columns(self) -> None:
+        from app.routers.semantic import _effective_known_columns
+
+        schema = _schema(["orders"], columns={"orders": ["id", "status"]})
+        stored = {"public.orders": TableSemantic(display_name="Orders")}
+        assert _effective_known_columns({}, stored, schema) == {
+            "public.orders": frozenset({"id", "status"})
+        }
+
+    def test_an_existing_entry_is_kept_even_when_empty(self) -> None:
+        from app.routers.semantic import _effective_known_columns
+
+        schema = _schema(["orders"], columns={"orders": ["id", "status"]})
+        stored = {"public.orders": TableSemantic(display_name="Orders")}
+        known = {"public.orders": frozenset()}
+        assert _effective_known_columns(known, stored, schema) == known
+
+    def test_a_stored_table_missing_from_the_live_schema_gets_no_entry(self) -> None:
+        from app.routers.semantic import _effective_known_columns
+
+        stored = {"public.ghosts": TableSemantic(display_name="Ghosts")}
+        assert _effective_known_columns({}, stored, _schema(["orders"])) == {}
+
+    def test_a_live_table_the_model_does_not_hold_gets_no_entry(self) -> None:
+        from app.routers.semantic import _effective_known_columns
+
+        assert _effective_known_columns({}, {}, _schema(["orders"])) == {}
+
+    def test_entries_of_tables_that_are_not_stored_pass_through(self) -> None:
+        from app.routers.semantic import _effective_known_columns
+
+        known = {"public.legacy": frozenset({"id"})}
+        assert _effective_known_columns(known, {}, _schema(["orders"])) == known
+
+
+class TestLiveColumns:
+    def test_names_the_live_columns_of_every_table(self) -> None:
+        from app.routers.semantic import _live_columns
+
+        schema = _schema(["orders", "customers"], columns={"orders": ["id", "status"]})
+        assert _live_columns(schema) == {
+            "public.orders": ["id", "status"],
+            "public.customers": ["id"],
+        }
+
+    def test_keys_limit_it_to_the_tables_named(self) -> None:
+        from app.routers.semantic import _live_columns
+
+        schema = _schema(["orders", "customers"])
+        assert _live_columns(schema, {"public.customers", "public.ghost"}) == {
+            "public.customers": ["id"]
+        }
+
+
+class TestWithNewColumns:
+    @staticmethod
+    def _orders() -> dict[str, TableSemantic]:
+        return {
+            "public.orders": TableSemantic(
+                display_name="Orders", columns={"id": ColumnSemantic(display_name="Id")}
+            )
+        }
+
+    def test_adds_a_missing_column_to_a_held_table(self) -> None:
+        from app.routers.semantic import _with_new_columns
+
+        out = _with_new_columns(
+            self._orders(), {"public.orders": {"tier": ColumnSemantic(display_name="Tier")}}
+        )
+        assert set(out["public.orders"].columns) == {"id", "tier"}
+
+    def test_never_replaces_an_existing_column(self) -> None:
+        from app.routers.semantic import _with_new_columns
+
+        out = _with_new_columns(
+            self._orders(),
+            {
+                "public.orders": {
+                    "id": ColumnSemantic(display_name="Overwritten"),
+                    "tier": ColumnSemantic(display_name="Tier"),
+                }
+            },
+        )
+        assert out["public.orders"].columns["id"].display_name == "Id"
+
+    def test_a_table_whose_columns_all_exist_is_returned_unchanged(self) -> None:
+        from app.routers.semantic import _with_new_columns
+
+        tables = self._orders()
+        out = _with_new_columns(
+            tables, {"public.orders": {"id": ColumnSemantic(display_name="Overwritten")}}
+        )
+        assert out["public.orders"] is tables["public.orders"]
+
+    def test_a_table_the_model_does_not_hold_gets_nothing(self) -> None:
+        from app.routers.semantic import _with_new_columns
+
+        out = _with_new_columns(
+            self._orders(), {"public.ghost": {"a": ColumnSemantic(display_name="A")}}
+        )
+        assert set(out) == {"public.orders"}
+
+    def test_does_not_mutate_its_input(self) -> None:
+        from app.routers.semantic import _with_new_columns
+
+        tables = self._orders()
+        _with_new_columns(tables, {"public.orders": {"tier": ColumnSemantic(display_name="Tier")}})
+        assert set(tables["public.orders"].columns) == {"id"}
+
+    def test_nothing_to_add_returns_the_tables(self) -> None:
+        from app.routers.semantic import _with_new_columns
+
+        tables = {"public.orders": TableSemantic(display_name="Orders")}
+        assert _with_new_columns(tables, {}) == tables
+
+
+class TestPlanColumnBatches:
+    @staticmethod
+    def _cols(n: int) -> set[str]:
+        return {f"c{i:03d}" for i in range(n)}
+
+    @staticmethod
+    def _plan(added, order, *, max_batches=3, ddl_sizes=None, ddl_limit=10**9):
+        from app.routers.semantic import _plan_column_batches
+
+        return _plan_column_batches(
+            added, order, max_batches=max_batches, ddl_sizes=ddl_sizes or {}, ddl_limit=ddl_limit
+        )
+
+    def test_tables_pack_into_a_batch_until_the_column_cap(self) -> None:
+        from app.routers.semantic import _DRIFT_MAX_COLUMNS_PER_BATCH as CAP
+
+        added = {"a": self._cols(CAP // 2 + 1), "b": self._cols(CAP // 2 + 1), "c": {"x"}}
+        batches, deferred, cut = self._plan(added, ["a", "b", "c"])
+        assert [list(b) for b in batches] == [["a"], ["b", "c"]]
+        assert deferred == [] and cut == {}
+
+    def test_a_batch_holds_at_most_a_generation_batch_of_tables(self) -> None:
+        keys = [f"t{i:02d}" for i in range(GENERATION_BATCH_SIZE + 1)]
+        batches, _, _ = self._plan({k: {"x"} for k in keys}, keys)
+        assert [list(b) for b in batches] == [keys[:GENERATION_BATCH_SIZE], keys[-1:]]
+
+    def test_a_table_wider_than_the_cap_is_cut_to_the_cap_and_the_cut_is_reported(self) -> None:
+        from app.routers.semantic import _DRIFT_MAX_COLUMNS_PER_BATCH as CAP
+
+        batches, _, cut = self._plan({"a": self._cols(CAP + 10)}, ["a"])
+        assert batches == [{"a": sorted(self._cols(CAP))}]
+        assert cut == {"a": sorted(self._cols(CAP + 10))[CAP:]}
+
+    def test_tables_past_the_batch_budget_are_deferred_in_order(self) -> None:
+        from app.routers.semantic import _DRIFT_MAX_COLUMNS_PER_BATCH as CAP
+
+        added = {k: self._cols(CAP // 2 + 1) for k in "abc"}
+        batches, deferred, _ = self._plan(added, ["a", "b", "c"], max_batches=1)
+        assert [list(b) for b in batches] == [["a"]]
+        assert deferred == ["b", "c"]
+
+    def test_no_budget_defers_everything(self) -> None:
+        assert self._plan({"a": {"x"}}, ["a"], max_batches=0) == ([], ["a"], {})
+
+    def test_tables_whose_ddl_does_not_fit_one_prompt_go_in_separate_batches(self) -> None:
+        added = {"a": {"x"}, "b": {"x"}, "c": {"x"}}
+        batches, _, _ = self._plan(
+            added, ["a", "b", "c"], ddl_sizes={"a": 12_000, "b": 12_000, "c": 100}, ddl_limit=20_000
+        )
+        assert [list(b) for b in batches] == [["a"], ["b", "c"]]
+
+    def test_ddl_that_fills_the_limit_exactly_still_fits(self) -> None:
+        """``_schema_to_ddl`` drops a table only past the limit, and counts the blocks
+        without the newlines that join them: the plain sum is compared."""
+        batches, _, _ = self._plan(
+            {"a": {"x"}, "b": {"x"}},
+            ["a", "b"],
+            ddl_sizes={"a": 15_000, "b": 5_000},
+            ddl_limit=20_000,
+        )
+        assert [list(b) for b in batches] == [["a", "b"]]
+
+    def test_a_table_whose_ddl_alone_exceeds_the_limit_is_still_sent_alone(self) -> None:
+        batches, deferred, _ = self._plan(
+            {"a": {"x"}, "b": {"x"}},
+            ["a", "b"],
+            ddl_sizes={"a": 30_000, "b": 100},
+            ddl_limit=20_000,
+        )
+        assert [list(b) for b in batches] == [["a"], ["b"]]
+        assert deferred == []
+
+    def test_an_oversized_table_between_others_is_sent_alone_and_none_is_dropped(self) -> None:
+        """The prompt renders no table after one past the limit, so the oversized table
+        must not share a batch with the tables after it either."""
+        batches, deferred, _ = self._plan(
+            {"a": {"x"}, "b": {"x"}, "c": {"x"}},
+            ["a", "b", "c"],
+            ddl_sizes={"a": 100, "b": 30_000, "c": 100},
+            ddl_limit=20_000,
+        )
+        assert [list(b) for b in batches] == [["a"], ["b"], ["c"]]
+        assert deferred == []
+
+
+class TestRebuildRelationshipsNewColumns:
+    """A catalog edge the model lacks is added when it is on a new column; one on an
+    existing column is not."""
+
+    @staticmethod
+    def _rebuild(
+        catalog: list[RelationshipEdge],
+        columns: dict[str, list[str]],
+        new_columns: dict[str, set[str]] | None,
+    ) -> list[RelationshipEdge]:
+        from app.routers.semantic import _rebuild_relationships
+
+        return _rebuild_relationships(
+            [],
+            catalog,
+            _snapshot().marks,
+            _schema(["orders", "customers"], columns),
+            None,
+            render_tables={"public.orders", "public.customers"},
+            keep_hidden_endpoints=False,
+            new_tables=set(),
+            new_columns=new_columns,
+        )
+
+    @classmethod
+    def _from_edges(cls, new_columns: dict[str, set[str]] | None) -> list[RelationshipEdge]:
+        edge = TestApplyDrift._edge
+        return cls._rebuild(
+            [
+                edge("public.orders", "customer_id", "public.customers"),
+                edge("public.orders", "region_id", "public.customers"),
+            ],
+            {"orders": ["id", "customer_id", "region_id"], "customers": ["id"]},
+            new_columns,
+        )
+
+    def test_an_edge_on_a_new_column_is_added_and_one_on_an_old_column_is_not(self) -> None:
+        rebuilt = self._from_edges({"public.orders": {"region_id"}})
+        assert [e.from_column for e in rebuilt] == ["region_id"]
+
+    def test_without_new_columns_neither_is_added(self) -> None:
+        assert self._from_edges(None) == []
+
+    def test_an_edge_to_a_new_column_is_added(self) -> None:
+        to_new = RelationshipEdge(
+            from_table="public.orders",
+            from_column="customer_id",
+            to_table="public.customers",
+            to_column="code",
+            join_sql="public.orders.customer_id = public.customers.code",
+        )
+        rebuilt = self._rebuild(
+            [to_new],
+            {"orders": ["id", "customer_id"], "customers": ["id", "code"]},
+            {"public.customers": {"code"}},
+        )
+        assert rebuilt == [to_new]
+
+
+class TestDriftAppliedModelNewColumns:
+    """``_drift_applied_model`` over a drift from ``compute_drift``: the supplied
+    annotations of new columns are added additively, and catalog FK edges follow the
+    drift's new columns that the apply records."""
+
+    @staticmethod
+    def _apply(
+        orders: dict[str, str],
+        *,
+        known: dict[str, list[str]],
+        catalog: list[RelationshipEdge],
+        new_columns: dict[str, dict[str, ColumnSemantic]],
+        recorded: dict[str, set[str]],
+    ) -> SemanticModel:
+        """Apply the drift of a model holding ``orders`` (column key → display name) and
+        a ``customers`` table holding ``id`` (no relationships) against a live schema
+        where orders has ``id``, ``customer_id``, ``status`` and ``region_id``."""
+        from app.routers.semantic import _drift_applied_model
+        from app.semantic.drift import compute_drift
+
+        schema = _schema(
+            ["orders", "customers"],
+            {"orders": ["id", "customer_id", "status", "region_id"], "customers": ["id"]},
+        )
+        model = SemanticModel.model_validate(
+            {
+                **_EMPTY_MODEL,
+                "tables": {
+                    "public.orders": {
+                        "display_name": "Orders",
+                        "columns": {
+                            name: {"display_name": label} for name, label in orders.items()
+                        },
+                    },
+                    "public.customers": {
+                        "display_name": "Customers",
+                        "columns": {"id": {"display_name": "Id"}},
+                    },
+                },
+            }
+        )
+        drift = compute_drift(schema, model, None, known)
+        return _drift_applied_model(
+            model,
+            _snapshot(),
+            schema=schema,
+            privacy=None,
+            drift=drift,
+            dialect="postgresql",
+            gen=_RealGenerator(),
+            relationship_edges=catalog,
+            new_tables={},
+            new_columns=new_columns,
+            recorded_columns=recorded,
+            llm_items=([], [], [], []),
+            connection_id="conn-123",
+            log=False,
+        ).model
+
+    def test_a_near_miss_key_is_replaced_by_the_annotated_real_column(self) -> None:
+        model = self._apply(
+            {"id": "Id", '"status"': "Stale"},
+            known={"public.orders": ["id", "status"]},
+            catalog=[],
+            new_columns={"public.orders": {"status": ColumnSemantic(display_name="Status")}},
+            recorded={},
+        )
+        columns = model.tables["public.orders"].columns
+        assert set(columns) == {"id", "status"}
+        assert columns["status"].display_name == "Status"
+
+    def test_a_supplied_column_the_model_holds_keeps_its_stored_annotation(self) -> None:
+        model = self._apply(
+            {"id": "Stored"},
+            known={"public.orders": ["id", "customer_id", "status", "region_id"]},
+            catalog=[],
+            new_columns={"public.orders": {"id": ColumnSemantic(display_name="Overwritten")}},
+            recorded={},
+        )
+        assert model.tables["public.orders"].columns["id"].display_name == "Stored"
+
+    def test_a_deleted_edge_on_a_respelled_column_is_not_re_added(self) -> None:
+        model = self._apply(
+            {"id": "Id", '"customer_id"': "Customer"},
+            known={"public.orders": ["id", "customer_id", "status", "region_id"]},
+            catalog=[TestApplyDrift._edge("public.orders", "customer_id", "public.customers")],
+            new_columns={"public.orders": {"customer_id": ColumnSemantic(display_name="Cust")}},
+            recorded={"public.orders": {"customer_id"}},
+        )
+        assert "customer_id" in model.tables["public.orders"].columns
+        assert model.relationships == []
+
+    def test_an_edge_on_a_recorded_new_column_is_added_though_the_llm_omitted_it(self) -> None:
+        model = self._apply(
+            {"id": "Id", "customer_id": "Customer", "status": "Status"},
+            known={"public.orders": ["id", "customer_id", "status"]},
+            catalog=[TestApplyDrift._edge("public.orders", "region_id", "public.customers")],
+            new_columns={},
+            recorded={"public.orders": {"region_id"}},
+        )
+        assert "region_id" not in model.tables["public.orders"].columns
+        assert [e.from_column for e in model.relationships] == ["region_id"]
+
+    def test_an_edge_on_a_new_column_that_is_not_recorded_is_not_added(self) -> None:
+        # Its batch failed, or it was deferred or cut: it stays new, and its edge waits
+        # for the apply that records it.
+        catalog = [TestApplyDrift._edge("public.orders", "region_id", "public.customers")]
+        for recorded in ({}, {"public.orders": set()}, {"public.orders": {"status"}}):
+            model = self._apply(
+                {"id": "Id", "customer_id": "Customer", "status": "Status"},
+                known={"public.orders": ["id", "customer_id", "status"]},
+                catalog=catalog,
+                new_columns={},
+                recorded=recorded,
+            )
+            assert model.relationships == []
+
+    def test_a_recorded_column_that_drift_does_not_report_as_new_does_not_widen_the_rule(
+        self,
+    ) -> None:
+        model = self._apply(
+            {"id": "Id", "customer_id": "Customer", "status": "Status"},
+            known={"public.orders": ["id", "customer_id", "status", "region_id"]},
+            catalog=[TestApplyDrift._edge("public.orders", "customer_id", "public.customers")],
+            new_columns={},
+            recorded={"public.orders": {"customer_id"}},
+        )
+        assert model.relationships == []
+
+    def test_a_missing_edge_on_an_existing_column_is_not_re_added(self) -> None:
+        model = self._apply(
+            {"id": "Id", "customer_id": "Customer", "status": "Status"},
+            known={"public.orders": ["id", "customer_id", "status", "region_id"]},
+            catalog=[TestApplyDrift._edge("public.orders", "customer_id", "public.customers")],
+            new_columns={},
+            recorded={},
+        )
+        assert model.relationships == []
+
 
 # ── POST /api/v1/connections/{id}/semantic/apply-drift ───────────────────────────
 
 _APPLY_DRIFT_URL = "/api/v1/connections/conn-123/semantic/apply-drift"
+# ``TestApplyDrift._run``'s default for ``known_after_lock``: the baseline under the lock
+# is the one read before it.
+_SAME = object()
 
 
 class TestApplyDrift:
@@ -1826,7 +2926,7 @@ class TestApplyDrift:
         return _mock_db(
             MockResult(single=conn),  # get_connection_or_404
             MockResult(single=conn),  # lock_and_reread_connection (_lock_generation)
-            # _invalidate_connection_caches: the query and embedding cache deletes (the
+            # _invalidate_connection_caches: the embedding and query cache deletes (the
             # schema cache is kept; the introspection's own cache writes are mocked away).
             MockResult(),
             MockResult(),
@@ -1841,6 +2941,7 @@ class TestApplyDrift:
         header_status: GenerationStatus = GenerationStatus.COMPLETE,
         post_lock_status: GenerationStatus | None = None,
         generated: dict | BaseException | Callable | None = None,
+        generated_columns: dict | BaseException | Callable | None = None,
         llm=([], [], [], [], []),
         provenance: dict | None = None,
         protected: dict | None = None,
@@ -1852,6 +2953,9 @@ class TestApplyDrift:
         dry_run: bool = False,
         on_record: Callable | None = None,
         last_apply: object = None,
+        known: dict | None = None,
+        known_after_lock: dict | object = _SAME,
+        provider_error: BaseException | None = None,
     ):
         """POST /apply-drift with the introspection, store and LLM mocked.
 
@@ -1867,6 +2971,14 @@ class TestApplyDrift:
         left on ``self.record``, ``self.loader``, ``self.load_model`` and
         ``self.refresh``; ``on_record`` is the ``record_drift_apply`` mock's side effect.
         ``last_apply`` is the summary of the newest logged apply (default: none logged).
+        ``generated_columns`` is what ``generate_new_columns`` returns, the error it
+        raises, or its side effect (default: nothing annotated). ``known`` is the baseline
+        ``load_known_columns`` returns before the lock and ``known_after_lock`` the one
+        under it (default: the same). ``known`` defaults to ``{}``, what the store returns
+        for no baseline: every stored table is baselined in memory and none has new
+        columns. Those two mocks are left on ``self.load_known`` and ``self.known_update``
+        (``update_known_columns``). ``provider_error`` is what ``_resolve_provider`` raises
+        (default: it resolves).
         """
         conn = conn or _make_conn()
         db = db or self._db(conn)
@@ -1880,7 +2992,11 @@ class TestApplyDrift:
             if isinstance(schema, BaseException)
             else AsyncMock(return_value=schema)
         )
-        resolve = AsyncMock(return_value=(MagicMock(), "model-x", "claude"))
+        resolve = (
+            AsyncMock(side_effect=provider_error)
+            if provider_error is not None
+            else AsyncMock(return_value=(MagicMock(), "model-x", "claude"))
+        )
         pre = (model, _snapshot(provenance, protected))
         locked = current if current is not None else pre
         loader = AsyncMock(side_effect=[pre, locked])
@@ -1900,6 +3016,12 @@ class TestApplyDrift:
             ]
         )
         self.lister = lister
+        known = {} if known is None else known
+        load_known = AsyncMock(
+            side_effect=[known, known if known_after_lock is _SAME else known_after_lock]
+        )
+        update_known = AsyncMock(return_value=None)
+        self.load_known, self.known_update = load_known, update_known
         with (
             patch("app.routers.semantic.refresh_user_schema_cache", new=refresh),
             patch("app.routers.semantic._resolve_provider", new=resolve),
@@ -1910,6 +3032,8 @@ class TestApplyDrift:
             patch(f"{_STORE}.save_model", new=save),
             patch(f"{_STORE}.record_drift_apply", new=record),
             patch(f"{_STORE}.list_drift_applies", new=lister),
+            patch(f"{_STORE}.load_known_columns", new=load_known),
+            patch(f"{_STORE}.update_known_columns", new=update_known),
         ):
             gen = mock_gen.return_value
             gen._build_relationship_graph.return_value = fresh_edges or []
@@ -1918,6 +3042,13 @@ class TestApplyDrift:
             else:
                 gen.generate_tables = AsyncMock(return_value=generated or {})
             gen.generate_globals = AsyncMock(return_value=llm)
+            if isinstance(generated_columns, BaseException) or callable(generated_columns):
+                gen.generate_new_columns = AsyncMock(side_effect=generated_columns)
+            else:
+                gen.generate_new_columns = AsyncMock(return_value=generated_columns or {})
+            # The real size helper and limit: the planner does arithmetic on them.
+            gen.table_ddl_sizes.side_effect = _RealGenerator().table_ddl_sizes
+            gen._MAX_DDL_CHARS = _RealGenerator._MAX_DDL_CHARS
             gen.build_time_expressions.return_value = {}
             gen.compute_schema_hash.return_value = "h"
             gen._auto_generate_notes.return_value = []
@@ -2846,10 +3977,15 @@ class TestApplyDrift:
         assert keys[-1] in warning and "Check Drift" in warning
         assert warning in body["semantic_model"]["generation_warnings"]
 
-    def test_the_new_table_cap_fits_the_proxy_timeout(self) -> None:
-        """Every table batch and the globals pass may each take the full LLM timeout;
-        together they must finish before the proxy gives up on the request."""
-        from app.routers.semantic import _DRIFT_MAX_NEW_TABLES, _GENERATION_TIMEOUT_SECONDS
+    def test_the_batch_budget_fits_the_proxy_timeout(self) -> None:
+        """Every annotation batch (new tables or new columns) and the globals pass may
+        each take the full LLM timeout; together they must finish before the proxy gives
+        up on the request."""
+        from app.routers.semantic import (
+            _DRIFT_MAX_BATCHES,
+            _DRIFT_MAX_NEW_TABLES,
+            _GENERATION_TIMEOUT_SECONDS,
+        )
 
         nginx_conf = Path(__file__).resolve().parents[3] / "frontend" / "nginx.conf"
         if not nginx_conf.is_file():
@@ -2862,7 +3998,9 @@ class TestApplyDrift:
         timeout = re.search(r"proxy_read_timeout\s+(\d+)s?\s*;", location.group(1))
         assert timeout, "the location sets no proxy_read_timeout"
         nginx_apply_drift_timeout_seconds = int(timeout.group(1))
-        llm_calls = math.ceil(_DRIFT_MAX_NEW_TABLES / GENERATION_BATCH_SIZE) + 1
+        # The new tables alone never take more batches than the budget.
+        assert math.ceil(_DRIFT_MAX_NEW_TABLES / GENERATION_BATCH_SIZE) <= _DRIFT_MAX_BATCHES
+        llm_calls = _DRIFT_MAX_BATCHES + 1
         assert llm_calls * _GENERATION_TIMEOUT_SECONDS < nginx_apply_drift_timeout_seconds
 
     @pytest.mark.parametrize("dry_run", [False, True], ids=["apply", "preview"])
@@ -3615,6 +4753,1300 @@ class TestApplyDrift:
         assert gen.generate_tables.await_args.kwargs["table_keys"] == ["sales.events"]
         names = [m["name"] for m in resp.json()["semantic_model"]["business_metrics"]]
         assert names == ["qualified"]
+
+    # ── new columns on held tables ──
+
+    # What ``_complete()`` holds: every stored live column is known.
+    _SEEN: ClassVar[dict[str, frozenset[str]]] = {
+        "public.orders": frozenset({"id"}),
+        "public.coupons": frozenset({"id"}),
+    }
+    _WIDE: ClassVar[dict[str, list[str]]] = {"orders": ["id", "loyalty_tier"], "coupons": ["id"]}
+
+    async def test_a_new_column_is_annotated_alone_and_added_to_its_table(
+        self, http_client
+    ) -> None:
+        resp, save, gen, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons"], self._WIDE),
+            known=self._SEEN,
+            generated_columns={
+                "public.orders": {"loyalty_tier": ColumnSemantic(display_name="Loyalty tier")}
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        columns = body["semantic_model"]["tables"]["public.orders"]["columns"]
+        assert set(columns) == {"id", "loyalty_tier"}
+        assert columns["id"]["display_name"] == "Id"
+        assert columns["loyalty_tier"]["display_name"] == "Loyalty tier"
+        assert body["summary"]["columns_added"] == {"public.orders": ["loyalty_tier"]}
+        assert body["summary"]["changed"] is True
+        kwargs = gen.generate_new_columns.await_args.kwargs
+        assert kwargs["columns_by_table"] == {"public.orders": ["loyalty_tier"]}
+        assert set(kwargs["table_context"]) == {"public.orders"}
+        gen.generate_tables.assert_not_awaited()
+        gen.generate_globals.assert_not_awaited()
+        save.assert_awaited_once()
+
+    async def test_an_existing_column_is_never_overwritten_by_the_new_column_pass(
+        self, http_client
+    ) -> None:
+        resp, _, _, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons"], self._WIDE),
+            known=self._SEEN,
+            generated_columns={
+                "public.orders": {
+                    "id": ColumnSemantic(display_name="Overwritten"),
+                    "loyalty_tier": ColumnSemantic(display_name="Loyalty tier"),
+                }
+            },
+        )
+        columns = resp.json()["semantic_model"]["tables"]["public.orders"]["columns"]
+        assert columns["id"]["display_name"] == "Id"
+
+    async def test_a_column_the_baseline_has_seen_is_not_sent_to_the_llm(self, http_client) -> None:
+        """Absent from the stored table (deleted by hand, or the LLM omitted it) but known:
+        there is nothing to apply."""
+        resp, save, gen, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons"], self._WIDE),
+            known={**self._SEEN, "public.orders": frozenset({"id", "loyalty_tier"})},
+        )
+        assert resp.json()["summary"]["changed"] is False
+        gen.generate_new_columns.assert_not_awaited()
+        save.assert_not_awaited()
+
+    async def test_a_hidden_column_is_never_sent_to_the_llm(self, http_client) -> None:
+        conn = _make_conn(privacy_settings={"excluded_columns": ["public.orders.ssn"]})
+        resp, _, gen, _ = await self._run(
+            http_client,
+            conn=conn,
+            model=self._complete(),
+            schema=_schema(
+                ["orders", "coupons"],
+                {"orders": ["id", "loyalty_tier", "ssn"], "coupons": ["id"]},
+            ),
+            known=self._SEEN,
+            generated_columns={
+                "public.orders": {"loyalty_tier": ColumnSemantic(display_name="Tier")}
+            },
+        )
+        assert resp.status_code == 200
+        assert gen.generate_new_columns.await_args.kwargs["columns_by_table"] == {
+            "public.orders": ["loyalty_tier"]
+        }
+        assert "ssn" not in str(resp.json()["semantic_model"]["tables"]["public.orders"])
+
+    async def test_a_model_with_no_baseline_is_baselined_in_memory_and_nothing_is_sent(
+        self, http_client
+    ) -> None:
+        """A legacy table's missing column is not new: the check seeds it, the apply treats
+        it as seen."""
+        resp, _, gen, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons"], self._WIDE),
+            known={},
+        )
+        assert resp.json()["summary"]["changed"] is False
+        gen.generate_new_columns.assert_not_awaited()
+
+    async def test_the_preview_lists_the_new_columns_and_calls_no_llm(self, http_client) -> None:
+        resp, save, gen, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons"], self._WIDE),
+            known=self._SEEN,
+            dry_run=True,
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["dry_run"] is True
+        assert summary["columns_added"] == {"public.orders": ["loyalty_tier"]}
+        assert summary["changed"] is True
+        gen.generate_new_columns.assert_not_awaited()
+        save.assert_not_awaited()
+        self.known_update.assert_not_awaited()
+
+    async def test_the_preview_warns_about_the_columns_it_would_defer_or_cut(
+        self, http_client
+    ) -> None:
+        """Two batches of new tables leave one: ``coupons`` fills it, cut to the column
+        cap, and ``orders`` waits. Neither is listed beyond what the apply would send."""
+        from app.routers.semantic import _DRIFT_MAX_COLUMNS_PER_BATCH as CAP
+
+        names = [f"t{i}" for i in range(2 * GENERATION_BATCH_SIZE)]
+        wide = [f"c{i:03d}" for i in range(CAP + 2)]
+        resp, _, _, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(
+                ["orders", "coupons", *names], {"orders": ["id", "x"], "coupons": ["id", *wide]}
+            ),
+            known=self._SEEN,
+            dry_run=True,
+        )
+        summary = resp.json()["summary"]
+        assert summary["columns_added"] == {"public.coupons": wide[:CAP]}
+        assert any(
+            "The new columns of 1 more table will not be annotated" in w
+            and "public.orders" in w
+            and "apply again afterwards" in w
+            for w in summary["warnings"]
+        )
+        assert any(
+            "2 more new column(s) on 1 table(s) will not be annotated" in w
+            and "public.coupons" in w
+            for w in summary["warnings"]
+        )
+
+    async def test_a_column_left_out_of_an_answered_table_is_recorded_as_seen_and_warned_about(
+        self, http_client
+    ) -> None:
+        """The batch answered for the table (``loyalty_tier`` came back), so ``region`` is
+        not retried forever: drift clears."""
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(
+                ["orders", "coupons"],
+                {"orders": ["id", "loyalty_tier", "region"], "coupons": ["id"]},
+            ),
+            known=self._SEEN,
+            generated_columns={
+                "public.orders": {"loyalty_tier": ColumnSemantic(display_name="Tier")}
+            },
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["columns_added"] == {"public.orders": ["loyalty_tier"]}
+        assert summary["column_tables_failed"] == []
+        assert any(
+            "public.orders.region" in w
+            and "treated as seen" in w
+            and w.endswith("Regenerate to annotate them.")
+            for w in summary["warnings"]
+        )
+        save.assert_awaited_once()
+        # Annotated or left out, every column of an answered table is seen now.
+        args, kwargs = self.known_update.await_args
+        assert args[2]["public.orders"] == {"id", "loyalty_tier", "region"}
+        # Only the table whose entry changed is written.
+        assert set(args[2]) == {"public.orders"}
+        assert kwargs == {"prune": True}
+
+    async def test_a_table_the_batch_returned_nothing_for_is_a_failed_batch_not_seen(
+        self, http_client
+    ) -> None:
+        """An empty answer is a soft failure (a provider returning ``{}``, a payload
+        grounding could not place), not evidence that the column needs no annotation."""
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons"], self._WIDE),
+            known=self._SEEN,
+            generated_columns={},
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["changed"] is False
+        assert summary["column_tables_failed"] == ["public.orders"]
+        assert any(
+            "public.orders.loyalty_tier" in w and "not annotated" in w and "retry" in w
+            for w in summary["warnings"]
+        )
+        save.assert_not_awaited()
+        # Not seen: the next check reports the column again. Nothing moved, so the
+        # (logged) no-op writes an empty baseline update.
+        assert "public.orders" not in self.known_update.await_args.args[2]
+        assert self.record.await_count == 1
+
+    async def test_a_hand_added_column_enters_the_baseline_with_the_next_save(
+        self, http_client
+    ) -> None:
+        """What the model stores it has seen: a column annotated by hand (PUT never writes
+        the baseline) is recorded by the next apply that writes."""
+        model = self._complete(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "columns": {"id": {"display_name": "Id"}, "by_hand": {"display_name": "H"}},
+                },
+                "public.coupons": {
+                    "display_name": "Coupons",
+                    "columns": {"id": {"display_name": "Id"}},
+                },
+            }
+        )
+        _, save, _, _ = await self._run(
+            http_client,
+            model=model,
+            schema=_schema(["orders"], {"orders": ["id", "by_hand"]}),  # coupons removed
+            known=self._SEEN,
+        )
+        save.assert_awaited_once()
+        assert self.known_update.await_args.args[2]["public.orders"] == {"id", "by_hand"}
+
+    async def test_a_dropped_column_leaves_the_baseline_so_a_return_is_new_again(
+        self, http_client
+    ) -> None:
+        model = self._complete(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "columns": {"id": {"display_name": "Id"}, "old": {"display_name": "Old"}},
+                },
+                "public.coupons": {
+                    "display_name": "Coupons",
+                    "columns": {"id": {"display_name": "Id"}},
+                },
+            }
+        )
+        _, save, _, _ = await self._run(
+            http_client,
+            model=model,
+            schema=_schema(["orders", "coupons"]),  # ``old`` is gone from the database
+            known={"public.orders": frozenset({"id", "old"}), "public.coupons": frozenset({"id"})},
+        )
+        save.assert_awaited_once()
+        assert self.known_update.await_args.args[2]["public.orders"] == {"id"}
+
+    async def test_a_hidden_column_leaves_the_baseline_entry(self, http_client) -> None:
+        """The policy-applied schema is what the model has seen, as in the finalisation:
+        once un-hidden, the column is new again unless the model stores it."""
+        conn = _make_conn(privacy_settings={"excluded_columns": ["public.orders.ssn"]})
+        _, save, _, _ = await self._run(
+            http_client,
+            conn=conn,
+            model=self._complete(),
+            schema=_schema(["orders"], {"orders": ["id", "ssn"]}),  # coupons removed
+            known={**self._SEEN, "public.orders": frozenset({"id", "ssn"})},
+        )
+        save.assert_awaited_once()
+        assert self.known_update.await_args.args[2]["public.orders"] == {"id"}
+
+    async def test_a_hidden_table_keeps_its_baseline_entry(self, http_client) -> None:
+        conn = _make_conn(privacy_settings={"excluded_tables": ["public.coupons"]})
+        await self._run(
+            http_client,
+            conn=conn,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons"], {"orders": ["id", "loyalty_tier"]}),
+            known=self._SEEN,
+            generated_columns={
+                "public.orders": {"loyalty_tier": ColumnSemantic(display_name="Tier")}
+            },
+        )
+        # Never rewritten, so never pruned by the intersection with the live columns:
+        # the table is not in the live schema, and its row stays.
+        assert "public.coupons" not in self.known_update.await_args.args[2]
+
+    async def test_an_annotated_new_column_enters_the_baseline_with_the_save(
+        self, http_client
+    ) -> None:
+        db = self._db()
+        baseline_writes_at_save: list[int] = []
+        save = AsyncMock(
+            side_effect=lambda _db, _cid, final, **_kw: (
+                baseline_writes_at_save.append(self.known_update.await_count) or final
+            )
+        )
+        _, save, _, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons"], self._WIDE),
+            known=self._SEEN,
+            generated_columns={
+                "public.orders": {"loyalty_tier": ColumnSemantic(display_name="Tier")}
+            },
+            save=save,
+            db=db,
+        )
+        save.assert_awaited_once()
+        assert self.known_update.await_args.args[2]["public.orders"] == {"id", "loyalty_tier"}
+        # After the save, in its transaction: the cache commit, then the save's.
+        assert baseline_writes_at_save == [0]
+        assert db.commit.await_count == 2
+
+    async def test_a_new_table_enters_the_baseline_with_all_its_live_columns(
+        self, http_client
+    ) -> None:
+        await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons", "events"], {"events": ["id", "kind"]}),
+            known=self._SEEN,
+            generated={"public.events": TableSemantic(display_name="Events")},
+        )
+        assert self.known_update.await_args.args[2]["public.events"] == {"id", "kind"}
+
+    async def test_a_stale_baseline_row_of_a_table_the_apply_adds_is_replaced(
+        self, http_client
+    ) -> None:
+        """A check that seeded the table before an earlier apply removed it leaves a row
+        behind; the table's return must not inherit it."""
+        await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons", "events"], {"events": ["id", "kind"]}),
+            known={**self._SEEN, "public.events": frozenset({"id", "gone"})},
+            generated={"public.events": TableSemantic(display_name="Events")},
+        )
+        args, kwargs = self.known_update.await_args
+        assert args[2]["public.events"] == {"id", "kind"}
+        assert kwargs == {"prune": True}
+
+    async def test_the_rows_of_tables_the_apply_removed_are_pruned(self, http_client) -> None:
+        _, save, _, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders"]),
+            known=self._SEEN,
+        )
+        save.assert_awaited_once()
+        args, kwargs = self.known_update.await_args
+        # Not rewritten: the prune deletes the row of every table the save left out.
+        assert "public.coupons" not in args[2]
+        assert kwargs == {"prune": True}
+
+    async def test_a_new_table_the_llm_skipped_is_not_baselined(self, http_client) -> None:
+        """Not even from a stale row it left behind (a check seeded it before an earlier
+        apply removed it): the row is the prune's, and the table stays new."""
+        await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons", "events"]),
+            known={**self._SEEN, "public.events": frozenset({"id", "gone"})},
+            generated={},
+        )
+        assert "public.events" not in self.known_update.await_args.args[2]
+
+    async def test_new_tables_and_new_columns_share_the_batch_budget(self, http_client) -> None:
+        """One more new table than a batch holds takes two batches, leaving one for new
+        columns: ``coupons`` gets it, and ``orders``, too wide to share it, waits."""
+        from app.routers.semantic import _DRIFT_MAX_BATCHES
+        from app.routers.semantic import _DRIFT_MAX_COLUMNS_PER_BATCH as CAP
+
+        assert _DRIFT_MAX_BATCHES == 3  # the split below assumes it
+        names = [f"t{i:02d}" for i in range(GENERATION_BATCH_SIZE + 1)]
+        wide = [f"c{i:03d}" for i in range(CAP // 2 + 1)]
+        resp, save, gen, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(
+                ["orders", "coupons", *names],
+                {"orders": ["id", *wide], "coupons": ["id", *wide]},
+            ),
+            known=self._SEEN,
+            generated=self._annotate_all,
+            generated_columns={"public.coupons": {c: ColumnSemantic(display_name=c) for c in wide}},
+        )
+        assert resp.status_code == 200
+        assert gen.generate_tables.await_count == 2
+        gen.generate_globals.assert_awaited_once()
+        gen.generate_new_columns.assert_awaited_once()
+        assert gen.generate_new_columns.await_args.kwargs["columns_by_table"] == {
+            "public.coupons": wide
+        }
+        summary = resp.json()["summary"]
+        assert summary["tables_added"] == sorted(f"public.{n}" for n in names)
+        assert summary["columns_added"] == {"public.coupons": wide}
+        assert any(
+            w.startswith("The new columns of 1 more table were not annotated")
+            and "public.orders" in w
+            for w in summary["warnings"]
+        )
+        save.assert_awaited_once()
+
+    async def test_a_throttled_column_phase_beside_a_new_table_is_a_warning(
+        self, http_client
+    ) -> None:
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons", "events"], self._WIDE),
+            known=self._SEEN,
+            generated={"public.events": TableSemantic(display_name="Events")},
+            generated_columns=ValueError("[RATE_LIMIT] slow down"),
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["tables_added"] == ["public.events"]
+        assert summary["column_tables_failed"] == ["public.orders"]
+        assert any(
+            "were not annotated" in w and "[RATE_LIMIT]" in w and "public.orders.loyalty_tier" in w
+            for w in summary["warnings"]
+        )
+        save.assert_awaited_once()
+        assert "public.events" in save.await_args.args[2].tables
+
+    async def test_tables_with_new_columns_past_the_batch_cap_are_deferred(
+        self, http_client
+    ) -> None:
+        """Three batches go to new tables first; with none left over, a table with a new
+        column waits for the next apply, and the warning says so."""
+        names = [f"t{i}" for i in range(3 * GENERATION_BATCH_SIZE)]
+        resp, _, gen, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons", *names], self._WIDE),
+            known=self._SEEN,
+            generated={},
+        )
+        assert resp.status_code == 200
+        gen.generate_new_columns.assert_not_awaited()
+        warnings = resp.json()["summary"]["warnings"]
+        assert any("public.orders" in w and "new columns" in w for w in warnings)
+
+    async def test_columns_past_the_per_batch_cap_stay_new_and_the_warning_counts_them(
+        self, http_client
+    ) -> None:
+        from app.routers.semantic import _DRIFT_MAX_COLUMNS_PER_BATCH as CAP
+
+        extra = [f"c{i:03d}" for i in range(CAP + 5)]
+        sent = sorted(extra)[:CAP]
+        resp, _, gen, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons"], {"orders": ["id", *extra], "coupons": ["id"]}),
+            known=self._SEEN,
+            generated_columns={"public.orders": {c: ColumnSemantic(display_name=c) for c in sent}},
+        )
+        assert gen.generate_new_columns.await_args.kwargs["columns_by_table"] == {
+            "public.orders": sent
+        }
+        assert any("5 more new column(s)" in w for w in resp.json()["summary"]["warnings"])
+        # The five left out are not in the baseline: the next check reports them.
+        assert not set(extra[-5:]) & self.known_update.await_args.args[2]["public.orders"]
+
+    # ── catalog FK edges on new columns ──
+
+    @classmethod
+    def _fk_model(cls, orders: list[str], *, coupons: bool = False) -> SemanticModel:
+        """``orders`` holding *orders* and ``customers`` holding ``id``, no relationships
+        (and ``coupons``, for drift beside the new column)."""
+        tables = {
+            "public.orders": {
+                "display_name": "Orders",
+                "columns": {name: {"display_name": name} for name in orders},
+            },
+            "public.customers": {"display_name": "C", "columns": {"id": {"display_name": "I"}}},
+        }
+        if coupons:
+            tables["public.coupons"] = {"display_name": "Coupons", "columns": {}}
+        return cls._complete(tables=tables, relationships=[])
+
+    _FK_KNOWN: ClassVar[dict[str, frozenset[str]]] = {
+        "public.orders": frozenset({"id", "customer_id"}),
+        "public.customers": frozenset({"id"}),
+    }
+
+    async def test_a_fk_on_a_new_column_is_added_but_a_deleted_edge_on_an_old_column_is_not(
+        self, http_client
+    ) -> None:
+        schema = _schema(
+            ["orders", "customers"],
+            {"orders": ["id", "customer_id", "region_id"], "customers": ["id"]},
+        )
+        deleted = self._edge("public.orders", "customer_id", "public.customers")
+        fresh = self._edge("public.orders", "region_id", "public.customers")
+        resp, _, _, _ = await self._run(
+            http_client,
+            model=self._fk_model(["id", "customer_id"]),
+            schema=schema,
+            known=self._FK_KNOWN,
+            generated_columns={
+                "public.orders": {"region_id": ColumnSemantic(display_name="Region")}
+            },
+            fresh_edges=[deleted, fresh],
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["relationships_added"] == ["public.orders.region_id → public.customers.id"]
+
+    async def test_the_preview_lists_the_fk_on_a_new_column_it_would_send(
+        self, http_client
+    ) -> None:
+        resp, _, _, _ = await self._run(
+            http_client,
+            model=self._fk_model(["id", "customer_id"]),
+            schema=_schema(
+                ["orders", "customers"],
+                {"orders": ["id", "customer_id", "region_id"], "customers": ["id"]},
+            ),
+            known=self._FK_KNOWN,
+            fresh_edges=[self._edge("public.orders", "region_id", "public.customers")],
+            dry_run=True,
+        )
+        summary = resp.json()["summary"]
+        assert summary["columns_added"] == {"public.orders": ["region_id"]}
+        assert summary["relationships_added"] == ["public.orders.region_id → public.customers.id"]
+
+    async def test_the_preview_lists_no_fk_on_a_new_column_it_would_defer(
+        self, http_client
+    ) -> None:
+        names = [f"t{i}" for i in range(3 * GENERATION_BATCH_SIZE)]
+        resp, _, _, _ = await self._run(
+            http_client,
+            model=self._fk_model(["id", "customer_id"]),
+            schema=_schema(
+                ["orders", "customers", *names],
+                {"orders": ["id", "customer_id", "region_id"], "customers": ["id"]},
+            ),
+            known=self._FK_KNOWN,
+            fresh_edges=[self._edge("public.orders", "region_id", "public.customers")],
+            dry_run=True,
+        )
+        summary = resp.json()["summary"]
+        assert summary["columns_added"] == {}
+        assert summary["relationships_added"] == []
+
+    async def test_a_fk_on_a_new_column_the_llm_omitted_arrives_with_its_answered_table(
+        self, http_client
+    ) -> None:
+        """The batch answered for ``orders`` but left ``region_id`` out: the column is
+        recorded as seen, so this is the apply its edge arrives with."""
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=self._fk_model(["id", "customer_id"]),
+            schema=_schema(
+                ["orders", "customers"],
+                {"orders": ["id", "customer_id", "region_id", "tier"], "customers": ["id"]},
+            ),
+            known=self._FK_KNOWN,
+            generated_columns={"public.orders": {"tier": ColumnSemantic(display_name="Tier")}},
+            fresh_edges=[self._edge("public.orders", "region_id", "public.customers")],
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["columns_added"] == {"public.orders": ["tier"]}
+        assert summary["relationships_added"] == ["public.orders.region_id → public.customers.id"]
+        save.assert_awaited_once()
+        assert "region_id" in self.known_update.await_args.args[2]["public.orders"]
+
+    async def test_a_fk_on_a_new_column_whose_batch_failed_is_not_added(self, http_client) -> None:
+        """Not recorded, so the column stays new and its edge waits for the apply that
+        records it. The removal beside it is still saved."""
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=self._fk_model(["id", "customer_id"], coupons=True),
+            schema=_schema(
+                ["orders", "customers"],
+                {"orders": ["id", "customer_id", "region_id"], "customers": ["id"]},
+            ),
+            known=self._FK_KNOWN,
+            generated_columns=RuntimeError("provider down"),
+            fresh_edges=[self._edge("public.orders", "region_id", "public.customers")],
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["tables_removed"] == ["public.coupons"]
+        assert summary["relationships_added"] == []
+        assert summary["columns_added"] == {}
+        saved = save.await_args.args[2]
+        assert saved.relationships == []
+        assert "region_id" not in saved.tables["public.orders"].columns
+        assert "public.orders" not in self.known_update.await_args.args[2]
+
+    async def test_a_deleted_fk_on_a_respelled_column_is_not_re_added(self, http_client) -> None:
+        """The model held ``customer_id`` under a quoted key: a missing edge on it is the
+        user's deletion, though the column is annotated again under its real name."""
+        resp, _, _, _ = await self._run(
+            http_client,
+            model=self._fk_model(["id", '"customer_id"']),
+            schema=_schema(
+                ["orders", "customers"],
+                {"orders": ["id", "customer_id"], "customers": ["id"]},
+            ),
+            known=self._FK_KNOWN,
+            generated_columns={
+                "public.orders": {"customer_id": ColumnSemantic(display_name="Customer")}
+            },
+            fresh_edges=[self._edge("public.orders", "customer_id", "public.customers")],
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["columns_added"] == {"public.orders": ["customer_id"]}
+        assert summary["relationships_added"] == []
+
+    # ── respelled columns: held only under a near-miss key the prune removes ──
+
+    @pytest.mark.parametrize("near_miss", ['"status"', "Status"], ids=["quoted", "case-only"])
+    async def test_a_respelled_column_whose_batch_failed_leaves_the_baseline(
+        self, http_client, near_miss: str
+    ) -> None:
+        """The baseline knows ``status``, but the prune drops its only annotation (the
+        near-miss key). Left in the baseline it would never be reported again, and its
+        annotation would be lost silently: it leaves, so the next apply asks for it."""
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=self._complete(
+                tables={
+                    "public.orders": {
+                        "display_name": "Orders",
+                        "columns": {"id": {"display_name": "Id"}, near_miss: {"display_name": "S"}},
+                    },
+                    "public.coupons": {
+                        "display_name": "Coupons",
+                        "columns": {"id": {"display_name": "Id"}},
+                    },
+                }
+            ),
+            schema=_schema(["orders", "coupons"], {"orders": ["id", "status"], "coupons": ["id"]}),
+            known={**self._SEEN, "public.orders": frozenset({"id", "status"})},
+            generated_columns=RuntimeError("provider down"),
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        # The near-miss key is still removed (a removal is not held back by the failure),
+        # listed quote-stripped.
+        assert summary["columns_removed"] == {"public.orders": [near_miss.strip('"')]}
+        assert summary["column_tables_failed"] == ["public.orders"]
+        save.assert_awaited_once()
+        assert set(save.await_args.args[2].tables["public.orders"].columns) == {"id"}
+        assert self.known_update.await_args.args[2]["public.orders"] == {"id"}
+
+    async def test_a_deferred_respelled_column_leaves_the_baseline(self, http_client) -> None:
+        names = [f"t{i}" for i in range(3 * GENERATION_BATCH_SIZE)]
+        resp, save, gen, _ = await self._run(
+            http_client,
+            model=self._complete(
+                tables={
+                    "public.orders": {
+                        "display_name": "Orders",
+                        "columns": {
+                            "id": {"display_name": "Id"},
+                            '"status"': {"display_name": "S"},
+                        },
+                    },
+                    "public.coupons": {
+                        "display_name": "Coupons",
+                        "columns": {"id": {"display_name": "Id"}},
+                    },
+                }
+            ),
+            schema=_schema(
+                ["orders", "coupons", *names], {"orders": ["id", "status"], "coupons": ["id"]}
+            ),
+            known={**self._SEEN, "public.orders": frozenset({"id", "status"})},
+            generated={},
+        )
+        assert resp.status_code == 200
+        gen.generate_new_columns.assert_not_awaited()
+        save.assert_awaited_once()
+        assert self.known_update.await_args.args[2]["public.orders"] == {"id"}
+
+    async def test_a_respelled_column_an_answered_batch_omitted_stays_seen(
+        self, http_client
+    ) -> None:
+        """Like any column an answered table left out: named in the warning, not retried."""
+        resp, _, _, _ = await self._run(
+            http_client,
+            model=self._complete(
+                tables={
+                    "public.orders": {
+                        "display_name": "Orders",
+                        "columns": {
+                            "id": {"display_name": "Id"},
+                            '"status"': {"display_name": "S"},
+                        },
+                    },
+                    "public.coupons": {
+                        "display_name": "Coupons",
+                        "columns": {"id": {"display_name": "Id"}},
+                    },
+                }
+            ),
+            schema=_schema(
+                ["orders", "coupons"], {"orders": ["id", "status", "region"], "coupons": ["id"]}
+            ),
+            known={**self._SEEN, "public.orders": frozenset({"id", "status"})},
+            generated_columns={"public.orders": {"region": ColumnSemantic(display_name="R")}},
+        )
+        assert resp.status_code == 200
+        assert any(
+            "public.orders.status" in w and "treated as seen" in w
+            for w in resp.json()["summary"]["warnings"]
+        )
+        assert self.known_update.await_args.args[2]["public.orders"] == {"id", "status", "region"}
+
+    # ── concurrency, review flag, failures ──
+
+    async def test_a_column_another_writer_added_during_the_llm_call_is_not_overwritten(
+        self, http_client
+    ) -> None:
+        before = self._complete()
+        meanwhile = self._complete(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "columns": {
+                        "id": {"display_name": "Id"},
+                        "loyalty_tier": {"display_name": "Hand written"},
+                    },
+                },
+                "public.coupons": {
+                    "display_name": "Coupons",
+                    "columns": {"id": {"display_name": "Id"}},
+                },
+            }
+        )
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=before,
+            current=(meanwhile, _snapshot()),
+            schema=_schema(["orders", "coupons"], self._WIDE),
+            known=self._SEEN,
+            generated_columns={
+                "public.orders": {"loyalty_tier": ColumnSemantic(display_name="From the LLM")}
+            },
+        )
+        assert resp.status_code == 200
+        # The re-read already has the column: nothing is left to apply, nothing is written.
+        assert resp.json()["summary"]["changed"] is False
+        save.assert_not_awaited()
+
+    async def test_a_column_another_writer_added_beside_other_drift_keeps_its_annotation(
+        self, http_client
+    ) -> None:
+        """The post-lock filter: with a removal still to save, the LLM's annotation of a
+        column the re-read holds is dropped. It is not merged over the stored one, and it
+        is not new LLM content, so the review flag stays."""
+        meanwhile = self._complete(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "columns": {
+                        "id": {"display_name": "Id"},
+                        "loyalty_tier": {"display_name": "Hand written"},
+                    },
+                },
+                "public.coupons": {
+                    "display_name": "Coupons",
+                    "columns": {"id": {"display_name": "Id"}},
+                },
+            }
+        )
+        resp, _, _, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            current=(meanwhile, _snapshot()),
+            schema=_schema(["orders"], {"orders": ["id", "loyalty_tier"]}),
+            known=self._SEEN,
+            generated_columns={
+                "public.orders": {"loyalty_tier": ColumnSemantic(display_name="From the LLM")}
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["summary"]["tables_removed"] == ["public.coupons"]
+        assert body["summary"]["columns_added"] == {}
+        columns = body["semantic_model"]["tables"]["public.orders"]["columns"]
+        assert columns["loyalty_tier"]["display_name"] == "Hand written"
+        assert body["semantic_model"]["is_user_reviewed"] is True
+
+    async def test_a_column_another_apply_recorded_during_the_llm_call_is_not_reported(
+        self, http_client
+    ) -> None:
+        """The baseline is re-read under the lock: another apply recorded ``loyalty_tier``
+        as seen while this one's LLM call ran (that call returned nothing). It is not new
+        any more, so it is not warned about, not marked for retry and not rewritten in the
+        baseline; the removal beside it is still saved."""
+        resp, save, gen, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders"], {"orders": ["id", "loyalty_tier"]}),  # coupons removed
+            known=self._SEEN,
+            known_after_lock={**self._SEEN, "public.orders": frozenset({"id", "loyalty_tier"})},
+            generated_columns={},
+        )
+        assert resp.status_code == 200
+        gen.generate_new_columns.assert_awaited_once()
+        summary = resp.json()["summary"]
+        assert summary["tables_removed"] == ["public.coupons"]
+        assert not any("loyalty_tier" in w for w in summary["warnings"])
+        assert summary["column_tables_failed"] == []
+        save.assert_awaited_once()
+        assert "public.orders" not in self.known_update.await_args.args[2]
+
+    async def test_an_omitted_column_is_recorded_when_nothing_else_changes(
+        self, http_client
+    ) -> None:
+        """The LLM annotated ``loyalty_tier``, which another writer stored meanwhile (the
+        post-lock filter drops the annotation), and left ``region`` out. The model is as it
+        was, so nothing is saved or logged, but the baseline records ``region`` and is
+        committed: that is what clears its drift."""
+        db = self._db()
+        meanwhile = self._complete(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "columns": {
+                        "id": {"display_name": "Id"},
+                        "loyalty_tier": {"display_name": "Hand written"},
+                    },
+                },
+                "public.coupons": {
+                    "display_name": "Coupons",
+                    "columns": {"id": {"display_name": "Id"}},
+                },
+            }
+        )
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            current=(meanwhile, _snapshot()),
+            schema=_schema(
+                ["orders", "coupons"],
+                {"orders": ["id", "loyalty_tier", "region"], "coupons": ["id"]},
+            ),
+            known=self._SEEN,
+            generated_columns={
+                "public.orders": {"loyalty_tier": ColumnSemantic(display_name="From the LLM")}
+            },
+            db=db,
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["changed"] is False
+        assert summary["column_tables_failed"] == summary["tables_not_annotated"] == []
+        save.assert_not_awaited()
+        self.record.assert_not_awaited()
+        self.known_update.assert_awaited_once()
+        assert self.known_update.await_args.args[2]["public.orders"] == {
+            "id",
+            "loyalty_tier",
+            "region",
+        }
+        # The schema cache, then the baseline; no rollback.
+        assert db.commit.await_count == 2
+        db.rollback.assert_not_awaited()
+
+    async def test_annotated_new_columns_mark_the_model_unreviewed(self, http_client) -> None:
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=self._complete(is_user_reviewed=True),
+            schema=_schema(["orders", "coupons"], self._WIDE),
+            known=self._SEEN,
+            generated_columns={
+                "public.orders": {"loyalty_tier": ColumnSemantic(display_name="Loyalty tier")}
+            },
+        )
+        assert resp.status_code == 200
+        assert save.await_args.args[2].is_user_reviewed is False
+
+    async def test_a_removal_alone_leaves_the_reviewed_flag_alone(self, http_client) -> None:
+        _, save, _, _ = await self._run(
+            http_client,
+            model=self._complete(is_user_reviewed=True),
+            schema=_schema(["orders"]),
+            known=self._SEEN,
+        )
+        assert save.await_args.args[2].is_user_reviewed is True
+
+    async def test_a_failed_new_column_call_does_not_block_the_removals(self, http_client) -> None:
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            # coupons is gone from the live schema; orders gained a column.
+            schema=_schema(["orders"], {"orders": ["id", "loyalty_tier"]}),
+            known=self._SEEN,
+            generated_columns=ValueError("boom"),
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["tables_removed"] == ["public.coupons"]
+        assert summary["columns_added"] == {}
+        assert summary["column_tables_failed"] == ["public.orders"]
+        assert any(
+            "public.orders.loyalty_tier" in w and "not annotated" in w and "failed" in w
+            for w in summary["warnings"]
+        )
+        save.assert_awaited_once()
+        # A failed batch's columns are NOT seen: nothing about ``orders`` changed (its new
+        # column is not recorded), so nothing is written for it, and the next check
+        # reports the column again.
+        assert "public.orders" not in self.known_update.await_args.args[2]
+
+    @pytest.mark.parametrize(
+        ("mark", "status_code"),
+        [("[RATE_LIMIT]", 429), ("[PROVIDER_UNAVAILABLE]", 503)],
+        ids=["throttled", "unavailable"],
+    )
+    async def test_a_transient_failure_of_a_column_only_apply_propagates_its_status(
+        self, http_client, mark: str, status_code: int
+    ) -> None:
+        """Nothing else to save: the request fails with the provider's 429 or 503, so the
+        user sees the throttle and can apply again, rather than a 200 that changed
+        nothing."""
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons"], self._WIDE),
+            known=self._SEEN,
+            generated_columns=ValueError(f"{mark} slow down"),
+        )
+        assert resp.status_code == status_code
+        save.assert_not_awaited()
+        self.record.assert_not_awaited()
+        self.known_update.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "removal", ["table", "column"], ids=["removed-table", "removed-column"]
+    )
+    async def test_a_throttled_column_phase_beside_removals_is_a_warning(
+        self, http_client, removal: str
+    ) -> None:
+        """A removed table or a removed column is something else to save, so the 429
+        becomes a warning and the removal is applied."""
+        if removal == "table":  # coupons is gone from the database
+            model = self._complete()
+            schema = _schema(["orders"], {"orders": ["id", "loyalty_tier"]})
+            known = self._SEEN
+            expected = {"tables_removed": ["public.coupons"]}
+        else:  # orders.old is gone from the database
+            model = self._complete(
+                tables={
+                    "public.orders": {
+                        "display_name": "Orders",
+                        "columns": {"id": {"display_name": "Id"}, "old": {"display_name": "Old"}},
+                    },
+                    "public.coupons": {
+                        "display_name": "Coupons",
+                        "columns": {"id": {"display_name": "Id"}},
+                    },
+                }
+            )
+            schema = _schema(["orders", "coupons"], self._WIDE)
+            known = {**self._SEEN, "public.orders": frozenset({"id", "old"})}
+            expected = {"columns_removed": {"public.orders": ["old"]}}
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=model,
+            schema=schema,
+            known=known,
+            generated_columns=ValueError("[RATE_LIMIT] slow down"),
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        for field, value in expected.items():
+            assert summary[field] == value
+        assert summary["column_tables_failed"] == ["public.orders"]
+        assert any(
+            "[RATE_LIMIT]" in w and "public.orders.loyalty_tier" in w for w in summary["warnings"]
+        )
+        save.assert_awaited_once()
+
+    async def test_a_failed_batch_is_logged_for_the_retry_order(self, http_client) -> None:
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons"], self._WIDE),
+            known=self._SEEN,
+            generated_columns=RuntimeError("provider down"),
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["column_tables_failed"] == ["public.orders"]
+        # The failed batch was the only one: no later batch went untried.
+        assert summary["warnings"] == [
+            "1 new column(s) were not annotated and stay missing from the model (the "
+            "new-column LLM call failed (provider down): public.orders.loyalty_tier). Run "
+            "Check Drift and apply again to retry."
+        ]
+        save.assert_not_awaited()
+        # Nothing changed, but the failure is logged: the next apply reads it.
+        assert self.record.await_count == 1
+
+    async def test_a_table_an_earlier_batch_got_no_answer_for_stays_failed_when_a_later_one_fails(
+        self, http_client
+    ) -> None:
+        """The column cap splits the two tables. ``coupons`` gets an empty answer, then
+        ``orders``' batch fails: both are marked, not just the table of the failed batch."""
+        from app.routers.semantic import _DRIFT_MAX_COLUMNS_PER_BATCH as CAP
+
+        wide = [f"c{i:03d}" for i in range(CAP // 2 + 1)]
+        answers: list[dict | BaseException] = [{}, RuntimeError("provider down")]
+
+        def answer(**_kw) -> dict:
+            result = answers.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        resp, _, gen, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(
+                ["orders", "coupons"], {"orders": ["id", *wide], "coupons": ["id", *wide]}
+            ),
+            known=self._SEEN,
+            generated_columns=answer,
+        )
+        assert resp.status_code == 200
+        assert gen.generate_new_columns.await_count == 2
+        summary = resp.json()["summary"]
+        assert summary["column_tables_failed"] == ["public.coupons", "public.orders"]
+        # One clause per reason, each naming its own tables' columns.
+        [warning] = summary["warnings"]
+        assert warning.startswith(f"{2 * len(wide)} new column(s) were not annotated")
+        assert "the LLM returned nothing for their table: public.coupons.c000, " in warning
+        assert "the new-column LLM call failed (provider down): public.orders.c000, " in warning
+        assert "not tried" not in warning
+
+    async def test_tables_whose_batch_failed_last_time_are_sent_last(self, http_client) -> None:
+        _, _, gen, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(
+                ["orders", "coupons"],
+                {"orders": ["id", "loyalty_tier"], "coupons": ["id", "code"]},
+            ),
+            known=self._SEEN,
+            generated_columns={},
+            last_apply={"column_tables_failed": ["public.coupons"]},
+        )
+        sent = gen.generate_new_columns.await_args.kwargs["columns_by_table"]
+        assert list(sent) == ["public.orders", "public.coupons"]
+
+    async def test_a_demotion_survives_an_apply_that_defers_the_table(self, http_client) -> None:
+        names = [f"t{i}" for i in range(3 * GENERATION_BATCH_SIZE)]
+        resp, _, _, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders", "coupons", *names], self._WIDE),
+            known=self._SEEN,
+            generated={},
+            last_apply={"column_tables_failed": ["public.orders"]},
+        )
+        assert resp.json()["summary"]["column_tables_failed"] == ["public.orders"]
+
+    async def test_a_demotion_survives_a_batch_that_was_never_reached(self, http_client) -> None:
+        """``coupons`` failed last time, so it is sent last, in its own batch (the column cap
+        splits the two). The first batch fails and ends the phase: ``coupons`` was never
+        tried, and keeps its mark — or the next apply would put it first again."""
+        from app.routers.semantic import _DRIFT_MAX_COLUMNS_PER_BATCH as CAP
+
+        wide = [f"c{i:03d}" for i in range(CAP // 2 + 1)]
+        resp, _, gen, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(
+                ["orders", "coupons"], {"orders": ["id", *wide], "coupons": ["id", *wide]}
+            ),
+            known=self._SEEN,
+            generated_columns=RuntimeError("provider down"),
+            last_apply={"column_tables_failed": ["public.coupons"]},
+        )
+        assert resp.status_code == 200
+        assert list(gen.generate_new_columns.await_args.kwargs["columns_by_table"]) == [
+            "public.orders"
+        ]
+        summary = resp.json()["summary"]
+        assert summary["column_tables_failed"] == ["public.coupons", "public.orders"]
+        [warning] = summary["warnings"]
+        assert "the new-column LLM call failed (provider down): public.orders.c000, " in warning
+        assert "the batch after the failed call was not tried: public.coupons.c000, " in warning
+        assert "returned nothing" not in warning
+
+    async def test_a_throttle_after_an_answered_batch_keeps_what_was_answered(
+        self, http_client
+    ) -> None:
+        """Nothing but new columns, yet the first batch answered: the 429 on the second is a
+        warning, and the first batch's annotations and baseline are saved."""
+        from app.routers.semantic import _DRIFT_MAX_COLUMNS_PER_BATCH as CAP
+
+        wide = [f"c{i:03d}" for i in range(CAP // 2 + 1)]
+        answers: list[dict | BaseException] = [
+            {"public.coupons": {c: ColumnSemantic(display_name=c) for c in wide}},
+            ValueError("[RATE_LIMIT] slow down"),
+        ]
+
+        def answer(**_kw) -> dict:
+            result = answers.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        resp, save, gen, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(
+                ["orders", "coupons"], {"orders": ["id", *wide], "coupons": ["id", *wide]}
+            ),
+            known=self._SEEN,
+            generated_columns=answer,
+        )
+        assert resp.status_code == 200
+        assert gen.generate_new_columns.await_count == 2
+        summary = resp.json()["summary"]
+        assert summary["columns_added"] == {"public.coupons": wide}
+        assert summary["column_tables_failed"] == ["public.orders"]
+        [warning] = summary["warnings"]
+        assert "the new-column LLM call failed ([RATE_LIMIT] slow down): public.orders.c000" in (
+            warning
+        )
+        save.assert_awaited_once()
+        written = self.known_update.await_args.args[2]
+        assert written["public.coupons"] == {"id", *wide}
+        assert "public.orders" not in written
+
+    # ── no provider ──
+
+    _NO_PROVIDER = HTTPException(status_code=400, detail="No API key configured for claude")
+
+    async def test_an_unresolvable_provider_does_not_hold_back_the_removals(
+        self, http_client
+    ) -> None:
+        """New columns beside a removal: the column phase fails like a failed call (no
+        column recorded, no edge on one), and the removal is saved."""
+        resp, save, gen, _ = await self._run(
+            http_client,
+            model=self._fk_model(["id", "customer_id"], coupons=True),
+            schema=_schema(
+                ["orders", "customers"],
+                {"orders": ["id", "customer_id", "region_id"], "customers": ["id"]},
+            ),
+            known=self._FK_KNOWN,
+            fresh_edges=[self._edge("public.orders", "region_id", "public.customers")],
+            provider_error=self._NO_PROVIDER,
+        )
+        assert resp.status_code == 200
+        gen.generate_new_columns.assert_not_awaited()
+        summary = resp.json()["summary"]
+        assert summary["tables_removed"] == ["public.coupons"]
+        assert summary["columns_added"] == {}
+        assert summary["relationships_added"] == []
+        assert summary["warnings"] == [
+            "1 new column(s) were not annotated and stay missing from the model (the LLM "
+            "provider could not be used (No API key configured for claude): "
+            "public.orders.region_id). Run Check Drift and apply again to retry."
+        ]
+        save.assert_awaited_once()
+        assert "public.orders" not in self.known_update.await_args.args[2]
+
+    @pytest.mark.parametrize(
+        "schema",
+        [
+            _schema(["orders", "coupons"], {"orders": ["id", "loyalty_tier"], "coupons": ["id"]}),
+            _schema(["orders", "coupons", "events"]),
+        ],
+        ids=["column-only", "new-table"],
+    )
+    async def test_an_unresolvable_provider_fails_an_apply_it_is_required_for(
+        self, http_client, schema: DataSourceSchema
+    ) -> None:
+        """Nothing but new columns, or a new table: the 400 is the answer, nothing is
+        written."""
+        resp, save, gen, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=schema,
+            known=self._SEEN,
+            provider_error=self._NO_PROVIDER,
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "No API key configured for claude"
+        gen.generate_tables.assert_not_awaited()
+        gen.generate_new_columns.assert_not_awaited()
+        save.assert_not_awaited()
+        self.record.assert_not_awaited()
+        self.known_update.assert_not_awaited()
+
+    async def test_the_preview_of_new_columns_resolves_no_provider(self, http_client) -> None:
+        resp, _, _, resolve = await self._run(
+            http_client,
+            model=self._complete(),
+            schema=_schema(["orders"], {"orders": ["id", "loyalty_tier"]}),
+            known=self._SEEN,
+            provider_error=self._NO_PROVIDER,
+            dry_run=True,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["summary"]["columns_added"] == {"public.orders": ["loyalty_tier"]}
+        resolve.assert_not_awaited()
+
+    # ── warnings planned before the lock ──
+
+    async def test_deferred_work_another_writer_stored_meanwhile_is_not_named(
+        self, http_client
+    ) -> None:
+        """Two new tables and two tables with new columns are past the budget. Under the
+        lock, one of each is stored already: the warnings name only the others."""
+        from app.routers.semantic import _DRIFT_MAX_NEW_TABLES
+
+        names = [f"t{i:02d}" for i in range(_DRIFT_MAX_NEW_TABLES + 2)]
+        keys = sorted(f"public.{n}" for n in names)
+        wide = {"orders": ["id", "loyalty_tier"], "coupons": ["id", "code"]}
+        meanwhile = self._complete(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "columns": {
+                        "id": {"display_name": "Id"},
+                        "loyalty_tier": {"display_name": "Tier"},
+                    },
+                },
+                "public.coupons": {
+                    "display_name": "Coupons",
+                    "columns": {"id": {"display_name": "Id"}},
+                },
+                keys[-1]: {"display_name": "Stored meanwhile", "columns": {}},
+            }
+        )
+        resp, _, gen, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            current=(meanwhile, _snapshot()),
+            schema=_schema(["orders", "coupons", *names], wide),
+            known=self._SEEN,
+            generated=self._annotate_all,
+        )
+        assert resp.status_code == 200
+        gen.generate_new_columns.assert_not_awaited()
+        warnings = resp.json()["summary"]["warnings"]
+        [tables_warning] = [w for w in warnings if "more new table" in w]
+        assert tables_warning.startswith("1 more new table was not annotated")
+        assert keys[-2] in tables_warning and keys[-1] not in tables_warning
+        [columns_warning] = [w for w in warnings if w.startswith("The new columns of")]
+        assert columns_warning.startswith("The new columns of 1 more table were not annotated")
+        assert "public.coupons" in columns_warning and "public.orders" not in columns_warning
+
+    async def test_cut_columns_another_writer_stored_meanwhile_are_not_counted(
+        self, http_client
+    ) -> None:
+        from app.routers.semantic import _DRIFT_MAX_COLUMNS_PER_BATCH as CAP
+
+        extra = [f"c{i:03d}" for i in range(CAP + 2)]
+        meanwhile = self._complete(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "columns": {name: {"display_name": name} for name in ["id", *extra[CAP:]]},
+                },
+                "public.coupons": {
+                    "display_name": "Coupons",
+                    "columns": {"id": {"display_name": "Id"}},
+                },
+            }
+        )
+        resp, _, _, _ = await self._run(
+            http_client,
+            model=self._complete(),
+            current=(meanwhile, _snapshot()),
+            schema=_schema(["orders", "coupons"], {"orders": ["id", *extra], "coupons": ["id"]}),
+            known=self._SEEN,
+            generated_columns={
+                "public.orders": {c: ColumnSemantic(display_name=c) for c in extra[:CAP]}
+            },
+        )
+        assert resp.status_code == 200
+        assert not any("more new column(s)" in w for w in resp.json()["summary"]["warnings"])
 
 
 _DRIFT_HISTORY_URL = "/api/v1/connections/conn-123/semantic/drift/history"

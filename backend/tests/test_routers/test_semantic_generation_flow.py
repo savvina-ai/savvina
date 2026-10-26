@@ -1,10 +1,12 @@
 # Copyright (c) 2025 Savvina AI Ltd
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-"""Phased generation driven through the real routes and the real semantic store.
+"""Phased generation, and the drift check and apply after it, driven through the real
+routes and the real semantic store.
 
-Only the LLM (``generate_tables`` / ``generate_globals``), provider resolution and
-schema loading are mocked; everything else — the routes, the row lock, the store's
+Only the LLM (``generate_tables`` / ``generate_globals`` / ``generate_new_columns``),
+provider resolution and schema loading (the drift routes' live introspection too) are
+mocked; everything else — the routes, the row lock, the store's
 reconcile, run stamping, provenance and the full save — runs against an in-memory
 SQLite database. SQLite ignores ``FOR NO KEY UPDATE`` / ``FOR UPDATE``, so this
 proves the flow, not the locking (that is covered against PostgreSQL by review, and
@@ -17,9 +19,10 @@ from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from fastapi import HTTPException
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 
 from app.database import get_db
 from app.datasources.models import (
@@ -36,6 +39,7 @@ from app.models.semantic_store import (
     SemanticColumnRow,
     SemanticGlobalItemRow,
     SemanticHistoryRow,
+    SemanticKnownColumnsRow,
     SemanticMetricRow,
     SemanticModelRow,
     SemanticRelationshipRow,
@@ -71,8 +75,9 @@ _TABLES = (
     SemanticRelationshipRow,
     SemanticGlobalItemRow,
     SemanticHistoryRow,
+    SemanticKnownColumnsRow,
     SemanticSuggestion,
-    # Emptied by _invalidate_connection_caches on every finalising write.
+    # Emptied by _invalidate_connection_caches on the writes that change the model.
     QueryCacheEntry,
     UserSchemaCache,
     TableEmbeddingCache,
@@ -132,6 +137,10 @@ class _Llm:
         self.during_batch = None  # optional async hook, run inside the "LLM call"
         self.during_globals = None  # likewise, inside the globals "LLM call"
         self.globals_tables: dict[str, TableSemantic] = {}
+        self.omit_columns: set[str] = set()  # "schema.table.column" names left unannotated
+        self.column_batches: list[dict[str, list[str]]] = []  # new-column asks, in order
+        # 1-based index of a new-column call → the error message it raises.
+        self.column_failures: dict[int, str] = {}
 
     async def generate_tables(self, *, schema, table_keys, **_kw) -> dict[str, TableSemantic]:
         self.batches.append(list(table_keys))
@@ -142,10 +151,26 @@ class _Llm:
             f"{t.schema_name}.{t.name}": TableSemantic(
                 display_name=t.name.title(),
                 description=f"{self.description} {t.name}",
-                columns={c.name: ColumnSemantic(display_name=c.name.upper()) for c in t.columns},
+                columns={
+                    c.name: ColumnSemantic(display_name=c.name.upper())
+                    for c in t.columns
+                    if f"{t.schema_name}.{t.name}.{c.name}" not in self.omit_columns
+                },
             )
             for t in schema.tables
             if f"{t.schema_name}.{t.name}" in wanted
+        }
+
+    async def generate_new_columns(
+        self, *, columns_by_table, **_kw
+    ) -> dict[str, dict[str, ColumnSemantic]]:
+        self.column_batches.append({key: list(names) for key, names in columns_by_table.items()})
+        if (failure := self.column_failures.get(len(self.column_batches))) is not None:
+            # What the generator raises for a provider error, the provider's mark kept.
+            raise ValueError(f"LLM call failed in generate_new_columns: {failure}")
+        return {
+            key: {name: ColumnSemantic(display_name=name.upper()) for name in names}
+            for key, names in columns_by_table.items()
         }
 
     async def generate_globals(self, **kw):
@@ -185,6 +210,7 @@ def flow(db):
         ),
         patch.object(SemanticModelGenerator, "generate_tables", new=llm.generate_tables),
         patch.object(SemanticModelGenerator, "generate_globals", new=llm.generate_globals),
+        patch.object(SemanticModelGenerator, "generate_new_columns", new=llm.generate_new_columns),
     ):
         yield llm, set_schema
 
@@ -213,6 +239,28 @@ async def _generate(client) -> dict:
     return await _globals(client)
 
 
+async def _check_drift(client, live: DataSourceSchema) -> dict:
+    """``GET .../drift`` against *live* as the introspection; the drift report."""
+    from app.auth.limiter import limiter
+
+    limiter._storage.reset()  # 5/minute, and a flow checks more often
+    with patch("app.routers.semantic.refresh_user_schema_cache", new=AsyncMock(return_value=live)):
+        resp = await client.get(f"{_BASE}/drift")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def _apply_drift(client, live: DataSourceSchema, *, dry_run: bool = False) -> dict:
+    """``POST .../apply-drift`` against *live* as the introspection; the response."""
+    from app.auth.limiter import limiter
+
+    limiter._storage.reset()
+    with patch("app.routers.semantic.refresh_user_schema_cache", new=AsyncMock(return_value=live)):
+        resp = await client.post(f"{_BASE}/apply-drift" + ("?dry_run=true" if dry_run else ""))
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
 class TestGenerationFlow:
     async def test_fresh_generate_reaches_complete(self, http_client, db, flow) -> None:
         body = await _generate(http_client)
@@ -225,6 +273,102 @@ class TestGenerationFlow:
         assert stored.generation_progress is None
         assert stored.tables["public.orders"].description == "generated orders"
         assert set(stored.tables["public.orders"].columns) == {"id", "total"}
+
+    async def test_generation_records_the_live_columns_as_the_baseline(
+        self, http_client, db, flow
+    ) -> None:
+        llm, _ = flow
+        llm.omit_columns = {"public.orders.total"}
+        await _generate(http_client)
+
+        # The LLM left ``total`` out, but the model has seen it: it is not a new column.
+        stored = await store.load_model(db, _CID)
+        assert set(stored.tables["public.orders"].columns) == {"id"}
+        assert await store.load_known_columns(db, _CID) == {
+            "public.orders": frozenset({"id", "total"}),
+            "public.customers": frozenset({"id"}),
+        }
+
+    async def test_a_regenerate_trims_the_baseline_but_keeps_that_of_an_unreadable_table(
+        self, http_client, db, flow
+    ) -> None:
+        _, set_schema = flow
+        set_schema({"orders": ["id", "total"], "customers": ["id", "email"], "legacy": ["id"]})
+        await _generate(http_client)
+
+        # ``total`` and ``legacy`` left the database; ``customers`` is only unreadable.
+        set_schema({"orders": ["id"]}, unreadable=["public.customers"])
+        await _generate(http_client)
+
+        assert await store.load_known_columns(db, _CID) == {
+            "public.orders": frozenset({"id"}),
+            "public.customers": frozenset({"id", "email"}),
+        }
+
+    async def test_check_drift_baselines_only_the_table_without_an_entry_then_reports_a_new_column(
+        self, http_client, db, flow
+    ) -> None:
+        await _generate(http_client)
+        # A legacy table has no entry; ``orders`` keeps one with a stale name that only an
+        # untouched row can still hold.
+        await db.execute(
+            delete(SemanticKnownColumnsRow).where(
+                SemanticKnownColumnsRow.table_key == "public.customers"
+            )
+        )
+        await db.execute(
+            update(SemanticKnownColumnsRow)
+            .where(SemanticKnownColumnsRow.table_key == "public.orders")
+            .values(columns=["id", "total", "ghost"])
+        )
+        await db.commit()
+
+        live = _schema({"orders": ["id", "total"], "customers": ["id"]})
+        with patch(
+            "app.routers.semantic.refresh_user_schema_cache", new=AsyncMock(return_value=live)
+        ):
+            resp = await http_client.get(f"{_BASE}/drift")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["has_actionable_changes"] is False
+        assert await store.load_known_columns(db, _CID) == {
+            "public.orders": frozenset({"id", "total", "ghost"}),
+            "public.customers": frozenset({"id"}),
+        }
+
+        live = _schema({"orders": ["id", "total", "region"], "customers": ["id"]})
+        with patch(
+            "app.routers.semantic.refresh_user_schema_cache", new=AsyncMock(return_value=live)
+        ):
+            resp = await http_client.get(f"{_BASE}/drift")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert any("public.orders.region" in w for w in body["warnings"])
+        assert body["has_actionable_changes"] is True
+
+    async def test_finishing_a_run_does_not_record_a_column_held_only_under_a_near_miss_key(
+        self, http_client, db, flow
+    ) -> None:
+        llm, set_schema = flow
+        set_schema({"orders": ["id"], "customers": ["id", "status"]})
+        llm.omit_columns = {"public.customers.status"}
+        await _generate(http_client)
+        # A near-miss key as a blob-era backfill (migration 0003) left it: one plain
+        # column row, no provenance, never grounded to the live name.
+        table_id = await db.scalar(
+            select(SemanticTableRow.id).where(SemanticTableRow.table_key == "public.customers")
+        )
+        db.add(SemanticColumnRow(table_id=table_id, column_name="Status", display_name="Legacy"))
+        await db.commit()
+        assert "Status" in (await store.load_model(db, _CID)).tables["public.customers"].columns
+
+        # "Finish with what's generated": no batch reaches ``customers``.
+        await _init(http_client)
+        await _globals(http_client)
+
+        stored = await store.load_model(db, _CID)
+        assert set(stored.tables["public.customers"].columns) == {"id"}
+        # The prune dropped ``Status`` and its annotation, so ``status`` is not seen.
+        assert (await store.load_known_columns(db, _CID))["public.customers"] == {"id"}
 
     async def test_regenerate_keeps_a_hand_edit_and_prunes_a_dropped_column(
         self, http_client, db, flow
@@ -280,6 +424,42 @@ class TestGenerationFlow:
 
         assert body["generation_status"] == "complete"
         assert set(body["tables"]) == set(first)
+
+    async def test_a_batch_purges_the_cached_answers_and_embeddings_but_keeps_the_schema_cache(
+        self, http_client, db, flow
+    ) -> None:
+        plan = await _init(http_client)
+        # An answer generated against the model as it was before this run, a table
+        # embedding, and the user's schema cache (what a real batch reads).
+        db.add(User(id="admin-1", email="admin@test.com", password_hash="x"))
+        # Flushed on its own: no ORM relationship links the cache rows to it, so the
+        # unit of work does not order its insert before theirs, and SQLite checks the FK.
+        await db.flush()
+        db.add(
+            QueryCacheEntry(
+                connection_id=_CID,
+                question_normalized="how many orders",
+                question_raw="How many orders?",
+                generated_query="SELECT COUNT(*) FROM public.orders",
+                query_dialect="postgresql",
+            )
+        )
+        db.add(
+            TableEmbeddingCache(connection_id=_CID, user_id="admin-1", table_key="public.orders")
+        )
+        db.add(UserSchemaCache(connection_id=_CID, user_id="admin-1", schema_cache={}))
+        await db.commit()
+
+        resp = await http_client.post(
+            f"{_BASE}/generate/batch", json={"table_keys": plan["pending_table_keys"][:1]}
+        )
+
+        assert resp.status_code == 200, resp.text
+        db.expunge_all()
+        assert (await db.scalars(select(QueryCacheEntry))).all() == []
+        assert (await db.scalars(select(TableEmbeddingCache))).all() == []
+        [kept] = (await db.scalars(select(UserSchemaCache))).all()
+        assert kept.user_id == "admin-1"
 
     async def test_a_table_the_llm_omits_stays_pending_and_is_reported(
         self, http_client, db, flow
@@ -613,3 +793,135 @@ class TestGenerationFlow:
         marks = (await store.provenance_snapshot(db, _CID)).marks
         assert "description" in marks["table"]["public.customers"]
         assert set(llm.globals_tables) == {"public.orders"}
+
+
+class TestApplyDriftFlow:
+    """Check Drift and Apply Drift over a generated model, the baseline included: what
+    the check reports, the apply acts on, and the check after it is clean."""
+
+    async def test_a_legacy_model_is_baselined_then_a_new_column_is_reported_and_applied(
+        self, http_client, db, flow
+    ) -> None:
+        llm, _ = flow
+        await _generate(http_client)
+        # A model from before the baseline existed: no row at all.
+        await db.execute(delete(SemanticKnownColumnsRow))
+        await db.commit()
+
+        report = await _check_drift(
+            http_client, _schema({"orders": ["id", "total"], "customers": ["id"]})
+        )
+        assert report["has_actionable_changes"] is False
+        assert set(await store.load_known_columns(db, _CID)) == {
+            "public.orders",
+            "public.customers",
+        }
+
+        live = _schema({"orders": ["id", "total", "region"], "customers": ["id"]})
+        report = await _check_drift(http_client, live)
+        assert report["has_actionable_changes"] is True
+        assert any("public.orders.region" in w for w in report["warnings"])
+
+        preview = await _apply_drift(http_client, live, dry_run=True)
+        assert preview["summary"]["columns_added"] == {"public.orders": ["region"]}
+        assert llm.column_batches == []
+
+        applied = await _apply_drift(http_client, live)
+        assert applied["summary"]["columns_added"] == {"public.orders": ["region"]}
+        assert llm.column_batches == [{"public.orders": ["region"]}]
+        stored = await store.load_model(db, _CID)
+        assert stored.tables["public.orders"].columns["region"].display_name == "REGION"
+        assert (await store.load_known_columns(db, _CID))["public.orders"] == {
+            "id",
+            "total",
+            "region",
+        }
+
+        report = await _check_drift(http_client, live)
+        assert report["has_actionable_changes"] is False
+        assert report["warnings"] == []
+
+    async def test_a_respelled_column_whose_batch_failed_is_reported_again_and_applied_next_time(
+        self, http_client, db, flow
+    ) -> None:
+        """The baseline knows ``status``, held only under a quoted blob-era key. The batch
+        fails: the key is still removed, so ``status`` must leave the baseline, or its
+        annotation would be lost without the check ever naming it again."""
+        llm, set_schema = flow
+        set_schema({"orders": ["id"], "customers": ["id", "status"]})
+        llm.omit_columns = {"public.customers.status"}
+        await _generate(http_client)
+        table_id = await db.scalar(
+            select(SemanticTableRow.id).where(SemanticTableRow.table_key == "public.customers")
+        )
+        db.add(SemanticColumnRow(table_id=table_id, column_name='"status"', display_name="Legacy"))
+        await db.commit()
+        live = _schema({"orders": ["id"], "customers": ["id", "status"]})
+        assert (await _check_drift(http_client, live))["has_actionable_changes"] is True
+
+        llm.column_failures = {1: "provider down"}
+        applied = await _apply_drift(http_client, live)
+        assert applied["summary"]["columns_removed"] == {"public.customers": ["status"]}
+        assert applied["summary"]["column_tables_failed"] == ["public.customers"]
+        stored = await store.load_model(db, _CID)
+        assert set(stored.tables["public.customers"].columns) == {"id"}
+        assert (await store.load_known_columns(db, _CID))["public.customers"] == {"id"}
+
+        report = await _check_drift(http_client, live)
+        assert report["has_actionable_changes"] is True
+        assert any("public.customers.status" in w for w in report["warnings"])
+
+        llm.column_failures = {}
+        applied = await _apply_drift(http_client, live)
+        assert applied["summary"]["columns_added"] == {"public.customers": ["status"]}
+        assert (await _check_drift(http_client, live))["has_actionable_changes"] is False
+
+    async def test_a_throttle_on_the_second_batch_keeps_the_first_and_the_next_apply_sends_the_rest(
+        self, http_client, db, flow
+    ) -> None:
+        """Nothing but new columns, over more tables than one batch holds: the throttled
+        second batch is a warning, not a 429, because the first one answered."""
+        llm, set_schema = flow
+        names = ["a", "b", "c", "d", "e"]  # one more than GENERATION_BATCH_SIZE
+        set_schema({n: ["id"] for n in names})
+        await _generate(http_client)
+        live = _schema({n: ["id", "x"] for n in names})
+
+        llm.column_failures = {2: "[RATE_LIMIT] slow down"}
+        summary = (await _apply_drift(http_client, live))["summary"]
+        assert summary["columns_added"] == {f"public.{n}": ["x"] for n in names[:4]}
+        assert summary["column_tables_failed"] == ["public.e"]
+        stored = await store.load_model(db, _CID)
+        assert all("x" in stored.tables[f"public.{n}"].columns for n in names[:4])
+        assert "x" not in stored.tables["public.e"].columns
+        report = await _check_drift(http_client, live)
+        assert report["has_actionable_changes"] is True
+
+        llm.column_batches, llm.column_failures = [], {}
+        summary = (await _apply_drift(http_client, live))["summary"]
+        assert llm.column_batches == [{"public.e": ["x"]}]
+        assert summary["columns_added"] == {"public.e": ["x"]}
+        assert summary["column_tables_failed"] == []
+        assert (await _check_drift(http_client, live))["has_actionable_changes"] is False
+
+    async def test_without_a_provider_the_removals_are_applied_and_the_new_column_stays_reported(
+        self, http_client, db, flow
+    ) -> None:
+        llm, set_schema = flow
+        set_schema({"orders": ["id", "total"], "customers": ["id"]})
+        await _generate(http_client)
+        live = _schema({"orders": ["id", "region"], "customers": ["id"]})  # total dropped
+
+        no_provider = HTTPException(status_code=400, detail="No API key configured for claude")
+        with patch(
+            "app.routers.semantic._resolve_provider", new=AsyncMock(side_effect=no_provider)
+        ):
+            summary = (await _apply_drift(http_client, live))["summary"]
+        assert summary["columns_removed"] == {"public.orders": ["total"]}
+        assert summary["columns_added"] == {}
+        assert llm.column_batches == []
+        assert set((await store.load_model(db, _CID)).tables["public.orders"].columns) == {"id"}
+
+        report = await _check_drift(http_client, live)
+        assert report["has_actionable_changes"] is True
+        assert any("public.orders.region" in w for w in report["warnings"])

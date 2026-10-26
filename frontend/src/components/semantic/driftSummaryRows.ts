@@ -6,13 +6,14 @@
 
 import type { DriftApplySummary } from '@/types';
 
+type ColumnKey = 'columns_added' | 'columns_removed';
 type ListKey = Exclude<
   keyof DriftApplySummary,
-  'changed' | 'dry_run' | 'columns_removed' | 'tables_not_annotated' | 'warnings'
+  'changed' | 'dry_run' | ColumnKey | 'tables_not_annotated' | 'column_tables_failed' | 'warnings'
 >;
 
 // Removals first: they are what the user cannot get back without a regenerate.
-const ROWS: { key: ListKey | 'columns_removed'; added: boolean; noun: string }[] = [
+const ROWS: { key: ListKey | ColumnKey; added: boolean; noun: string }[] = [
   { key: 'tables_removed', added: false, noun: 'table' },
   { key: 'columns_removed', added: false, noun: 'column' },
   { key: 'metrics_removed', added: false, noun: 'metric' },
@@ -21,6 +22,7 @@ const ROWS: { key: ListKey | 'columns_removed'; added: boolean; noun: string }[]
   { key: 'segments_removed', added: false, noun: 'segment' },
   { key: 'relationships_removed', added: false, noun: 'relationship' },
   { key: 'tables_added', added: true, noun: 'table' },
+  { key: 'columns_added', added: true, noun: 'column' },
   { key: 'metrics_added', added: true, noun: 'metric' },
   { key: 'joins_added', added: true, noun: 'join' },
   { key: 'derived_columns_added', added: true, noun: 'derived column' },
@@ -43,8 +45,8 @@ export function summaryRows(summary: DriftApplySummary): SummaryRow[] {
     : ['Added', 'Removed'];
   return ROWS.map(({ key, added, noun }) => {
     const names =
-      key === 'columns_removed'
-        ? Object.entries(summary.columns_removed).flatMap(([table, cols]) =>
+      key === 'columns_added' || key === 'columns_removed'
+        ? Object.entries(summary[key]).flatMap(([table, cols]) =>
             cols.map((c) => `${table}.${c}`),
           )
         : summary[key];
@@ -58,12 +60,18 @@ export function summaryTitle(summary: DriftApplySummary): string {
   return summary.changed ? 'Schema drift applied' : 'Nothing was applied';
 }
 
-/** One line for assistive tech: the row labels, the skipped tables, or why there is nothing. */
+/**
+ * One line for assistive tech: the row labels; otherwise the new tables not annotated;
+ * failing that, the tables whose new columns were not annotated (a failed batch, no
+ * answer, or an earlier apply's mark); otherwise why there is nothing.
+ */
 export function summaryDescription(summary: DriftApplySummary): string {
   const rows = summaryRows(summary);
   if (rows.length > 0) return rows.map((r) => r.label).join(' · ');
   const skipped = summary.tables_not_annotated.length;
   if (skipped > 0) return `${plural(skipped, 'new table')} not annotated`;
+  const failed = summary.column_tables_failed.length;
+  if (failed > 0) return `New columns on ${plural(failed, 'table')} not annotated`;
   return 'Nothing to apply — the model already matches the live schema.';
 }
 
