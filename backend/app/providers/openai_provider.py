@@ -23,6 +23,7 @@ from .base import (
     is_transient_status,
     parse_llm_response,
     provider_unavailable,
+    strip_error_marker,
 )
 from .registry import register_provider
 
@@ -101,11 +102,12 @@ class OpenAIProvider(BaseLLMProvider):
         self._default_model = default_model or _DEFAULT_MODEL
 
     @staticmethod
-    def _normalize_api_error(exc: openai.APIStatusError) -> ValueError:
+    def _normalize_api_error(exc: openai.APIStatusError, model: str = "") -> ValueError:
         """Convert an openai.APIStatusError into a descriptive ValueError.
 
         Covers Gemini, Groq, Cerebras, Mistral, and any other OpenAI-compatible
-        provider that routes through this class.
+        provider that routes through this class.  *model* is the model the failed
+        request asked for, so a 404 can name it.
         """
         try:
             body = exc.response.json()
@@ -158,6 +160,14 @@ class OpenAIProvider(BaseLLMProvider):
                 f"[AUTH_ERROR] Invalid or expired API key (HTTP {exc.status_code}). "
                 f"Check your provider credentials."
             )
+        # Cerebras, Groq and OpenAI answer an unknown or retired model with 404 and
+        # code model_not_found; Gemini's OpenAI endpoint only says so in the message.
+        if exc.status_code == 404 and (code == "model_not_found" or "model" in api_msg.lower()):
+            which = f"Model '{model}'" if model else "The requested model"
+            return ValueError(
+                f"[MODEL_NOT_FOUND] {which} is not available on this provider, or this API key "
+                f"has no access to it. Click Fetch Models and pick one of the models it returns."
+            )
         return ValueError(f"[PROVIDER_ERROR] Provider returned HTTP {exc.status_code}. {api_msg}")
 
     async def generate_response(
@@ -189,7 +199,7 @@ class OpenAIProvider(BaseLLMProvider):
                 temperature=temperature,
             )
         except openai.APIStatusError as exc:
-            raise self._normalize_api_error(exc) from exc
+            raise self._normalize_api_error(exc, model or self._default_model) from exc
         if not response.choices:
             raise ValueError(
                 "[EMPTY_RESPONSE] The model returned no choices. "
@@ -246,7 +256,7 @@ class OpenAIProvider(BaseLLMProvider):
             # Any other status (429 rate-limit, 401 auth, …) is a real error; surface it.
             # A 400 that says the prompt itself is too large is a real error too: a
             # text-mode resend of the same prompt would fail the same way.
-            normalized = self._normalize_api_error(exc)
+            normalized = self._normalize_api_error(exc, model or self._default_model)
             if exc.status_code != 400 or str(normalized).startswith("[CONTEXT_EXCEEDED]"):
                 raise normalized from exc
             # Run the text-mode fallback on the same no-retry client (a shallow copy, so
@@ -294,6 +304,9 @@ class OpenAIProvider(BaseLLMProvider):
         try:
             await self._client.models.list()
             return True, ""
+        except openai.APIStatusError as exc:
+            logger.warning("OpenAIProvider health check failed: %s", exc, exc_info=True)
+            return False, strip_error_marker(str(self._normalize_api_error(exc)))
         except Exception as e:
             logger.warning("OpenAIProvider health check failed: %s", e, exc_info=True)
             return False, str(e)
@@ -311,6 +324,10 @@ class OpenAIProvider(BaseLLMProvider):
                 max_tokens=1,
             )
             return True, ""
+        except openai.APIStatusError as exc:
+            logger.warning("%s health check failed: %s", self.provider_name, exc, exc_info=True)
+            normalized = self._normalize_api_error(exc, self._default_model)
+            return False, strip_error_marker(str(normalized))
         except Exception as e:
             logger.warning("%s health check failed: %s", self.provider_name, e, exc_info=True)
             return False, str(e)

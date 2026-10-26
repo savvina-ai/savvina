@@ -12,6 +12,7 @@ insufficient_quota), 402 (HuggingFace), 400+context_length_exceeded (Cerebras),
 from __future__ import annotations
 
 import json
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -478,3 +479,55 @@ class TestIsTransientStatus:
     )
     def test_classifies_statuses(self, status: int, expected: bool) -> None:
         assert is_transient_status(status) is expected
+
+
+class TestModelNotFoundAndHealthCheckMessages:
+    _NOT_FOUND_BODY: ClassVar[dict] = {
+        "message": "Model does not exist or you do not have access to it.",
+        "type": "not_found_error",
+        "param": "model",
+        "code": "model_not_found",
+    }
+
+    async def test_404_model_not_found_names_the_model(self) -> None:
+        provider = _make_provider()
+        provider._client.chat.completions.create = AsyncMock(
+            side_effect=_make_api_status_error(404, self._NOT_FOUND_BODY)
+        )
+        with pytest.raises(ValueError, match=r"^\[MODEL_NOT_FOUND\]") as excinfo:
+            await provider.generate_response("sys", "msg", [], model="retired-model")
+        assert "'retired-model'" in str(excinfo.value)
+
+    async def test_ping_health_check_404_reports_the_default_model_without_the_raw_body(
+        self,
+    ) -> None:
+        provider = _make_provider()
+        provider._client.chat.completions.create = AsyncMock(
+            side_effect=_make_api_status_error(404, self._NOT_FOUND_BODY)
+        )
+        ok, detail = await provider._ping_completion()
+        assert ok is False
+        assert "'gpt-4o'" in detail
+        assert "Fetch Models" in detail
+        assert not detail.startswith("[")
+        assert "{" not in detail
+        assert "not_found_error" not in detail
+
+    async def test_health_check_401_reports_a_clean_auth_message(self) -> None:
+        provider = _make_provider()
+        provider._client.models.list = AsyncMock(
+            side_effect=_make_api_status_error(401, {"error": {"message": "bad key"}})
+        )
+        ok, detail = await provider.health_check()
+        assert ok is False
+        assert "Invalid or expired API key" in detail
+        assert not detail.startswith("[")
+
+    async def test_404_without_a_model_hint_is_a_plain_provider_error(self) -> None:
+        provider = _make_provider()
+        provider._client.chat.completions.create = AsyncMock(
+            side_effect=_make_api_status_error(404, {"error": {"message": "no such route"}})
+        )
+        with pytest.raises(ValueError, match=r"^\[PROVIDER_ERROR\]") as excinfo:
+            await provider.generate_response("sys", "msg", [])
+        assert "no such route" in str(excinfo.value)

@@ -223,3 +223,35 @@ class TestClaudeGenerateStructuredGuards:
                 system_prompt="sys", user_message="q", schema_type=_StructSchema
             )
         assert "[PROVIDER_UNAVAILABLE]" not in str(excinfo.value)
+
+
+class TestClaudeModelNotFoundAndHealthCheckMessages:
+    async def test_404_raises_model_not_found_naming_the_model(self) -> None:
+        provider = _make_provider()
+        provider._client.messages.create = AsyncMock(
+            side_effect=_make_api_status_error(404, "model: retired-model")
+        )
+        with pytest.raises(ValueError, match=r"^\[MODEL_NOT_FOUND\]") as excinfo:
+            await provider.generate_response("sys", "msg", [], model="retired-model")
+        assert "'retired-model'" in str(excinfo.value)
+
+    async def test_health_check_404_reports_the_default_model_without_the_marker(self) -> None:
+        provider = _make_provider()
+        provider._client.messages.create = AsyncMock(
+            side_effect=_make_api_status_error(404, "model: claude-sonnet-4-6")
+        )
+        ok, detail = await provider.health_check()
+        assert ok is False
+        assert "'claude-sonnet-4-6'" in detail
+        assert "Fetch Models" in detail
+        assert not detail.startswith("[")
+
+    async def test_health_check_401_reports_a_clean_auth_message(self) -> None:
+        provider = _make_provider()
+        provider._client.messages.create = AsyncMock(
+            side_effect=_make_api_status_error(401, "invalid x-api-key")
+        )
+        ok, detail = await provider.health_check()
+        assert ok is False
+        assert "Invalid or expired Anthropic API key" in detail
+        assert not detail.startswith("[")

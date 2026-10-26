@@ -24,8 +24,8 @@ class CerebrasProvider(OpenAIProvider):
     chars_per_token = 2.0
 
     _BASE_URL = "https://api.cerebras.ai/v1"
-    _DEFAULT_MODEL = "qwen-3-235b-a22b-instruct-2507"
-    default_model = "qwen-3-235b-a22b-instruct-2507"
+    _DEFAULT_MODEL = "gpt-oss-120b"
+    default_model = "gpt-oss-120b"
 
     def __init__(
         self,

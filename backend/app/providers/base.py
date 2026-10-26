@@ -54,6 +54,13 @@ def provider_unavailable(detail: str) -> ValueError:
     return ValueError(f"{PROVIDER_UNAVAILABLE_MARK} {detail} Retrying usually helps.")
 
 
+def strip_error_marker(message: str) -> str:
+    """Drop the leading ``[MARKER] `` the normalisers prefix, for text shown as-is in the UI."""
+    if message.startswith("[") and "] " in message:
+        return message.split("] ", 1)[1]
+    return message
+
+
 def _raise_if_fetch_error(exc: Exception, provider: str) -> None:
     """Re-raise *exc* as a typed provider error for known httpx failure modes.
 
