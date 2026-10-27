@@ -101,7 +101,9 @@ class ValidationResult:
 class PrivacySettings:
     """Per-connection privacy controls for what metadata reaches the LLM."""
 
-    include_sample_values: bool = True
+    # Off until an admin turns it on. A stored settings dict that lacks the key reads as
+    # off too (from_dict falls back to this default) — the UI has always shown it off.
+    include_sample_values: bool = False
     include_column_comments: bool = False
     include_row_counts: bool = True
     sensitive_column_patterns: list[str] = field(
@@ -139,15 +141,24 @@ class PrivacySettings:
     # format: "schema.table" or bare "table" — same syntax as excluded_tables
     always_include_tables: list[str] = field(default_factory=list)
     schema_pruning_threshold: float = 0.30  # per-connection cosine threshold for table relevance
-    # Optional SQL condition injected into every generated query as a mandatory row-level filter.
-    # Example: "tenant_id = 'acme-corp'" or "org_id = 42"
-    # Applied by wrapping the generated query in a derived table with this WHERE clause.
+    # Optional SQL condition every executed statement is wrapped in as a mandatory row-level
+    # filter, e.g. "tenant_id = 'acme-corp'". Validated on write (services/row_filter.py:
+    # validate_row_filter) and applied by _inject_row_filter.
     row_filter_sql: str | None = None
 
     def is_column_sensitive(self, column_name: str) -> bool:
         """Check if a column name matches any sensitive pattern."""
         col_lower = column_name.lower()
         return any(pattern in col_lower for pattern in self.sensitive_column_patterns)
+
+    def column_values_allowed(self, column_name: str) -> bool:
+        """Whether a real value from *column_name* may reach the LLM.
+
+        The single rule every value channel reads — sample values, ENUM/SET member lists,
+        entity-resolution hints, catalog statistics: the toggle must be on and the column
+        must not match a sensitive pattern.
+        """
+        return self.include_sample_values and not self.is_column_sensitive(column_name)
 
     def is_table_excluded(self, schema_name: str | None, table_name: str) -> bool:
         """Check if a table should be excluded from LLM context."""

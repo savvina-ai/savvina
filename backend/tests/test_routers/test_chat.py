@@ -484,8 +484,9 @@ class TestGetSession:
 class TestGetSessionHistory:
     async def test_returns_200(self, http_client):
         msg = _make_message()
-        # scalar: count=1 (non-zero → skip exists check); execute: messages
-        db = _mock_db(MockResult(rows=[msg]))
+        # scalar: count=1 (non-zero → skip exists check); execute: messages, then the
+        # session's connection privacy settings (stored results are re-masked on read)
+        db = _mock_db(MockResult(rows=[msg]), MockResult(rows=[]))
         db.scalar = AsyncMock(return_value=1)
         app.dependency_overrides[get_db] = lambda: db
         resp = await http_client.get("/api/v1/chat/sessions/sess-1/history")
@@ -679,6 +680,43 @@ class TestListExamples:
         assert "items" in body
         assert "total" in body
         assert body["total"] == 0
+
+    @staticmethod
+    def _example(query: str) -> MagicMock:
+        example = MagicMock()
+        example.id = "ex-1"
+        example.question = "Active users"
+        example.query = query
+        example.query_dialect = "postgresql"
+        example.created_at = datetime(2025, 1, 1, tzinfo=UTC)
+        return example
+
+    async def test_serves_a_row_stored_wrapped_without_the_wrap(self, http_client):
+        example = self._example(
+            "SELECT * FROM (\nSELECT id, tenant_id FROM users\n) AS _sift_q WHERE tenant_id = 7"
+        )
+        db = _mock_db(MockResult(rows=[example]))
+        db.scalar = AsyncMock(return_value=1)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/chat/examples/conn-123")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 1
+        item = body["items"][0]
+        assert item["id"] == "ex-1"
+        assert item["question"] == "Active users"
+        assert item["query"] == "SELECT id, tenant_id FROM users"
+        assert item["query_dialect"] == "postgresql"
+        assert item["created_at"].startswith("2025-01-01")
+
+    async def test_serves_a_clean_row_unchanged(self, http_client):
+        example = self._example("SELECT id FROM users LIMIT 5")
+        db = _mock_db(MockResult(rows=[example]))
+        db.scalar = AsyncMock(return_value=1)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/chat/examples/conn-123")
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["query"] == "SELECT id FROM users LIMIT 5"
 
 
 # ── POST /api/v1/chat/examples/{connection_id} ───────────────────────────────────

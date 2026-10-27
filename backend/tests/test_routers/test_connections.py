@@ -99,6 +99,92 @@ class TestCreateConnection:
         )
         assert resp.status_code == 422
 
+    async def test_invalid_row_filter_returns_422_and_creates_nothing(self, http_client):
+        db = _mock_db()
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.post(
+            "/api/v1/connections",
+            json={
+                "name": "My DB",
+                "source_type": "postgresql",
+                "config": {"host": "localhost"},
+                "privacy_settings": {"row_filter_sql": "tenant_id = 1; DROP TABLE t"},
+            },
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "Row filter must be a single condition without ';'"
+        db.add.assert_not_called()
+
+    async def test_row_filter_is_stored_stripped_and_empty_becomes_null(self, http_client):
+        db = _mock_db()
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.post(
+            "/api/v1/connections",
+            json={
+                "name": "My DB",
+                "source_type": "postgresql",
+                "config": {"host": "localhost"},
+                "privacy_settings": {
+                    "include_sample_values": False,
+                    "row_filter_sql": "  tenant_id = 1 ",
+                },
+            },
+        )
+        assert resp.status_code == 201
+        assert db.add.call_args.args[0].privacy_settings == {
+            "include_sample_values": False,
+            "row_filter_sql": "tenant_id = 1",
+        }
+
+        db = _mock_db()
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.post(
+            "/api/v1/connections",
+            json={
+                "name": "My DB",
+                "source_type": "postgresql",
+                "config": {"host": "localhost"},
+                "privacy_settings": {"row_filter_sql": "   "},
+            },
+        )
+        assert resp.status_code == 201
+        assert db.add.call_args.args[0].privacy_settings == {"row_filter_sql": None}
+
+    @pytest.mark.parametrize("value", [False, 0, ["x"], {"a": 1}])
+    async def test_non_string_row_filter_returns_422_and_creates_nothing(self, http_client, value):
+        db = _mock_db()
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.post(
+            "/api/v1/connections",
+            json={
+                "name": "My DB",
+                "source_type": "postgresql",
+                "config": {"host": "localhost"},
+                "privacy_settings": {"row_filter_sql": value},
+            },
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "Row filter must be a string"
+        db.add.assert_not_called()
+
+    async def test_unregistered_source_type_validates_with_the_strictest_dialect(self, http_client):
+        db = _mock_db()
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.post(
+            "/api/v1/connections",
+            json={
+                "name": "My DB",
+                "source_type": "nosuch",
+                "config": {"host": "localhost"},
+                "privacy_settings": {"row_filter_sql": "tag = '#1'"},
+            },
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            "Row filter must not contain comment markers, even inside quotes"
+        )
+        db.add.assert_not_called()
+
 
 # ── GET /api/v1/connections ───────────────────────────────────────────────────────
 
@@ -429,6 +515,111 @@ class TestUpdatePrivacy:
             json={"include_sample_values": True},
         )
         assert resp.status_code == 404
+
+    @staticmethod
+    def _stored_privacy(db) -> dict:
+        # execute call 0 is the lookup, call 1 the UPDATE.
+        update_stmt = db.execute.call_args_list[1].args[0]
+        return update_stmt.compile().params["privacy_settings"]
+
+    @staticmethod
+    def _db_for_update(conn):
+        db = _mock_db(
+            MockResult(single=conn),  # _get_or_404
+            MockResult(),  # update
+            MockResult(),  # delete UserSchemaCache
+            MockResult(),  # delete QueryCacheEntry
+            MockResult(),  # delete TableEmbeddingCache
+        )
+        db.refresh = AsyncMock()
+        return db
+
+    @staticmethod
+    def _use_db(db) -> None:
+        # A factory call binds ``db`` (no B023); a ``db=db`` default would be read by FastAPI
+        # as a dependency parameter.
+        app.dependency_overrides[get_db] = lambda: db
+
+    async def test_sets_the_row_filter(self, http_client):
+        conn = _make_conn(privacy_settings={"include_sample_values": False})
+        db = self._db_for_update(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={"row_filter_sql": " tenant_id = 42 "},
+        )
+        assert resp.status_code == 200
+        assert self._stored_privacy(db) == {
+            "include_sample_values": False,
+            "row_filter_sql": "tenant_id = 42",
+        }
+
+    async def test_empty_string_clears_the_row_filter(self, http_client):
+        conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
+        db = self._db_for_update(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={"row_filter_sql": ""}
+        )
+        assert resp.status_code == 200
+        assert self._stored_privacy(db) == {"row_filter_sql": None}
+
+    async def test_absent_or_null_leaves_the_row_filter_unchanged(self, http_client):
+        for body in ({"include_sample_values": True}, {"row_filter_sql": None}):
+            conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
+            db = self._db_for_update(conn)
+            self._use_db(db)
+            resp = await http_client.put("/api/v1/connections/conn-123/privacy", json=body)
+            assert resp.status_code == 200
+            assert self._stored_privacy(db)["row_filter_sql"] == "tenant_id = 42"
+
+    async def test_invalid_row_filter_returns_422_and_writes_nothing(self, http_client):
+        conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
+        db = self._db_for_update(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={"row_filter_sql": "WHERE tenant_id = 1"},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            "Row filter is a condition: write it without the leading WHERE"
+        )
+        assert db.execute.call_count == 1  # only the lookup
+        db.commit.assert_not_called()
+
+    async def test_validation_uses_the_connections_dialect(self, http_client):
+        # "#" starts a comment on MySQL only.
+        for source_type, expected in (("postgresql", 200), ("mysql", 422)):
+            conn = _make_conn(source_type=source_type, privacy_settings={})
+            db = self._db_for_update(conn)
+            self._use_db(db)
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filter_sql": "tag = '#1'"},
+            )
+            assert resp.status_code == expected, source_type
+
+    async def test_row_filter_on_missing_connection_returns_404_before_validation(
+        self, http_client
+    ):
+        db = _mock_db(MockResult(single=None))
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put(
+            "/api/v1/connections/missing/privacy", json={"row_filter_sql": "WHERE x = 1"}
+        )
+        assert resp.status_code == 404
+
+    async def test_non_string_row_filter_is_rejected_by_the_schema(self, http_client):
+        conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={"row_filter_sql": 42}
+        )
+        assert resp.status_code == 422
+        assert db.execute.call_count == 0
+        db.commit.assert_not_called()
 
 
 # ── PUT /api/v1/connections/{id}/execution-mode ──────────────────────────────────

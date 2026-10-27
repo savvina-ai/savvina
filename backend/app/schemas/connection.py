@@ -23,6 +23,10 @@ class PrivacySettingsUpdate(BaseModel):
     excluded_schemas: list[str] | None = None
     excluded_tables: list[str] | None = None
     excluded_columns: list[str] | None = None
+    # A SQL condition every executed statement is wrapped in (see services/row_filter.py).
+    # Validated against the connection's dialect on write. "" clears it; None (or absent)
+    # leaves it unchanged.
+    row_filter_sql: str | None = None
 
 
 # ── Execution Mode ──────────────────────────────────────────────────────────────

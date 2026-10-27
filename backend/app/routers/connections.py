@@ -23,7 +23,7 @@ from ..auth.limiter import limiter
 from ..config import get_settings
 from ..database import get_db
 from ..datasources.adapters.postgresql import evict_pool as _evict_pg_pool
-from ..datasources.registry import create_datasource
+from ..datasources.registry import create_datasource, get_datasource_class
 from ..models.chat import ChatMessage, ChatSession
 from ..models.connection import Connection
 from ..models.example import VerifiedExample
@@ -42,6 +42,7 @@ from ..schemas.connection import (
 )
 from ..schemas.pagination import PaginatedResponse
 from ..semantic import store as semantic_store
+from ..services.row_filter import RowFilterInvalidError, validate_row_filter
 from ..services.schema_utils import SchemaRefreshError, refresh_user_schema_cache
 from ..utils.encryption import decrypt_value, encrypt_value
 from ._utils import _invalidate_connection_caches, cached_json_response, get_connection_or_404
@@ -65,6 +66,25 @@ _SENSITIVE_CONFIG_KEYS: frozenset[str] = frozenset(
         "secret_key",
     }
 )
+
+
+def _query_dialect(source_type: str) -> str:
+    """The adapter's dialect name, for row-filter validation; ``""`` (every scanner) when
+    the source type is not registered."""
+    try:
+        return get_datasource_class(source_type).query_dialect
+    except ValueError:
+        return ""
+
+
+def _validated_row_filter(text: object, source_type: str) -> str | None:
+    """*text* as ``validate_row_filter`` returns it, or HTTP 422 with the reason."""
+    if text is not None and not isinstance(text, str):
+        raise HTTPException(status_code=422, detail="Row filter must be a string")
+    try:
+        return validate_row_filter(text, _query_dialect(source_type))
+    except RowFilterInvalidError as exc:
+        raise HTTPException(status_code=422, detail=f"Row filter {exc}") from exc
 
 
 def _mask_config(config: dict) -> dict:
@@ -140,6 +160,12 @@ async def create_connection(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"A connection named '{body.name}' already exists.",
         )
+    privacy = body.privacy_settings
+    if privacy is not None and privacy.get("row_filter_sql") is not None:
+        privacy = {
+            **privacy,
+            "row_filter_sql": _validated_row_filter(privacy["row_filter_sql"], body.source_type),
+        }
     settings = get_settings()
     config_encrypted = encrypt_value(json.dumps(body.config), settings.encryption_key)
     conn = Connection(
@@ -147,7 +173,7 @@ async def create_connection(
         name=body.name,
         source_type=body.source_type,
         config_encrypted=config_encrypted,
-        privacy_settings=body.privacy_settings,
+        privacy_settings=privacy,
         execution_mode=body.execution_mode,
         is_active=True,
         created_at=datetime.now(UTC),
@@ -307,6 +333,9 @@ async def update_privacy(
     conn = await get_connection_or_404(connection_id, db)
     existing: dict = dict(conn.privacy_settings) if conn.privacy_settings else {}
     existing.update(body.model_dump(exclude_none=True))
+    if body.row_filter_sql is not None:
+        # "" clears the filter: stored as an explicit None, which exclude_none dropped.
+        existing["row_filter_sql"] = _validated_row_filter(body.row_filter_sql, conn.source_type)
     await db.execute(
         update(Connection).where(Connection.id == connection_id).values(privacy_settings=existing)
     )

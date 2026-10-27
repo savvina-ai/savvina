@@ -47,18 +47,20 @@ from ..semantic import store as semantic_store
 from ..semantic.models import SemanticModel
 from ..utils.encryption import decrypt_value
 from .execution import (
+    _executable,
     _execute_auto_query,
     _inject_order_by,
-    _inject_row_filter,
-    _mask_sensitive_result_columns,
     _results_to_response,
     _stream_execute_with_correction,
     _StreamResult,
+    _user_error_text,
+    unwrap_row_filter,
 )
 from .intent_classifier import IntentClassifier
 from .pipeline import (
     _generate_query,
 )
+from .result_masking import _double_quote_is_literal, _mask_sensitive_result_columns
 from .schema_pruning import (
     _filter_semantic_by_relevance,
     _filter_semantic_to_schema,
@@ -1018,16 +1020,16 @@ class ChatService:
         )
         adapter = create_datasource(conn.source_type)
 
-        approved_query = msg.query_generated
-
-        if privacy and privacy.row_filter_sql:
-            approved_query = _inject_row_filter(
-                approved_query, privacy.row_filter_sql, adapter.query_dialect
-            )
+        # A row stored before Task 9 may hold the row-filter wrap: run it wrapped once.
+        clean_query = unwrap_row_filter(msg.query_generated)
+        approved_query = clean_query
 
         exec_error: str | None = None
         query_result: QueryResult | None = None
         try:
+            # Wrapping can reject the query (RowFilterRejectedError): handled like any
+            # execution failure below.
+            approved_query = _executable(approved_query, privacy, adapter.query_dialect)
             await adapter.connect(config_dict)
             query_result = await adapter.execute_query(
                 approved_query,
@@ -1035,7 +1037,7 @@ class ChatService:
                 max_rows=settings.default_row_limit,
             )
         except Exception as e:
-            exec_error = str(e)
+            exec_error = _user_error_text(adapter, e)
         finally:
             await adapter.disconnect()
 
@@ -1048,7 +1050,7 @@ class ChatService:
             return ChatResponse(
                 session_id=msg.session_id,
                 message_id=msg.id,
-                query=msg.query_generated,
+                query=clean_query,
                 query_dialect=msg.query_dialect,
                 explanation=msg.content,
                 status="error",
@@ -1059,7 +1061,11 @@ class ChatService:
         if query_result is None:
             raise ValueError("Query execution produced no result object")
         results_response = _mask_sensitive_result_columns(
-            _results_to_response(query_result), privacy
+            _results_to_response(query_result),
+            privacy,
+            sql=approved_query,
+            original_sql=clean_query,
+            double_quote_is_string_literal=_double_quote_is_literal(adapter),
         )
 
         # 4. Update the message with results
@@ -1079,7 +1085,7 @@ class ChatService:
         return ChatResponse(
             session_id=msg.session_id,
             message_id=msg.id,
-            query=msg.query_generated,
+            query=clean_query,
             query_dialect=msg.query_dialect,
             explanation=msg.content,
             results=results_response,
@@ -1178,9 +1184,8 @@ class ChatService:
         # 3. Execute the edited query (with row filter enforced)
         exec_error: str | None = None
         run_query = edited_query
-        if privacy and privacy.row_filter_sql:
-            run_query = _inject_row_filter(run_query, privacy.row_filter_sql, adapter.query_dialect)
         try:
+            run_query = _executable(run_query, privacy, adapter.query_dialect)
             await adapter.connect(config_dict)
             query_result = await adapter.execute_query(
                 run_query,
@@ -1188,7 +1193,7 @@ class ChatService:
                 max_rows=settings.default_row_limit,
             )
         except Exception as e:
-            exec_error = str(e)
+            exec_error = _user_error_text(adapter, e)
         finally:
             await adapter.disconnect()
 
@@ -1211,7 +1216,11 @@ class ChatService:
             )
 
         results_response = _mask_sensitive_result_columns(
-            _results_to_response(query_result), privacy
+            _results_to_response(query_result),
+            privacy,
+            sql=run_query,
+            original_sql=edited_query,
+            double_quote_is_string_literal=_double_quote_is_literal(adapter),
         )
 
         # 4. Update the message with the edited query + results
@@ -1285,9 +1294,11 @@ class ChatService:
         if sort_column not in stored_columns:
             raise ValueError(f"Column '{sort_column}' is not in the result set")
 
-        original_query = msg.query_generated
-        if not original_query:
+        if not msg.query_generated:
             raise ValueError("Message has no generated query")
+        # A row stored before Task 9 may hold the row-filter wrap: sort the query inside
+        # it, then wrap once.
+        original_query = unwrap_row_filter(msg.query_generated)
 
         # 4. Inject ORDER BY
         dialect = msg.query_dialect or "sql"
@@ -1318,13 +1329,12 @@ class ChatService:
 
         # Apply row filter after ORDER BY injection (wraps the sorted query)
         run_query = sorted_query
-        if privacy and privacy.row_filter_sql:
-            run_query = _inject_row_filter(run_query, privacy.row_filter_sql, adapter.query_dialect)
 
         # 7. Execute
         exec_error: str | None = None
         query_result: QueryResult | None = None
         try:
+            run_query = _executable(run_query, privacy, adapter.query_dialect)
             await adapter.connect(config_dict)
             query_result = await adapter.execute_query(
                 run_query,
@@ -1332,14 +1342,20 @@ class ChatService:
                 max_rows=settings.default_row_limit,
             )
         except Exception as e:
-            exec_error = str(e)
+            exec_error = _user_error_text(adapter, e)
         finally:
             await adapter.disconnect()
 
         if exec_error or query_result is None:
             raise ValueError(f"Sort execution failed: {exec_error}")
 
-        return _mask_sensitive_result_columns(_results_to_response(query_result), privacy)
+        return _mask_sensitive_result_columns(
+            _results_to_response(query_result),
+            privacy,
+            sql=run_query,
+            original_sql=sorted_query,
+            double_quote_is_string_literal=_double_quote_is_literal(adapter),
+        )
 
     async def submit_feedback(
         self,
@@ -1393,7 +1409,9 @@ class ChatService:
             await self.examples.add_example(
                 connection_id=connection_id,
                 question=question,
-                query=msg.query_generated,
+                # Rows from before clean storage may hold the row-filter wrap: never copy
+                # it into the example library.
+                query=unwrap_row_filter(msg.query_generated),
                 query_dialect=msg.query_dialect or "",
                 embedding=embedding,
                 db=db,
@@ -1458,11 +1476,16 @@ class ChatService:
 
                 from ..models.example import VerifiedExample
 
+                # The example was stored clean, or wrapped by a version before clean
+                # storage: match either form.
+                raw = msg.query_generated
+                clean = unwrap_row_filter(raw)
+                stored_forms = [raw] if clean == raw else [raw, clean]
                 await db.execute(
                     sa_delete(VerifiedExample).where(
                         VerifiedExample.connection_id == session.connection_id,
                         VerifiedExample.question == user_msg.content,
-                        VerifiedExample.query == msg.query_generated,
+                        VerifiedExample.query.in_(stored_forms),
                     )
                 )
 

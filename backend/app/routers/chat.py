@@ -47,7 +47,9 @@ from ..schemas.chat import (
 )
 from ..schemas.pagination import PaginatedResponse
 from ..services.chat_service import ChatService, ResourceNotFoundError
+from ..services.row_filter import unwrap_row_filter
 from ..services.sse_utils import format_sse_event
+from ..services.stored_results import load_result_masks
 from ._utils import get_connection_or_404
 
 if TYPE_CHECKING:
@@ -466,9 +468,18 @@ async def get_session_history(
         .limit(limit)
         .offset(offset)
     )
-    return PaginatedResponse(
-        items=list(result.scalars().all()), total=total, limit=limit, offset=offset
+    messages = list(result.scalars().all())
+    masks = await load_result_masks(db, [session_id] if messages else [])
+    served = await masks.serve_all(
+        [(session_id, m.results_json, m.query_generated) for m in messages]
     )
+    items = [
+        MessageResponse.model_validate(m).model_copy(
+            update={"results_json": results_json, "query_generated": query}
+        )
+        for m, (results_json, query) in zip(messages, served, strict=True)
+    ]
+    return PaginatedResponse(items=items, total=total, limit=limit, offset=offset)
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -621,8 +632,19 @@ async def list_examples(
         .offset(offset)
     )
     examples = result.scalars().all()
+    # Rows stored by versions before clean storage hold the row-filter wrap: serve the
+    # query as the few-shot path reads it.
     return PaginatedResponse(
-        items=[ExampleResponse.model_validate(e) for e in examples],
+        items=[
+            ExampleResponse(
+                id=e.id,
+                question=e.question,
+                query=unwrap_row_filter(e.query),
+                query_dialect=e.query_dialect,
+                created_at=e.created_at,
+            )
+            for e in examples
+        ],
         total=total,
         limit=limit,
         offset=offset,
