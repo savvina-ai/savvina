@@ -165,7 +165,7 @@ The application entry point:
 
 ### ChatService
 
-`ChatService` lives in `services/chat_service.py` (slim orchestrator) and delegates to six focused sub-modules. See [Data Flow](data-flow.md) for the step-by-step breakdown including precise function and class references.
+`ChatService` lives in `services/chat_service.py` (slim orchestrator) and delegates to seven focused sub-modules. See [Data Flow](data-flow.md) for the step-by-step breakdown including precise function and class references.
 
 ```
 services/
@@ -173,7 +173,10 @@ services/
 ├── correction.py      — self-correction loops (schema, complexity, execution, zero-result)
 ├── schema_pruning.py  — schema pruning, relevance filtering, schema resolution
 ├── validation.py      — query validation pipeline (_validate_and_correct_query)
-├── execution.py       — query execution, result masking, row-filter injection
+├── execution.py       — query execution, ORDER BY injection, streaming
+├── row_filter.py      — row-filter wrap/unwrap, LIMIT hoisting, filter validation
+├── row_filter_scan.py — parenthesis depth of a query as each engine lexes it, for the wrap
+├── result_masking.py  — SELECT-list classifier and [REDACTED] mask for query results
 ├── pipeline.py        — LLM provider setup, prompt compression, query generation
 └── chat_service.py    — ChatService class, session helpers, message persistence
 ```
@@ -199,8 +202,8 @@ services/
 | `_validate_columns_against_schema()` | `schema_utils` | Cross-references query table/column references against schema |
 | `_check_query_complexity()` | `schema_utils` | Rejects CROSS JOIN and large-table full scans |
 | `_execute_auto_query()` | `execution` | Runs the generated query and handles results |
-| `_mask_sensitive_result_columns()` | `execution` | Redacts sensitive/excluded columns in results |
-| `_inject_row_filter()` | `execution` | Enforces mandatory row-level security filter via subquery wrap |
+| `_plan_result_mask()` / `_mask_sensitive_result_columns()` | `result_masking` | Classifies the SELECT list and redacts sensitive/excluded columns in results, through aliases, expressions, CTEs and subqueries |
+| `_inject_row_filter()` / `validate_row_filter()` | `row_filter` | Wraps every executed statement in the connection's row filter; validates the filter an admin saves |
 | `_get_or_create_session()` | `chat_service` | Loads or creates `ChatSession` |
 | `_save_user_message()` / `_save_assistant_message()` | `chat_service` | Persists `ChatMessage` rows |
 

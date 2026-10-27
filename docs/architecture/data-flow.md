@@ -46,11 +46,11 @@ routers/chat.py: process_message()
        │    ├─ schema_utils._check_query_complexity() # CROSS JOIN / large-table guard
        │    ├─ correction._attempt_complexity_correction() # self-correction for complexity
        │    └─ QueryCache.store()                    # persist to query_cache
-       ├─ execution._execute_auto_query()            # run query on user's DB (auto_execute mode)
+       ├─ execution._stream_execute_with_correction() # run query on user's DB (auto_execute mode)
+       │    ├─ row_filter._executable()              # wrap every executed statement in the row filter
+       │    ├─ result_masking._plan_result_mask()    # redact excluded/sensitive columns in every row batch
        │    ├─ correction._attempt_sql_execution_correction() # runtime error self-correction
        │    └─ correction._attempt_zero_result_correction()   # 0-row result re-examination
-       ├─ execution._mask_sensitive_result_columns() # redact excluded/sensitive columns
-       ├─ execution._inject_row_filter()             # enforce row-level security filter
        ├─ chat_service._get_or_create_session()      # create/load ChatSession
        ├─ chat_service._save_user_message()          # persist user ChatMessage
        └─ chat_service._save_assistant_message()     # persist assistant ChatMessage
@@ -442,10 +442,10 @@ For `auto_execute`:
 - `adapter.connect(config_dict)` — creates connection pool
 - `adapter.execute_query(query, timeout_ms, max_rows)` — runs query, returns `QueryResult`
 - `adapter.disconnect()` — always via `finally`
-- On runtime error: `_attempt_sql_execution_correction()` sends error + hint back to LLM (single attempt); hints for known patterns live in `_EXEC_ERROR_HINTS` dict
+- On runtime error: `_attempt_sql_execution_correction()` sends the failed SQL, Savvina's own description of the error (`error_feedback.describe_error_for_llm`: a category from `adapter.classify_error()` plus, for name-quoting categories, names the LLM already has) and a hint back to the LLM (single attempt). The database's message is never sent. Hints live in `_EXEC_ERROR_HINTS` (text match, used only when it agrees with the category) and `_CATEGORY_FALLBACK_HINTS`
 - **Zero-result detection** — if the query succeeds but returns 0 rows, `_attempt_zero_result_correction()` is called (skipped for `QueryIntent.EXISTENCE` queries and cache hits). It prompts the LLM to identify the most likely cause (wrong filter value, case mismatch, overly restrictive date range, faulty JOIN) and optionally return a corrected query. If a corrected query is returned and passes read-only validation, it is re-executed and replaces the original result. If the LLM confirms 0 rows is correct, its explanation is surfaced to the user.
-- `_mask_sensitive_result_columns(response, privacy)` — redacts `[REDACTED]` over sensitive/excluded columns in the result
-- `_inject_row_filter(sql, row_filter_sql, dialect)` — wraps query in subquery to enforce row-level security (if configured)
+- `result_masking._mask_sensitive_result_columns(response, privacy)` — redacts `[REDACTED]` over sensitive/excluded columns in the result; the streaming path applies the same plan (`result_masking._plan_result_mask`) to every `row_batch` event
+- `row_filter._inject_row_filter(sql, row_filter_sql, dialect)` — wraps every executed statement (first run, corrections, zero-result re-run) in a subquery to enforce row-level security (if configured); prompts, events and the stored message carry the unwrapped SQL; the trailing `LIMIT`/`OFFSET` clause is hoisted outside the wrap
 
 ### Step 16: Persistence
 

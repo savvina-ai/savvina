@@ -211,7 +211,8 @@ Create and save a new data source connection.
     "sensitive_column_patterns": ["email", "ssn", "password"],
     "excluded_schemas": [],
     "excluded_tables": [],
-    "excluded_columns": []
+    "excluded_columns": [],
+    "row_filter_sql": "tenant_id = 42"
   },
   "execution_mode": "auto_execute"
 }
@@ -219,7 +220,11 @@ Create and save a new data source connection.
 
 **Execution mode values:** `auto_execute`, `review_first`, `generate_only`
 
+`row_filter_sql` is optional; `null` or `""` means no filter. It is validated as described under [Row Filter](../user-guide/04_privacy-controls.md#row-filter).
+
 **Response `201`:** `ConnectionResponse`
+
+**Response `422`:** `Row filter …` (the filter is invalid; the detail gives the reason)
 
 ---
 
@@ -314,11 +319,16 @@ Update privacy settings for a connection. Partial updates are supported — omit
   "sensitive_column_patterns": ["email", "phone"],
   "excluded_schemas": ["audit"],
   "excluded_tables": ["sessions"],
-  "excluded_columns": ["public.users.password_hash"]
+  "excluded_columns": ["public.users.password_hash"],
+  "row_filter_sql": "tenant_id = 42"
 }
 ```
 
+`row_filter_sql`: a string sets the filter after validation, `""` clears it, and `null` or an absent field leaves it unchanged. Changing privacy settings invalidates the connection's caches.
+
 **Response `200`:** `ConnectionDetail`
+
+**Response `422`:** `Row filter …` (the filter is invalid; the detail gives the reason)
 
 ---
 
