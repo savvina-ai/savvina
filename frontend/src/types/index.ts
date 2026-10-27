@@ -43,6 +43,9 @@ export interface PrivacySettings {
   excluded_schemas: string[];
   excluded_tables: string[];
   excluded_columns: string[];
+  /** SQL condition every executed query is wrapped in; null or "" = no filter. On PUT, null
+   *  leaves the stored filter unchanged and "" clears it. */
+  row_filter_sql: string | null;
 }
 
 // ── Connections ──

@@ -56,6 +56,7 @@ const DEFAULT_PRIVACY: PrivacySettings = {
   excluded_schemas: [],
   excluded_tables: [],
   excluded_columns: [],
+  row_filter_sql: null,
 };
 
 function EditPanel({ connId, onClose }: { connId: string; onClose: () => void }) {
@@ -66,6 +67,7 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
   const [execMode, setExecMode] = useState<Connection['execution_mode']>('auto_execute');
   const [privacyOpen, setPrivacyOpen] = useState(false);
   const [initialized, setInitialized] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (detail && !initialized) {
@@ -76,11 +78,15 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
   }, [detail, initialized]);
 
   const handleSave = async () => {
-    await Promise.all([
-      updatePrivacy.mutateAsync({ id: connId, settings: privacy }),
-      updateMode.mutateAsync({ id: connId, mode: execMode }),
-    ]);
-    onClose();
+    setError(null);
+    try {
+      // Privacy first: a rejected row filter (422) stops before the execution mode changes.
+      await updatePrivacy.mutateAsync({ id: connId, settings: privacy });
+      await updateMode.mutateAsync({ id: connId, mode: execMode });
+      onClose();
+    } catch (e: unknown) {
+      setError(apiErrorMessage(e, 'Failed to save'));
+    }
   };
 
   if (isLoading) {
@@ -113,6 +119,12 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
         <p className="mb-3 text-sm font-medium text-foreground">Execution Mode</p>
         <ExecutionModeSelector value={execMode} onChange={setExecMode} />
       </div>
+      {error && (
+        <div className="flex items-start gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3">
+          <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+          <p className="text-sm text-destructive">{error}</p>
+        </div>
+      )}
       <div className="flex gap-2">
         <Button
           variant="gradient"

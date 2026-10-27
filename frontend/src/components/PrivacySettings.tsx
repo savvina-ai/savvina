@@ -1,7 +1,7 @@
 // Copyright (c) 2025 Savvina AI Ltd
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import type { PrivacySettings } from '../types';
 
 const DEFAULTS: PrivacySettings = {
@@ -18,6 +18,7 @@ const DEFAULTS: PrivacySettings = {
   excluded_schemas: [],
   excluded_tables: [],
   excluded_columns: [],
+  row_filter_sql: null,
 };
 
 interface Props {
@@ -126,12 +127,13 @@ function Toggle({
 export default function PrivacySettingsForm({ settings, onChange }: Props) {
   const set = <K extends keyof PrivacySettings>(key: K, val: PrivacySettings[K]) =>
     onChange({ ...settings, [key]: val });
+  const rowFilterId = useId();
 
   return (
     <div className="space-y-5">
       <Toggle
         label="Include sample values"
-        description="Sends up to 5 sample values per column to improve accuracy. Disable for sensitive data."
+        description="Off by default. When on, sends up to 3 example values per column (an ENUM's declared members on MySQL) to your LLM provider to improve filter accuracy. Sensitive columns never send sample values."
         checked={settings.include_sample_values}
         onChange={(v) => set('include_sample_values', v)}
       />
@@ -174,9 +176,30 @@ export default function PrivacySettingsForm({ settings, onChange }: Props) {
         items={settings.excluded_columns}
         onChange={(v) => set('excluded_columns', v)}
       />
+      <div>
+        <label htmlFor={rowFilterId} className="block text-sm font-medium text-foreground mb-1">
+          Row filter
+        </label>
+        <p id={`${rowFilterId}-desc`} className="text-xs text-muted-foreground mb-2">
+          A SQL condition applied to the output of every query sent to this connection. The
+          query must return every column the condition names. Leave empty for no filter.
+        </p>
+        <input
+          id={rowFilterId}
+          aria-describedby={`${rowFilterId}-desc`}
+          type="text"
+          value={settings.row_filter_sql ?? ''}
+          onChange={(e) => set('row_filter_sql', e.target.value)}
+          placeholder="tenant_id = 42"
+          spellCheck={false}
+          className="w-full bg-background text-foreground px-3 py-1.5 border border-border rounded text-sm font-mono placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+        />
+      </div>
       <button
         type="button"
-        onClick={() => onChange({ ...DEFAULTS })}
+        // Keep the row filter: null on PUT means "unchanged", so resetting it to null would
+        // show an empty input while the server keeps the filter. Clear it by emptying the input.
+        onClick={() => onChange({ ...DEFAULTS, row_filter_sql: settings.row_filter_sql })}
         className="text-sm text-muted-foreground hover:text-foreground underline"
       >
         Reset to defaults
