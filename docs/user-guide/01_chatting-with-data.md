@@ -87,7 +87,12 @@ A brief description of what the query does and why the LLM structured it that wa
 
 ### 6. Error Banner
 
-If query generation fails or the query cannot execute, a red error banner shows the error message. If schema data was unavailable, a yellow info banner is shown instead.
+If query generation fails or the query cannot execute, a red error banner shows the error message. For a database error that can quote a stored value (a value that could not be converted, for example), only the first line of the database's message is shown, with its quoted parts replaced by `[REDACTED]`; see [Privacy Controls](04_privacy-controls.md#error-messages-you-see). If schema data was unavailable, a yellow info banner is shown instead.
+
+Two generation errors are worth telling apart:
+
+- **"The model hit its N-token output limit"** — the reply was cut off at the output budget (the provider's **Max tokens** setting, capped by the model's own limit), so the query is incomplete and is not executed. Raise Max tokens, switch to a model with a larger output budget, or reduce the number of tables in scope.
+- **"The model returned an unusable response"** — the provider sent back the same character repeated instead of a query. This is an inference failure on the provider's side (seen with `gpt-oss-120b` on Cloudflare Workers AI), not a prompt-size problem. Simply ask again; if it recurs, switch model.
 
 ---
 

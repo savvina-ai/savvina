@@ -18,7 +18,7 @@ from ..datasources.base import BaseDataSource
 from ..datasources.models import DataSourceSchema, PrivacySettings
 from ..models.chat import ChatMessage
 from ..providers._factory import resolve_provider_config
-from ..providers.base import BaseLLMProvider
+from ..providers.base import BaseLLMProvider, is_degenerate_output
 from ..semantic.models import SemanticModel
 from .execution import unwrap_row_filter
 from .prompt_builder import PromptBuilder
@@ -511,17 +511,42 @@ async def _generate_query(
             input_tokens = llm_response.input_tokens
             output_tokens = llm_response.output_tokens
 
-            # If the model ran out of tokens, the SQL is incomplete — do not execute it.
-            if llm_response.truncated:
+            # One token repeated until max_tokens is an inference failure on the
+            # provider's side (e.g. 4096 x "!" from gpt-oss-120b on Workers AI). It
+            # arrives with finish_reason=length, so check it before the truncation path
+            # or the user is told to shrink a prompt that was never the problem.
+            if not llm_response.query and is_degenerate_output(llm_response.raw_response):
                 logger.warning(
-                    "LLM response truncated (finish_reason=length, tokens_used=%s) — "
-                    "discarding partial query",
-                    tokens_used,
+                    "LLM returned degenerate output from %s (%d chars of repeated %r, "
+                    "truncated=%s) — discarding",
+                    llm_response.model,
+                    len(llm_response.raw_response),
+                    llm_response.raw_response.strip()[:1],
+                    llm_response.truncated,
                 )
                 error = (
-                    f"The model hit its output token limit ({tokens_used} tokens) and produced "
-                    "an incomplete query. Try a provider with a larger context window "
-                    "(e.g. Claude, Gemini, OpenAI), or reduce the number of tables in scope."
+                    "The model returned an unusable response (the same character repeated "
+                    "instead of a query). This is usually a transient failure on the "
+                    "provider's side. Try again, or switch to another model."
+                )
+                status = "error"
+                generated_query = ""
+            # If the model ran out of tokens, the SQL is incomplete — do not execute it.
+            elif llm_response.truncated:
+                output_limit = output_tokens or min(
+                    configured_max_tokens, provider.max_output_tokens
+                )
+                logger.warning(
+                    "LLM response truncated (finish_reason=length, output_tokens=%s, "
+                    "input_tokens=%s) — discarding partial query",
+                    output_tokens,
+                    input_tokens,
+                )
+                error = (
+                    f"The model hit its {output_limit}-token output limit and produced an "
+                    "incomplete query. Raise the provider's max tokens setting, switch to a "
+                    "model with a larger output budget, or reduce the number of tables in "
+                    "scope."
                 )
                 status = "error"
                 generated_query = llm_response.query  # keep for display, but won't execute

@@ -307,6 +307,22 @@ def _parse_unstructured_response(raw: str, model: str) -> tuple[str, str]:
     return query, explanation
 
 
+_DEGENERATE_MIN_CHARS = 32
+
+
+def is_degenerate_output(raw: str) -> bool:
+    """True when the reply is one character repeated (whitespace ignored).
+
+    This is the signature of an inference failure, not of a long answer: the backend
+    emits the same token until ``max_tokens`` (seen as thousands of ``!`` from
+    gpt-oss-120b on Cloudflare Workers AI). Such a reply also arrives with
+    ``finish_reason=length``, so callers must check this *before* treating the
+    response as a truncated query.
+    """
+    compact = "".join(raw.split())
+    return len(compact) >= _DEGENERATE_MIN_CHARS and len(set(compact)) == 1
+
+
 def parse_llm_response(
     raw: str,
     model: str,

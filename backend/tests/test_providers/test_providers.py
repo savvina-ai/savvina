@@ -9,7 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.providers.base import LLMResponse, _extract_sql, parse_llm_response
+from app.providers.base import (
+    LLMResponse,
+    _extract_sql,
+    is_degenerate_output,
+    parse_llm_response,
+)
 from app.providers.cerebras_provider import CerebrasProvider
 from app.providers.claude_provider import ClaudeProvider
 from app.providers.gemini_provider import GeminiProvider
@@ -157,6 +162,36 @@ class TestParseLLMResponse:
         raw = "QUERY:\nNULL\n\nEXPLANATION:\nNo relevant table found."
         r = parse_llm_response(raw, "m")
         assert r.query == ""
+
+
+# ── is_degenerate_output ──────────────────────────────────────────────────────
+
+
+class TestIsDegenerateOutput:
+    """Detects inference failures that emit one token repeated until max_tokens.
+
+    Seen on Cloudflare Workers AI with gpt-oss-120b: 4096 tokens of ``!`` (token id 0)
+    with finish_reason=length. That is not a truncated query and must not be reported
+    as one.
+    """
+
+    def test_long_run_of_one_character_is_degenerate(self):
+        assert is_degenerate_output("!" * 4096)
+
+    def test_whitespace_between_repeats_is_ignored(self):
+        assert is_degenerate_output("  \n" + "!!!! " * 20 + "\n")
+
+    def test_short_run_is_not_degenerate(self):
+        assert not is_degenerate_output("!!!")
+
+    def test_real_sql_is_not_degenerate(self):
+        assert not is_degenerate_output(
+            "SELECT 1 FROM t WHERE id = 1 AND x = 'aaaaaaaaaaaaaaaaaaaaa'"
+        )
+
+    def test_empty_is_not_degenerate(self):
+        assert not is_degenerate_output("")
+        assert not is_degenerate_output("   \n  ")
 
 
 # ── parse_llm_response fallback logging ───────────────────────────────────────
