@@ -25,6 +25,7 @@ from ..schemas.chat import (
     QueryResultsResponse,
 )
 from ..services.export_service import generate_csv, generate_xlsx
+from ..services.stored_results import load_result_masks
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,6 +37,22 @@ router = APIRouter(prefix="/public", tags=["share"])
 # ── Single-message share ─────────────────────────────────────────────────────
 
 
+async def _shared_message(token: str, db: AsyncSession) -> tuple[dict, str | None]:
+    """The shared message's stored results re-masked with the owning connection's current
+    privacy settings (``stored_results``) and its served SQL; 404 / 410 as the share
+    dictates."""
+    msg = await db.scalar(select(ChatMessage).where(ChatMessage.share_token == token))
+    if not msg or msg.results_json is None:
+        raise HTTPException(status_code=404, detail="Shared result not found")
+    if msg.share_expires_at and msg.share_expires_at < datetime.now(UTC):
+        raise HTTPException(status_code=410, detail="Share link has expired")
+    masks = await load_result_masks(db, [msg.session_id])
+    [(results_data, query)] = await masks.serve_all(
+        [(msg.session_id, msg.results_json, msg.query_generated)]
+    )
+    return results_data, query
+
+
 @router.get("/share/{token}", response_model=PublicShareResult)
 @limiter.limit("60/minute")
 async def get_shared_result(
@@ -44,17 +61,12 @@ async def get_shared_result(
     db: AsyncSession = Depends(get_db),
 ) -> PublicShareResult:
     """Return results for a shared chart link — no authentication required."""
-    msg = await db.scalar(select(ChatMessage).where(ChatMessage.share_token == token))
-    if not msg or msg.results_json is None:
-        raise HTTPException(status_code=404, detail="Shared result not found")
-    if msg.share_expires_at and msg.share_expires_at < datetime.now(UTC):
-        raise HTTPException(status_code=410, detail="Share link has expired")
-    results_data = msg.results_json
+    results_data, query = await _shared_message(token, db)
     row_limit = get_settings().default_row_limit
     if isinstance(results_data.get("rows"), list) and len(results_data["rows"]) > row_limit:
         results_data = {**results_data, "rows": results_data["rows"][:row_limit]}
     results = QueryResultsResponse(**results_data)
-    return PublicShareResult(results=results, query_generated=msg.query_generated)
+    return PublicShareResult(results=results, query_generated=query)
 
 
 @router.get("/share/{token}/csv")
@@ -65,12 +77,8 @@ async def get_shared_result_csv(
     db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     """Download shared message results as CSV — no authentication required."""
-    msg = await db.scalar(select(ChatMessage).where(ChatMessage.share_token == token))
-    if not msg or msg.results_json is None:
-        raise HTTPException(status_code=404, detail="Shared result not found")
-    if msg.share_expires_at and msg.share_expires_at < datetime.now(UTC):
-        raise HTTPException(status_code=410, detail="Share link has expired")
-    csv_content = await asyncio.to_thread(generate_csv, msg.results_json)
+    results_data, _query = await _shared_message(token, db)
+    csv_content = await asyncio.to_thread(generate_csv, results_data)
     return StreamingResponse(
         iter([csv_content]),
         media_type="text/csv",
@@ -86,12 +94,8 @@ async def get_shared_result_xlsx(
     db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     """Download shared message results as XLSX — no authentication required."""
-    msg = await db.scalar(select(ChatMessage).where(ChatMessage.share_token == token))
-    if not msg or msg.results_json is None:
-        raise HTTPException(status_code=404, detail="Shared result not found")
-    if msg.share_expires_at and msg.share_expires_at < datetime.now(UTC):
-        raise HTTPException(status_code=410, detail="Share link has expired")
-    xlsx_bytes = await asyncio.to_thread(generate_xlsx, msg.results_json, "Shared Results")
+    results_data, _query = await _shared_message(token, db)
+    xlsx_bytes = await asyncio.to_thread(generate_xlsx, results_data, "Shared Results")
     return StreamingResponse(
         iter([xlsx_bytes]),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -121,16 +125,22 @@ async def get_shared_session(
         .order_by(ChatMessage.created_at)
         .limit(200)
     )
-    messages = []
-    for m in result.scalars().all():
+    rows = list(result.scalars().all())
+    masks = await load_result_masks(db, [session.id] if rows else [])
+    previews = []
+    for m in rows:
         results_json = m.results_json
         if results_json and isinstance(results_json.get("rows"), list):
             results_json = {**results_json, "rows": results_json["rows"][:10]}
+        previews.append((session.id, results_json, m.query_generated))
+    served = await masks.serve_all(previews)
+    messages = []
+    for m, (results_json, query) in zip(rows, served, strict=True):
         messages.append(
             PublicMessageSummary(
                 role=m.role,
                 content=m.content,
-                query_generated=m.query_generated,
+                query_generated=query,
                 query_dialect=m.query_dialect,
                 results_json=results_json,
                 execution_time_ms=m.execution_time_ms,

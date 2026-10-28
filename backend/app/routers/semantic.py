@@ -256,9 +256,12 @@ async def check_drift(
         schema_cached_at = cached_at.isoformat() if cached_at else None
         refresh_error = str(exc)
 
-    privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
-    if privacy:
-        schema = _apply_privacy_to_schema(schema, privacy)
+    privacy = (
+        PrivacySettings.from_dict(conn.privacy_settings)
+        if conn.privacy_settings
+        else PrivacySettings()
+    )
+    schema = _apply_privacy_to_schema(schema, privacy)
 
     known = await semantic_store.load_known_columns(db, connection_id)
     effective = _effective_known_columns(known, stored_model.tables, schema, privacy)
@@ -1035,9 +1038,12 @@ async def apply_drift(
         raise HTTPException(
             status_code=400, detail=f"Could not reach the data source to apply drift: {exc}"
         ) from exc
-    privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
-    if privacy:
-        schema = _apply_privacy_to_schema(schema, privacy)
+    privacy = (
+        PrivacySettings.from_dict(conn.privacy_settings)
+        if conn.privacy_settings
+        else PrivacySettings()
+    )
+    schema = _apply_privacy_to_schema(schema, privacy)
 
     # The baseline decides which live columns are new and which near-miss keys are
     # renamed. A table with no entry is baselined in memory here, so a legacy table has no

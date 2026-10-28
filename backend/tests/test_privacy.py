@@ -141,3 +141,28 @@ class TestIsColumnExcluded:
         assert "email" in p.sensitive_column_patterns
         assert "password" in p.sensitive_column_patterns
         assert "ssn" in p.sensitive_column_patterns
+
+
+class TestDefaults:
+    def test_sample_values_are_off_by_default(self):
+        assert PrivacySettings().include_sample_values is False
+
+    def test_a_stored_dict_without_the_key_reads_as_off(self):
+        assert (
+            PrivacySettings.from_dict({"include_row_counts": True}).include_sample_values is False
+        )
+
+    def test_column_comments_are_off_by_default(self):
+        assert PrivacySettings().include_column_comments is False
+
+
+class TestColumnValuesAllowed:
+    def test_off_by_default(self):
+        assert PrivacySettings().column_values_allowed("status") is False
+
+    def test_on_for_an_ordinary_column_when_enabled(self):
+        assert PrivacySettings(include_sample_values=True).column_values_allowed("status") is True
+
+    def test_never_for_a_sensitive_column(self):
+        p = PrivacySettings(include_sample_values=True)
+        assert p.column_values_allowed("customer_email") is False

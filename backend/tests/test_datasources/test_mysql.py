@@ -6,6 +6,8 @@
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from app.datasources.adapters.mysql import (
     MySQLDataSource,
     _is_enum_or_set,
@@ -457,6 +459,75 @@ class TestIntrospect:
         assert rel.from_table == "orders"
         assert rel.to_table == "users"
 
+    @staticmethod
+    def _enum_rows(column_name: str) -> list[list]:
+        """The four fetchall results introspect() reads, for one ENUM column."""
+        schema_rows = [{"schema_name": "app"}]
+        table_rows = [
+            {
+                "table_schema": "app",
+                "table_name": "orders",
+                "table_type": "BASE TABLE",
+                "table_rows": None,
+                "table_comment": "",
+            }
+        ]
+        column_rows = [
+            {
+                "table_schema": "app",
+                "table_name": "orders",
+                "column_name": column_name,
+                "data_type": "enum",
+                "column_type": "enum('pending','shipped','delivered')",
+                "is_nullable": "YES",
+                "column_key": "",
+                "ordinal_position": 1,
+                "column_comment": "",
+            }
+        ]
+        fk_rows: list = []
+        return [schema_rows, table_rows, column_rows, fk_rows]
+
+    async def test_enum_labels_withheld_when_sample_values_are_off(self) -> None:
+        """The member list rides on native_type too; with the toggle off it must not."""
+        adapter, conn = _make_adapter()
+        conn._cursor.fetchall = AsyncMock(side_effect=self._enum_rows("status"))
+
+        result = await adapter.introspect(MINIMAL_PRIVACY)
+
+        col = result.tables[0].columns[0]
+        assert col.sample_values is None
+        assert col.native_type == "enum(…)"
+
+    async def test_enum_labels_withheld_for_a_sensitive_column_even_when_on(self) -> None:
+        adapter, conn = _make_adapter()
+        conn._cursor.fetchall = AsyncMock(side_effect=self._enum_rows("email_status"))
+        privacy = PrivacySettings(
+            include_sample_values=True,
+            include_column_comments=False,
+            include_row_counts=False,
+        )
+
+        result = await adapter.introspect(privacy)
+
+        col = result.tables[0].columns[0]
+        assert col.sample_values is None
+        assert col.native_type == "enum(…)"
+
+    async def test_enum_labels_kept_when_allowed(self) -> None:
+        adapter, conn = _make_adapter()
+        conn._cursor.fetchall = AsyncMock(side_effect=self._enum_rows("status"))
+        privacy = PrivacySettings(
+            include_sample_values=True,
+            include_column_comments=False,
+            include_row_counts=False,
+        )
+
+        result = await adapter.introspect(privacy)
+
+        col = result.tables[0].columns[0]
+        assert col.native_type == "enum('pending','shipped','delivered')"
+
 
 # ── format_schema_for_llm ─────────────────────────────────────────────────────
 
@@ -764,3 +835,46 @@ class TestExecuteQueryStream:
             c.args == ("SET SESSION max_statement_time = 0",)
             for c in plain_cursor.execute.call_args_list
         )
+
+
+# ── read-only session ─────────────────────────────────────────────────────────
+
+
+def _executed_statements(cursor: MockCursor) -> list[str]:
+    return [str(call.args[0]) for call in cursor.execute.await_args_list]
+
+
+class TestReadOnlySession:
+    async def test_execute_query_runs_read_only_and_resets(self) -> None:
+        adapter, conn = _make_adapter()
+
+        await adapter.execute_query("SELECT 1")
+
+        statements = _executed_statements(conn._cursor)
+        assert statements.index("SET SESSION TRANSACTION READ ONLY") < statements.index("SELECT 1")
+        assert statements.index("SELECT 1") < statements.index("SET SESSION TRANSACTION READ WRITE")
+
+    async def test_execute_query_resets_even_when_the_query_fails(self) -> None:
+        adapter, conn = _make_adapter()
+
+        async def _execute(query: str, *_args: object) -> None:
+            if query == "SELECT 1":
+                raise RuntimeError("boom")
+
+        conn._cursor.execute = AsyncMock(side_effect=_execute)
+
+        with pytest.raises(RuntimeError):
+            await adapter.execute_query("SELECT 1")
+
+        assert "SET SESSION TRANSACTION READ WRITE" in _executed_statements(conn._cursor)
+
+    async def test_stream_runs_read_only_and_resets(self) -> None:
+        adapter = _make_stream_adapter(rows=[("a",)])
+
+        async for _batch in adapter.execute_query_stream("SELECT 1"):
+            pass
+
+        plain = adapter._pool._conn._plain_cursor  # type: ignore[attr-defined]
+        statements = _executed_statements(plain)
+        assert "SET SESSION TRANSACTION READ ONLY" in statements
+        assert statements[-1] == "SET SESSION TRANSACTION READ WRITE"

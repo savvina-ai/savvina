@@ -143,3 +143,58 @@ class TestUnreadableTables:
         schema.unreadable_tables = ["store.payroll", "finance.ledger", "store.audit"]
         privacy = PrivacySettings(excluded_schemas=["finance"], excluded_tables=["audit"])
         assert _apply_privacy_to_schema(schema, privacy).unreadable_tables == ["store.payroll"]
+
+
+def _valued_schema() -> DataSourceSchema:
+    """A MySQL schema whose cache row still carries values and ENUM members."""
+    return DataSourceSchema(
+        source_type="mysql",
+        tables=[
+            TableInfo(
+                catalog=None,
+                schema_name="shop",
+                name="orders",
+                table_type="table",
+                columns=[
+                    ColumnInfo(
+                        name="status",
+                        data_type="enum",
+                        native_type="enum('pending','shipped')",
+                        sample_values=["pending", "shipped"],
+                    ),
+                    ColumnInfo(
+                        name="customer_email",
+                        data_type="varchar",
+                        native_type="varchar(255)",
+                        sample_values=["a@example.com"],
+                    ),
+                ],
+            )
+        ],
+    )
+
+
+class TestApplyPrivacyWithholdsValues:
+    """Columns stay (the sensitive patterns mark, they do not hide); their values go."""
+
+    def test_values_withheld_when_sample_values_are_off(self) -> None:
+        out = _apply_privacy_to_schema(_valued_schema(), PrivacySettings())
+        status, email = out.tables[0].columns
+        assert [status.name, email.name] == ["status", "customer_email"]
+        assert status.sample_values is None
+        assert status.native_type == "enum(…)"
+        assert email.sample_values is None
+
+    def test_sensitive_column_values_withheld_even_when_on(self) -> None:
+        out = _apply_privacy_to_schema(
+            _valued_schema(), PrivacySettings(include_sample_values=True)
+        )
+        status, email = out.tables[0].columns
+        assert status.sample_values == ["pending", "shipped"]
+        assert status.native_type == "enum('pending','shipped')"
+        assert email.sample_values is None
+
+    def test_valued_input_schema_is_not_mutated(self) -> None:
+        schema = _valued_schema()
+        _apply_privacy_to_schema(schema, PrivacySettings())
+        assert schema.tables[0].columns[0].sample_values == ["pending", "shipped"]

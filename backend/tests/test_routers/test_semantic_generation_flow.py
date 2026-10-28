@@ -800,6 +800,45 @@ class TestApplyDriftFlow:
     """Check Drift and Apply Drift over a generated model, the baseline included: what
     the check reports, the apply acts on, and the check after it is clean."""
 
+    async def test_a_connection_without_privacy_settings_gets_the_defaults_in_both_drift_routes(
+        self, http_client, db, flow
+    ) -> None:
+        """The live schema reaches ``compute_drift`` with sample values and ENUM/SET member
+        lists withheld even though the connection stores no privacy settings."""
+        from app.semantic.drift import compute_drift
+
+        await _generate(http_client)
+        live = _schema({"orders": ["id", "total"], "customers": ["id"]})
+        live.tables[0].columns.append(
+            ColumnInfo(
+                name="status",
+                data_type="enum",
+                native_type="enum('a','b')",
+                sample_values=["a", "b"],
+            )
+        )
+        seen: list[DataSourceSchema] = []
+
+        def spy(schema, *args, **kwargs):
+            seen.append(schema)
+            return compute_drift(schema, *args, **kwargs)
+
+        with patch("app.routers.semantic.compute_drift", new=spy):
+            await _check_drift(http_client, live)
+            await _apply_drift(http_client, live, dry_run=True)
+
+        assert len(seen) == 2
+        for schema in seen:
+            status = next(
+                c
+                for t in schema.tables
+                if t.name == "orders"
+                for c in t.columns
+                if c.name == "status"
+            )
+            assert status.sample_values is None
+            assert status.native_type == "enum(…)"
+
     async def test_a_legacy_model_is_baselined_then_a_new_column_is_reported_and_applied(
         self, http_client, db, flow
     ) -> None:

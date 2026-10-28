@@ -5,13 +5,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
 
-from ..cache.example_library import ExampleLibrary
+from ..cache.example_library import ExampleEntry, ExampleLibrary
 from ..cache.query_cache import QueryCache
 from ..database import async_session_maker
 from ..datasources.base import BaseDataSource
@@ -20,6 +20,7 @@ from ..models.chat import ChatMessage
 from ..providers._factory import resolve_provider_config
 from ..providers.base import BaseLLMProvider
 from ..semantic.models import SemanticModel
+from .execution import unwrap_row_filter
 from .prompt_builder import PromptBuilder
 from .schema_utils import _is_fallback_query, _validate_columns_against_schema
 
@@ -207,11 +208,24 @@ async def _build_provider(
     return provider, model, max_tokens
 
 
+def _without_row_filter_wrap(found: list[ExampleEntry] | None) -> list[ExampleEntry] | None:
+    """Few-shot examples with the row-filter wrap removed from their SQL: a thumbs-up on a
+    message stored before Task 9 saved the wrapped query, and the LLM must not see it."""
+    if not found:
+        return found
+    return [
+        replace(ex, query=unwrap_row_filter(ex.query)) if isinstance(ex, ExampleEntry) else ex
+        for ex in found
+    ]
+
+
 async def _load_history(session_id: str, db: AsyncSession) -> list[dict]:
     """Load the most recent N chat turns as role/content dicts for the LLM history.
 
     Capped at _HISTORY_TURN_LIMIT to prevent unbounded memory growth on long sessions.
     The prompt compression step handles context-window overflow from large individual turns.
+    A query stored before Task 9 may hold the row-filter wrap; the LLM sees it unwrapped,
+    so the filter's columns and literals never reach it.
     """
     result = await db.execute(
         select(ChatMessage)
@@ -223,7 +237,8 @@ async def _load_history(session_id: str, db: AsyncSession) -> list[dict]:
     history = []
     for msg in messages:
         if msg.role == "assistant" and msg.query_generated:
-            content = f"QUERY:\n```sql\n{msg.query_generated}\n```\n\nEXPLANATION:\n{msg.content}"
+            query = unwrap_row_filter(msg.query_generated)
+            content = f"QUERY:\n```sql\n{query}\n```\n\nEXPLANATION:\n{msg.content}"
         else:
             content = msg.content
         history.append({"role": msg.role, "content": content})
@@ -276,6 +291,10 @@ async def _generate_query(
         cache_result = None
         if settings.cache_enabled and not bypass_cache and not force_refresh:
             cache_result = await cache.lookup(connection_id, message, db)
+        if cache_result is not None:
+            # A row stored before Task 9 may hold the row-filter wrap: every check below,
+            # the execution (wrapped once) and the correction prompt get the clean query.
+            cache_result.generated_query = unwrap_row_filter(cache_result.generated_query)
 
         # If the cached query references tables not visible in this user's schema, treat it as a
         # cache miss and regenerate. Prevents a privileged user's cached query from being served
@@ -324,8 +343,10 @@ async def _generate_query(
             cache_hit = True
         else:
             embedding = await cache.compute_embedding_async(message)
-            similar_examples = await examples.find_similar_examples(
-                connection_id, message, embedding, db, query_dialect=adapter.query_dialect
+            similar_examples = _without_row_filter_wrap(
+                await examples.find_similar_examples(
+                    connection_id, message, embedding, db, query_dialect=adapter.query_dialect
+                )
             )
 
             system_prompt = PromptBuilder().build_system_prompt(

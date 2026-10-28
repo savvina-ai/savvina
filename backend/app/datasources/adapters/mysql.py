@@ -12,6 +12,7 @@ from typing import Any
 import aiomysql
 
 from ..base import BaseDataSource, _serialize
+from ..errors import ErrorCategory, classify_chain
 from ..models import (
     ColumnInfo,
     ConnectionResult,
@@ -24,6 +25,7 @@ from ..models import (
     ValidationResult,
 )
 from ..registry import register_datasource
+from ..sampling import withhold_enum_labels
 from ..validators.mysql_validator import MySQLValidator
 
 logger = logging.getLogger(__name__)
@@ -42,6 +44,52 @@ _SYSTEM_SCHEMAS = frozenset({"information_schema", "mysql", "performance_schema"
 _SYSTEM_SCHEMAS_TUPLE = "(" + ", ".join(f"'{s}'" for s in sorted(_SYSTEM_SCHEMAS)) + ")"
 
 
+# MySQL server error numbers (MySQL Reference Manual, "Server Error Message Reference").
+# 1969 is MariaDB-only (max_statement_time); 3024 is MySQL-only (MAX_EXECUTION_TIME).
+_MYSQL_ERRNO_CODES: dict[int, ErrorCategory] = {
+    1054: ErrorCategory.UNKNOWN_NAME,  # ER_BAD_FIELD_ERROR
+    1146: ErrorCategory.UNKNOWN_NAME,  # ER_NO_SUCH_TABLE
+    1305: ErrorCategory.UNKNOWN_NAME,  # ER_SP_DOES_NOT_EXIST
+    1049: ErrorCategory.UNKNOWN_NAME,  # ER_BAD_DB_ERROR
+    1582: ErrorCategory.UNKNOWN_NAME,  # ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT
+    1583: ErrorCategory.UNKNOWN_NAME,  # ER_WRONG_PARAMETERS_TO_NATIVE_FCT
+    1052: ErrorCategory.AMBIGUOUS_NAME,  # ER_NON_UNIQ_ERROR
+    1066: ErrorCategory.AMBIGUOUS_NAME,  # ER_NONUNIQ_TABLE
+    1064: ErrorCategory.SYNTAX,  # ER_PARSE_ERROR
+    1149: ErrorCategory.SYNTAX,  # ER_SYNTAX_ERROR
+    1248: ErrorCategory.SYNTAX,  # ER_DERIVED_MUST_HAVE_ALIAS
+    1222: ErrorCategory.SYNTAX,  # ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT
+    1055: ErrorCategory.GROUPING,  # ER_WRONG_FIELD_WITH_GROUP
+    1056: ErrorCategory.GROUPING,  # ER_WRONG_GROUP_FIELD
+    1111: ErrorCategory.GROUPING,  # ER_INVALID_GROUP_FUNC_USE
+    1140: ErrorCategory.GROUPING,  # ER_MIX_OF_GROUP_FUNC_AND_FIELDS
+    3065: ErrorCategory.GROUPING,  # ER_FIELD_IN_ORDER_NOT_SELECT
+    1267: ErrorCategory.TYPE_MISMATCH,  # ER_CANT_AGGREGATE_2COLLATIONS
+    1270: ErrorCategory.TYPE_MISMATCH,  # ER_CANT_AGGREGATE_3COLLATIONS
+    1271: ErrorCategory.TYPE_MISMATCH,  # ER_CANT_AGGREGATE_NCOLLATIONS
+    # SQLSTATE 21000, but "Operand should contain 1 column(s)" is not a row-count problem.
+    1241: ErrorCategory.TYPE_MISMATCH,  # ER_OPERAND_COLUMNS
+    1292: ErrorCategory.DATA,  # ER_TRUNCATED_WRONG_VALUE
+    1366: ErrorCategory.DATA,  # ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+    1264: ErrorCategory.DATA,  # ER_WARN_DATA_OUT_OF_RANGE
+    1265: ErrorCategory.DATA,  # WARN_DATA_TRUNCATED
+    1406: ErrorCategory.DATA,  # ER_DATA_TOO_LONG
+    1690: ErrorCategory.DATA,  # ER_DATA_OUT_OF_RANGE
+    1365: ErrorCategory.DIVISION_BY_ZERO,  # ER_DIVISION_BY_ZERO
+    1242: ErrorCategory.CARDINALITY,  # ER_SUBQUERY_NO_1_ROW
+    1142: ErrorCategory.PERMISSION,  # ER_TABLEACCESS_DENIED_ERROR
+    1143: ErrorCategory.PERMISSION,  # ER_COLUMNACCESS_DENIED_ERROR
+    1044: ErrorCategory.PERMISSION,  # ER_DBACCESS_DENIED_ERROR
+    1227: ErrorCategory.PERMISSION,  # ER_SPECIFIC_ACCESS_DENIED_ERROR
+    1370: ErrorCategory.PERMISSION,  # ER_PROCACCESS_DENIED_ERROR
+    1235: ErrorCategory.UNSUPPORTED,  # ER_NOT_SUPPORTED_YET
+    1290: ErrorCategory.UNSUPPORTED,  # ER_OPTION_PREVENTS_STATEMENT (read_only server)
+    1792: ErrorCategory.UNSUPPORTED,  # ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION (Task 11)
+    3024: ErrorCategory.TIMEOUT,  # ER_QUERY_TIMEOUT
+    1969: ErrorCategory.TIMEOUT,  # ER_STATEMENT_TIMEOUT (MariaDB)
+}
+
+
 @register_datasource("mysql")
 class MySQLDataSource(BaseDataSource):
     """MySQL / MariaDB data source adapter."""
@@ -49,6 +97,7 @@ class MySQLDataSource(BaseDataSource):
     source_type = "mysql"
     display_name = "MySQL / MariaDB"
     query_dialect = "MySQL"
+    double_quote_is_string_literal = True  # unless sql_mode has ANSI_QUOTES, which is not detected
     icon = "🐬"
 
     def __init__(self) -> None:
@@ -278,16 +327,22 @@ class MySQLDataSource(BaseDataSource):
 
             comment = row["column_comment"] or None
 
-            # ENUM/SET: extract sample values from column type without any table scan
+            # ENUM/SET members are the column's value domain: sample values and the type
+            # string both carry them, so both follow the same decision.
+            labels_allowed = privacy.column_values_allowed(col_name)
             sample_values: list[str] | None = None
-            if privacy.include_sample_values and _is_enum_or_set(row["column_type"]):
+            if labels_allowed and _is_enum_or_set(row["column_type"]):
                 sample_values = _parse_enum_values(row["column_type"])
 
             columns_by_table[key].append(
                 ColumnInfo(
                     name=col_name,
                     data_type=row["data_type"],
-                    native_type=row["column_type"],
+                    native_type=(
+                        row["column_type"]
+                        if labels_allowed
+                        else withhold_enum_labels(row["column_type"])
+                    ),
                     nullable=row["is_nullable"] == "YES",
                     is_primary_key=row["column_key"] == "PRI",
                     description=comment if privacy.include_column_comments else None,
@@ -395,11 +450,15 @@ class MySQLDataSource(BaseDataSource):
                 await cur.execute("SET SESSION max_statement_time = %s", (timeout,))
             else:
                 await cur.execute("SET SESSION MAX_EXECUTION_TIME = %s", (timeout * 1000,))
+            # Enforced by the engine for every autocommitted statement until reset: a write
+            # the text validator missed is refused with errno 1792.
+            await cur.execute("SET SESSION TRANSACTION READ ONLY")
             try:
                 await cur.execute(query)
                 records = await cur.fetchall()
                 description = cur.description or []
             finally:
+                await cur.execute("SET SESSION TRANSACTION READ WRITE")
                 # Reset so the pooled connection is clean for reuse
                 if self._is_mariadb:
                     await cur.execute("SET SESSION max_statement_time = 0")
@@ -473,6 +532,7 @@ class MySQLDataSource(BaseDataSource):
                     await setup_cur.execute(
                         "SET SESSION MAX_EXECUTION_TIME = %s", (timeout * 1000,)
                     )
+                await setup_cur.execute("SET SESSION TRANSACTION READ ONLY")
 
             try:
                 async with conn.cursor(aiomysql.SSCursor) as cur:
@@ -521,12 +581,28 @@ class MySQLDataSource(BaseDataSource):
                         await reset_cur.execute("SET SESSION max_statement_time = 0")
                     else:
                         await reset_cur.execute("SET SESSION MAX_EXECUTION_TIME = 0")
+                    await reset_cur.execute("SET SESSION TRANSACTION READ WRITE")
 
     # ── Validation ─────────────────────────────────────────────────────────────
 
     def validate_query(self, query: str) -> ValidationResult:
         """Delegate to the MySQL-specific validator."""
         return self._validator.validate(query)
+
+    def classify_error(self, exc: BaseException) -> ErrorCategory:
+        """Map a pymysql/aiomysql failure via its numeric errno (``exc.args[0]``)."""
+        return classify_chain(exc, self._classify_one)
+
+    @staticmethod
+    def _classify_one(err: BaseException) -> ErrorCategory | None:
+        # `aiomysql.MySQLError` *is* `pymysql.err.MySQLError`; restricting to it keeps an
+        # unrelated exception whose first arg happens to be an int from being misread.
+        if not isinstance(err, aiomysql.MySQLError):
+            return None
+        args = getattr(err, "args", ())
+        if args and isinstance(args[0], int):
+            return _MYSQL_ERRNO_CODES.get(args[0])
+        return None
 
     # ── LLM formatting ─────────────────────────────────────────────────────────
 

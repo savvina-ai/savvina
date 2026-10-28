@@ -365,7 +365,7 @@ class TestPromptBuilderEntityResolution:
         prompt = PromptBuilder().build_system_prompt(
             datasource=_make_adapter(),
             schema=schema,
-            privacy=None,  # include_sample_values defaults to True
+            privacy=PrivacySettings(include_sample_values=True),
             semantic_model=None,
             few_shot_examples=None,
             user_question='show orders for "Acme Corp"',
@@ -379,12 +379,25 @@ class TestPromptBuilderEntityResolution:
         prompt = PromptBuilder().build_system_prompt(
             datasource=_make_adapter(),
             schema=schema,
-            privacy=None,
+            privacy=PrivacySettings(include_sample_values=True),
             semantic_model=None,
             few_shot_examples=None,
             user_question='show me "XYZ Corp" orders',
         )
         # No crash; no spurious "may match" note for a non-existent entity
+        assert "may match" not in prompt
+
+    def test_missing_settings_do_not_permit_resolution(self):
+        """A connection with no stored privacy settings must behave as if the toggle is off."""
+        schema = _make_schema_with_samples("customers", "company_name", ["Acme Corp"])
+        prompt = PromptBuilder().build_system_prompt(
+            datasource=_make_adapter(),
+            schema=schema,
+            privacy=None,
+            semantic_model=None,
+            few_shot_examples=None,
+            user_question='show orders for "Acme Corp"',
+        )
         assert "may match" not in prompt
 
     def test_ner_skipped_when_sample_values_disabled(self):

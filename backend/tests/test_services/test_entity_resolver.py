@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from app.datasources.models import ColumnInfo, DataSourceSchema, TableInfo
+from app.datasources.models import ColumnInfo, DataSourceSchema, PrivacySettings, TableInfo
 from app.services.entity_resolver import extract_entity_candidates, resolve_entities
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -183,3 +183,33 @@ class TestResolveEntities:
         schema = DataSourceSchema(source_type="postgresql", tables=[table])
         notes = resolve_entities(["Acme Corp", "North America"], schema)
         assert len(notes) == 2
+
+
+class TestResolveEntitiesRespectsPrivacy:
+    def test_sensitive_column_is_never_matched(self):
+        schema = _make_schema("customers", "customer_email", ["jane@example.com"])
+        notes = resolve_entities(
+            ["jane@example.com"], schema, PrivacySettings(include_sample_values=True)
+        )
+        assert notes == []
+
+    def test_excluded_column_is_never_matched(self):
+        schema = _make_schema("customers", "nickname", ["Acme Corp"])
+        privacy = PrivacySettings(
+            include_sample_values=True, excluded_columns=["public.customers.nickname"]
+        )
+        assert resolve_entities(["Acme Corp"], schema, privacy) == []
+
+    def test_excluded_table_is_never_matched(self):
+        schema = _make_schema("customers", "company_name", ["Acme Corp"])
+        privacy = PrivacySettings(include_sample_values=True, excluded_tables=["customers"])
+        assert resolve_entities(["Acme Corp"], schema, privacy) == []
+
+    def test_ordinary_column_still_matches_with_privacy(self):
+        schema = _make_schema("customers", "company_name", ["Acme Corp"])
+        notes = resolve_entities(["Acme Corp"], schema, PrivacySettings(include_sample_values=True))
+        assert len(notes) == 1
+
+    def test_no_privacy_keeps_the_old_behaviour(self):
+        schema = _make_schema("customers", "company_name", ["Acme Corp"])
+        assert len(resolve_entities(["Acme Corp"], schema)) == 1

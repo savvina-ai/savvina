@@ -253,6 +253,33 @@ class TestGetOrRefreshSchema:
 
         assert schema.tables == []
 
+    @pytest.mark.parametrize("stored_privacy", [None, {}])
+    async def test_a_hit_withholds_values_when_the_connection_has_no_privacy_settings(
+        self, stored_privacy
+    ) -> None:
+        """No stored settings means the defaults (sample values off), not "no filter"."""
+        from app.services.schema_utils import _schema_to_dict
+
+        schema = _schema()
+        schema.tables[0].columns.append(
+            ColumnInfo(
+                name="status",
+                data_type="enum",
+                native_type="enum('a','b')",
+                sample_values=["a", "b"],
+            )
+        )
+        cache = MagicMock()
+        cache.schema_cache = _schema_to_dict(schema)
+        conn = _conn()
+        conn.privacy_settings = stored_privacy
+
+        result = await self._get(_db(cache), conn=conn)
+
+        status = next(c for c in result.tables[0].columns if c.name == "status")
+        assert status.sample_values is None
+        assert status.native_type == "enum(…)"
+
     async def test_a_miss_introspects_stores_the_hash_and_flushes_nothing(self) -> None:
         db = _db(None, None)
         adapter = _adapter()

@@ -545,8 +545,7 @@ async def _resolve_schema(
             await db.commit()
         embeddings_available = True
 
-    if privacy:
-        schema = _apply_privacy_to_schema(schema, privacy)
+    schema = _apply_privacy_to_schema(schema, privacy or PrivacySettings())
 
     return _SchemaResult(
         schema=schema, connected=connected, embeddings_available=embeddings_available

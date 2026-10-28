@@ -29,6 +29,7 @@ from ..datasources.models import (
     table_key,
 )
 from ..datasources.registry import create_datasource
+from ..datasources.sampling import withhold_enum_labels
 from ..models.cache import QueryCacheEntry
 from ..models.connection import Connection
 from ..models.table_embedding_cache import TableEmbeddingCache
@@ -79,9 +80,12 @@ async def get_or_refresh_schema(
         schema = await refresh_user_schema_cache(conn, user_id, db, encryption_key, flush="never")
         await db.commit()
 
-    privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
-    if privacy:
-        schema = _apply_privacy_to_schema(schema, privacy)
+    privacy = (
+        PrivacySettings.from_dict(conn.privacy_settings)
+        if conn.privacy_settings
+        else PrivacySettings()
+    )
+    schema = _apply_privacy_to_schema(schema, privacy)
     return schema
 
 
@@ -278,6 +282,22 @@ def _schema_from_dict(d: dict) -> DataSourceSchema:
     )
 
 
+def _withhold_column_values(table: TableInfo, privacy: PrivacySettings) -> TableInfo:
+    """Drop sample values and ENUM/SET member lists from columns whose values may not reach the LLM.
+
+    The column itself stays — the sensitive patterns mark a column, they do not hide it.
+    Runs on every cached read, so a schema cached under older settings, or before this
+    rule existed, needs no migration. Returns a new TableInfo; the cached one is untouched.
+    """
+    columns = [
+        col
+        if privacy.column_values_allowed(col.name)
+        else replace(col, sample_values=None, native_type=withhold_enum_labels(col.native_type))
+        for col in table.columns
+    ]
+    return replace(table, columns=columns)
+
+
 def _apply_privacy_to_schema(
     schema: DataSourceSchema, privacy: PrivacySettings
 ) -> DataSourceSchema:
@@ -293,6 +313,8 @@ def _apply_privacy_to_schema(
     them, and every consumer of this function — chat validation and pruning,
     drift, generation — must not see one. The sensitive-name patterns are
     deliberately not applied here: the adapters still introspect those columns.
+    Their *values* are withheld, though: sample values and ENUM/SET member lists survive only
+    on columns ``column_values_allowed`` admits.
     """
     visible = {
         (t.schema_name, t.name)
@@ -303,9 +325,14 @@ def _apply_privacy_to_schema(
         source_type=schema.source_type,
         schemas=[s for s in schema.schemas if s.name not in privacy.excluded_schemas],
         tables=[
-            replace(
-                t,
-                columns=[c for c in t.columns if not privacy.hides_column(table_key(t), c.name)],
+            _withhold_column_values(
+                replace(
+                    t,
+                    columns=[
+                        c for c in t.columns if not privacy.hides_column(table_key(t), c.name)
+                    ],
+                ),
+                privacy,
             )
             for t in schema.tables
             if (t.schema_name, t.name) in visible

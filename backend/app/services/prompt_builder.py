@@ -170,12 +170,12 @@ class PromptBuilder:
                 raw = m.group(1).replace(",", "")
                 bullets.append(f"Detected numeric filter: {operator} {raw}")
 
-        # Named entity resolution — only when sample values are already permitted to
-        # reach the LLM (respects the app's no-data-to-LLM privacy guarantee).
-        if privacy is None or privacy.include_sample_values is not False:
+        # Named entity resolution — only when sample values are permitted to reach the
+        # LLM. A connection with no stored settings has not consented to anything.
+        if privacy is not None and privacy.include_sample_values:
             candidates = extract_entity_candidates(user_question)
             if candidates:
-                for note in resolve_entities(candidates, schema):
+                for note in resolve_entities(candidates, schema, privacy):
                     bullets.append(note)
 
         if not bullets:

@@ -2,12 +2,11 @@
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 """
-Verify that introspect(), get_column_statistics(), and get_sample_values() never
-issue queries that perform full sequential scans on user data tables.
+Verify that introspect() and get_sample_values() never issue queries that perform full
+sequential scans on user data tables.
 
 OVERHEAD CONTRACT:
 - introspect() must only read catalog/pg_stats tables, never user tables
-- get_column_statistics() must only query pg_stats
 - get_sample_values() must use TABLESAMPLE when pg_stats has no data (never bare SELECT DISTINCT)
 """
 
@@ -190,66 +189,6 @@ class TestIntrospectOnlyReadsCatalog:
         assert not any("pg_stats" in s.lower() for s in sql_calls), (
             "pg_stats must not be queried when include_sample_values=False"
         )
-
-
-class TestGetColumnStatisticsReadsPgStatsOnly:
-    async def test_queries_pg_stats(self):
-        """get_column_statistics() must query only pg_stats."""
-        adapter, conn = make_adapter()
-        conn.fetchrow.return_value = FakeRecord(
-            {
-                "n_distinct": -0.05,
-                "null_frac": 0.0,
-                "avg_width": 8,
-                "most_common_vals": ["active", "inactive"],
-                "most_common_freqs": [0.8, 0.2],
-                "correlation": 0.1,
-            }
-        )
-
-        await adapter.get_column_statistics("public", "users", "status")
-
-        assert conn.fetchrow.call_count == 1
-        sql = str(conn.fetchrow.call_args.args[0])
-        assert "pg_stats" in sql.lower()
-        assert conn.fetch.call_count == 0
-
-    async def test_returns_empty_dict_when_no_stats(self):
-        """Returns {} when pg_stats has no row for this column."""
-        adapter, conn = make_adapter()
-        conn.fetchrow.return_value = None
-
-        result = await adapter.get_column_statistics("public", "users", "email")
-
-        assert result == {}
-
-    async def test_returns_all_stat_fields(self):
-        """All six statistic fields are returned."""
-        adapter, conn = make_adapter()
-        conn.fetchrow.return_value = FakeRecord(
-            {
-                "n_distinct": 3.0,
-                "null_frac": 0.01,
-                "avg_width": 6,
-                "most_common_vals": ["a", "b"],
-                "most_common_freqs": [0.6, 0.4],
-                "correlation": 0.5,
-            }
-        )
-
-        result = await adapter.get_column_statistics("public", "orders", "status")
-
-        assert result["n_distinct"] == 3.0
-        assert result["null_frac"] == 0.01
-        assert result["avg_width"] == 6
-        assert result["most_common_vals"] == ["a", "b"]
-        assert result["most_common_freqs"] == [0.6, 0.4]
-        assert result["correlation"] == 0.5
-
-    async def test_not_connected_raises(self):
-        adapter = PostgreSQLDataSource()  # no pool
-        with pytest.raises(RuntimeError, match="Not connected"):
-            await adapter.get_column_statistics("public", "users", "id")
 
 
 class TestGetSampleValuesUsesSafePaths:

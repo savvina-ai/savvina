@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from .errors import ErrorCategory
 from .models import (
     ConnectionResult,
     DataSourceSchema,
@@ -31,6 +32,10 @@ class BaseDataSource(ABC):
     source_type: str = ""
     display_name: str = ""
     query_dialect: str = ""
+    # Whether `"…"` in this dialect is a string literal (MySQL default) rather than a
+    # quoted identifier (SQL standard). Read by the result mask: on a literal dialect a
+    # double-quoted token is not a column reference and must not trigger redaction.
+    double_quote_is_string_literal: bool = False
     icon: str = ""
 
     @abstractmethod
@@ -116,6 +121,14 @@ class BaseDataSource(ABC):
     def validate_query(self, query: str) -> ValidationResult:
         """Validate query is safe (read-only, no dangerous patterns)."""
         ...
+
+    def classify_error(self, exc: BaseException) -> ErrorCategory:
+        """Map a query failure onto an ``ErrorCategory`` from documented codes.
+
+        Must never raise. The engine's message text may inform the choice when a code is
+        too coarse, because only the category, never the text, reaches the LLM.
+        """
+        return ErrorCategory.OTHER
 
     def _quote_identifier(self, name: str) -> str:
         """Return a dialect-appropriate quoted identifier. Default: no quoting."""
