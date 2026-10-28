@@ -1,7 +1,7 @@
 // Copyright (c) 2025 Savvina AI Ltd
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-import { useId, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { PrivacySettings } from '../types';
 
 const DEFAULTS: PrivacySettings = {
@@ -18,12 +18,17 @@ const DEFAULTS: PrivacySettings = {
   excluded_schemas: [],
   excluded_tables: [],
   excluded_columns: [],
-  row_filter_sql: null,
+  row_filters: {},
 };
 
 interface Props {
   settings: PrivacySettings;
   onChange: (settings: PrivacySettings) => void;
+  /** `schema.table` names offered by the table input; free text when absent. */
+  knownTables?: string[];
+  /** Called with `false` while a row filter is incomplete or duplicated, so the parent can
+   *  block saving; `true` otherwise. */
+  onValidityChange?: (valid: boolean) => void;
 }
 
 function TagList({
@@ -124,10 +129,178 @@ function Toggle({
   );
 }
 
-export default function PrivacySettingsForm({ settings, onChange }: Props) {
+interface RowFilterRow {
+  id: number;
+  table: string;
+  condition: string;
+}
+
+function rowsFromMap(map: Record<string, string>): RowFilterRow[] {
+  return Object.entries(map).map(([table, condition], id) => ({ id, table, condition }));
+}
+
+function mapFromRows(rows: RowFilterRow[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const row of rows) {
+    const table = row.table.trim();
+    if (table) out[table] = row.condition;
+  }
+  return out;
+}
+
+const DUPLICATE_TABLE_ERROR = 'This table already has a filter';
+const MISSING_TABLE_ERROR = 'Choose a table for this condition';
+
+/** Per-row error for the table input, by row id. A row that is empty in both fields is
+ *  valid (it is dropped); a duplicate is flagged on the later row only. */
+function rowErrors(rows: RowFilterRow[]): Map<number, string> {
+  const errors = new Map<number, string>();
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const table = row.table.trim();
+    if (!table) {
+      if (row.condition.trim()) errors.set(row.id, MISSING_TABLE_ERROR);
+    } else if (seen.has(table)) {
+      errors.set(row.id, DUPLICATE_TABLE_ERROR);
+    } else {
+      seen.add(table);
+    }
+  }
+  return errors;
+}
+
+function sameMap(a: Record<string, string>, b: Record<string, string>): boolean {
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  return ka.length === kb.length && ka.every((k) => b[k] === a[k]);
+}
+
+function RowFilterList({
+  filters,
+  onChange,
+  knownTables,
+  onValidityChange,
+}: {
+  filters: Record<string, string>;
+  onChange: (filters: Record<string, string>) => void;
+  knownTables?: string[];
+  onValidityChange?: (valid: boolean) => void;
+}) {
+  // Rows are local so a half-typed row (empty table name) survives without being emitted;
+  // when the parent hands in a map the rows do not already describe (the initial load),
+  // the rows are rebuilt from it.
+  const [rows, setRows] = useState<RowFilterRow[]>(() => rowsFromMap(filters));
+  const nextId = useRef(rows.length);
+  const listId = useId();
+
+  useEffect(() => {
+    setRows((current) => {
+      if (sameMap(mapFromRows(current), filters)) return current;
+      const rebuilt = rowsFromMap(filters);
+      // Ids restart at 0 on a rebuild: keep the counter ahead of them so a row added
+      // afterwards never shares an id with a stored one.
+      nextId.current = Math.max(nextId.current, rebuilt.length);
+      return rebuilt;
+    });
+  }, [filters]);
+
+  const errors = useMemo(() => rowErrors(rows), [rows]);
+  const valid = errors.size === 0;
+  useEffect(() => {
+    onValidityChange?.(valid);
+  }, [valid, onValidityChange]);
+
+  const update = (next: RowFilterRow[]) => {
+    setRows(next);
+    onChange(mapFromRows(next));
+  };
+  const edit = (id: number, patch: Partial<RowFilterRow>) =>
+    update(rows.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  const add = () => update([...rows, { id: nextId.current++, table: '', condition: '' }]);
+  const remove = (id: number) => update(rows.filter((r) => r.id !== id));
+
+  const inputClass =
+    'bg-background text-foreground px-3 py-1.5 border border-border rounded text-sm font-mono placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring';
+
+  return (
+    <div>
+      <p className="text-sm font-medium text-foreground mb-1">Row filters</p>
+      <p className="text-xs text-muted-foreground mb-2">
+        One condition per table, applied to every query that reads the table. Name the table
+        as the database stores it (schema.table); tables not listed are unfiltered.
+      </p>
+      {knownTables && (
+        <datalist id={listId}>
+          {knownTables.map((t) => (
+            <option key={t} value={t} />
+          ))}
+        </datalist>
+      )}
+      <div className="space-y-2">
+        {rows.map((row, index) => {
+          const error = errors.get(row.id);
+          const errorId = `${listId}-error-${row.id}`;
+          return (
+            <div key={row.id} className="flex gap-2">
+              <div className="w-2/5">
+                <input
+                  aria-label={`Table ${index + 1}`}
+                  aria-invalid={error ? true : undefined}
+                  aria-describedby={error ? errorId : undefined}
+                  type="text"
+                  list={knownTables ? listId : undefined}
+                  value={row.table}
+                  onChange={(e) => edit(row.id, { table: e.target.value })}
+                  placeholder="public.orders"
+                  spellCheck={false}
+                  className={`w-full ${inputClass} aria-[invalid=true]:border-destructive`}
+                />
+                {error && (
+                  <p id={errorId} className="mt-1 text-xs text-destructive">
+                    {error}
+                  </p>
+                )}
+              </div>
+              <input
+                aria-label={`Condition ${index + 1}`}
+                type="text"
+                value={row.condition}
+                onChange={(e) => edit(row.id, { condition: e.target.value })}
+                placeholder="tenant_id = 42"
+                spellCheck={false}
+                className={`flex-1 ${inputClass}`}
+              />
+              <button
+                type="button"
+                aria-label={`Remove filter ${index + 1}`}
+                onClick={() => remove(row.id)}
+                className="px-2 text-muted-foreground hover:text-destructive"
+              >
+                ×
+              </button>
+            </div>
+          );
+        })}
+      </div>
+      <button
+        type="button"
+        onClick={add}
+        className="mt-2 px-3 py-1.5 bg-muted hover:bg-muted/80 rounded text-sm"
+      >
+        Add filter
+      </button>
+    </div>
+  );
+}
+
+export default function PrivacySettingsForm({
+  settings,
+  onChange,
+  knownTables,
+  onValidityChange,
+}: Props) {
   const set = <K extends keyof PrivacySettings>(key: K, val: PrivacySettings[K]) =>
     onChange({ ...settings, [key]: val });
-  const rowFilterId = useId();
 
   return (
     <div className="space-y-5">
@@ -176,30 +349,17 @@ export default function PrivacySettingsForm({ settings, onChange }: Props) {
         items={settings.excluded_columns}
         onChange={(v) => set('excluded_columns', v)}
       />
-      <div>
-        <label htmlFor={rowFilterId} className="block text-sm font-medium text-foreground mb-1">
-          Row filter
-        </label>
-        <p id={`${rowFilterId}-desc`} className="text-xs text-muted-foreground mb-2">
-          A SQL condition applied to the output of every query sent to this connection. The
-          query must return every column the condition names. Leave empty for no filter.
-        </p>
-        <input
-          id={rowFilterId}
-          aria-describedby={`${rowFilterId}-desc`}
-          type="text"
-          value={settings.row_filter_sql ?? ''}
-          onChange={(e) => set('row_filter_sql', e.target.value)}
-          placeholder="tenant_id = 42"
-          spellCheck={false}
-          className="w-full bg-background text-foreground px-3 py-1.5 border border-border rounded text-sm font-mono placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
-        />
-      </div>
+      <RowFilterList
+        filters={settings.row_filters ?? {}}
+        onChange={(row_filters) => set('row_filters', row_filters)}
+        knownTables={knownTables}
+        onValidityChange={onValidityChange}
+      />
       <button
         type="button"
-        // Keep the row filter: null on PUT means "unchanged", so resetting it to null would
-        // show an empty input while the server keeps the filter. Clear it by emptying the input.
-        onClick={() => onChange({ ...DEFAULTS, row_filter_sql: settings.row_filter_sql })}
+        // Keep the row filters: resetting the other settings must not drop the per-table
+        // filters the admin defined. Remove rows one by one to clear them.
+        onClick={() => onChange({ ...DEFAULTS, row_filters: settings.row_filters ?? {} })}
         className="text-sm text-muted-foreground hover:text-foreground underline"
       >
         Reset to defaults

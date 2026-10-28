@@ -43,10 +43,20 @@ export interface PrivacySettings {
   excluded_schemas: string[];
   excluded_tables: string[];
   excluded_columns: string[];
-  /** SQL condition every executed query is wrapped in; null or "" = no filter. On PUT, null
-   *  leaves the stored filter unchanged and "" clears it. */
-  row_filter_sql: string | null;
+  /** Per-table row filters: {"schema.table": "<condition without WHERE>"}. Tables not
+   *  listed are unfiltered. On PUT, an absent field leaves the map unchanged and {} clears
+   *  it (refused while a legacy row_filter_sql is stored, unless clear_legacy_row_filter). */
+  row_filters: Record<string, string>;
+  /** Legacy whole-query filter (before 2.3). Read only, shown in the migration banner;
+   *  the server ignores it on PUT. */
+  row_filter_sql?: string | null;
 }
+
+/** Payload of PUT /connections/{id}/privacy: any subset of the settings plus the command
+ *  that removes the legacy whole-query filter. */
+export type PrivacySettingsUpdate = Partial<PrivacySettings> & {
+  clear_legacy_row_filter?: boolean;
+};
 
 // ── Connections ──
 export interface Connection {
@@ -61,6 +71,7 @@ export interface Connection {
 
 export interface ConnectionDetail extends Connection {
   privacy_settings: PrivacySettings | null;
+  row_filter_needs_migration: boolean;
   schema_cache: Record<string, unknown> | null;
 }
 

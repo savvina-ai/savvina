@@ -180,6 +180,7 @@ export default function SchemaExplorer({ onClose, embedded = false }: Props) {
     try {
       await connectionsApi.refreshSchema(activeConnectionId);
       await queryClient.invalidateQueries({ queryKey: ['schema', activeConnectionId] });
+      await queryClient.invalidateQueries({ queryKey: ['schema-tables', activeConnectionId] });
       await queryClient.invalidateQueries({ queryKey: ['semantic', activeConnectionId] });
     } catch (e: unknown) {
       setRefreshError(apiErrorMessage(e, 'Schema refresh failed'));
