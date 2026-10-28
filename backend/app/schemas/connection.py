@@ -8,7 +8,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
+
+from ..datasources.models import PrivacySettings
 
 # ── Privacy Settings ───────────────────────────────────────────────────────────
 
@@ -23,10 +25,14 @@ class PrivacySettingsUpdate(BaseModel):
     excluded_schemas: list[str] | None = None
     excluded_tables: list[str] | None = None
     excluded_columns: list[str] | None = None
-    # A SQL condition every executed statement is wrapped in (see services/row_filter.py).
-    # Validated against the connection's dialect on write. "" clears it; None (or absent)
-    # leaves it unchanged.
-    row_filter_sql: str | None = None
+    # Per-table row filters, {"schema.table": "<condition>"} (see services/row_filter.py:
+    # validate_row_filters). None (or absent) leaves the stored map unchanged; {} clears it,
+    # which a connection with a legacy row_filter_sql refuses unless clear_legacy_row_filter
+    # is sent too.
+    row_filters: dict[str, str] | None = None
+    # A command, not a setting: remove the legacy whole-query filter (row_filter_sql) and
+    # leave the connection unfiltered unless row_filters is sent as well. Never stored.
+    clear_legacy_row_filter: bool = False
 
 
 # ── Execution Mode ──────────────────────────────────────────────────────────────
@@ -79,6 +85,13 @@ class ConnectionDetail(ConnectionResponse):
     """Full detail response — includes cached metadata."""
 
     privacy_settings: dict | None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def row_filter_needs_migration(self) -> bool:
+        """True while the stored settings hold a legacy ``row_filter_sql`` and no
+        ``row_filters`` map: every execution is refused until the admin acts."""
+        return PrivacySettings.from_dict(self.privacy_settings or {}).row_filter_needs_migration
 
 
 class ConnectionConfigResponse(BaseModel):

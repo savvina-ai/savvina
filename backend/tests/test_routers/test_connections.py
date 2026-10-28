@@ -99,7 +99,7 @@ class TestCreateConnection:
         )
         assert resp.status_code == 422
 
-    async def test_invalid_row_filter_returns_422_and_creates_nothing(self, http_client):
+    async def test_invalid_row_filters_returns_422_and_creates_nothing(self, http_client):
         db = _mock_db()
         app.dependency_overrides[get_db] = lambda: db
         resp = await http_client.post(
@@ -108,14 +108,16 @@ class TestCreateConnection:
                 "name": "My DB",
                 "source_type": "postgresql",
                 "config": {"host": "localhost"},
-                "privacy_settings": {"row_filter_sql": "tenant_id = 1; DROP TABLE t"},
+                "privacy_settings": {"row_filters": {"public.t": "tenant_id = 1; DROP TABLE t"}},
             },
         )
         assert resp.status_code == 422
-        assert resp.json()["detail"] == "Row filter must be a single condition without ';'"
+        assert resp.json()["detail"] == (
+            "row_filters[\"public.t\"] must be a single condition without ';'"
+        )
         db.add.assert_not_called()
 
-    async def test_row_filter_is_stored_stripped_and_empty_becomes_null(self, http_client):
+    async def test_row_filters_are_stored_clean_and_row_filter_sql_is_dropped(self, http_client):
         db = _mock_db()
         app.dependency_overrides[get_db] = lambda: db
         resp = await http_client.post(
@@ -126,16 +128,19 @@ class TestCreateConnection:
                 "config": {"host": "localhost"},
                 "privacy_settings": {
                     "include_sample_values": False,
-                    "row_filter_sql": "  tenant_id = 1 ",
+                    "row_filters": {" public.t ": "  tenant_id = 1 "},
+                    "row_filter_sql": "tenant_id = 1",
                 },
             },
         )
         assert resp.status_code == 201
         assert db.add.call_args.args[0].privacy_settings == {
             "include_sample_values": False,
-            "row_filter_sql": "tenant_id = 1",
+            "row_filters": {"public.t": "tenant_id = 1"},
         }
 
+    @pytest.mark.parametrize("value", [False, 0, ["x"], "tenant_id = 1"])
+    async def test_non_object_row_filters_returns_422_and_creates_nothing(self, http_client, value):
         db = _mock_db()
         app.dependency_overrides[get_db] = lambda: db
         resp = await http_client.post(
@@ -144,30 +149,34 @@ class TestCreateConnection:
                 "name": "My DB",
                 "source_type": "postgresql",
                 "config": {"host": "localhost"},
-                "privacy_settings": {"row_filter_sql": "   "},
-            },
-        )
-        assert resp.status_code == 201
-        assert db.add.call_args.args[0].privacy_settings == {"row_filter_sql": None}
-
-    @pytest.mark.parametrize("value", [False, 0, ["x"], {"a": 1}])
-    async def test_non_string_row_filter_returns_422_and_creates_nothing(self, http_client, value):
-        db = _mock_db()
-        app.dependency_overrides[get_db] = lambda: db
-        resp = await http_client.post(
-            "/api/v1/connections",
-            json={
-                "name": "My DB",
-                "source_type": "postgresql",
-                "config": {"host": "localhost"},
-                "privacy_settings": {"row_filter_sql": value},
+                "privacy_settings": {"row_filters": value},
             },
         )
         assert resp.status_code == 422
-        assert resp.json()["detail"] == "Row filter must be a string"
+        assert resp.json()["detail"] == (
+            "row_filters must be an object mapping schema.table to a condition"
+        )
         db.add.assert_not_called()
 
-    async def test_unregistered_source_type_validates_with_the_strictest_dialect(self, http_client):
+    async def test_null_row_filters_returns_422_and_creates_nothing(self, http_client):
+        db = _mock_db()
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.post(
+            "/api/v1/connections",
+            json={
+                "name": "My DB",
+                "source_type": "postgresql",
+                "config": {"host": "localhost"},
+                "privacy_settings": {"row_filters": None},
+            },
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            "row_filters must be an object mapping schema.table to a condition"
+        )
+        db.add.assert_not_called()
+
+    async def test_unregistered_source_type_refuses_row_filters(self, http_client):
         db = _mock_db()
         app.dependency_overrides[get_db] = lambda: db
         resp = await http_client.post(
@@ -176,13 +185,12 @@ class TestCreateConnection:
                 "name": "My DB",
                 "source_type": "nosuch",
                 "config": {"host": "localhost"},
-                "privacy_settings": {"row_filter_sql": "tag = '#1'"},
+                "privacy_settings": {"row_filters": {"s.t": "tag = '#1'"}},
             },
         )
         assert resp.status_code == 422
-        assert resp.json()["detail"] == (
-            "Row filter must not contain comment markers, even inside quotes"
-        )
+        # The rewriter knows no dialect for an unregistered source type (Task 5b).
+        assert resp.json()["detail"] == "row_filters are not supported for this database"
         db.add.assert_not_called()
 
 
@@ -531,7 +539,12 @@ class TestUpdatePrivacy:
             MockResult(),  # delete QueryCacheEntry
             MockResult(),  # delete TableEmbeddingCache
         )
-        db.refresh = AsyncMock()
+
+        async def _refresh(obj) -> None:
+            # Like the real refresh: the object shows what the UPDATE stored.
+            obj.privacy_settings = TestUpdatePrivacy._stored_privacy(db)
+
+        db.refresh = AsyncMock(side_effect=_refresh)
         return db
 
     @staticmethod
@@ -540,52 +553,224 @@ class TestUpdatePrivacy:
         # as a dependency parameter.
         app.dependency_overrides[get_db] = lambda: db
 
-    async def test_sets_the_row_filter(self, http_client):
+    @staticmethod
+    def _executes(db) -> int:
+        return db.execute.call_count
+
+    @staticmethod
+    def _touches_schema_cache(db) -> bool:
+        return any("user_schema_caches" in str(c.args[0]) for c in db.execute.call_args_list)
+
+    async def test_sets_the_map_and_keeps_the_schema_cache(self, http_client):
         conn = _make_conn(privacy_settings={"include_sample_values": False})
         db = self._db_for_update(conn)
-        app.dependency_overrides[get_db] = lambda: db
+        self._use_db(db)
         resp = await http_client.put(
             "/api/v1/connections/conn-123/privacy",
-            json={"row_filter_sql": " tenant_id = 42 "},
+            json={"row_filters": {" public.t ": " tenant_id = 42 "}},
         )
         assert resp.status_code == 200
         assert self._stored_privacy(db) == {
             "include_sample_values": False,
-            "row_filter_sql": "tenant_id = 42",
+            "row_filters": {"public.t": "tenant_id = 42"},
         }
+        # lookup + update + delete TableEmbeddingCache + delete QueryCacheEntry: the
+        # UserSchemaCache row stays.
+        assert self._executes(db) == 4
+        assert not self._touches_schema_cache(db)
 
-    async def test_empty_string_clears_the_row_filter(self, http_client):
-        conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
+    async def test_any_other_key_still_flushes_the_schema_cache(self, http_client):
+        conn = _make_conn(privacy_settings={})
         db = self._db_for_update(conn)
-        app.dependency_overrides[get_db] = lambda: db
+        self._use_db(db)
         resp = await http_client.put(
-            "/api/v1/connections/conn-123/privacy", json={"row_filter_sql": ""}
+            "/api/v1/connections/conn-123/privacy",
+            json={"row_filters": {"public.t": "tenant_id = 42"}, "excluded_tables": ["x"]},
         )
         assert resp.status_code == 200
-        assert self._stored_privacy(db) == {"row_filter_sql": None}
+        assert self._executes(db) == 5
 
-    async def test_absent_or_null_leaves_the_row_filter_unchanged(self, http_client):
-        for body in ({"include_sample_values": True}, {"row_filter_sql": None}):
-            conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
+    async def test_whole_form_with_only_a_condition_changed_keeps_the_schema_cache(
+        self, http_client
+    ):
+        stored = {
+            "include_sample_values": False,
+            "excluded_tables": ["a"],
+            "row_filters": {"public.t": "tenant_id = 42"},
+        }
+        conn = _make_conn(privacy_settings=dict(stored))
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={**stored, "row_filters": {"public.t": "tenant_id = 43"}},
+        )
+        assert resp.status_code == 200
+        assert self._stored_privacy(db)["row_filters"] == {"public.t": "tenant_id = 43"}
+        assert self._executes(db) == 4
+        assert not self._touches_schema_cache(db)
+
+    async def test_padded_key_is_stored_clean_and_keeps_the_schema_cache(self, http_client):
+        stored = {
+            "include_sample_values": False,
+            "row_filters": {"public.t": "tenant_id = 42"},
+        }
+        conn = _make_conn(privacy_settings=dict(stored))
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={**stored, "row_filters": {" public.t ": " tenant_id = 42 "}},
+        )
+        assert resp.status_code == 200
+        assert self._stored_privacy(db) == stored
+        assert self._executes(db) == 4
+        assert not self._touches_schema_cache(db)
+
+    async def test_whole_form_with_another_key_changed_flushes_the_schema_cache(self, http_client):
+        stored = {
+            "include_sample_values": False,
+            "excluded_tables": ["a"],
+            "row_filters": {"public.t": "tenant_id = 42"},
+        }
+        conn = _make_conn(privacy_settings=dict(stored))
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={**stored, "excluded_tables": ["a", "b"]},
+        )
+        assert resp.status_code == 200
+        assert self._executes(db) == 5
+        assert self._touches_schema_cache(db)
+
+    async def test_the_lookup_takes_the_row_lock(self, http_client):
+        from sqlalchemy.dialects import postgresql
+
+        conn = _make_conn(privacy_settings={})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={"include_sample_values": True}
+        )
+        assert resp.status_code == 200
+        lookup = db.execute.call_args_list[0].args[0]
+        sql = str(lookup.compile(dialect=postgresql.dialect()))
+        assert "FOR NO KEY UPDATE" in sql
+
+    async def test_empty_map_clears_when_there_is_no_legacy_filter(self, http_client):
+        conn = _make_conn(privacy_settings={"row_filters": {"public.t": "tenant_id = 42"}})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={"row_filters": {}}
+        )
+        assert resp.status_code == 200
+        assert self._stored_privacy(db) == {"row_filters": {}}
+
+    async def test_empty_map_on_a_legacy_filter_is_422_and_writes_nothing(self, http_client):
+        conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={"row_filters": {}, "include_sample_values": True},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            "row_filters: this connection still has the old whole-query filter. Define"
+            " per-table filters, or send clear_legacy_row_filter to remove it."
+        )
+        assert self._executes(db) == 1
+        db.commit.assert_not_called()
+
+    async def test_non_empty_map_ends_the_migration_state(self, http_client):
+        conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={"row_filters": {"public.t": "tenant_id = 42"}},
+        )
+        assert resp.status_code == 200
+        assert self._stored_privacy(db) == {"row_filters": {"public.t": "tenant_id = 42"}}
+        assert resp.json()["row_filter_needs_migration"] is False
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"row_filters": {}, "clear_legacy_row_filter": True},
+            {"clear_legacy_row_filter": True},
+        ],
+    )
+    async def test_clear_flag_removes_the_legacy_filter(self, http_client, body):
+        conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put("/api/v1/connections/conn-123/privacy", json=body)
+        assert resp.status_code == 200
+        assert self._stored_privacy(db) == {"row_filters": {}}
+        assert self._executes(db) == 4
+        assert not self._touches_schema_cache(db)
+        assert resp.json()["row_filter_needs_migration"] is False
+
+    async def test_clear_flag_keeps_an_existing_map(self, http_client):
+        conn = _make_conn(privacy_settings={"row_filters": {"public.t": "tenant_id = 42"}})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={"clear_legacy_row_filter": True}
+        )
+        assert resp.status_code == 200
+        assert self._stored_privacy(db) == {"row_filters": {"public.t": "tenant_id = 42"}}
+
+    async def test_unrelated_keys_leave_a_legacy_connection_in_the_migration_state(
+        self, http_client
+    ):
+        conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={"include_sample_values": True}
+        )
+        assert resp.status_code == 200
+        stored = self._stored_privacy(db)
+        assert stored == {"row_filter_sql": "tenant_id = 42", "include_sample_values": True}
+        assert "row_filters" not in stored
+        assert resp.json()["row_filter_needs_migration"] is True
+
+    async def test_row_filter_sql_in_the_body_is_ignored(self, http_client):
+        conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={"row_filter_sql": "x = 1"}
+        )
+        assert resp.status_code == 200
+        assert self._stored_privacy(db) == {"row_filter_sql": "tenant_id = 42"}
+
+    async def test_absent_or_null_leaves_the_map_unchanged(self, http_client):
+        for body in ({"include_sample_values": True}, {"row_filters": None}):
+            conn = _make_conn(privacy_settings={"row_filters": {"public.t": "tenant_id = 42"}})
             db = self._db_for_update(conn)
             self._use_db(db)
             resp = await http_client.put("/api/v1/connections/conn-123/privacy", json=body)
             assert resp.status_code == 200
-            assert self._stored_privacy(db)["row_filter_sql"] == "tenant_id = 42"
+            assert self._stored_privacy(db)["row_filters"] == {"public.t": "tenant_id = 42"}
 
-    async def test_invalid_row_filter_returns_422_and_writes_nothing(self, http_client):
-        conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
+    async def test_invalid_map_returns_422_and_writes_nothing(self, http_client):
+        conn = _make_conn(privacy_settings={})
         db = self._db_for_update(conn)
-        app.dependency_overrides[get_db] = lambda: db
+        self._use_db(db)
         resp = await http_client.put(
             "/api/v1/connections/conn-123/privacy",
-            json={"row_filter_sql": "WHERE tenant_id = 1"},
+            json={"row_filters": {"public.t": "WHERE tenant_id = 1"}},
         )
         assert resp.status_code == 422
         assert resp.json()["detail"] == (
-            "Row filter is a condition: write it without the leading WHERE"
+            'row_filters["public.t"] is a condition: write it without the leading WHERE'
         )
-        assert db.execute.call_count == 1  # only the lookup
+        assert self._executes(db) == 1
         db.commit.assert_not_called()
 
     async def test_validation_uses_the_connections_dialect(self, http_client):
@@ -596,30 +781,56 @@ class TestUpdatePrivacy:
             self._use_db(db)
             resp = await http_client.put(
                 "/api/v1/connections/conn-123/privacy",
-                json={"row_filter_sql": "tag = '#1'"},
+                json={"row_filters": {"s.t": "tag = '#1'"}},
             )
             assert resp.status_code == expected, source_type
 
-    async def test_row_filter_on_missing_connection_returns_404_before_validation(
+    async def test_row_filters_on_missing_connection_returns_404_before_validation(
         self, http_client
     ):
         db = _mock_db(MockResult(single=None))
-        app.dependency_overrides[get_db] = lambda: db
+        self._use_db(db)
         resp = await http_client.put(
-            "/api/v1/connections/missing/privacy", json={"row_filter_sql": "WHERE x = 1"}
+            "/api/v1/connections/missing/privacy", json={"row_filters": {"s.t": "WHERE x = 1"}}
         )
         assert resp.status_code == 404
 
-    async def test_non_string_row_filter_is_rejected_by_the_schema(self, http_client):
-        conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
+    async def test_non_object_row_filters_is_rejected_by_the_schema(self, http_client):
+        conn = _make_conn(privacy_settings={})
         db = self._db_for_update(conn)
         self._use_db(db)
         resp = await http_client.put(
-            "/api/v1/connections/conn-123/privacy", json={"row_filter_sql": 42}
+            "/api/v1/connections/conn-123/privacy", json={"row_filters": "tenant_id = 1"}
         )
         assert resp.status_code == 422
-        assert db.execute.call_count == 0
+        assert self._executes(db) == 0
         db.commit.assert_not_called()
+
+
+class TestRowFilterNeedsMigration:
+    @pytest.mark.parametrize(
+        ("privacy", "expected"),
+        [
+            (None, False),
+            ({}, False),
+            ({"row_filter_sql": "tenant_id = 42"}, True),
+            # A stored {} next to a legacy value is still the migration state: with False,
+            # _executable would see an empty map and run unfiltered. The router never stores
+            # this combination (422 or the legacy value is popped); the property stays safe.
+            ({"row_filter_sql": "tenant_id = 42", "row_filters": {}}, True),
+            ({"row_filter_sql": "tenant_id = 42", "row_filters": {"s.t": "x = 1"}}, False),
+            ({"row_filter_sql": None}, False),
+        ],
+    )
+    async def test_detail_reports_the_state(self, http_client, privacy, expected):
+        conn = _make_conn(privacy_settings=privacy)
+        db = _mock_db(MockResult(single=conn))
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/connections/conn-123")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["row_filter_needs_migration"] is expected
+        assert body["privacy_settings"] == privacy
 
 
 # ── PUT /api/v1/connections/{id}/execution-mode ──────────────────────────────────

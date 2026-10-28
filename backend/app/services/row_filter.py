@@ -1,62 +1,89 @@
 # Copyright (c) 2025 Savvina AI Ltd
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-"""The connection's row filter: wrapping every executed statement in it, unwrapping stored
-SQL, and validating the filter an admin saves.
+"""The connection's row filters: the statement the database receives (``_executable``),
+unwrapping SQL stored under the Phase 1 wrap, and validating what an admin saves.
 
-The wrap is ``SELECT * FROM (\\n<query>\\n) AS _sift_q WHERE <filter><trailing LIMIT>``.
-Parenthesis depth of the wrapped query, as each engine lexes it, lives in
-``row_filter_scan``.
+The rewrite itself (per-table derived tables) lives in ``row_filter_rewrite``.
 """
 
 from __future__ import annotations
 
 import re
 
+import sqlglot
+from sqlglot import exp
+from sqlglot.dialects.dialect import Dialect
+from sqlglot.errors import ParseError, TokenError
+from sqlglot.tokens import TokenType
 import sqlparse
 import sqlparse.tokens as sql_tokens
 
 from ..datasources.models import PrivacySettings
-from .row_filter_scan import parentheses_balance
+from .row_filter_errors import RowFilterInvalidError, RowFilterRejectedError
+from .row_filter_rewrite import apply_row_filters, parse_condition, sqlglot_dialect
 
-
-class RowFilterRejectedError(ValueError):
-    """The query cannot be enclosed by the row-filter wrap, so it is never sent.
-
-    Raised before execution and classified as ``ErrorCategory.SYNTAX``: on the chat paths
-    it feeds the self-correction loop like any rejected statement, and its text is our own.
-    """
-
-
-class RowFilterInvalidError(ValueError):
-    """The text an admin saved as the row filter cannot be used as one.
-
-    The message completes the sentence "Row filter …" for the admin.
-    """
-
+__all__ = ["RowFilterInvalidError", "RowFilterRejectedError"]
 
 _MAX_ROW_FILTER_LENGTH = 1000
+_MAX_NESTING = 20
 _LEADING_WHERE = re.compile(r"^WHERE\b", re.IGNORECASE)
+# C0 controls except tab, LF and CR, DEL, and the lone-surrogate range (not encodable as
+# UTF-8, so a stored one would raise in the length check or when the query is sent).
+# PostgreSQL refuses a NUL anywhere in a query, so a stored NUL would make every query on the
+# table fail.
+_CONTROL_CHARACTER = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff]")
+
+# Shown verbatim (no apostrophe, no quote: see RowFilterRejectedError).
+_MIGRATION_MESSAGE = (
+    "Row filter needs migration: this connection still has the old whole-query filter. "
+    "Open the privacy settings of the connection and define per-table filters, or remove "
+    "the old filter there."
+)
+
+
+def _parenthesis_depth(text: str, dialect: str) -> int:
+    """The deepest parenthesis nesting in *text*, counted on the dialect's own sqlglot tokens:
+    parentheses inside strings, quoted names and comments are not counted. The tokenizer is
+    linear and does not recurse, so this keeps the sqlglot parse, at save and again at every
+    execution, well inside Python's recursion limit. Text the tokenizer refuses counts as 0:
+    the parse that follows rejects it anyway."""
+    read = sqlglot_dialect(dialect)
+    try:
+        tokens = Dialect.get_or_raise(read).tokenize(text) if read else sqlglot.tokenize(text)
+    except TokenError:
+        return 0
+    depth = deepest = 0
+    for token in tokens:
+        if token.token_type == TokenType.L_PAREN:
+            depth += 1
+            deepest = max(deepest, depth)
+        elif token.token_type == TokenType.R_PAREN:
+            depth -= 1
+    return deepest
 
 
 def validate_row_filter(text: str | None, dialect: str) -> str | None:
-    """*text* stripped, ready to be stored as ``row_filter_sql``; ``None`` when it is empty
+    """*text* stripped, ready to be stored as a row-filter condition; ``None`` when it is empty
     (no filter).
 
-    Raises ``RowFilterInvalidError`` when the text cannot be the single condition that
-    ``_inject_row_filter`` appends after ``WHERE``: a ``;``, a comment start (``--``,
-    ``/*``, and ``#`` unless the dialect is PostgreSQL), a ``$`` (dollar quoting on
-    PostgreSQL, unsure lexing on MySQL), a leading ``WHERE`` (the word, so ``WHERE(…)``
-    too), parentheses that do not balance as *dialect* lexes them, or more than
-    ``_MAX_ROW_FILTER_LENGTH`` characters.
-    The checks are textual and fail closed: a ``;`` inside a string literal is rejected
-    too.
+    Raises ``RowFilterInvalidError`` when the text cannot be a single condition: a ``;``, a
+    comment start (``--``, ``/*``, and ``#`` unless the dialect is PostgreSQL), a ``$``
+    (dollar quoting on PostgreSQL, unsure lexing on MySQL), a leading ``WHERE`` (the word,
+    so ``WHERE(…)`` too), a control character (other than tab, LF, CR), more than
+    ``_MAX_NESTING`` levels of parentheses, or more than ``_MAX_ROW_FILTER_LENGTH``
+    characters. The checks
+    are textual and fail closed: a ``;`` inside a string literal is rejected too. Whether
+    the text is one well-formed expression is checked by the sqlglot parse in
+    ``validate_row_filters``.
     """
     if text is None:
         return None
-    text = text.strip()
-    if not text:
+    if not text.strip():
         return None
+    if _CONTROL_CHARACTER.search(text):  # before the strip, which would eat a trailing \x0b
+        raise RowFilterInvalidError("must not contain control characters")
+    text = text.strip()
     if ";" in text:
         raise RowFilterInvalidError("must be a single condition without ';'")
     comment_starts = ("--", "/*") if (dialect or "").lower() == "postgresql" else ("--", "/*", "#")
@@ -66,106 +93,118 @@ def validate_row_filter(text: str | None, dialect: str) -> str | None:
         raise RowFilterInvalidError("must not contain '$'")
     if _LEADING_WHERE.match(text):
         raise RowFilterInvalidError("is a condition: write it without the leading WHERE")
-    if not _parentheses_balance(text, dialect):
-        raise RowFilterInvalidError(
-            "has parentheses that do not balance, or a string that cannot be checked safely"
-            " (a backslash or an unterminated quote)"
-        )
+    if _parenthesis_depth(text, dialect) > _MAX_NESTING:
+        raise RowFilterInvalidError(f"is nested too deeply ({_MAX_NESTING} levels max)")
     if len(text) > _MAX_ROW_FILTER_LENGTH:
         raise RowFilterInvalidError(f"is too long ({_MAX_ROW_FILTER_LENGTH} characters max)")
     return text
 
 
-def _parentheses_balance(sql: str, dialect: str) -> bool:
-    """Whether *sql*'s parentheses balance as *dialect*'s engine lexes them; ``False`` when
-    the scanner cannot lex a construct with certainty. See ``row_filter_scan``."""
-    return parentheses_balance(sql, dialect)
-
-
-# Trailing row-limiting clauses, per engine: numbers only, anchored at the end of the
-# right-stripped statement. The matched text is hoisted verbatim (whitespace and case kept).
-_PG_TRAILING_LIMIT = re.compile(
-    r"(\s+LIMIT\s+\d+(?:\s+OFFSET\s+\d+)?|\s+OFFSET\s+\d+\s+LIMIT\s+\d+)$", re.IGNORECASE
-)
-_MYSQL_TRAILING_LIMIT = re.compile(
-    r"(\s+LIMIT\s+\d+(?:\s+OFFSET\s+\d+)?|\s+LIMIT\s+\d+\s*,\s*\d+)$", re.IGNORECASE
-)
-_ANY_TRAILING_LIMIT = re.compile(
+_WRAP_HEAD = "SELECT * FROM ("
+_WRAP_TAIL = " AS _sift_q WHERE "
+# At unwrap time the dialect is unknown: every shape the Phase 1 wrap ever hoisted is put
+# back.
+_HOISTED_LIMIT = re.compile(
     r"(\s+LIMIT\s+\d+(?:\s+OFFSET\s+\d+)?"
     r"|\s+OFFSET\s+\d+\s+LIMIT\s+\d+"
     r"|\s+LIMIT\s+\d+\s*,\s*\d+)$",
     re.IGNORECASE,
 )
-_TRAILING_LIMIT_BY_DIALECT = {
-    "postgresql": _PG_TRAILING_LIMIT,
-    "mysql": _MYSQL_TRAILING_LIMIT,
-}
 
 
-def _split_trailing_limit(sql: str, dialect: str) -> tuple[str, str]:
-    """``(body, tail)``: *sql* without its trailing row-limiting clause, and that clause
-    verbatim (``""`` when there is none). *sql* is already right-stripped of whitespace
-    and ``;``.
+_MAX_ROW_FILTERS = 200
+_BARE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+_QUOTE_BY_DIALECT = {"postgresql": '"', "mysql": "`"}
+_SHAPE = "row_filters must be an object mapping schema.table to a condition"
 
-    PostgreSQL: ``LIMIT n``, ``LIMIT n OFFSET m``, ``OFFSET m LIMIT n``. MySQL: ``LIMIT n``,
-    ``LIMIT n OFFSET m``, ``LIMIT m, n``. An unrecognised dialect hoists any of them. A
-    clause the engine does not have stays inside the wrap; when it precedes a recognised
-    trailing ``LIMIT n`` only that ``LIMIT`` is hoisted. Either way the result has fewer rows,
-    never more.
+
+# The longest identifier each engine keeps: PostgreSQL truncates at 63 bytes (NAMEDATALEN
+# - 1), MySQL refuses more than 64 characters.
+_MAX_NAME = {"postgresql": ("bytes", 63), "mysql": ("characters", 64)}
+
+
+def _key_part(part: str, dialect: str) -> str | None:
+    """*part* as a bare name, or the inside of a correctly quoted one; ``None`` if neither.
+
+    A quoted part may not start or end with whitespace: the rewriter refuses such a key at
+    every execution, so it is refused here first."""
+    quote = _QUOTE_BY_DIALECT.get((dialect or "").lower())
+    if quote and len(part) >= 2 and part[0] == quote and part[-1] == quote:
+        inner = part[1:-1]
+        ok = inner and quote not in inner and inner == inner.strip()
+        ok = ok and not _CONTROL_CHARACTER.search(inner)
+        return inner if ok else None
+    return part if _BARE_NAME.match(part) else None
+
+
+def _too_long(name: str, dialect: str) -> bool:
+    unit, limit = _MAX_NAME.get((dialect or "").lower(), ("bytes", 63))
+    size = len(name.encode("utf-8")) if unit == "bytes" else len(name)
+    return size > limit
+
+
+def validate_row_filters(raw: object, dialect: str) -> dict[str, str]:
+    """The clean per-table map, or ``RowFilterInvalidError`` naming the key and the reason.
+
+    Keys: ``schema.table``, each part a bare name (``[A-Za-z_][A-Za-z0-9_$]*``) or a quoted
+    identifier of the dialect with no quote inside, stored without the quotes and with the
+    casing given (the rewriter compares it exactly with the engine-normalised reference).
+    Values: ``validate_row_filter``'s textual rules, then a sqlglot parse as one condition.
+    Nothing is checked against the schema (spec section 6).
     """
-    pattern = _TRAILING_LIMIT_BY_DIALECT.get((dialect or "").lower(), _ANY_TRAILING_LIMIT)
-    match = pattern.search(sql)
-    if not match:
-        return sql, ""
-    return sql[: match.start()], match.group(1)
-
-
-def _inject_row_filter(sql: str, row_filter_sql: str, dialect: str) -> str:
-    """Enforce a mandatory row-level filter by wrapping the query in a derived table.
-
-    The query goes on its own lines inside the parentheses, so a trailing ``-- note`` (or
-    MySQL ``#`` comment) ends before the closing ``)``. A trailing ``LIMIT``/``OFFSET`` clause
-    in one of the engine's shapes (``_split_trailing_limit``) is hoisted outside so the filter
-    applies before row truncation. Safe for CTEs: all SQL dialects supported by Savvina allow
-    inline CTEs in subqueries.
-
-    The filter is applied to the query's *output*, so the query must project every column
-    the filter names (``row_filter_sql = "tenant_id = 7"`` needs ``tenant_id`` in the SELECT
-    list). One that does not fails at the database: fail-closed by design.
-
-    A query whose parentheses do not balance (``SELECT * FROM t) AS a --``) would close the
-    wrap early and leave the rest of the statement outside the filter, so it is rejected
-    with ``RowFilterRejectedError`` and never sent. The check lexes as *dialect*'s engine
-    does (``row_filter_scan``) and fails closed on anything it cannot read with certainty:
-    a backslash in a string literal, a MySQL executable comment, an unterminated string or
-    comment. An unrecognised dialect must satisfy both the PostgreSQL and MySQL rules.
-
-    Trust model: ``row_filter_sql`` is sourced exclusively from the connection's
-    privacy settings, which are written by an authenticated org-admin through the
-    settings UI.  It is never derived from user-supplied chat input, so the
-    injection risk is limited to a compromised admin account.
-    """
-    sql = sql.rstrip().rstrip(";").rstrip()
-    sql, limit_clause = _split_trailing_limit(sql, dialect)
-    if not _parentheses_balance(sql, dialect):
-        raise RowFilterRejectedError(
-            "The query cannot be run under the connection's row filter: its parentheses"
-            " do not balance, or it uses a construct the filter cannot safely enclose (a"
-            " backslash in a string literal, an executable comment, or an unterminated"
-            " string or comment)."
-        )
-    return f"SELECT * FROM (\n{sql}\n) AS _sift_q WHERE {row_filter_sql}{limit_clause}"  # noqa: S608
-
-
-_WRAP_HEAD = "SELECT * FROM ("
-_WRAP_TAIL = " AS _sift_q WHERE "
-# At unwrap time the dialect is unknown: every shape ever hoisted is put back.
-_HOISTED_LIMIT = _ANY_TRAILING_LIMIT
+    if not isinstance(raw, dict):
+        raise RowFilterInvalidError(_SHAPE)
+    if len(raw) > _MAX_ROW_FILTERS:
+        raise RowFilterInvalidError(f"row_filters has at most {_MAX_ROW_FILTERS} entries")
+    dialect_name = dialect or "SQL"
+    read = sqlglot_dialect(dialect)
+    if raw and read is None:
+        raise RowFilterInvalidError("row_filters are not supported for this database")
+    clean: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise RowFilterInvalidError("row_filters keys and conditions must be strings")
+        stripped = key.strip()
+        parts = stripped.split(".")
+        if len(parts) != 2:
+            raise RowFilterInvalidError(f'row_filters key "{stripped}" must be schema.table')
+        names = [_key_part(p, dialect) for p in parts]
+        if None in names:
+            raise RowFilterInvalidError(f'row_filters key "{stripped}" has an invalid name')
+        if any(_too_long(n, dialect) for n in names):
+            raise RowFilterInvalidError(
+                f'row_filters key "{stripped}" is longer than the database allows'
+            )
+        stored = f"{names[0]}.{names[1]}"
+        if stored in clean:
+            raise RowFilterInvalidError(f'row_filters key "{stored}" appears twice')
+        try:
+            condition = validate_row_filter(value, dialect)
+        except RowFilterInvalidError as exc:
+            raise RowFilterInvalidError(f'row_filters["{stored}"] {exc}') from exc
+        if condition is None:
+            raise RowFilterInvalidError(f'row_filters["{stored}"] is empty')
+        try:
+            parsed = parse_condition(condition, read)
+        except (ParseError, TokenError) as exc:  # TokenError is not a ParseError
+            raise RowFilterInvalidError(
+                f'row_filters["{stored}"] is not a valid condition for {dialect_name}'
+            ) from exc
+        except RecursionError as exc:
+            raise RowFilterInvalidError(f'row_filters["{stored}"] is nested too deeply') from exc
+        if parsed.find(exp.Placeholder, exp.Parameter):
+            raise RowFilterInvalidError(
+                f'row_filters["{stored}"] must not contain a placeholder; write the value itself'
+            )
+        if parsed.find(exp.Insert, exp.Update, exp.Delete, exp.Merge):
+            raise RowFilterInvalidError(f'row_filters["{stored}"] must not modify data')
+        clean[stored] = condition
+    return clean
 
 
 def _closing_paren(sql: str, open_at: int) -> int | None:
     """Offset of the ``)`` that closes the ``(`` at *open_at*, as sqlparse lexes *sql* (the
-    lexing ``_inject_row_filter`` has always used); ``None`` when nothing closes it."""
+    lexing the Phase 1 wrap has always used); ``None`` when nothing closes it."""
     depth = 0
     offset = open_at
     for ttype, value in sqlparse.lexer.tokenize(sql[open_at:]):
@@ -217,7 +256,7 @@ def _unwrap_once(sql: str) -> str | None:
 
 
 def unwrap_row_filter(sql: str) -> str:
-    """The query *sql* was before ``_inject_row_filter`` wrapped it; *sql* itself otherwise.
+    """The query *sql* was before the Phase 1 wrap wrapped it; *sql* itself otherwise.
 
     Reverses both wraps ever stored: the current ``SELECT * FROM (\\n<sql>\\n) AS _sift_q
     WHERE <filter>`` and the pre-Task-9 ``SELECT * FROM (<sql>) AS _sift_q WHERE <filter>``,
@@ -241,13 +280,22 @@ def unwrap_row_filter(sql: str) -> str:
 
 
 def _executable(sql: str, privacy: PrivacySettings | None, dialect: str) -> str:
-    """The SQL actually sent to the database: *sql* wrapped in the row filter when one is set.
+    """The SQL actually sent to the database: *sql* with every filtered table reference
+    rewritten (``apply_row_filters``) when the connection has row filters.
 
     Only this form reaches the adapter. The correction prompt, the ``sql`` event, the stored
-    message and the cache row all carry the clean query the model wrote — the wrapped form
-    names the admin's filter columns and literals, and a corrected query must be wrapped
+    message and the cache row all carry the clean query the model wrote: the rewritten form
+    names the admin's filter columns and literals, and a corrected query must be rewritten
     again, not executed bare.
+
+    A connection in the migration state (a legacy ``row_filter_sql`` and no map) runs
+    nothing: ``RowFilterRejectedError`` with ``_MIGRATION_MESSAGE``. The chat paths check
+    that state before generating; this is the safety net for every other caller.
     """
-    if privacy and privacy.row_filter_sql:
-        return _inject_row_filter(sql, privacy.row_filter_sql, dialect)
+    if privacy is None:
+        return sql
+    if privacy.row_filter_needs_migration:
+        raise RowFilterRejectedError(_MIGRATION_MESSAGE)
+    if privacy.row_filters:
+        return apply_row_filters(sql, privacy.row_filters, dialect)
     return sql

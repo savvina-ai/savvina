@@ -14,6 +14,7 @@ import pytest
 from app.datasources.models import QueryResult, ValidationResult
 from app.providers.base import LLMResponse
 from app.services.chat_service import ChatService
+from app.services.row_filter_rewrite import apply_row_filters
 
 pytestmark = pytest.mark.usefixtures("stored_semantic_model")
 
@@ -463,3 +464,167 @@ class TestStreamMessageExecutionMode:
         assert "row_batch" not in types
         done = next(e for e in events if e["type"] == "done")
         assert done["status"] == "pending_approval"
+
+
+# ── Row filter and masking end to end ─────────────────────────────────────────
+
+
+class TestStreamMessageRowFilterAndMasking:
+    """With row filters set, the database sees the rewritten SQL; the ``sql`` events, the
+    stored message and the cache row all carry the clean SQL; every ``row_batch`` event and
+    the stored result are masked."""
+
+    async def test_rewritten_on_the_wire_clean_everywhere_else(self):
+        clean = "SELECT email AS contact FROM users"
+        filters = {"public.users": "tenant_id = 7"}
+        conn = _make_connection(privacy_settings={"row_filters": filters})
+        db = _make_db_with_conn(conn)
+        adapter = _make_adapter(batch_rows=[["a@x.com"]], batch_cols=["contact"])
+        executed: list[str] = []
+        inner_stream = adapter.execute_query_stream
+
+        async def _capturing_stream(query, **kwargs):
+            executed.append(query)
+            async for batch in inner_stream(query, **kwargs):
+                yield batch
+
+        adapter.execute_query_stream = _capturing_stream
+        provider = _make_provider()
+
+        svc = ChatService(MagicMock(), MagicMock())
+        svc.cache.store = AsyncMock()
+        save = AsyncMock(return_value=MagicMock(id="m"))
+
+        with (
+            patch(f"{_MODULE}.get_settings", return_value=_make_settings()),
+            patch(f"{_MODULE}.decrypt_value", return_value=json.dumps({"host": "db"})),
+            patch(f"{_MODULE}.create_datasource", return_value=adapter),
+            patch(f"{_MODULE}._create_session", _mock_session_factory(db)),
+            patch(f"{_MODULE}._resolve_schema") as mock_schema,
+            patch(f"{_MODULE}._generate_query") as mock_gen,
+            patch(f"{_MODULE}._validate_and_correct_query") as mock_val,
+            patch(f"{_MODULE}._get_or_create_session") as mock_session,
+            patch(f"{_MODULE}._save_user_message", new=AsyncMock()),
+            patch(f"{_MODULE}._save_assistant_message", new=save),
+        ):
+            mock_schema.return_value = MagicMock(
+                schema=MagicMock(), connected=False, embeddings_available=False
+            )
+            mock_gen.return_value = MagicMock(
+                generated_query=clean,
+                explanation="contacts",
+                error=None,
+                status="executed",
+                cache_hit=False,
+                cache_embedding=[0.1],
+                provider=provider,
+                configured_model="m",
+                system_prompt="s",
+                history=[],
+            )
+            mock_val.return_value = MagicMock(
+                generated_query=clean, explanation="contacts", error=None, status="executed"
+            )
+            mock_session.return_value = MagicMock(id="sess-1")
+
+            events = await _collect(
+                svc.stream_message(
+                    connection_id="conn-1",
+                    session_id=None,
+                    message="contacts?",
+                    provider_name="claude",
+                    options={},
+                )
+            )
+
+        assert executed == [apply_row_filters(clean, filters, "postgresql")]
+        assert "WHERE (tenant_id = 7)" in executed[0]
+        assert [e["query"] for e in events if e["type"] == "sql"] == [clean]
+        assert [e["rows"] for e in events if e["type"] == "row_batch"] == [[["[REDACTED]"]]]
+        saved = save.await_args.kwargs
+        assert saved["query"] == clean
+        assert saved["results_json"]["rows"] == [["[REDACTED]"]]
+        svc.cache.store.assert_awaited_once()
+        assert svc.cache.store.await_args.kwargs["generated_query"] == clean
+
+    async def test_failed_zero_result_refinement_is_neither_stored_nor_cached(self):
+        original = "SELECT id FROM users WHERE id < 0"
+        refined = "SELECT id FROM users WHERE id > 0"
+        conn = _make_connection()
+        db = _make_db_with_conn(conn)
+        adapter = _make_adapter()
+        calls = {"n": 0}
+
+        async def _stream(query, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                yield QueryResult(
+                    columns=["id"],
+                    column_types=["integer"],
+                    rows=[],
+                    row_count=0,
+                    truncated=False,
+                    execution_time_ms=1.0,
+                )
+                return
+            raise RuntimeError("boom")
+            yield  # pragma: no cover
+
+        adapter.execute_query_stream = _stream
+        provider = _make_provider(_make_llm_response(query=refined, explanation="refined"))
+
+        svc = ChatService(MagicMock(), MagicMock())
+        svc.cache.store = AsyncMock()
+        save = AsyncMock(return_value=MagicMock(id="m"))
+
+        with (
+            patch(f"{_MODULE}.get_settings", return_value=_make_settings()),
+            patch(f"{_MODULE}.decrypt_value", return_value=json.dumps({"host": "db"})),
+            patch(f"{_MODULE}.create_datasource", return_value=adapter),
+            patch(f"{_MODULE}._create_session", _mock_session_factory(db)),
+            patch(f"{_MODULE}._resolve_schema") as mock_schema,
+            patch(f"{_MODULE}._generate_query") as mock_gen,
+            patch(f"{_MODULE}._validate_and_correct_query") as mock_val,
+            patch(f"{_MODULE}._get_or_create_session") as mock_session,
+            patch(f"{_MODULE}._save_user_message", new=AsyncMock()),
+            patch(f"{_MODULE}._save_assistant_message", new=save),
+        ):
+            mock_schema.return_value = MagicMock(
+                schema=MagicMock(), connected=False, embeddings_available=False
+            )
+            mock_gen.return_value = MagicMock(
+                generated_query=original,
+                explanation="original",
+                error=None,
+                status="executed",
+                cache_hit=False,
+                cache_embedding=[0.1],
+                provider=provider,
+                configured_model="m",
+                configured_max_tokens=1024,
+                system_prompt="s",
+                history=[],
+            )
+            mock_val.return_value = MagicMock(
+                generated_query=original, explanation="original", error=None, status="executed"
+            )
+            mock_session.return_value = MagicMock(id="sess-1")
+
+            await _collect(
+                svc.stream_message(
+                    connection_id="conn-1",
+                    session_id=None,
+                    message="ids?",
+                    provider_name="claude",
+                    options={},
+                )
+            )
+
+        assert calls["n"] == 2  # the refinement did run, and failed
+        saved = save.await_args.kwargs
+        assert saved["query"] == original
+        assert saved["content"] == "original"
+        assert saved["results_json"]["rows"] == []
+        stored = [c.kwargs["generated_query"] for c in svc.cache.store.await_args_list]
+        assert refined not in stored
+        assert stored == [original]

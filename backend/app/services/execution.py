@@ -8,7 +8,8 @@ Result masking lives in ``result_masking``. The streaming path builds one
 final payload; the non-streaming path masks the complete result with
 ``_mask_sensitive_result_columns``.
 
-The row-filter wrap lives in ``row_filter``; its names are re-exported here for existing importers.
+The row-filter rewrite lives in ``row_filter``; its names are re-exported here for existing
+importers.
 """
 
 from __future__ import annotations
@@ -42,7 +43,6 @@ from .result_masking import (
 from .row_filter import (  # noqa: F401 — re-exported for existing importers
     RowFilterRejectedError,
     _executable,
-    _inject_row_filter,
     unwrap_row_filter,
 )
 
@@ -91,23 +91,38 @@ def _exec_error_text(exc: BaseException) -> str:
     return f"Query failed ({type(exc).__name__})"
 
 
-def _user_facing_error(exec_error: str, category: ErrorCategory, note: str | None = None) -> str:
+def _user_facing_error(
+    exec_error: str, category: ErrorCategory, note: str | None = None, *, verbatim: bool = False
+) -> str:
     """The error shown to the user and stored on the message for a failed execution.
 
     *exec_error* is the engine's text, redacted by category (``redact_error_for_user``):
-    value-quoting categories lose their quoted spans and extra lines. The raw text goes to
-    the server log only. The self-correction's note, when it gave one, follows the redacted
-    text.
+    value-quoting categories lose their quoted spans and extra lines. With *verbatim* the
+    text is ours (a ``RowFilterRejectedError``) and is shown as it is. This is a guard in
+    case the category ever changes: today rejections are classified SYNTAX, which is not
+    redacted, but a redacting category would cut the text at the first apostrophe. The raw
+    text goes to the server log only. The
+    self-correction's note, when it gave one, follows the text.
     """
     logger.debug("Execution failed (%s): %s", category, exec_error)
-    shown = redact_error_for_user(category, exec_error)
+    shown = exec_error if verbatim else redact_error_for_user(category, exec_error)
     return f"{shown}\n\nNote: {note}" if note else shown
 
 
 def _user_error_text(adapter: object, exc: BaseException) -> str:
     """``_user_facing_error`` for a single execution with no correction loop (approve,
     edit-and-execute, sort)."""
-    return _user_facing_error(_exec_error_text(exc), _classify(adapter, exc))
+    return _user_facing_error(
+        _exec_error_text(exc), _classify(adapter, exc), verbatim=_is_rejection(exc)
+    )
+
+
+def _is_rejection(exc: BaseException) -> bool:
+    return isinstance(exc, RowFilterRejectedError)
+
+
+def _llm_hint(exc: BaseException) -> str | None:
+    return exc.llm_hint if isinstance(exc, RowFilterRejectedError) else None
 
 
 def _classify(adapter: object, exc: BaseException) -> ErrorCategory:
@@ -201,7 +216,7 @@ async def _execute_auto_query(
 ) -> _ExecutionResult:
     """Step 12 auto_execute: run query, handle errors, attempt execution correction.
 
-    Every executed statement is wrapped in the row filter (``_executable``), including each
+    Every executed statement is rewritten by the row filter (``_executable``), including each
     corrected and zero-result-refined query; the returned ``generated_query`` (stored on the
     message and in the cache) and every correction prompt carry the clean SQL. Each result is
     masked by the plan of the statement that produced it.
@@ -222,29 +237,32 @@ async def _execute_auto_query(
     exec_error: str | None = None
     error_note: str | None = None
     exec_category = ErrorCategory.OTHER
+    exec_verbatim = False
+    exec_hint: str | None = None
     clean_query = generated_query  # the model's SQL: prompts, storage and the cache use this
     max_exec_attempts = _MAX_SELF_CORRECTION_ATTEMPTS + 1  # initial + retries
 
-    async def _run(clean: str) -> QueryResult:
+    async def _run(executed: str) -> QueryResult:
         return await adapter.execute_query(
-            _executable(clean, privacy, dialect),
+            executed,
             timeout=settings.default_query_timeout,
             max_rows=max_rows,
         )
 
-    def _masked(query_result: QueryResult, clean: str) -> QueryResultsResponse:
+    def _masked(query_result: QueryResult, executed: str, clean: str) -> QueryResultsResponse:
         return _mask_sensitive_result_columns(
             _results_to_response(query_result),
             privacy,
-            sql=_executable(clean, privacy, dialect),
+            sql=executed,
             original_sql=clean,
             double_quote_is_string_literal=dq_literal,
         )
 
     for attempt in range(max_exec_attempts):
         try:
-            query_result = await _run(clean_query)
-            results_response = _masked(query_result, clean_query)
+            executed = _executable(clean_query, privacy, dialect)
+            query_result = await _run(executed)
+            results_response = _masked(query_result, executed, clean_query)
             execution_time_ms = query_result.execution_time_ms
             bytes_scanned_val = query_result.bytes_scanned
             exec_error = None
@@ -252,6 +270,8 @@ async def _execute_auto_query(
         except Exception as e:
             exec_error = _exec_error_text(e)
             exec_category = _classify(adapter, e)
+            exec_verbatim = _is_rejection(e)
+            exec_hint = _llm_hint(e)
 
         if attempt < max_exec_attempts - 1 and not cache_hit and provider is not None:
             corrected_query, corrected_explanation = await _attempt_sql_execution_correction(
@@ -267,6 +287,7 @@ async def _execute_auto_query(
                 adapter=adapter,
                 attempt_num=attempt + 1,
                 error_category=exec_category,
+                llm_hint=exec_hint,
             )
             if corrected_query:
                 clean_query = corrected_query
@@ -281,7 +302,7 @@ async def _execute_auto_query(
             break
 
     if exec_error:
-        error = _user_facing_error(exec_error, exec_category, error_note)
+        error = _user_facing_error(exec_error, exec_category, error_note, verbatim=exec_verbatim)
         status = "error"
 
     # ── Zero-result detection ──────────────────────────────────────────────────
@@ -310,8 +331,9 @@ async def _execute_auto_query(
         )
         if zero_query:
             try:
-                query_result = await _run(zero_query)
-                results_response = _masked(query_result, zero_query)
+                zero_executed = _executable(zero_query, privacy, dialect)
+                query_result = await _run(zero_executed)
+                results_response = _masked(query_result, zero_executed, zero_query)
                 execution_time_ms = query_result.execution_time_ms
                 bytes_scanned_val = query_result.bytes_scanned
                 clean_query = zero_query
@@ -422,7 +444,7 @@ async def _stream_statement(
 ) -> AsyncGenerator[RowBatchEvent, None]:
     """Execute one statement on the streaming path and yield its masked ``row_batch`` events.
 
-    The database receives *clean_query* wrapped in the row filter; the result mask is
+    The database receives *clean_query* rewritten by the row filter; the result mask is
     planned once for this statement (from the clean SQL) and stored on *acc*, so every
     batch here and the final payload built from *acc* are redacted by the same plan.
     """
@@ -476,7 +498,7 @@ async def _stream_self_correction_phase(
     Preconditions: out["exec_error"] is truthy, provider is not None, and
     cache_hit is False — the caller should skip this generator otherwise.
 
-    Each corrected query is executed through _stream_statement: wrapped in the row filter,
+    Each corrected query is executed through _stream_statement: rewritten by the row filter,
     its batches masked by a plan built for it. The prompt and the ``sql`` event carry the
     clean query.
 
@@ -486,6 +508,9 @@ async def _stream_self_correction_phase(
     - ``out["exec_error"]``     — set to None on success; the latest failure's text when
                                   all correction attempts are exhausted
     - ``out["exec_category"]``  — the category of the latest failure
+    - ``out["exec_hint"]``      — the latest failure's ``RowFilterRejectedError.llm_hint``,
+                                  else None
+    - ``out["exec_verbatim"]``  — True when the latest failure was a ``RowFilterRejectedError``
     - ``out["error_note"]``     — the correction's note when it gave up with one
     """
     for _attempt in range(1, _MAX_SELF_CORRECTION_ATTEMPTS + 1):
@@ -503,6 +528,7 @@ async def _stream_self_correction_phase(
             adapter=adapter,
             attempt_num=_attempt,
             error_category=out["exec_category"],
+            llm_hint=out["exec_hint"],
         )
         if not corrected_query:
             out["error_note"] = corrected_explanation or None
@@ -514,6 +540,8 @@ async def _stream_self_correction_phase(
         acc.reset_rows()
         out["exec_error"] = None
         out["exec_category"] = ErrorCategory.OTHER
+        out["exec_hint"] = None
+        out["exec_verbatim"] = False
         try:
             async for event in _stream_statement(
                 adapter,
@@ -528,6 +556,8 @@ async def _stream_self_correction_phase(
         except Exception as exc:
             out["exec_error"] = _exec_error_text(exc)
             out["exec_category"] = _classify(adapter, exc)
+            out["exec_hint"] = _llm_hint(exc)
+            out["exec_verbatim"] = _is_rejection(exc)
         if not out["exec_error"]:
             return
 
@@ -633,7 +663,7 @@ async def _stream_execute_with_correction(
 
     Yields RowBatchEvent/StatusEvent/SqlEvent objects as execution progresses, applying
     self-correction and zero-result recovery using the same helpers as _execute_auto_query.
-    Every executed statement is wrapped in the row filter; every ``row_batch`` event and
+    Every executed statement is rewritten by the row filter; every ``row_batch`` event and
     the final payload are masked by the plan of the statement that produced them, so a
     client watching the stream and one reading the stored message see the same values.
     Prompts, ``sql`` events and the stored result carry the clean SQL. Stores the final
@@ -664,6 +694,8 @@ async def _stream_execute_with_correction(
         "exec_error": None,  # the engine's text; see _user_facing_error for what is shown
         "error_note": None,
         "exec_category": ErrorCategory.OTHER,
+        "exec_hint": None,
+        "exec_verbatim": False,
         "zero_result_reexecuted": False,
     }
 
@@ -682,6 +714,8 @@ async def _stream_execute_with_correction(
     except Exception as exc:
         out["exec_error"] = _exec_error_text(exc)
         out["exec_category"] = _classify(adapter, exc)
+        out["exec_hint"] = _llm_hint(exc)
+        out["exec_verbatim"] = _is_rejection(exc)
 
     # Self-correction retry loop
     if out["exec_error"] and not cache_hit and provider is not None:
@@ -709,7 +743,12 @@ async def _stream_execute_with_correction(
             execution_time_ms=acc.execution_time_ms,
             bytes_scanned=None,
             status="error",
-            error=_user_facing_error(out["exec_error"], out["exec_category"], out["error_note"]),
+            error=_user_facing_error(
+                out["exec_error"],
+                out["exec_category"],
+                out["error_note"],
+                verbatim=out["exec_verbatim"],
+            ),
             generated_query=out["clean_query"],
             explanation=out["explanation"],
             connected=connected,

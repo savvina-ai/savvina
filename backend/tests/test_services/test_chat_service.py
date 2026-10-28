@@ -38,6 +38,7 @@ from app.semantic.models import SemanticModel
 from app.services.chat_service import ChatService
 from app.services.execution import _results_to_response
 from app.services.result_masking import _mask_sensitive_result_columns
+from app.services.row_filter_rewrite import apply_row_filters
 from app.services.schema_utils import (
     LARGE_TABLE_ROW_THRESHOLD,
     _check_query_complexity,
@@ -618,10 +619,10 @@ class TestProcessMessageFullPipeline:
         assert resp.error is not None
         adapter.execute_query.assert_not_called()
 
-    async def test_row_filter_wraps_execution_but_message_and_cache_carry_clean_sql(self):
-        # The wrap filters the derived table, so the query must project the filter's column.
+    async def test_row_filter_rewrites_execution_but_message_and_cache_carry_clean_sql(self):
         clean = "SELECT id, tenant_id FROM users"
-        conn = _make_connection(privacy_settings={"row_filter_sql": "tenant_id = 7"})
+        filters = {"public.users": "tenant_id = 7"}
+        conn = _make_connection(privacy_settings={"row_filters": filters})
         adapter = _make_adapter()
         provider = _make_llm_provider(_make_llm_response(query=clean))
         db = self._make_full_db(conn)
@@ -643,9 +644,9 @@ class TestProcessMessageFullPipeline:
         ):
             resp = await service.process_message("conn-1", None, "q?", "claude", {})
 
-        assert adapter.execute_query.await_args.args[0] == (
-            f"SELECT * FROM (\n{clean}\n) AS _sift_q WHERE tenant_id = 7"  # noqa: S608
-        )
+        executed = adapter.execute_query.await_args.args[0]
+        assert executed == apply_row_filters(clean, filters, "postgresql")
+        assert "WHERE (tenant_id = 7)" in executed
         assert resp.query == clean
         assert save.await_args.kwargs["query"] == clean
         assert service.cache.store.await_args.kwargs["generated_query"] == clean
@@ -1070,9 +1071,9 @@ class TestUserFacingErrorOnReExecution:
 
 
 class TestRowFilterRejectionOnReExecution:
-    async def test_unbalanced_edit_is_rejected_without_running(self):
+    async def test_unparsable_edit_is_rejected_without_running(self):
         msg = _make_msg(status="pending_approval")
-        conn = _make_connection(privacy_settings={"row_filter_sql": "tenant_id = 7"})
+        conn = _make_connection(privacy_settings={"row_filters": {"public.users": "tenant_id = 7"}})
         db = _make_db(MockResult(row=(msg, _make_session(), conn)), MockResult())
         adapter = _make_adapter()
         service = ChatService(MagicMock(), MagicMock())
@@ -1083,11 +1084,11 @@ class TestRowFilterRejectionOnReExecution:
             _patch_create_datasource(adapter),
         ):
             resp = await service.edit_and_execute(
-                message_id="msg-1", edited_query="SELECT * FROM users) AS a --", db=db
+                message_id="msg-1", edited_query="SELECT * FROM users WHERE (", db=db
             )
 
         assert resp.status == "error"
-        assert "row filter" in resp.error
+        assert "could not be parsed by the row-filter rewriter" in resp.error
         adapter.execute_query.assert_not_called()
 
 
@@ -1544,19 +1545,22 @@ class TestMaskSensitiveResultColumns:
         assert result is resp
 
 
-# ── Stored wrapped SQL is run with a single wrap ──────────────────────────────
+# ── Stored wrapped SQL is unwrapped and rewritten once ────────────────────────
 
 _FILTER = "tenant_id = 7"
+_FILTERS = {"public.users": _FILTER}
 _CLEAN_SQL = "SELECT id, tenant_id FROM users"
 # What the pre-Task-9 non-streaming path stored in ChatMessage.query_generated and in
-# cache rows: the row-filter wrap around the model's query.
+# cache rows: the Phase 1 row-filter wrap around the model's query.
 _OLD_WRAPPED_SQL = "SELECT * FROM (SELECT id, tenant_id FROM users) AS _sift_q WHERE tenant_id = 7"
-_ONE_WRAP_SQL = "SELECT * FROM (\nSELECT id, tenant_id FROM users\n) AS _sift_q WHERE tenant_id = 7"
 
 
-class TestStoredWrappedSqlRunsOneWrap:
+class TestStoredWrappedSqlRunsRewrittenOnce:
+    """A row stored under the old wrap is unwrapped, then rewritten per table: the database
+    never sees ``_sift_q`` and the filter is applied exactly once."""
+
     def _conn(self, **kwargs) -> MagicMock:
-        return _make_connection(privacy_settings={"row_filter_sql": _FILTER}, **kwargs)
+        return _make_connection(privacy_settings={"row_filters": _FILTERS}, **kwargs)
 
     async def test_cache_hit_on_a_stored_wrapped_query(self):
         adapter = _make_adapter()
@@ -1581,8 +1585,9 @@ class TestStoredWrappedSqlRunsOneWrap:
         assert resp.cache_hit is True
         assert resp.query == _CLEAN_SQL
         executed = adapter.execute_query.await_args.args[0]
-        assert executed.count("_sift_q") == 1
-        assert executed == _ONE_WRAP_SQL
+        assert "_sift_q" not in executed
+        assert executed == apply_row_filters(_CLEAN_SQL, _FILTERS, "postgresql")
+        assert "WHERE (tenant_id = 7)" in executed
 
     async def test_execute_pending_on_a_stored_wrapped_query(self):
         msg = _make_msg(status="pending_approval", query_generated=_OLD_WRAPPED_SQL)
@@ -1599,7 +1604,8 @@ class TestStoredWrappedSqlRunsOneWrap:
 
         assert resp.status == "executed"
         executed = adapter.execute_query.await_args.args[0]
-        assert executed == _ONE_WRAP_SQL
+        assert executed == apply_row_filters(_CLEAN_SQL, _FILTERS, "postgresql")
+        assert "WHERE (tenant_id = 7)" in executed
         assert resp.query == _CLEAN_SQL
 
     async def test_sort_on_a_stored_wrapped_query(self):
@@ -1619,7 +1625,132 @@ class TestStoredWrappedSqlRunsOneWrap:
             )
 
         executed = adapter.execute_query.await_args.args[0]
-        assert executed == (
-            'SELECT * FROM (\nSELECT id, tenant_id FROM users\nORDER BY "id" DESC\n)'
-            " AS _sift_q WHERE tenant_id = 7"
-        )
+        sorted_sql = 'SELECT id, tenant_id FROM users\nORDER BY "id" DESC'
+        assert executed == apply_row_filters(sorted_sql, _FILTERS, "postgresql")
+        assert "WHERE (tenant_id = 7)" in executed
+
+
+# ── Migration state: a legacy row_filter_sql and no row_filters ───────────────
+
+_LEGACY_PRIVACY = {"row_filter_sql": "tenant_id = 7"}
+
+
+class TestRowFilterMigrationState:
+    async def test_load_connection_stage_raises_before_any_generation(self):
+        from app.services.chat_service import _RowFilterMigrationError, _stage_load_connection
+        from app.services.row_filter import _MIGRATION_MESSAGE
+
+        conn = _make_connection(privacy_settings=_LEGACY_PRIVACY)
+        db = _make_db(MockResult(single=conn))
+        with (
+            _patch_decrypt({"host": "localhost"}),
+            pytest.raises(_RowFilterMigrationError) as excinfo,
+        ):
+            await _stage_load_connection("conn-1", db, _make_settings())
+        assert str(excinfo.value) == _MIGRATION_MESSAGE
+
+    async def test_process_message_is_a_400_without_an_llm_call(self):
+        conn = _make_connection(privacy_settings=_LEGACY_PRIVACY)
+        adapter = _make_adapter()
+        provider = _make_llm_provider()
+        db = _make_db(MockResult(single=conn))
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            _patch_create_provider(provider),
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, _make_null_db())),
+            pytest.raises(ValueError, match="needs migration"),
+        ):
+            await service.process_message("conn-1", None, "q?", "claude", {})
+
+        provider.generate_response.assert_not_called()
+        adapter.execute_query.assert_not_called()
+
+    async def test_stream_message_emits_the_error_without_an_llm_call(self):
+        conn = _make_connection(privacy_settings=_LEGACY_PRIVACY)
+        adapter = _make_adapter()
+        provider = _make_llm_provider()
+        db = _make_db(MockResult(single=conn))
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            _patch_create_provider(provider),
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, _make_null_db())),
+        ):
+            events = [e async for e in service.stream_message("conn-1", None, "q?", "claude", {})]
+
+        errors = [e for e in events if e["type"] == "error"]
+        assert len(errors) == 1 and "needs migration" in errors[0]["message"]
+        assert events[-1]["type"] == "done" and events[-1]["status"] == "error"
+        provider.generate_response.assert_not_called()
+
+    async def test_execute_pending_is_rejected_verbatim(self):
+        from app.services.row_filter import _MIGRATION_MESSAGE
+
+        msg = _make_msg(status="pending_approval", query_generated="SELECT id FROM users")
+        conn = _make_connection(privacy_settings=_LEGACY_PRIVACY)
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)), MockResult())
+        adapter = _make_adapter()
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+        ):
+            resp = await service.execute_pending(message_id="msg-1", db=db)
+
+        assert resp.status == "error"
+        assert resp.error == _MIGRATION_MESSAGE
+        adapter.execute_query.assert_not_called()
+
+    async def test_edit_and_execute_is_rejected_verbatim(self):
+        from app.services.row_filter import _MIGRATION_MESSAGE
+
+        msg = _make_msg(status="pending_approval")
+        conn = _make_connection(privacy_settings=_LEGACY_PRIVACY)
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)), MockResult())
+        adapter = _make_adapter()
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+        ):
+            resp = await service.edit_and_execute(
+                message_id="msg-1", edited_query="SELECT id FROM users", db=db
+            )
+
+        assert resp.status == "error"
+        assert resp.error == _MIGRATION_MESSAGE
+        adapter.execute_query.assert_not_called()
+
+    async def test_sort_and_execute_is_rejected_verbatim(self):
+        from app.services.row_filter import _MIGRATION_MESSAGE
+
+        msg = _make_msg(status="executed", query_generated="SELECT id, tenant_id FROM users")
+        msg.results_json = {"columns": ["id", "tenant_id"], "rows": []}
+        conn = _make_connection(privacy_settings=_LEGACY_PRIVACY)
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)))
+        adapter = _make_adapter()
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            pytest.raises(ValueError, match="Sort execution failed") as excinfo,
+        ):
+            await service.sort_and_execute(
+                message_id="msg-1", sort_column="id", sort_order="DESC", db=db
+            )
+
+        assert _MIGRATION_MESSAGE in str(excinfo.value)
+        adapter.execute_query.assert_not_called()

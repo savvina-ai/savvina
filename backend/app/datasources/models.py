@@ -141,10 +141,24 @@ class PrivacySettings:
     # format: "schema.table" or bare "table" — same syntax as excluded_tables
     always_include_tables: list[str] = field(default_factory=list)
     schema_pruning_threshold: float = 0.30  # per-connection cosine threshold for table relevance
-    # Optional SQL condition every executed statement is wrapped in as a mandatory row-level
-    # filter, e.g. "tenant_id = 'acme-corp'". Validated on write (services/row_filter.py:
-    # validate_row_filter) and applied by _inject_row_filter.
+    # Per-table row filters: {"schema.table": "<condition without WHERE>"}, keyed by the
+    # names as introspection reports them. Validated on write
+    # (services/row_filter.py: validate_row_filters) and applied by
+    # services/row_filter_rewrite.apply_row_filters, which replaces each listed table
+    # reference with a filtered derived table. Tables not listed are unfiltered.
+    row_filters: dict[str, str] = field(default_factory=dict)
+    # Legacy (before per-table filters): the whole-query condition. Read-only; nothing
+    # writes it any more. A connection that still has one and no row_filters is in the
+    # migration state (row_filter_needs_migration) and runs nothing until the admin acts.
     row_filter_sql: str | None = None
+
+    @property
+    def row_filter_needs_migration(self) -> bool:
+        """The single definition of the migration state: a legacy whole-query filter is
+        stored and the per-table map is empty. A stored ``{}`` next to a legacy value is
+        still the migration state; the connections router never stores that combination
+        (it refuses the empty map or removes the legacy value)."""
+        return bool(self.row_filter_sql) and not self.row_filters
 
     def is_column_sensitive(self, column_name: str) -> bool:
         """Check if a column name matches any sensitive pattern."""

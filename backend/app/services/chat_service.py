@@ -61,6 +61,7 @@ from .pipeline import (
     _generate_query,
 )
 from .result_masking import _double_quote_is_literal, _mask_sensitive_result_columns
+from .row_filter import _MIGRATION_MESSAGE
 from .schema_pruning import (
     _filter_semantic_by_relevance,
     _filter_semantic_to_schema,
@@ -91,6 +92,12 @@ class ResourceNotFoundError(ValueError):
 
 class _PipelineError(Exception):
     """Raised by pipeline stage functions; callers convert to SSE error or status field."""
+
+
+class _RowFilterMigrationError(_PipelineError):
+    """The connection still has the Phase 1 whole-query filter and no per-table map: no
+    generation, no execution, until the admin acts
+    (``PrivacySettings.row_filter_needs_migration``)."""
 
 
 @dataclass
@@ -208,6 +215,9 @@ async def _stage_load_connection(
     """Stage 1-2: load active connection, decrypt config, create datasource adapter.
 
     Raises _PipelineError if the connection is not found or inactive.
+    Raises _RowFilterMigrationError (a _PipelineError) when the connection is in the row-filter
+    migration state: the streaming path emits it as the error event, process_message turns it
+    into a 400.
     """
     conn_result = await db.execute(
         select(Connection).where(
@@ -224,6 +234,8 @@ async def _stage_load_connection(
         if conn.privacy_settings
         else PrivacySettings()
     )
+    if privacy.row_filter_needs_migration:
+        raise _RowFilterMigrationError(_MIGRATION_MESSAGE)
     adapter = create_datasource(conn.source_type)
     return conn, config_dict, privacy, adapter
 
@@ -858,6 +870,8 @@ class ChatService:
                     examples=self.examples,
                     settings=settings,
                 )
+            except _RowFilterMigrationError as exc:
+                raise ValueError(str(exc)) from exc
             except _PipelineError as exc:
                 raise ResourceNotFoundError(str(exc)) from exc
         # ── Session A closed — LLM inference already completed inside _stage_generate
@@ -1020,14 +1034,15 @@ class ChatService:
         )
         adapter = create_datasource(conn.source_type)
 
-        # A row stored before Task 9 may hold the row-filter wrap: run it wrapped once.
+        # A row stored before Task 9 may hold the legacy row-filter wrap: unwrap it, then
+        # rewrite it once.
         clean_query = unwrap_row_filter(msg.query_generated)
         approved_query = clean_query
 
         exec_error: str | None = None
         query_result: QueryResult | None = None
         try:
-            # Wrapping can reject the query (RowFilterRejectedError): handled like any
+            # The row-filter rewrite can reject the query (RowFilterRejectedError): handled like any
             # execution failure below.
             approved_query = _executable(approved_query, privacy, adapter.query_dialect)
             await adapter.connect(config_dict)
@@ -1296,8 +1311,8 @@ class ChatService:
 
         if not msg.query_generated:
             raise ValueError("Message has no generated query")
-        # A row stored before Task 9 may hold the row-filter wrap: sort the query inside
-        # it, then wrap once.
+        # A row stored before Task 9 may hold the legacy row-filter wrap: unwrap it,
+        # sort the query, then rewrite it once.
         original_query = unwrap_row_filter(msg.query_generated)
 
         # 4. Inject ORDER BY
@@ -1327,7 +1342,7 @@ class ChatService:
         if complexity_error:
             raise ValueError(f"Sort query failed complexity check: {complexity_error}")
 
-        # Apply row filter after ORDER BY injection (wraps the sorted query)
+        # Apply row filter after ORDER BY injection (rewrites the sorted query)
         run_query = sorted_query
 
         # 7. Execute

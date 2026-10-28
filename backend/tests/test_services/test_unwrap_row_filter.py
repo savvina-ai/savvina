@@ -1,21 +1,41 @@
 # Copyright (c) 2025 Savvina AI Ltd
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-"""unwrap_row_filter: stored SQL loses exactly the wrap _inject_row_filter put on it."""
+"""unwrap_row_filter: stored SQL loses exactly the Phase 1 wrap put on it."""
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
-from app.services.execution import _inject_row_filter, unwrap_row_filter
+from app.services.execution import unwrap_row_filter
 
 _F = "tenant_id = 7"
+
+_PG_TRAILING = re.compile(
+    r"(\s+LIMIT\s+\d+(?:\s+OFFSET\s+\d+)?|\s+OFFSET\s+\d+\s+LIMIT\s+\d+)$", re.IGNORECASE
+)
+_MYSQL_TRAILING = re.compile(
+    r"(\s+LIMIT\s+\d+(?:\s+OFFSET\s+\d+)?|\s+LIMIT\s+\d+\s*,\s*\d+)$", re.IGNORECASE
+)
+
+
+def _new_wrap(sql: str, row_filter_sql: str, dialect: str) -> str:
+    """The Phase 1 wrap, copied from the removed ``_inject_row_filter``: the query on its own
+    lines, the engine's trailing LIMIT/OFFSET shape hoisted outside."""
+    sql = sql.rstrip().rstrip(";").rstrip()
+    pattern = _PG_TRAILING if dialect == "PostgreSQL" else _MYSQL_TRAILING
+    match = pattern.search(sql)
+    tail = ""
+    if match:
+        tail = match.group(1)
+        sql = sql[: match.start()]
+    return f"SELECT * FROM (\n{sql}\n) AS _sift_q WHERE {row_filter_sql}{tail}"  # noqa: S608
 
 
 def _old_wrap(sql: str, row_filter_sql: str) -> str:
     """The wrap the non-streaming path stored before Task 9: no newlines, no balance check."""
-    import re
-
     sql = sql.rstrip(";").rstrip()
     limit_match = re.search(r"(\s+LIMIT\s+\d+)\s*$", sql, re.IGNORECASE)
     limit_clause = ""
@@ -52,7 +72,7 @@ class TestRoundTrip:
     @pytest.mark.parametrize("sql", _QUERIES)
     @pytest.mark.parametrize("row_filter_sql", _FILTERS)
     def test_new_form_round_trips(self, dialect: str, sql: str, row_filter_sql: str) -> None:
-        assert unwrap_row_filter(_inject_row_filter(sql, row_filter_sql, dialect)) == sql
+        assert unwrap_row_filter(_new_wrap(sql, row_filter_sql, dialect)) == sql
 
     @pytest.mark.parametrize("sql", [q for q in _QUERIES if "--" not in q])
     @pytest.mark.parametrize("row_filter_sql", _FILTERS)
@@ -87,14 +107,14 @@ class TestRoundTrip:
         assert unwrap_row_filter(stored) == "SELECT id, tenant_id FROM t LIMIT 5"
 
     def test_trailing_semicolon_is_not_restored(self) -> None:
-        wrapped = _inject_row_filter("SELECT id, tenant_id FROM t;", _F, "PostgreSQL")
+        wrapped = _new_wrap("SELECT id, tenant_id FROM t;", _F, "PostgreSQL")
         assert unwrap_row_filter(wrapped) == "SELECT id, tenant_id FROM t"
 
     @pytest.mark.parametrize("wrap", ["new", "old"])
     def test_double_wrap_from_an_old_cache_hit_is_fully_removed(self, wrap: str) -> None:
         inner = "SELECT id, tenant_id FROM t LIMIT 3"
         if wrap == "new":
-            twice = _inject_row_filter(_inject_row_filter(inner, _F, "PostgreSQL"), _F, "MySQL")
+            twice = _new_wrap(_new_wrap(inner, _F, "PostgreSQL"), _F, "MySQL")
         else:
             twice = _old_wrap(_old_wrap(inner, _F), _F)
         assert unwrap_row_filter(twice) == inner

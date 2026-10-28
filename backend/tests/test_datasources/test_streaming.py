@@ -168,6 +168,8 @@ class TestPostgreSQLExecuteQueryStream:
     def _make_record(self, **fields) -> MagicMock:
         r = MagicMock()
         r.keys.return_value = list(fields.keys())
+        r.values.return_value = list(fields.values())
+        r.__iter__ = lambda self: iter(fields.values())
         r.__getitem__ = lambda self, k: fields[k]
         return r
 
@@ -267,3 +269,33 @@ class TestPostgreSQLExecuteQueryStream:
 
         batches = await _drain(adapter.execute_query_stream("SELECT alpha, beta FROM t"))
         assert batches[0].columns == ["alpha", "beta"]
+        assert batches[0].rows == [[1, 2]]
+
+    async def test_cursor_runs_in_a_read_only_transaction(self):
+        from app.datasources.adapters.postgresql import PostgreSQLDataSource
+
+        pool = self._make_pool([self._make_record(id=1)])
+        adapter = PostgreSQLDataSource()
+        adapter._pool = pool  # type: ignore[assignment]
+
+        await _drain(adapter.execute_query_stream("SELECT id FROM t"))
+
+        conn_mock = pool.acquire.return_value.__aenter__.return_value
+        conn_mock.transaction.assert_called_once_with(readonly=True)
+
+    async def test_statement_timeout_and_standard_strings_set_locally(self):
+        from unittest.mock import call
+
+        from app.datasources.adapters.postgresql import PostgreSQLDataSource
+
+        pool = self._make_pool([self._make_record(id=1)])
+        adapter = PostgreSQLDataSource()
+        adapter._pool = pool  # type: ignore[assignment]
+
+        await _drain(adapter.execute_query_stream("SELECT id FROM t", timeout=15))
+
+        conn_mock = pool.acquire.return_value.__aenter__.return_value
+        assert conn_mock.execute.call_args_list == [
+            call("SET LOCAL statement_timeout = 15000"),
+            call("SET LOCAL standard_conforming_strings = on"),
+        ]

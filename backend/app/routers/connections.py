@@ -42,10 +42,15 @@ from ..schemas.connection import (
 )
 from ..schemas.pagination import PaginatedResponse
 from ..semantic import store as semantic_store
-from ..services.row_filter import RowFilterInvalidError, validate_row_filter
+from ..services.row_filter import RowFilterInvalidError, validate_row_filters
 from ..services.schema_utils import SchemaRefreshError, refresh_user_schema_cache
 from ..utils.encryption import decrypt_value, encrypt_value
-from ._utils import _invalidate_connection_caches, cached_json_response, get_connection_or_404
+from ._utils import (
+    _invalidate_connection_caches,
+    cached_json_response,
+    get_connection_or_404,
+    lock_and_reread_connection,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/connections", tags=["connections"])
@@ -77,14 +82,18 @@ def _query_dialect(source_type: str) -> str:
         return ""
 
 
-def _validated_row_filter(text: object, source_type: str) -> str | None:
-    """*text* as ``validate_row_filter`` returns it, or HTTP 422 with the reason."""
-    if text is not None and not isinstance(text, str):
-        raise HTTPException(status_code=422, detail="Row filter must be a string")
+_LEGACY_FILTER_DETAIL = (
+    "row_filters: this connection still has the old whole-query filter. Define per-table"
+    " filters, or send clear_legacy_row_filter to remove it."
+)
+
+
+def _validated_row_filters(raw: object, source_type: str) -> dict[str, str]:
+    """*raw* as ``validate_row_filters`` returns it, or HTTP 422 with the reason."""
     try:
-        return validate_row_filter(text, _query_dialect(source_type))
+        return validate_row_filters(raw, _query_dialect(source_type))
     except RowFilterInvalidError as exc:
-        raise HTTPException(status_code=422, detail=f"Row filter {exc}") from exc
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _mask_config(config: dict) -> dict:
@@ -161,11 +170,14 @@ async def create_connection(
             detail=f"A connection named '{body.name}' already exists.",
         )
     privacy = body.privacy_settings
-    if privacy is not None and privacy.get("row_filter_sql") is not None:
-        privacy = {
-            **privacy,
-            "row_filter_sql": _validated_row_filter(privacy["row_filter_sql"], body.source_type),
-        }
+    if privacy is not None:
+        # The legacy whole-query filter is never written: a new connection cannot be born
+        # in the migration state.
+        privacy = {k: v for k, v in privacy.items() if k != "row_filter_sql"}
+        if "row_filters" in privacy:
+            privacy["row_filters"] = _validated_row_filters(
+                privacy["row_filters"], body.source_type
+            )
     settings = get_settings()
     config_encrypted = encrypt_value(json.dumps(body.config), settings.encryption_key)
     conn = Connection(
@@ -330,16 +342,38 @@ async def update_privacy(
     _user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> ConnectionDetail:
-    conn = await get_connection_or_404(connection_id, db)
-    existing: dict = dict(conn.privacy_settings) if conn.privacy_settings else {}
-    existing.update(body.model_dump(exclude_none=True))
-    if body.row_filter_sql is not None:
-        # "" clears the filter: stored as an explicit None, which exclude_none dropped.
-        existing["row_filter_sql"] = _validated_row_filter(body.row_filter_sql, conn.source_type)
+    # Row lock: two simultaneous saves cannot both read the old JSON and let the later one
+    # overwrite the earlier one's map. A stale tab sending an old map is not covered.
+    conn = await lock_and_reread_connection(connection_id, db)
+    prior: dict = dict(conn.privacy_settings) if conn.privacy_settings else {}
+    existing: dict = dict(prior)
+    changes = body.model_dump(exclude_none=True, exclude={"clear_legacy_row_filter"})
+    existing.update(changes)
+    legacy = bool(existing.get("row_filter_sql"))
+    if body.row_filters is not None:
+        existing["row_filters"] = _validated_row_filters(body.row_filters, conn.source_type)
+        if existing["row_filters"]:
+            # Defining real filters ends the migration state.
+            existing.pop("row_filter_sql", None)
+        elif legacy and not body.clear_legacy_row_filter:
+            # An empty map must not drop the old filter silently (an unrelated save sends
+            # the whole form): the admin removes it explicitly or defines filters.
+            raise HTTPException(status_code=422, detail=_LEGACY_FILTER_DETAIL)
+    if body.clear_legacy_row_filter:
+        existing.pop("row_filter_sql", None)
+        existing.setdefault("row_filters", {})
     await db.execute(
         update(Connection).where(Connection.id == connection_id).values(privacy_settings=existing)
     )
-    await _invalidate_connection_caches(connection_id, db)
+    # A row-filter change does not alter introspection: keep the schema cache so the page's
+    # schema read does not 404 after the save. Cached answers hold only generated SQL, which
+    # runs through the row-filter rewrite again on every hit, so flushing them (and the
+    # embeddings, which the helper flushes together with them) is a safe extra, not a
+    # correctness need.
+    # The UI sends the whole form, so look at stored values, not at the keys sent. A key
+    # missing from storage counts as changed.
+    changed = {k for k, v in changes.items() if k not in prior or prior[k] != v}
+    await _invalidate_connection_caches(connection_id, db, keep_schema=changed <= {"row_filters"})
     await db.commit()
     await db.refresh(conn)
     return conn

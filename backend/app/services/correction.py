@@ -8,8 +8,10 @@ from __future__ import annotations
 import logging
 
 from ..datasources.base import BaseDataSource
+from ..datasources.errors import ErrorCategory
 from ..datasources.models import DataSourceSchema
 from ..providers.base import BaseLLMProvider
+from .error_feedback import describe_error_for_llm
 from .schema_utils import _check_query_complexity, _validate_columns_against_schema
 
 logger = logging.getLogger(__name__)
@@ -196,62 +198,130 @@ async def _attempt_complexity_correction(
     return None, ""
 
 
-# Hints injected into the correction prompt for well-known SQL runtime errors.
-_EXEC_ERROR_HINTS: dict[str, str] = {
-    "division by zero": (
-        "Use NULLIF(divisor, 0) to guard against division by zero. "
-        "Example: revenue / NULLIF(spent, 0)."
-    ),
+_PERMISSION_ADVICE = (
+    "The database has denied access to one or more objects or columns in your query. "
+    "Do NOT attempt to rewrite the query to retrieve that data via a workaround. "
+    "Instead, respond with an EXPLANATION only (no QUERY block) telling the user "
+    "which object is restricted and that it cannot be accessed with their current credentials."
+)
+
+_UNKNOWN_NAME_ADVICE = (
+    "A column or relation name was not found. Check for typos and confirm the exact names "
+    "from the schema. Qualify ambiguous column names with the table name. If a function "
+    "exists but rejects its arguments, cast them explicitly with CAST(... AS ...) instead of "
+    "switching to a different function."
+)
+
+_AMBIGUOUS_ADVICE = (
+    "A column or alias reference is ambiguous. "
+    "For ORDER BY: use column ordinal positions (e.g. ORDER BY 3 DESC) instead of alias names. "
+    "For SELECT/WHERE/JOIN: qualify the column with its table or CTE name "
+    "(e.g. cte_name.column_name or table_alias.column_name)."
+)
+
+_DIVISION_ADVICE = (
+    "Use NULLIF(divisor, 0) to guard against division by zero. Example: revenue / NULLIF(spent, 0)."
+)
+
+# Each hint is keyed by a fragment of the engine's text and tagged with the category it
+# belongs to. A text match is used only when it agrees with the classified category (or
+# the category is OTHER): the text is read here for hint selection and never copied into
+# the prompt. Dict order is match order; the backtick entry must precede the generic
+# "syntax error at or near" one.
+_EXEC_ERROR_HINTS: dict[str, tuple[ErrorCategory, str]] = {
+    "division by zero": (ErrorCategory.DIVISION_BY_ZERO, _DIVISION_ADVICE),
     "aggregate functions are not allowed in where": (
+        ErrorCategory.GROUPING,
         "Aggregate functions (SUM, AVG, COUNT, MIN, MAX) cannot appear in a WHERE clause. "
-        "Move aggregate conditions to a HAVING clause."
+        "Move aggregate conditions to a HAVING clause.",
     ),
-    "select permission was denied on the column": (
-        "The database has denied SELECT access to one or more columns in your query. "
-        "Do NOT attempt to rewrite the query to retrieve that data via a workaround. "
-        "Instead, respond with an EXPLANATION only (no QUERY block) telling the user "
-        "which column is restricted and that it cannot be accessed with their current credentials."
-    ),
-    "the select permission was denied": (
-        "The database has denied SELECT access to one or more objects in your query. "
-        "Do NOT attempt to rewrite the query to retrieve that data via a workaround. "
-        "Instead, respond with an EXPLANATION only (no QUERY block) telling the user "
-        "which object is restricted and that it cannot be accessed with their current credentials."
-    ),
+    "select permission was denied on the column": (ErrorCategory.PERMISSION, _PERMISSION_ADVICE),
+    "the select permission was denied": (ErrorCategory.PERMISSION, _PERMISSION_ADVICE),
     "must appear in the group by clause": (
+        ErrorCategory.GROUPING,
         "Every non-aggregated column in SELECT must appear in GROUP BY. "
         "If the column is a scalar from a single-row CTE, wrap it in MAX() or MIN(). "
         "Prefer a single aggregate query over CTEs for percentages: "
-        "SUM(CASE WHEN ... THEN 1 ELSE 0 END)::numeric / COUNT(*) * 100."
+        "SUM(CASE WHEN ... THEN 1 ELSE 0 END)::numeric / COUNT(*) * 100.",
     ),
     'filter" is not supported': (
+        ErrorCategory.UNSUPPORTED,
         "The FILTER clause on aggregate functions is not supported by this database. "
         "Replace agg(...) FILTER (WHERE condition) with agg(CASE WHEN condition THEN expr END). "
-        "Example: COUNT(*) FILTER (WHERE status = 'x') → COUNT(CASE WHEN status = 'x' THEN 1 END)."
+        "Example: COUNT(*) FILTER (WHERE status = 'x') → COUNT(CASE WHEN status = 'x' THEN 1 END).",
     ),
-    "does not exist": (
-        "A column or relation name was not found. Check for typos and confirm the exact names "
-        "from the schema. Qualify ambiguous column names with the table name."
-    ),
+    "does not exist": (ErrorCategory.UNKNOWN_NAME, _UNKNOWN_NAME_ADVICE),
     "ambiguous column": (
+        ErrorCategory.AMBIGUOUS_NAME,
         "A column name appears in multiple joined tables. Qualify it with its table name, "
-        "e.g. table_name.column_name."
+        "e.g. table_name.column_name.",
     ),
     "invalid input syntax for type": (
+        ErrorCategory.DATA,
         "A value cannot be cast to the expected column type. Use an explicit CAST or :: operator "
-        "(e.g. column::integer) and ensure the value matches the target type."
+        "(e.g. column::integer) and ensure the value matches the target type.",
+    ),
+    # The composed description no longer carries the database's text, so the model cannot
+    # itself notice that the reported location is a backtick — say so explicitly, and only
+    # where the raw text actually names one.
+    'at or near "`': (
+        ErrorCategory.SYNTAX,
+        "The database's message points at a backtick (`) in your query. "
+        'PostgreSQL uses double quotes (") for quoted identifiers, not backticks — '
+        'replace `name` with "name". '
+        "Also check for unclosed parentheses, missing commas, or incorrect clause ordering.",
     ),
     "syntax error at or near": (
-        "There is a SQL syntax error near the highlighted token. "
-        'If the token is a backtick (`), replace it with double quotes (") — '
-        "PostgreSQL uses double quotes for quoted identifiers, not backticks. "
-        "Also check for unclosed parentheses, missing commas, or incorrect clause ordering."
+        ErrorCategory.SYNTAX,
+        "There is a SQL syntax error in your query for this SQL dialect. "
+        "Check for typos, incorrect keywords, unclosed parentheses, missing commas, "
+        "or incorrect clause ordering.",
     ),
-    "is ambiguous": (
-        "A column or alias reference is ambiguous. "
-        "For ORDER BY: use column ordinal positions (e.g. ORDER BY 3 DESC) instead of alias names. "
-        "For SELECT/WHERE/JOIN: qualify the column with its table or CTE name "
-        "(e.g. cte_name.column_name or table_alias.column_name)."
+    "is ambiguous": (ErrorCategory.AMBIGUOUS_NAME, _AMBIGUOUS_ADVICE),
+}
+
+# Used when no text hint both matched and agreed with the category (a non-English server,
+# or the only textual match was refused). Dialect-neutral by construction: these fire for
+# PostgreSQL and MySQL alike.
+_CATEGORY_FALLBACK_HINTS: dict[ErrorCategory, str] = {
+    ErrorCategory.UNKNOWN_NAME: _UNKNOWN_NAME_ADVICE,
+    ErrorCategory.AMBIGUOUS_NAME: _AMBIGUOUS_ADVICE,
+    ErrorCategory.GROUPING: (
+        "Every non-aggregated column in SELECT must appear in GROUP BY, or be wrapped in an "
+        "aggregate such as MAX() or MIN(). Aggregate conditions belong in HAVING, not WHERE."
+    ),
+    ErrorCategory.DIVISION_BY_ZERO: _DIVISION_ADVICE,
+    ErrorCategory.PERMISSION: _PERMISSION_ADVICE,
+    ErrorCategory.DATA: (
+        "Guard the conversion: filter out the rows whose values cannot be converted before "
+        "casting, cast with a CASE that checks the value's shape first, or select a different "
+        "column that already has the right type."
+    ),
+    ErrorCategory.TYPE_MISMATCH: (
+        "An operator or function received operands of incompatible types. Cast one side "
+        "explicitly so both sides share a type, and check the argument types the function expects."
+    ),
+    # The model no longer sees the engine's `near '...'` location, so name the usual causes.
+    ErrorCategory.SYNTAX: (
+        "A reserved word used as an alias or column name must be quoted with the dialect's "
+        "identifier quote (double quotes in PostgreSQL, backticks in MySQL). "
+        "Every derived table (subquery in FROM) needs an alias, and all UNION/INTERSECT/EXCEPT "
+        "branches need the same number of columns. "
+        "Also check for unclosed parentheses, missing or trailing commas, and clause order "
+        "(SELECT ... FROM ... WHERE ... GROUP BY ... HAVING ... ORDER BY ... LIMIT)."
+    ),
+    ErrorCategory.CARDINALITY: (
+        "A subquery used as a single value returned more than one row. Use IN or EXISTS "
+        "instead of =, aggregate the subquery (MAX or MIN), or add LIMIT 1 only if any one "
+        "row is acceptable."
+    ),
+    ErrorCategory.TIMEOUT: (
+        "The query exceeded the time limit. Narrow it: filter earlier, aggregate instead "
+        "of returning raw rows, or reduce the number of joins."
+    ),
+    ErrorCategory.UNSUPPORTED: (
+        "Only a single read-only SELECT (or WITH … SELECT) is permitted. Rewrite the statement "
+        "as one, and avoid features this database engine lacks."
     ),
 }
 
@@ -269,25 +339,45 @@ async def _attempt_sql_execution_correction(
     schema: DataSourceSchema | None,
     adapter: BaseDataSource,
     attempt_num: int = 1,
+    error_category: ErrorCategory = ErrorCategory.OTHER,
+    llm_hint: str | None = None,
 ) -> tuple[str | None, str]:
     """Ask the LLM to self-correct a query that failed at execution time (single attempt).
 
-    Sends the failed query and runtime error (plus a targeted hint for known error patterns)
-    back to the LLM with explicit correction instructions.  Re-validates the corrected query
-    before returning it.  The caller is responsible for looping if multiple retries are needed.
-    Returns (corrected_query, explanation) on success, or (None, "") if still invalid.
+    Sends the failed query and *our own* description of the runtime error (plus a targeted
+    hint) back to the LLM. The database's error text is read here to pick a hint and is
+    never copied into the prompt: it can quote a value stored in the tables. Re-validates
+    the corrected query before returning it. Returns (corrected_query, explanation) on
+    success, or (None, "") if still invalid. *llm_hint* is a ``RowFilterRejectedError.llm_hint``,
+    appended to the description as it is.
     """
     hint = ""
-    for pattern, advice in _EXEC_ERROR_HINTS.items():
-        if pattern in exec_error.lower():
-            hint = f"\n\nHint: {advice}"
-            break
+    lowered = exec_error.lower()
+    for pattern, (category, advice) in _EXEC_ERROR_HINTS.items():
+        if pattern not in lowered:
+            continue
+        # A text match is trusted only when it agrees with the classified category, or
+        # when nothing more specific was determined (OTHER). Under OTHER a fixed hint may
+        # be chosen from the raw text, which reveals at most which of the fixed phrases
+        # appeared in the engine message: accepted, because the phrases are engine wording,
+        # not data, and OTHER has no better signal.
+        if error_category is not ErrorCategory.OTHER and error_category is not category:
+            continue
+        hint = f"\n\nHint: {advice}"
+        break
+    if not hint:
+        fallback = _CATEGORY_FALLBACK_HINTS.get(error_category)
+        if fallback:
+            hint = f"\n\nHint: {fallback}"
 
+    error_description = describe_error_for_llm(
+        error_category, exec_error, sql=failed_query, schema=schema, hint=llm_hint
+    )
     correction_message = (
         f"The query you generated failed when executed against the database"
         f" (correction attempt {attempt_num}):\n\n"
         f"FAILED QUERY:\n```sql\n{failed_query}\n```\n\n"
-        f"EXECUTION ERROR:\n{exec_error}{hint}\n\n"
+        f"EXECUTION ERROR:\n{error_description}{hint}\n\n"
         f"Please correct the query to fix the above error. "
         f"The original question was: {original_question}"
     )

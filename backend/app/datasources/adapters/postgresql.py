@@ -12,6 +12,13 @@ from typing import Any
 import asyncpg
 
 from ..base import BaseDataSource, _serialize
+from ..errors import (
+    NAME_ECHOING_CATEGORIES,
+    ErrorCategory,
+    category_for_sqlstate,
+    classify_chain,
+    refine_undefined_function,
+)
 from ..models import (
     ColumnInfo,
     ConnectionResult,
@@ -75,6 +82,11 @@ async def close_all_pools() -> None:
         pool = _pool_cache.pop(key, None)
         if pool is not None and not pool.is_closing():
             await pool.close()
+
+
+def _column_types(record: Any) -> list[str]:
+    """Python type name of each field of *record*, by position (``unknown`` for NULL)."""
+    return [type(v).__name__ if v is not None else "unknown" for v in record.values()]
 
 
 def _quote_pg_ident(name: str) -> str:
@@ -569,47 +581,6 @@ class PostgreSQLDataSource(BaseDataSource):
             except Exception:
                 return []
 
-    # OVERHEAD: catalog-read only
-    async def get_column_statistics(
-        self,
-        schema: str,
-        table: str,
-        column: str,
-    ) -> dict:
-        """Read column statistics from pg_stats (populated by autovacuum/ANALYZE).
-
-        Zero impact on production workload. Returns empty dict if no stats exist.
-        """
-        if self._pool is None:
-            raise RuntimeError("Not connected.")
-        query = """
-            SELECT
-                n_distinct,
-                null_frac,
-                avg_width,
-                most_common_vals::text,
-                most_common_freqs,
-                correlation
-            FROM pg_stats
-            WHERE schemaname = $1
-              AND tablename  = $2
-              AND attname    = $3
-        """
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(query, schema, table, column)
-            if not row:
-                return {}
-            return {
-                "n_distinct": row["n_distinct"],
-                "null_frac": row["null_frac"],
-                "avg_width": row["avg_width"],
-                "most_common_vals": self._parse_pg_text_array(row["most_common_vals"]),
-                "most_common_freqs": list(row["most_common_freqs"])
-                if row["most_common_freqs"]
-                else [],
-                "correlation": row["correlation"],
-            }
-
     # ── Query execution ────────────────────────────────────────────────────────
 
     async def execute_query(
@@ -623,8 +594,14 @@ class PostgreSQLDataSource(BaseDataSource):
             raise RuntimeError("Not connected.")
 
         start = time.monotonic()
-        async with self._pool.acquire() as conn, conn.transaction():
+        # READ ONLY is enforced by the engine: a write the text validator missed — including
+        # SELECT … INTO, nextval()/setval() and CREATE TABLE AS — is refused with SQLSTATE 25006.
+        async with self._pool.acquire() as conn, conn.transaction(readonly=True):
             await conn.execute(f"SET LOCAL statement_timeout = {timeout * 1000}")
+            # The row-filter rewriter reads string literals as standard strings (a backslash
+            # is an ordinary character). Pin that here so a server, database or role default
+            # of off cannot make the engine read a literal differently from the rewriter.
+            await conn.execute("SET LOCAL standard_conforming_strings = on")
             records = await conn.fetch(query)
 
         elapsed_ms = (time.monotonic() - start) * 1000
@@ -638,16 +615,14 @@ class PostgreSQLDataSource(BaseDataSource):
                 execution_time_ms=elapsed_ms,
             )
 
+        # By position, never by name: an asyncpg Record looked up by name returns the last
+        # field of that name, so ``SELECT count(*), count(DISTINCT x)`` (two columns named
+        # ``count``) would show the second value twice. keys()/values() keep every field.
         columns = list(records[0].keys())
-        column_types = [
-            type(records[0][col]).__name__ if records[0][col] is not None else "unknown"
-            for col in columns
-        ]
+        column_types = _column_types(records[0])
 
         truncated = len(records) > max_rows
-        rows: list[list[Any]] = [
-            [_serialize(r[col]) for col in columns] for r in records[:max_rows]
-        ]
+        rows: list[list[Any]] = [[_serialize(v) for v in r.values()] for r in records[:max_rows]]
 
         return QueryResult(
             columns=columns,
@@ -682,21 +657,24 @@ class PostgreSQLDataSource(BaseDataSource):
         column_types: list[str] | None = None
         first_batch = True
 
-        async with self._pool.acquire() as conn, conn.transaction():
+        # READ ONLY is enforced by the engine: a write the text validator missed — including
+        # SELECT … INTO, nextval()/setval() and CREATE TABLE AS — is refused with SQLSTATE 25006.
+        async with self._pool.acquire() as conn, conn.transaction(readonly=True):
             await conn.execute(f"SET LOCAL statement_timeout = {timeout * 1000}")
+            # The row-filter rewriter reads string literals as standard strings (a backslash
+            # is an ordinary character). Pin that here so a server, database or role default
+            # of off cannot make the engine read a literal differently from the rewriter.
+            await conn.execute("SET LOCAL standard_conforming_strings = on")
             async for record in conn.cursor(query, prefetch=batch_size):
                 if columns is None:
                     columns = list(record.keys())
-                    column_types = [
-                        type(record[col]).__name__ if record[col] is not None else "unknown"
-                        for col in columns
-                    ]
+                    column_types = _column_types(record)
 
                 if total >= max_rows:
                     # We've hit the limit; yield remaining batch then stop
                     break
 
-                batch.append([_serialize(record[col]) for col in columns])
+                batch.append([_serialize(v) for v in record.values()])  # by position
                 total += 1
 
                 if len(batch) >= batch_size:
@@ -752,6 +730,26 @@ class PostgreSQLDataSource(BaseDataSource):
     def validate_query(self, query: str) -> ValidationResult:
         """Delegate to the PostgreSQL-specific validator."""
         return self._validator.validate(query)
+
+    def classify_error(self, exc: BaseException) -> ErrorCategory:
+        """Map an asyncpg failure via its SQLSTATE (PostgreSQL docs, Appendix A "Error Codes")."""
+        return classify_chain(exc, self._classify_one)
+
+    @staticmethod
+    def _classify_one(err: BaseException) -> ErrorCategory | None:
+        # Restricted to asyncpg's own hierarchy: an unrelated exception can carry a
+        # same-named `.sqlstate` attribute and must not be read as a database verdict.
+        if not isinstance(err, asyncpg.PostgresError):
+            return None
+        state = getattr(err, "sqlstate", None)
+        if not state:
+            return None
+        category = category_for_sqlstate(state)
+        if category in NAME_ECHOING_CATEGORIES and _may_quote_a_value(err, category):
+            return ErrorCategory.DATA
+        if state.upper() == "42883":
+            return refine_undefined_function(str(err))
+        return category
 
     def get_system_prompt_additions(self) -> str:
         """Return PostgreSQL-specific instructions for the LLM."""
@@ -828,3 +826,58 @@ You are querying a PostgreSQL database. Use PostgreSQL-specific syntax:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+# PostgreSQL reports a stored value it failed to look up or parse under the same SQLSTATEs
+# as a mistake in the query: ``ssn::regclass`` -> 42P01 ``relation "123456789" does not
+# exist``. A name-quoting category (``NAME_ECHOING_CATEGORIES``) keeps the engine's text
+# for the user and lists matching names for the LLM, so such an error must read as DATA.
+# What tells them apart, measured on PostgreSQL 16 (asyncpg 0.30: ``.position`` is the
+# server's 'P' field, a 1-based offset as a str, or None; ``.context`` is 'W'):
+#
+#   SQLSTATE  genuine error in the query           pos   value-driven error            pos
+#   42703     column "nope" does not exist         8     has_column_privilege('u', col) -
+#   42P01     relation "nope" does not exist       15    col::regclass                  -
+#   42883     function nofunc(integer) …; operator 8/10  col::regproc, col::regoper     -
+#             does not exist: integer + boolean;
+#             could not identify an equality op…   17
+#   42704     type "nosuchtype" does not exist     11    current_setting(col),          -
+#             current_setting('nosuch')            -     col::regconfig/regrole/regtype
+#   3F000     nosch.f()                            8     col::regnamespace,             -
+#             has_schema_privilege('nosch', …)     -     has_table_privilege(col, …)
+#   3D000     has_database_privilege('nodb', …)    -     pg_database_size(col)          -
+#   42702     column reference "id" is ambiguous   8     (none found)
+#   42725     function amb(integer) is not unique  8     '+'::text::regoper             -
+#   42601     syntax error at end of input         22    to_tsquery(col), col::tsquery, -
+#                                                        col::jsonpath
+#                                                        col::regtype, to_regtype(col)  6 *
+#             query_to_xml(col, …)                 -     (internal_position 1)
+#   42803     … must appear in the GROUP BY clause 8     (none found)
+#   42804     argument of WHERE must be boolean    23    (none found)
+#   42846     cannot cast type integer to date     9     (none found)
+#   42P18     cannot determine type of empty array 8     (none found)
+#   42501     permission denied for table hidden   -     set_config(col, …) when col   -
+#             permission denied for schema s       15    names a superuser-only setting;
+#             (direct reference); for function     -     col::regclass when col names a
+#                                                        schema the role cannot use
+#
+# * regtype input runs the SQL parser on the stored text: the position points into the
+#   value, and the server adds the context line 'invalid type name "<value>"'.
+#
+# Every genuine error found has a position and no context, except permission errors (most
+# have no position, so 42501/28xxx are exempt from the position test) and a few lookups of a
+# literal the model wrote (current_setting('nosuch'), has_schema_privilege('nosch', …)),
+# which read as DATA: the safe direction. So a name-quoting SQLSTATE is DATA when the error
+# has no position (PERMISSION excepted), or when it has an error context or an internal
+# query (the failing text came from a function or the data, not the model's SQL).
+# Residual: a permission error caused by a stored value that names an existing schema or a
+# superuser-only setting keeps PERMISSION; it can only echo such a name.
+def _may_quote_a_value(err: BaseException, category: ErrorCategory) -> bool:
+    """Whether a PostgreSQL error under a name-quoting *category* may quote a stored value."""
+    if getattr(err, "context", None) or getattr(err, "internal_query", None):
+        return True
+    if getattr(err, "internal_position", None):
+        return True
+    if category is ErrorCategory.PERMISSION:
+        return False
+    return not getattr(err, "position", None)
