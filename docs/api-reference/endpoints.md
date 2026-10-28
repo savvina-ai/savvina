@@ -212,7 +212,7 @@ Create and save a new data source connection.
     "excluded_schemas": [],
     "excluded_tables": [],
     "excluded_columns": [],
-    "row_filter_sql": "tenant_id = 42"
+    "row_filters": {"public.orders": "tenant_id = 42"}
   },
   "execution_mode": "auto_execute"
 }
@@ -220,7 +220,7 @@ Create and save a new data source connection.
 
 **Execution mode values:** `auto_execute`, `review_first`, `generate_only`
 
-`row_filter_sql` is optional; `null` or `""` means no filter. It is validated as described under [Row Filter](../user-guide/04_privacy-controls.md#row-filter).
+`row_filters` is optional, `{"schema.table": "<condition>"}`; `row_filter_sql` is no longer accepted and is dropped. Each entry is validated as described under [Row Filters](../user-guide/04_privacy-controls.md#row-filters); a 422 names the key and the reason.
 
 **Response `201`:** `ConnectionResponse`
 
@@ -320,11 +320,13 @@ Update privacy settings for a connection. Partial updates are supported — omit
   "excluded_schemas": ["audit"],
   "excluded_tables": ["sessions"],
   "excluded_columns": ["public.users.password_hash"],
-  "row_filter_sql": "tenant_id = 42"
+  "row_filters": {"public.orders": "tenant_id = 42"}
 }
 ```
 
-`row_filter_sql`: a string sets the filter after validation, `""` clears it, and `null` or an absent field leaves it unchanged. Changing privacy settings invalidates the connection's caches.
+`row_filters`: an object sets the map after validation, `{}` clears it, and an absent field leaves it unchanged. On a connection that still stores the legacy `row_filter_sql`, `{}` is refused (422) unless `clear_legacy_row_filter: true` is sent as well; that flag alone also removes the legacy filter. `row_filter_sql` in the body is ignored. Changing privacy settings invalidates the connection's caches; a change that only touches `row_filters` keeps the cached schema.
+
+The connection response carries `row_filter_needs_migration: true` while a legacy `row_filter_sql` is stored and no `row_filters` map has been saved; every query on such a connection is refused until one of the two actions above.
 
 **Response `200`:** `ConnectionDetail`
 

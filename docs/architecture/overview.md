@@ -174,8 +174,9 @@ services/
 ├── schema_pruning.py  — schema pruning, relevance filtering, schema resolution
 ├── validation.py      — query validation pipeline (_validate_and_correct_query)
 ├── execution.py       — query execution, ORDER BY injection, streaming
-├── row_filter.py      — row-filter wrap/unwrap, LIMIT hoisting, filter validation
-├── row_filter_scan.py — parenthesis depth of a query as each engine lexes it, for the wrap
+├── row_filter.py         — _executable, unwrap of the old wrap, filter validation
+├── row_filter_rewrite.py — per-table rewrite of a statement with sqlglot
+├── row_filter_errors.py  — RowFilterRejectedError (with llm_hint), RowFilterInvalidError
 ├── result_masking.py  — SELECT-list classifier and [REDACTED] mask for query results
 ├── pipeline.py        — LLM provider setup, prompt compression, query generation
 └── chat_service.py    — ChatService class, session helpers, message persistence
@@ -203,7 +204,8 @@ services/
 | `_check_query_complexity()` | `schema_utils` | Rejects CROSS JOIN and large-table full scans |
 | `_execute_auto_query()` | `execution` | Runs the generated query and handles results |
 | `_plan_result_mask()` / `_mask_sensitive_result_columns()` | `result_masking` | Classifies the SELECT list and redacts sensitive/excluded columns in results, through aliases, expressions, CTEs and subqueries |
-| `_inject_row_filter()` / `validate_row_filter()` | `row_filter` | Wraps every executed statement in the connection's row filter; validates the filter an admin saves |
+| `apply_row_filters()` | `row_filter_rewrite` | Replaces every filtered table reference with a filtered derived table; rejects what it cannot rewrite safely |
+| `_executable()` / `validate_row_filters()` | `row_filter` | The statement the database receives; validates the per-table map an admin saves |
 | `_get_or_create_session()` | `chat_service` | Loads or creates `ChatSession` |
 | `_save_user_message()` / `_save_assistant_message()` | `chat_service` | Persists `ChatMessage` rows |
 

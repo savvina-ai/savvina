@@ -125,31 +125,108 @@ public.users.password_hash
 public.employees.salary
 ```
 
-### Row Filter
+### Row Filters
 
-An optional SQL condition (`row_filter_sql`, e.g. `tenant_id = 42`) that every statement sent to the database is wrapped in:
+Per-table SQL conditions (`row_filters`), one per table the admin lists, e.g.
+`{"public.orders": "tenant_id = 42"}`. Every statement sent to the database is rewritten
+before it runs: each reference to a listed table becomes a filtered derived table,
 
 ```sql
-SELECT * FROM (
-<the query>
-) AS _sift_q WHERE tenant_id = 42
+SELECT o.id FROM (SELECT * FROM public.orders WHERE (tenant_id = 42)) AS o
 ```
 
-This applies to the first execution, every self-corrected retry, the re-run after a query returns no rows, approved queries, edited queries, re-sorts and answers served from the cache. A trailing row limit is moved outside the wrap, so the filter applies before rows are cut: `LIMIT n`, `LIMIT n OFFSET m`, and on PostgreSQL `OFFSET m LIMIT n`, on MySQL `LIMIT m, n`. The SQL shown to you, stored with the message, kept as a verified example and sent to the LLM is the query without the wrap.
+so the filter applies to what the query **reads**, whatever the query projects. Aggregates,
+joins and CTEs over a filtered table are filtered; tables not listed are unfiltered, by
+your choice. The rewrite applies to the first execution, every self-corrected retry, the
+re-run after a query returns no rows, approved queries, edited queries, re-sorts and
+answers served from the cache. The SQL shown to you, stored with the message, kept as a
+verified example and sent to the LLM is the query as the model wrote it.
 
-**Setting it.** Use the **Row filter** field in the Privacy Settings form, when creating a connection or editing one, or send `row_filter_sql` to `POST /api/v1/connections` or `PUT /api/v1/connections/{id}/privacy`. Empty the field, or send `""`, to remove the filter; omitting the field or sending `null` on `PUT` leaves it unchanged. **Reset to defaults** in the form leaves the row filter as it is. Changing the filter invalidates the connection's query cache.
+**Keys.** `schema.table`, written as the database stores the names. Quote a part the way
+the engine does (`public."Orders"` on PostgreSQL, `` `db`.`Orders` `` on MySQL) to keep its
+case; the stored key has no quotes. A query that names a filtered table in a different case
+is rejected rather than run unfiltered (PostgreSQL folds unquoted names to lowercase, so
+`Orders` there means `orders`; MySQL keeps the case). A table in two schemas needs the
+schema in the query, or the query is rejected as ambiguous. A column written as
+`schema.table.column` stops resolving once its table is a derived table; write `table.column`
+or an alias.
 
-**Validation.** The filter is checked when it is saved and rejected (HTTP 422, with the reason) when it contains `;`, a comment (`--`, `/*`, or `#` on MySQL), a `$`, starts with the word `WHERE`, has parentheses that do not balance as the connection's engine reads them, contains a string the check cannot read safely (a backslash or an unterminated quote), or is longer than 1000 characters. The check is textual: a `;` or comment marker inside a string literal is rejected too. A wrong column name is not caught here; it fails at the database on the first query.
+**Child tables.** A table without the tenant column is filtered through its parent:
+`{"public.order_items": "order_id IN (SELECT id FROM orders WHERE tenant_id = 42)"}`. The
+tables named inside a condition are not themselves rewritten.
 
-**Known limit:** the filter is applied to the query's **output**, so the query must return every column the filter names. A query that does not, such as `SELECT COUNT(*) …`, most aggregates, or on MySQL a join whose output has two columns with the same name, fails with a database error instead of running unfiltered. This is deliberate: the filter fails closed.
+**Setting them.** Use the **Row filters** list in the Privacy Settings form (one row per
+table; the table input offers the cached schema's names), or send `row_filters` to
+`POST /api/v1/connections` or `PUT /api/v1/connections/{id}/privacy`. An absent field on
+`PUT` leaves the map unchanged; `{}` clears it. **Reset to defaults** keeps the filters.
+Saving filters clears the connection's cached answers but keeps the cached schema.
 
-A query that the wrap cannot safely enclose is rejected before it is sent: one whose parentheses do not balance, one with a backslash inside a string literal, a MySQL executable comment (`/*! … */`), an unterminated string or comment, a PostgreSQL dollar-quote tag with a non-ASCII character (`$café$…$café$`), or on MySQL two `$` signs with only letters, digits or `_` between them outside a string, comment or backtick-quoted name (`$x$`, `$$`, also an identifier such as `a$b$c`).
+**Validation.** Each key must be `schema.table`; each condition is rejected (HTTP 422,
+naming the key and the reason) when it contains `;`, a comment (`--`, `/*`, or `#` on
+MySQL), a `$`, starts with `WHERE`, is longer than 1000 characters, or is not a single
+well-formed condition for the connection's dialect (so `tenant_id = 7 UNION SELECT 1`,
+`... LIMIT 5` and an unbalanced parenthesis are refused). Keys are not checked against the
+schema: a typo filters a table nothing reads. A wrong column name fails at the database on
+the first query, with the error shown.
+Keys are limited to the database's own identifier length (63 bytes on PostgreSQL, 64
+characters on MySQL); conditions may not contain control characters other than tab and
+newlines, placeholders (`:tenant`, `?`), data-modifying statements, or more than 20 levels
+of nested parentheses.
+
+**How a condition runs.** The condition is read with the connection's SQL dialect and
+written back into each query from that reading, so what runs is that reading of your text.
+On MySQL servers with `PIPES_AS_CONCAT` or `ANSI_QUOTES` enabled, `||` and `"..."` in a
+condition are read as `OR` and as a string, not as the server would read them; avoid both.
+The condition is trusted as written: it runs inside the read-only transaction and the
+statement timeout, and a subquery in it reads its own tables unfiltered.
+
+**Fail-closed.** A statement the rewriter cannot parse, a query with more than one
+statement, a CTE named like a filtered table (inside its own body that name would be the
+unfiltered table; rename the CTE), an ambiguous or mis-cased table name, and a construct
+the rewriter cannot write back are rejected before they are sent; the chat shows the reason.
+So are functions that read rows from SQL or a table name given as a string
+(`query_to_xml`, `table_to_xml` and the rest of that family, `ts_stat`, `ts_rewrite`,
+`crosstab`, `connectby`, the `dblink` functions) and the statistics views that expose column values (`pg_stats`,
+`pg_statistic`, MySQL `information_schema.column_statistics`).
+
+**Limits.** Row filters rewrite table references in the SQL text. A function that runs SQL
+from a string and is not on the list above (an extension, a function defined in your
+database) can still read a filtered table unfiltered. If the connection's database user can
+call such functions, restrict them at the database, or rely on native row-level security.
+
+**Three controls, three jobs.** Row filters decide which rows the database reads. Excluded
+schemas, tables and columns decide what the model is told about. Sensitive patterns and
+excluded columns also decide what is shown: their values come back as `[REDACTED]`. Use
+them together; none of them replaces another.
+
+**Upgrading from 2.2.** The old single `row_filter_sql` is no longer applied. A connection
+that still has one and no `row_filters` is in a migration state: every query is rejected
+with "Row filter needs migration" until you open its privacy settings. The form shows a
+banner with the previous condition. Either add the per-table rows and save, or click
+**Remove the old filter** (after a confirmation) to run unfiltered. A save that would drop
+the old filter without doing either is refused.
 
 ---
 
 ## Sensitive Column Auto-Detection
 
 Pattern matching is applied **automatically** at schema introspection time. If your table has a column `customer_email_address`, it matches `email`. The column appears in the schema as `[SENSITIVE]`, no sample values are sent for it, and its result values are masked, without you listing it anywhere.
+
+**What masking does, and does not, protect.** Masking changes what is displayed, not what
+the query reads. A `WHERE`, `JOIN`, `ORDER BY` or `GROUP BY` on a sensitive column still
+works on the real values, so someone who can ask free-form questions can narrow a masked
+value down (`WHERE salary > 99999 AND salary < 100001` returns the matching rows with the
+salary redacted), and an error raised by an expression over the value tells them something
+too. Masking prevents accidental exposure; it is not a defence against a user who is
+trying to extract the value. For that, restrict the rows with row filters, remove the
+column with **Excluded columns** so the model never sees it, or restrict the database
+account itself. Statistical aggregates (`COUNT`, `SUM`, `AVG`) over a sensitive column are
+returned unmasked on purpose; a group of one row reveals its value.
+
+A query under row filters is regenerated before it runs, and a function column without an
+alias comes back under the engine function's name (`strpos(email, '@')` is shown as
+`position`). The masking still lands on the right column; give the column an alias to keep
+its name.
 
 ---
 
@@ -222,7 +299,7 @@ Content-Type: application/json
 }
 ```
 
-Saving privacy settings clears the connection's cached schema, table embeddings and cached query answers. The next question introspects the schema again under the new settings, so a newly enabled toggle takes effect without a manual **Refresh Schema**.
+Saving privacy settings clears the connection's cached schema, table embeddings and cached query answers. The next question introspects the schema again under the new settings, so a newly enabled toggle takes effect without a manual **Refresh Schema**. A save that changes only `row_filters` keeps the cached schema (the filters do not change introspection) and clears the rest.
 
 ---
 
