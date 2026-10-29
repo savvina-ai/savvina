@@ -117,6 +117,10 @@ export interface QueryResults {
   row_count: number;
   truncated: boolean;
   bytes_scanned: number | null;
+  /** The row-filter map the rows were computed under; "" for none. */
+  row_filter_fingerprint?: string | null;
+  /** Set by the server on a stored result computed under a different row filter: rows are empty. */
+  stale_row_filter?: boolean;
 }
 
 export interface ChatSession {

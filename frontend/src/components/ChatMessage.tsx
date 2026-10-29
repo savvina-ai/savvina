@@ -303,7 +303,7 @@ function ChatMessageBubble({ message, onRetry, onEdit, userQuestion: _userQuesti
                 <span className="rounded bg-badge-bg px-1.5 py-0.5 font-mono text-[10px] font-medium uppercase text-badge-text">
                   {message.query_dialect ?? 'SQL'}
                 </span>
-                {message.results_json && (
+                {message.results_json && !message.results_json.stale_row_filter && (
                   <span className="font-mono text-[10px] text-muted-foreground">
                     {message.results_json.row_count} row
                     {message.results_json.row_count !== 1 ? 's' : ''}

@@ -151,4 +151,22 @@ describe('ResultsTable', () => {
       expect(screen.getByText('2.00 GB scanned')).toBeInTheDocument();
     });
   });
+
+  describe('Stale row filter', () => {
+    it('shows the notice instead of the table', () => {
+      const results = makeQueryResults({ rows: [], row_count: 0, stale_row_filter: true });
+      render(<ResultsTable results={results} />);
+      expect(
+        screen.getByText(
+          'These results were computed under a different row filter. Re-run the question.',
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByRole('table')).not.toBeInTheDocument();
+    });
+
+    it('renders the table when the flag is absent', () => {
+      render(<ResultsTable results={makeQueryResults()} />);
+      expect(screen.getByRole('table')).toBeInTheDocument();
+    });
+  });
 });
