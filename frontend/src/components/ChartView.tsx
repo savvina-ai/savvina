@@ -22,6 +22,7 @@ import { ArrowUp, ArrowDown, Minus } from 'lucide-react';
 import type { QueryResults } from '../types';
 import type { UserChart, LegendPosition, NumberFormat } from '../types/charts';
 import { transformChartData, computeTrendLine } from '../lib/chartDataTransform';
+import { computeXAxisLayout, truncateToWidth } from '../lib/chartAxisLayout';
 
 const CHART_COLORS = [
   'hsl(var(--chart-1))',
@@ -289,7 +290,6 @@ export default function ChartView({ results, chart, containerRef, animate = true
   const isPie = chart.type === 'pie';
   const sideLegend =
     chart.showLegend && (chart.legendPosition === 'left' || chart.legendPosition === 'right');
-  const chartHeight = isPie ? (sideLegend ? 380 : 440) : 320;
 
   const pieOuterRadius = sideLegend ? '65%' : '55%';
   const pieCx =
@@ -299,11 +299,24 @@ export default function ChartView({ results, chart, containerRef, animate = true
     : { top: 20, right: 40, bottom: 24, left: 40 };
 
   const xAxisAngle = chart.xAxisAngle ?? 0;
-  const xAxisHeight = xAxisAngle === -90 ? 90 : xAxisAngle !== 0 ? 65 : undefined;
+  const xTickFontSize = axisProps.tick.fontSize;
+  const xAxisLayout = computeXAxisLayout(
+    data.map((d) => String(d[chart.xKey!] ?? '')),
+    xAxisAngle,
+    xTickFontSize,
+  );
   const xAxisTickProps = xAxisAngle !== 0
     ? { ...axisProps.tick, angle: xAxisAngle, textAnchor: 'end' as const, dy: 4 }
     : axisProps.tick;
   const xAxisInterval = xAxisAngle !== 0 ? 0 : undefined;
+  // Grow the chart by whatever the axis needs beyond the 65px the 320px baseline was tuned for,
+  // so long labels don't squeeze the plot area.
+  const chartHeight = isPie
+    ? sideLegend ? 380 : 440
+    : 320 + Math.max(0, (xAxisLayout.height ?? 0) - 65);
+  // Rotated labels hang left of their tick; widen the left margin (beyond the 60px Y-axis) so the
+  // first one isn't cut off. The other sides keep Recharts' 5px default.
+  const cartesianMargin = { top: 5, right: 5, bottom: 5, left: Math.max(5, xAxisLayout.leftOverflow - 60) };
 
   const commonYAxisProps = {
     ...axisProps,
@@ -317,8 +330,9 @@ export default function ChartView({ results, chart, containerRef, animate = true
     dataKey: chart.xKey,
     ...axisProps,
     tick: xAxisTickProps,
-    height: xAxisHeight,
+    height: xAxisLayout.height,
     interval: xAxisInterval,
+    tickFormatter: (v: unknown) => truncateToWidth(String(v), xAxisLayout.maxLabelWidth, xTickFontSize),
   } as const;
 
   const trendLine = showTrend ? (
@@ -361,7 +375,7 @@ export default function ChartView({ results, chart, containerRef, animate = true
           </PieChart>
         ) : chart.type === 'bar' && showTrend ? (
           // Bar + trend line requires ComposedChart to mix bar and line series
-          <ComposedChart data={data}>
+          <ComposedChart data={data} margin={cartesianMargin}>
             <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
             <XAxis {...commonXAxisProps} />
             <YAxis {...commonYAxisProps} />
@@ -389,7 +403,7 @@ export default function ChartView({ results, chart, containerRef, animate = true
             {trendLine}
           </ComposedChart>
         ) : chart.type === 'bar' ? (
-          <BarChart data={data}>
+          <BarChart data={data} margin={cartesianMargin}>
             <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
             <XAxis {...commonXAxisProps} />
             <YAxis {...commonYAxisProps} />
@@ -416,7 +430,7 @@ export default function ChartView({ results, chart, containerRef, animate = true
             ))}
           </BarChart>
         ) : chart.type === 'area' ? (
-          <AreaChart data={data}>
+          <AreaChart data={data} margin={cartesianMargin}>
             <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
             <XAxis {...commonXAxisProps} />
             <YAxis {...commonYAxisProps} />
@@ -439,7 +453,7 @@ export default function ChartView({ results, chart, containerRef, animate = true
             {trendLine}
           </AreaChart>
         ) : chart.type === 'combo' ? (
-          <ComposedChart data={data}>
+          <ComposedChart data={data} margin={cartesianMargin}>
             <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
             <XAxis {...commonXAxisProps} />
             <YAxis {...commonYAxisProps} />
@@ -483,7 +497,7 @@ export default function ChartView({ results, chart, containerRef, animate = true
           </ComposedChart>
         ) : (
           /* line */
-          <LineChart data={data}>
+          <LineChart data={data} margin={cartesianMargin}>
             <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
             <XAxis {...commonXAxisProps} />
             <YAxis {...commonYAxisProps} />
