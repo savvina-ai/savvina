@@ -29,10 +29,10 @@ Expand **Privacy Settings** to control what metadata reaches the LLM:
 
 | Setting | Default | Description |
 |---|---|---|
-| Include sample values | On | Sends 5 distinct values per column to the LLM for better accuracy |
-| Include column comments | On | Sends database column description text |
-| Include row counts | On | Sends approximate row counts |
-| Sensitive column patterns | (list) | Columns matching these patterns are never sampled (e.g., `email`, `ssn`, `password`) |
+| Include sample values | Off | Sends up to 3 example values per column (on MySQL, an ENUM/SET column's members) to the LLM for better accuracy |
+| Include column comments | Off | Sends database column description text |
+| Include row counts | Off | Sends approximate row counts |
+| Sensitive column patterns | (list) | Columns matching these patterns are never sampled and their values are masked in results (e.g., `email`, `ssn`, `password`) |
 | Excluded schemas | (empty) | Schemas to completely hide from the LLM |
 | Excluded tables | (empty) | Tables to completely hide |
 | Excluded columns | (empty) | Individual columns to hide, format: `schema.table.column` |
@@ -89,7 +89,7 @@ See [MySQL](../datasources/mysql.md) for read-only user setup and MariaDB compat
 
 ## Using a Read-Only Database Role
 
-Always connect Savvina AI using a read-only role. All generated SQL is validated before execution, but a read-only role provides defence in depth.
+Always connect Savvina AI using a read-only role. All generated SQL is validated before execution and runs inside a database-enforced read-only transaction; a read-only role is a third layer that also limits what the connection can *read*.
 
 **PostgreSQL example:**
 

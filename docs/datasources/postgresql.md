@@ -32,7 +32,7 @@ schema. No user tables are scanned — only metadata catalog views are read.
 | Column data types | `information_schema.columns.data_type` |
 | Row counts (approx.) | `pg_stat_user_tables.n_live_tup` |
 | Column comments | `pg_description` via `col_description()` |
-| Sample values | `SELECT DISTINCT <column> FROM <table> LIMIT 5` |
+| Sample values | `pg_stats.most_common_vals` (catalog statistics; only when **Include sample values** is on) |
 
 **Privacy controls flow through introspection:**
 
@@ -40,7 +40,8 @@ schema. No user tables are scanned — only metadata catalog views are read.
 - Columns matching `sensitive_column_patterns` (e.g., `email`, `password`, `ssn`) have sample
   values suppressed — the column appears in the schema description but without examples.
 - `include_row_counts`, `include_column_comments`, and `include_sample_values` can each be
-  independently disabled per connection.
+  independently toggled per connection. `include_sample_values` and `include_column_comments`
+  are off by default.
 
 ---
 
@@ -55,9 +56,12 @@ All generated SQL passes through `PostgreSQLValidator` before execution:
 | DDL blocking | `CREATE`, `DROP`, `ALTER`, `RENAME` are rejected |
 | Dangerous functions | `pg_sleep`, `pg_read_file`, `pg_write_file`, `lo_export`, `copy_to` are blocked |
 | Privilege escalation | `SET ROLE`, `SET SESSION AUTHORIZATION`, `RESET` are blocked |
+| Writing keywords | `SELECT … INTO` is rejected (`INTO` as a keyword; the word in a comment, string or quoted identifier is allowed) |
 | Auto-limit | A `LIMIT` clause is injected if none is present (default: 1,000 rows) |
 
 Validation is based on `sqlparse` token analysis — it runs before any database connection is opened.
+
+Every statement then runs inside a read-only transaction (asyncpg `transaction(readonly=True)`). A write the validator misses, such as `nextval()`, is refused by PostgreSQL with SQLSTATE `25006`.
 
 ---
 
@@ -79,7 +83,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
   GRANT SELECT ON TABLES TO savvina_reader;
 ```
 
-Even though the validator blocks DML/DDL, a read-only role provides defence in depth.
+Savvina validates every statement as a read-only SELECT and also runs it inside a database-enforced read-only transaction, so a write cannot succeed even if the text check is fooled. A read-only role is a third layer: it also limits what the connection can *read*.
 
 ---
 

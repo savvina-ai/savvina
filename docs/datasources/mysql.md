@@ -31,15 +31,19 @@ tables are scanned.
 | Column data types | `INFORMATION_SCHEMA.COLUMNS.DATA_TYPE` |
 | Row counts (approx.) | `INFORMATION_SCHEMA.TABLES.TABLE_ROWS` |
 | Column comments | `INFORMATION_SCHEMA.COLUMNS.COLUMN_COMMENT` |
-| Sample values | `SELECT DISTINCT <column> FROM <table> LIMIT 5` |
+| Sample values | ENUM/SET members parsed from `INFORMATION_SCHEMA.COLUMNS.COLUMN_TYPE` (only when **Include sample values** is on; other columns have none) |
 
 **Privacy controls flow through introspection:**
 
 - Schemas, tables, or columns in the `excluded_*` lists are never fetched or passed to the LLM.
 - Columns matching `sensitive_column_patterns` (e.g., `email`, `password`, `ssn`) have sample
   values suppressed.
+- An ENUM/SET column's member list is part of its type (`enum('placed','confirmed',…)`). Unless
+  the column's values are allowed (sample values on and the column not sensitive), the list is
+  withheld from the type as `enum(…)`, at introspection and again whenever a cached schema is read.
 - `include_row_counts`, `include_column_comments`, and `include_sample_values` can each be
-  independently disabled per connection.
+  independently toggled per connection. `include_sample_values` and `include_column_comments`
+  are off by default.
 
 > **Note:** MySQL's `INFORMATION_SCHEMA.TABLES.TABLE_ROWS` is an estimate based on InnoDB
 > statistics, not an exact count. It may differ significantly from `COUNT(*)` on large tables.
@@ -56,7 +60,10 @@ All generated SQL passes through `MySQLSQLValidator` before execution:
 | DML blocking | `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REPLACE` are rejected |
 | DDL blocking | `CREATE`, `DROP`, `ALTER`, `RENAME` are rejected |
 | Dangerous statements | `LOAD DATA`, `SELECT INTO OUTFILE`, `CALL` are blocked |
+| Writing keywords | Any `SELECT … INTO` (`@var`, `OUTFILE`, `DUMPFILE`) is rejected (`INTO` as a keyword; the word in a comment, string or quoted identifier is allowed) |
 | Auto-limit | A `LIMIT` clause is injected if none is present (default: 1,000 rows) |
+
+Every statement then runs with `SET SESSION TRANSACTION READ ONLY` in effect, restored to `READ WRITE` afterwards. A write the validator misses is refused by the server with errno 1792.
 
 ---
 
@@ -75,7 +82,7 @@ GRANT SELECT ON myapp.* TO 'savvina_reader'@'%';
 FLUSH PRIVILEGES;
 ```
 
-Even though the validator blocks DML/DDL, a read-only user provides defence in depth.
+Savvina validates every statement as a read-only SELECT and also runs it inside a database-enforced read-only transaction, so a write cannot succeed even if the text check is fooled. A read-only user is a third layer: it also limits what the connection can *read*.
 
 ---
 

@@ -113,7 +113,8 @@ the analyst role.
 
 **Steps**
 
-1. Add Connection 6 (MySQL analyst user) and trigger schema introspection.
+1. Add Connection 6 (MySQL analyst user) with **Include sample values** turned on (it is off by
+   default, and ENUM members count as sample values) and trigger schema introspection.
 2. Open the schema viewer and confirm ENUM columns show sample values
    (e.g. `cuisine_type` shows `Italian, Asian, Mexican…`; `status` shows `placed, confirmed…`).
 3. Open a new chat session.

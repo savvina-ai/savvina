@@ -64,21 +64,15 @@ Each history row names its entity twice: `entity_id`, the row the change was mad
 
 ---
 
-## Two Generation Paths
+## Generation Path
 
-### Path A — Phased (used by the frontend)
-
-The frontend drives three sequential API calls. Each call commits partial results to the DB so the user sees incremental progress and the browser can refresh without losing work. Batches are named by table key, never by position.
+Generation is phased. The frontend drives three sequential API calls. Each call commits partial results to the DB so the user sees incremental progress and the browser can refresh without losing work. Batches are named by table key, never by position.
 
 ```
 POST /api/v1/connections/{id}/semantic/generate/init[?resume=true]
 POST /api/v1/connections/{id}/semantic/generate/batch   {"table_keys": [...]}  (1–4 keys, one call per batch)
 POST /api/v1/connections/{id}/semantic/generate/globals
 ```
-
-### Path B — Full (internal / programmatic)
-
-`SemanticModelGenerator.generate()` runs the complete pipeline in a single async call. Internally it calls `_generate_batched()` which is the same batch + globals strategy as Path A, but without inter-call checkpointing.
 
 ---
 
@@ -185,7 +179,7 @@ The page retries a call that is throttled (`429`), finds the provider unavailabl
 
 For each batch of up to 4 tables, named by key:
 
-1. **`_schema_to_ddl(batch_schema_obj)`** — builds a compact `CREATE TABLE` DDL string for the batch tables. Column lines include native type, NOT NULL, PRIMARY KEY, and inline `--` comments from column descriptions. Sample values are omitted here (this is a semantic DDL, not the full schema). Total DDL capped at `_MAX_DDL_CHARS = 20,000` characters.
+1. **`_schema_to_ddl(batch_schema_obj)`** — builds a compact `CREATE TABLE` DDL string for the batch tables. Column lines include native type, NOT NULL, PRIMARY KEY, and inline `--` comments from column descriptions. Sample values are omitted here (this is a semantic DDL, not the full schema). A MySQL ENUM/SET native type carries its member list only when the column's values are allowed (`PrivacySettings.column_values_allowed`); otherwise `_apply_privacy_to_schema` has already withheld it as `enum(…)`. Total DDL capped at `_MAX_DDL_CHARS = 20,000` characters.
 
 2. **`_format_relationships_for_prompt(batch_edges)`** — renders FK edges as `from.col → to.col (JOIN: ...)` lines for the prompt.
 
@@ -253,17 +247,16 @@ Because regenerating never blanks the model, this is where a full run removes ta
 
 ---
 
-## Post-Processing (Path B — Full generation)
+## Enrichment not yet on the generation path
 
-When `SemanticModelGenerator.generate()` is called directly (not via phased endpoints), additional enrichment runs after `_generate_batched()`:
+Two `SemanticModelGenerator` methods are kept but not called by any route. They were post-processing of a former single-call generator and have not been wired into the phased path. Wiring them belongs after grounding in `generate_tables`, with provenance so a generated value never overwrites a hand edit.
 
-| Method | What it does |
+| Method | What it would do |
 |---|---|
-| `_infer_temporal_columns(table_key, columns)` | Per-table: selects `primary_timestamp_column` and `primary_date_column` by name+type priority list; suppresses audit timestamps on fiscal-period tables |
-| `_fingerprint_column(datasource, schema, table, col)` | Reads `pg_stats` (PostgreSQL only) for `n_distinct`, `null_frac`, `common_vals`; computes `cardinality` + `semantic_type` without scanning user data rows |
-| `_classify_cardinality(n_distinct)` | Maps PostgreSQL `n_distinct` → `CardinalityClass` (unique / high / medium / low) |
-| `_infer_semantic_type(name, data_type, n_distinct, ...)` | Local inference: PK → `identifier`, name patterns → `monetary`/`email`/`foreign_key`/etc., type → `timestamp`/`date`/`boolean_flag`, cardinality → `categorical` |
-| `_populate_schema_metadata(tables, schema)` | Backfills `base_sql` (view definitions), `AggregationType.COUNT_DISTINCT_APPROX` for high-cardinality ID/FK columns |
+| `_infer_temporal_columns(table_key, columns)` | Per-table: selects `primary_timestamp_column` and `primary_date_column` by a name+type priority list; suppresses audit timestamps on fiscal-period tables. No database call |
+| `_populate_schema_metadata(tables, schema)` | Backfills `partition_columns` and view `base_sql` from introspection metadata, `time_granularity = day` for `date`-typed columns, and `AggregationType.COUNT_DISTINCT_APPROX` for high-cardinality ID/FK columns (that last branch needs `cardinality`, which generation does not set; only a hand edit in the Tables tab does) |
+
+Until then, `primary_timestamp_column`, `primary_date_column` and `time_granularity` are set by hand in the Tables tab. `partition_columns` and view `base_sql` have no source: the Tables tab shows them read-only and `PUT /semantic` does not accept them.
 
 ---
 

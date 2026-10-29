@@ -219,6 +219,7 @@ Every adapter must implement:
 - `introspect(privacy)` — schema discovery
 - `get_sample_values(schema, table, column, limit)`
 - `execute_query(query, timeout, max_rows)`
+- `explain(sql, timeout)` — plans a statement without returning rows (row-filter verification at save)
 - `validate_query(query)` — delegates to a Validator class
 - `format_schema_for_llm(schema, privacy)`
 - `get_system_prompt_additions()` — dialect-specific LLM instructions
