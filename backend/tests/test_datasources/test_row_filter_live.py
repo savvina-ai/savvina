@@ -13,9 +13,12 @@ Opt-in: ``SAVVINA_LIVE_TEST_DBS=1`` with the ``test-dbs`` compose profile up
 from __future__ import annotations
 
 import os
+import warnings
 
 import pytest
 
+from app.datasources.adapters.postgresql import close_all_pools
+from app.datasources.errors import ExplainError
 from app.datasources.registry import create_datasource
 from app.services.row_filter_rewrite import apply_row_filters
 
@@ -100,6 +103,14 @@ _CASES = {
 }
 
 
+@pytest.fixture(autouse=True)
+async def _drop_cached_pools():
+    """The PostgreSQL adapter keeps its pool in a module cache that outlives ``disconnect``;
+    each test runs on its own event loop, so close the pool before that loop goes away."""
+    yield
+    await close_all_pools()
+
+
 async def _run(adapter, sql: str):
     return await adapter.execute_query(sql, timeout=30, max_rows=10_000)
 
@@ -135,5 +146,135 @@ async def test_rewritten_statements_return_only_filtered_rows(dialect: str) -> N
         for sql in corpus:
             rewritten = apply_row_filters(sql, filters, dialect)
             await _run(adapter, rewritten)  # executes without an engine error
+    finally:
+        await adapter.disconnect()
+
+
+# Rows the side-channel filters let through (both end in ``<= 10`` on an id starting at 1).
+_VISIBLE = 10
+
+# (source_type, config, filtered table key, a filter the index cannot serve, the column the
+# probe compares, the id of a row the filter hides, the probe predicates that raise on a hit)
+_SIDE_CHANNEL = {
+    "PostgreSQL": (
+        "postgresql",
+        _PG,
+        "ecommerce.customers",
+        f"id IN (SELECT id FROM ecommerce.customers WHERE id <= {_VISIBLE})",
+        "email",
+        50,
+        ["1/(CASE WHEN email = '{value}' THEN 0 ELSE 1 END) = 1"],
+    ),
+    "MySQL": (
+        "mysql",
+        _MYSQL,
+        "sample_delivery.customers",
+        f"id + 0 <= {_VISIBLE}",
+        "email",
+        50,
+        [
+            "REGEXP_LIKE('a', IF(email = '{value}', '(', 'a'))",
+            "JSON_EXTRACT('{{}}', IF(email = '{value}', '$[', '$')) IS NOT NULL",
+        ],
+    ),
+}
+
+
+@pytest.mark.parametrize("dialect", list(_SIDE_CHANNEL))
+async def test_the_fence_keeps_the_models_predicates_off_hidden_rows(dialect: str) -> None:
+    """Without the fence these probes raise a data-dependent error on the hidden row (one
+    bit per query, in text the correction prompt sees); with it they return."""
+    source_type, config, key, condition, column, hidden_id, probes = _SIDE_CHANNEL[dialect]
+    adapter = create_datasource(source_type)
+    result = await adapter.connect(config)
+    assert result is None or result.success, getattr(result, "message", "")
+    try:
+        schema, table = key.split(".")
+        hidden = (
+            await _run(adapter, f"SELECT {column} FROM {schema}.{table} WHERE id = {hidden_id}")
+        ).rows[0][0]
+        fence = {"PostgreSQL": " OFFSET 0", "MySQL": " LIMIT 18446744073709551615"}[dialect]
+        for probe in probes:
+            # Seeded emails hold no ' or {, so the interpolation and the {{}} escape are safe.
+            sql = f"SELECT count(*) FROM {schema}.{table} WHERE {probe.format(value=hidden)}"
+            fenced = apply_row_filters(sql, {key: condition}, dialect)
+            assert fence in fenced
+            unfenced = fenced.replace(fence, "")
+            # Arm the probe: with the fence stripped the engine must raise on the hidden row.
+            with pytest.raises(Exception):  # noqa: B017 - any engine error proves the leak
+                await _run(adapter, unfenced)
+            out = await _run(adapter, fenced)
+            assert out.rows[0][0] == _VISIBLE
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.parametrize("dialect", list(_CASES))
+async def test_explain_refuses_a_column_the_table_does_not_have(dialect: str) -> None:
+    source_type, config, key, _column, _statements, _corpus = _CASES[dialect]
+    adapter = create_datasource(source_type)
+    result = await adapter.connect(config)
+    assert result is None or result.success, getattr(result, "message", "")
+    try:
+        schema, table = key.split(".")
+        quote = {"PostgreSQL": '"', "MySQL": "`"}[dialect]
+        q = f"{quote}{schema}{quote}.{quote}{table}{quote}"
+        good = f"SELECT * FROM (SELECT * FROM {q} WHERE (id > 0)) AS _t"
+        await adapter.explain(good, timeout=10)
+        bad = f"SELECT * FROM (SELECT * FROM {q} WHERE (nosuch_col > 0)) AS _t"
+        with pytest.raises(ExplainError, match="nosuch_col"):
+            await adapter.explain(bad, timeout=10)
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.parametrize("dialect", list(_CASES))
+async def test_the_router_check_accepts_a_real_column_and_refuses_a_missing_one(
+    dialect: str,
+) -> None:
+    """``_verify_row_filters`` end to end: connect, rewrite, plan, classify, disconnect."""
+    from fastapi import HTTPException
+
+    from app.routers.connections import _verify_row_filters
+
+    source_type, config, key, column, _statements, _corpus = _CASES[dialect]
+    await _verify_row_filters(source_type, config, {key: f"{column} > 0"})
+    with pytest.raises(HTTPException) as info:
+        await _verify_row_filters(source_type, config, {key: "nosuch_col > 0"})
+    assert info.value.status_code == 422
+    assert info.value.detail.startswith(f'row_filters["{key}"]: rejected by the database:')
+    assert "nosuch_col" in info.value.detail  # an unknown-name error is shown unredacted
+
+
+async def test_postgresql_explain_refuses_a_second_statement() -> None:
+    """Task 2 plans through ``conn.fetch`` (extended protocol), which PostgreSQL parses as
+    exactly one statement; the mocked tests only show which method is called."""
+    source_type, config, _key, _column, _statements, _corpus = _CASES["PostgreSQL"]
+    adapter = create_datasource(source_type)
+    result = await adapter.connect(config)
+    assert result is None or result.success, getattr(result, "message", "")
+    try:
+        with pytest.raises(ExplainError, match="multiple commands"):
+            await adapter.explain("SELECT 1; SELECT 2", timeout=10)
+    finally:
+        await adapter.disconnect()
+
+
+async def test_mysql_explain_emits_no_warning_with_the_condition() -> None:
+    """A successful MySQL EXPLAIN raises Note 1003, which quotes the rewritten statement with
+    the condition's literals; aiomysql passes each warning to ``warnings.warn``, so it would
+    reach the logs. ``explain`` plans with ``sql_notes`` off, so nothing is emitted."""
+    from app.routers.connections import _check_statement
+
+    source_type, config, key, column, _statements, _corpus = _CASES["MySQL"]
+    statement = _check_statement(key, f"{column} > 12345", "mysql")
+    adapter = create_datasource(source_type)
+    result = await adapter.connect(config)
+    assert result is None or result.success, getattr(result, "message", "")
+    try:
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            await adapter.explain(statement, timeout=10)
+        assert not [w for w in recorded if "12345" in str(w.message)]
     finally:
         await adapter.disconnect()

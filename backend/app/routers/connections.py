@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 from datetime import UTC, datetime
 import json
@@ -14,6 +15,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import delete, func, select, update
+from sqlglot import exp
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +25,7 @@ from ..auth.limiter import limiter
 from ..config import get_settings
 from ..database import get_db
 from ..datasources.adapters.postgresql import evict_pool as _evict_pg_pool
+from ..datasources.errors import ErrorCategory, ExplainError
 from ..datasources.registry import create_datasource, get_datasource_class
 from ..models.chat import ChatMessage, ChatSession
 from ..models.connection import Connection
@@ -42,7 +45,13 @@ from ..schemas.connection import (
 )
 from ..schemas.pagination import PaginatedResponse
 from ..semantic import store as semantic_store
-from ..services.row_filter import RowFilterInvalidError, validate_row_filters
+from ..services.error_feedback import redact_error_for_user
+from ..services.row_filter import (
+    RowFilterInvalidError,
+    RowFilterRejectedError,
+    validate_row_filters,
+)
+from ..services.row_filter_rewrite import apply_row_filters, sqlglot_dialect
 from ..services.schema_utils import SchemaRefreshError, refresh_user_schema_cache
 from ..utils.encryption import decrypt_value, encrypt_value
 from ._utils import (
@@ -94,6 +103,131 @@ def _validated_row_filters(raw: object, source_type: str) -> dict[str, str]:
         return validate_row_filters(raw, _query_dialect(source_type))
     except RowFilterInvalidError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+_UNVERIFIED_DETAIL = "row filters could not be verified against the database: {reason}"
+
+# Seconds past the query timeout a save waits for one plan before giving up.
+_EXPLAIN_GRACE_SECONDS = 5
+
+
+def _explain_budget() -> float:
+    """Seconds the save waits for one plan: the query timeout the adapter asks the engine
+    to apply, plus a grace for the round trip. PostgreSQL and MariaDB cancel the plan
+    themselves at the query timeout; MySQL applies no timeout to an ``EXPLAIN`` (its
+    ``MAX_EXECUTION_TIME`` covers ``SELECT`` only and aiomysql has no read timeout), so
+    this bound is what frees a save whose plan waits on a metadata or row lock there."""
+    return get_settings().default_query_timeout + _EXPLAIN_GRACE_SECONDS
+
+
+def _check_statement(key: str, condition: str, source_type: str) -> str:
+    """The statement planned to verify one pair: ``SELECT * FROM <schema>.<table>`` (both
+    parts quoted, so the engine-normalised stored names match the reference exactly) run
+    through the same ``apply_row_filters`` every query goes through. What is planned is thus
+    the condition as sqlglot reads and writes it back, inside the fenced derived table, and
+    nothing outside that table can supply a column the condition names. HTTP 422 naming the
+    key when the rewriter refuses the pair (a construct it cannot write back for the dialect)
+    or leaves the statement unchanged (it matched no table reference, so the condition would
+    never be planned).
+    """
+    schema, table = key.split(".", 1)
+    dialect = _query_dialect(source_type)
+    reference = exp.Table(
+        this=exp.to_identifier(table, quoted=True), db=exp.to_identifier(schema, quoted=True)
+    )
+    base = exp.select("*").from_(reference).sql(dialect=sqlglot_dialect(dialect))
+    try:
+        sql = apply_row_filters(base, {key: condition}, dialect)
+    except RowFilterRejectedError as exc:
+        raise HTTPException(status_code=422, detail=f'row_filters["{key}"]: {exc}') from exc
+    if sql == base:
+        # The key validator and the rewriter disagree about this key. Saving the pair would
+        # keep a filter whose condition was never checked, and that the runtime would equally
+        # not apply, so fail closed.
+        raise HTTPException(
+            status_code=422,
+            detail=f'row_filters["{key}"]: the filter could not be applied to the table, '
+            "so it was not saved.",
+        )
+    return sql
+
+
+def _changed_pairs(new: dict[str, str], stored: dict[str, str] | None) -> dict[str, str]:
+    """The pairs of *new* whose key is not stored or whose condition differs."""
+    stored = stored or {}
+    return {key: cond for key, cond in new.items() if stored.get(key) != cond}
+
+
+async def _verify_row_filters(source_type: str, config: dict, pairs: dict[str, str]) -> None:
+    """Plan every pair of *pairs* on the live database, or raise HTTP 422.
+
+    The statement is the one the runtime would send for ``SELECT * FROM <schema>.<table>``
+    (``_check_statement``): ``EXPLAIN SELECT * FROM (SELECT * FROM "s"."t" WHERE (<cond>)
+    OFFSET 0) AS "t"`` on PostgreSQL, the MySQL fence on MySQL. It returns no row and fails
+    inside the derived table when the table does not exist or the condition names a column
+    it does not have (no outer scope can supply one). The statements are built before the
+    connection is opened, so a pair the rewriter refuses is 422 naming the key and opens
+    nothing. An engine error is 422 naming the key, with the engine's text redacted by
+    category as every execution error is. A timeout, a plan that does not return within
+    ``_explain_budget()`` seconds, a refused connection or a driver error is 422 "could not
+    be verified" and nothing is stored. Opens the connection as the schema refresh does,
+    from the decrypted *config*; the callers pass only new or changed pairs and call only
+    when there is one, so an unchanged map opens nothing.
+    """
+    # Built before the connection is opened: a pair the rewriter refuses opens nothing.
+    statements = {key: _check_statement(key, cond, source_type) for key, cond in pairs.items()}
+    settings = get_settings()
+    budget = _explain_budget()
+    adapter = create_datasource(source_type)
+    try:
+        result = await adapter.connect(config)
+        if result is not None and result.success is False:
+            raise HTTPException(
+                status_code=422, detail=_UNVERIFIED_DETAIL.format(reason=result.message)
+            )
+        for key, sql in statements.items():
+            try:
+                await asyncio.wait_for(
+                    adapter.explain(sql, timeout=settings.default_query_timeout), timeout=budget
+                )
+            except TimeoutError as exc:
+                # asyncio.wait_for cancelled the plan. On MySQL the adapter closes the
+                # cancelled connection and the disconnect below closes the pool. On
+                # PostgreSQL asyncpg cancels the statement on the server and rolls back
+                # before the connection returns to the shared pool.
+                raise HTTPException(
+                    status_code=422,
+                    detail=_UNVERIFIED_DETAIL.format(
+                        reason=f"the planning check did not finish within {budget:g} seconds"
+                    ),
+                ) from exc
+            except ExplainError as exc:
+                category = adapter.classify_error(exc.__cause__ or exc)
+                if category == ErrorCategory.TIMEOUT:
+                    raise HTTPException(
+                        status_code=422, detail=_UNVERIFIED_DETAIL.format(reason=str(exc))
+                    ) from exc
+                text = redact_error_for_user(category, str(exc))
+                raise HTTPException(
+                    status_code=422,
+                    detail=f'row_filters["{key}"]: rejected by the database: {text}',
+                ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        reason = str(exc) or type(exc).__name__
+        raise HTTPException(
+            status_code=422, detail=_UNVERIFIED_DETAIL.format(reason=reason)
+        ) from exc
+    finally:
+        try:
+            await adapter.disconnect()
+        except Exception:
+            # The verdict is already decided; a close that fails must not turn a 422 (or
+            # a success) into a 500.
+            logger.warning(
+                "Could not close the connection opened to verify row filters", exc_info=True
+            )
 
 
 def _mask_config(config: dict) -> dict:
@@ -178,6 +312,10 @@ async def create_connection(
             privacy["row_filters"] = _validated_row_filters(
                 privacy["row_filters"], body.source_type
             )
+        if privacy.get("row_filters"):
+            # Verified before the row exists: a connection is not created with a filter
+            # the database refuses. body.config is the plain dict the row is encrypted from.
+            await _verify_row_filters(body.source_type, body.config, privacy["row_filters"])
     settings = get_settings()
     config_encrypted = encrypt_value(json.dumps(body.config), settings.encryption_key)
     conn = Connection(
@@ -351,7 +489,13 @@ async def update_privacy(
     existing.update(changes)
     legacy = bool(existing.get("row_filter_sql"))
     if body.row_filters is not None:
-        existing["row_filters"] = _validated_row_filters(body.row_filters, conn.source_type)
+        new_map = _validated_row_filters(body.row_filters, conn.source_type)
+        pairs = _changed_pairs(new_map, prior.get("row_filters"))
+        if pairs:
+            key = get_settings().encryption_key
+            config = json.loads(decrypt_value(conn.config_encrypted, key))
+            await _verify_row_filters(conn.source_type, config, pairs)
+        existing["row_filters"] = new_map
         if existing["row_filters"]:
             # Defining real filters ends the migration state.
             existing.pop("row_filter_sql", None)

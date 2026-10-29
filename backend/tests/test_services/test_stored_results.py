@@ -9,9 +9,12 @@ import threading
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
+from app.config import get_settings
 from app.datasources.models import PrivacySettings
 from app.services import result_masking, stored_results
+from app.services.row_filter import row_filter_fingerprint
 from app.services.stored_results import (
+    STALE_ROW_FILTER_TEXT,
     StoredResultMasks,
     StoredResultPrivacy,
     load_result_masks,
@@ -274,3 +277,113 @@ class TestServeOncePerRequest:
 
     async def test_serve_all_of_nothing_is_empty(self) -> None:
         assert await self._masks().serve_all([]) == []
+
+
+_FILTERS = {"public.users": "tenant_id = 7"}
+
+
+def _fp(filters: dict[str, str]) -> str:
+    return row_filter_fingerprint(filters, get_settings().encryption_key)
+
+
+def _filtered_privacy(filters: dict[str, str] = _FILTERS) -> StoredResultPrivacy:
+    return stored_result_privacy({"row_filters": filters}, "postgresql")
+
+
+class TestStaleRowFilter:
+    def test_same_fingerprint_passes(self) -> None:
+        stored = {**_results(["id"], [[1]]), "row_filter_fingerprint": _fp(_FILTERS)}
+        out = _filtered_privacy().mask(stored, "SELECT id FROM users")
+        assert out["rows"] == [[1]]
+        assert "stale_row_filter" not in out
+
+    def test_different_fingerprint_blanks_the_rows_and_flags(self) -> None:
+        stored = {
+            **_results(["id", "email"], [[1, "a@x.io"]]),
+            "row_filter_fingerprint": _fp({"public.users": "tenant_id = 8"}),
+        }
+        out = _filtered_privacy().mask(stored, "SELECT id, email FROM users")
+        assert out["rows"] == []
+        assert out["row_count"] == 0
+        assert out["stale_row_filter"] is True
+        assert out["columns"] == ["id", "email"]  # every other key is kept
+        assert stored["rows"] == [[1, "a@x.io"]]  # the stored dict is untouched
+
+    def test_a_result_without_the_field_passes_only_while_the_connection_has_no_filters(
+        self,
+    ) -> None:
+        stored = _results(["id"], [[1]])
+        assert _DEFAULT.mask(stored, "SELECT id FROM users")["rows"] == [[1]]
+        assert _filtered_privacy().mask(stored, "SELECT id FROM users")["stale_row_filter"] is True
+
+    def test_the_migration_state_blanks_every_result(self) -> None:
+        # The legacy filter's tables are unknown, so no stored result can be shown to match
+        # the connection's filters; the rule is "same map or nothing" with no map to match.
+        migrating = stored_result_privacy({"row_filter_sql": "tenant_id = 7"}, "postgresql")
+        assert migrating.row_filter_fingerprint is None
+        for stored in (
+            _results(["id"], [[1]]),
+            {**_results(["id"], [[1]]), "row_filter_fingerprint": ""},
+            {**_results(["id"], [[1]]), "row_filter_fingerprint": _fp(_FILTERS)},
+        ):
+            out = migrating.mask(stored, "SELECT id FROM users")
+            assert out["rows"] == []
+            assert out["stale_row_filter"] is True
+
+    def test_a_non_string_fingerprint_is_stale_and_served_without_it(self) -> None:
+        # A tampered or corrupt row is served stale, with the field cleared for typed consumers.
+        stored = {**_results(["id"], [[1]]), "row_filter_fingerprint": {"x": 1}}
+        out = _DEFAULT.mask(stored, "SELECT id FROM users")
+        assert out["rows"] == []
+        assert out["stale_row_filter"] is True
+        assert out["row_filter_fingerprint"] is None
+        assert stored["row_filter_fingerprint"] == {"x": 1}  # the stored dict is untouched
+
+    def test_a_null_fingerprint_still_means_no_filters(self) -> None:
+        stored = {**_results(["id"], [[1]]), "row_filter_fingerprint": None}
+        assert _DEFAULT.mask(stored, "SELECT id FROM users")["rows"] == [[1]]
+
+    def test_loosening_the_filter_also_blanks(self) -> None:
+        stored = {**_results(["id"], [[1]]), "row_filter_fingerprint": _fp(_FILTERS)}
+        assert _DEFAULT.mask(stored, "SELECT id FROM users")["stale_row_filter"] is True
+
+    def test_a_gone_connection_blanks_a_result_that_carries_a_fingerprint(self) -> None:
+        stored = {**_results(["id"], [[1]]), "row_filter_fingerprint": _fp(_FILTERS)}
+        gone = stored_result_privacy(None, None)
+        out = gone.mask(stored, "SELECT id FROM users")
+        assert out["rows"] == []
+        assert out["stale_row_filter"] is True
+
+    def test_a_session_with_no_privacy_entry_falls_back_to_the_default(self) -> None:
+        masks = StoredResultMasks({})
+        carrying = {**_results(["id"], [[1]]), "row_filter_fingerprint": _fp(_FILTERS)}
+        out = masks.mask("missing", carrying, "SELECT id FROM users")
+        assert out["rows"] == []
+        assert out["stale_row_filter"] is True
+        plain = masks.mask("missing", _results(["id"], [[1]]), "SELECT id FROM users")
+        assert plain["rows"] == [[1]]
+        assert "stale_row_filter" not in plain
+
+    def test_an_unregistered_source_type_still_checks_the_fingerprint(self) -> None:
+        privacy = stored_result_privacy({"row_filters": _FILTERS}, "nosuch")
+        fresh = {**_results(["id"], [[1]]), "row_filter_fingerprint": _fp(_FILTERS)}
+        out = privacy.mask(fresh, "SELECT id FROM users")
+        assert out["rows"] == [[_R]]  # mask_all still applies
+        assert "stale_row_filter" not in out
+        stale = _results(["id"], [[1]])
+        assert privacy.mask(stale, "SELECT id FROM users")["stale_row_filter"] is True
+
+    async def test_serve_all_applies_the_same_rule(self) -> None:
+        masks = StoredResultMasks({"s": _filtered_privacy()})
+        fresh = {**_results(["id"], [[1]]), "row_filter_fingerprint": _fp(_FILTERS)}
+        stale = _results(["id"], [[2]])
+        [(served_fresh, _), (served_stale, _)] = await masks.serve_all(
+            [("s", fresh, "SELECT id FROM users"), ("s", stale, "SELECT id FROM users")]
+        )
+        assert served_fresh["rows"] == [[1]]
+        assert served_stale["rows"] == [] and served_stale["stale_row_filter"] is True
+
+    def test_the_notice_text(self) -> None:
+        assert STALE_ROW_FILTER_TEXT == (
+            "These results were computed under a different row filter. Re-run the question."
+        )

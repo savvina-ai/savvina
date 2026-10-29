@@ -9,7 +9,10 @@ streaming path hold sensitive values in the clear, and the privacy settings may 
 tightened since. So every read masks the stored rows again with the connection's
 **current** settings, classified from the stored SQL exactly as a fresh execution is
 (``result_masking._plan_result_mask``). Masking is idempotent: ``[REDACTED]`` stays
-``[REDACTED]``.
+``[REDACTED]``. A result also carries the fingerprint of the row-filter map it was computed
+under (``QueryResultsResponse.row_filter_fingerprint``); when it differs from the
+connection's current map, is not a string, or the connection is in the row-filter migration
+state, the result is served with no rows and ``stale_row_filter`` set, whatever the columns.
 
 A connection with no stored settings, or one that no longer exists, masks with
 ``PrivacySettings()`` and an unknown dialect (double quotes read as identifiers, the
@@ -33,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
 
+from ..config import get_settings
 from ..datasources.models import PrivacySettings
 from ..datasources.registry import get_datasource_class
 from ..models.chat import ChatSession
@@ -45,25 +49,41 @@ from .result_masking import (
     _plan_result_mask,
     _ResultMaskPlan,
 )
+from .row_filter import row_filter_fingerprint
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+# Shown in place of a result computed under a different row-filter map than the connection
+# has now (history notice, share and export 410, report section).
+STALE_ROW_FILTER_TEXT = (
+    "These results were computed under a different row filter. Re-run the question."
+)
 
 
 @dataclass(frozen=True)
 class StoredResultPrivacy:
     """The privacy settings and dialect quoting a stored result is re-masked with.
-    *mask_all*: the dialect is unknown, so every column is masked."""
+    *mask_all*: the dialect is unknown, so every column is masked. *row_filter_fingerprint*:
+    the fingerprint a stored result must carry to be served at all (``""`` when the
+    connection has no row filters; ``None`` when no stored result can match, the row-filter
+    migration state)."""
 
     privacy: PrivacySettings = field(default_factory=PrivacySettings)
     double_quote_is_string_literal: bool = False
     mask_all: bool = False
+    row_filter_fingerprint: str | None = ""
 
     def mask(self, results_json: dict | None, query: str | None) -> dict | None:
         """*results_json* with sensitive and excluded columns redacted; the same dict when
         nothing changes. *query* is the stored SQL (possibly row-filter wrapped). Every key
-        other than ``rows`` is kept as stored."""
-        return _remask(results_json, lambda: self.plan(query, served_query(query)))
+        other than ``rows`` is kept as stored. A result computed under another row-filter
+        map comes back with no rows and ``stale_row_filter`` set."""
+        return _remask(
+            results_json,
+            lambda: self.plan(query, served_query(query)),
+            self.row_filter_fingerprint,
+        )
 
     def plan(self, query: str | None, served: str | None) -> _ResultMaskPlan | None:
         """The mask plan for stored *query*, *served* being ``served_query(query)``: the
@@ -79,12 +99,31 @@ class StoredResultPrivacy:
 
 
 def _remask(
-    results_json: dict | None, plan_for: Callable[[], _ResultMaskPlan | None]
+    results_json: dict | None,
+    plan_for: Callable[[], _ResultMaskPlan | None],
+    expected_fingerprint: str | None,
 ) -> dict | None:
     """``StoredResultPrivacy.mask`` with the plan supplied by *plan_for*, called only when
-    the rows are readable enough to need one."""
+    the rows are readable enough to need one. First the row-filter check: a result whose
+    stored fingerprint is not *expected_fingerprint* was computed under another map (or
+    before fingerprints existed, while the connection now has filters) and is served with
+    no rows; the rule is "same map or nothing", so loosening a filter blanks older results
+    too. *expected_fingerprint* ``None`` (the migration state) makes every result stale. A
+    stored fingerprint that is neither a string nor null is stale too and is served as
+    ``None``."""
     if not results_json:
         return results_json
+    stored = results_json.get("row_filter_fingerprint")
+    readable = isinstance(stored, str | None)
+    if expected_fingerprint is None or not readable or (stored or "") != expected_fingerprint:
+        stale = {**results_json, "rows": [], "row_count": 0, "stale_row_filter": True}
+        if not readable:
+            # Not the string every writer stores: a tampered or corrupt row. Served stale,
+            # with the field cleared so typed consumers (the single-share
+            # ``QueryResultsResponse``, the frontend's ``string | null``) never see a
+            # non-string.
+            stale["row_filter_fingerprint"] = None
+        return stale
     rows = results_json.get("rows")
     if not isinstance(rows, list):
         return {**results_json, "rows": []}
@@ -113,15 +152,25 @@ def stored_result_privacy(
 ) -> StoredResultPrivacy:
     """The re-mask settings for a connection's stored ``privacy_settings`` and
     ``source_type``, read without connecting (the adapter class attribute). A source type
-    that is no longer registered masks every column: the dialect is unknown."""
+    that is no longer registered masks every column: the dialect is unknown. The expected
+    row-filter fingerprint is computed from the stored map with the app's encryption key. In
+    the migration state the expected fingerprint is ``None``: every stored result is stale
+    until the admin migrates or removes the legacy filter."""
     privacy = PrivacySettings.from_dict(privacy_settings) if privacy_settings else PrivacySettings()
+    fingerprint = (
+        None
+        if privacy.row_filter_needs_migration
+        else row_filter_fingerprint(privacy.row_filters, get_settings().encryption_key)
+    )
     dq = False
     if source_type:
         try:
             dq = _double_quote_is_literal(get_datasource_class(source_type))
         except ValueError:
-            return StoredResultPrivacy(privacy, False, mask_all=True)
-    return StoredResultPrivacy(privacy, dq)
+            return StoredResultPrivacy(
+                privacy, False, mask_all=True, row_filter_fingerprint=fingerprint
+            )
+    return StoredResultPrivacy(privacy, dq, row_filter_fingerprint=fingerprint)
 
 
 @dataclass(frozen=True)
@@ -161,7 +210,8 @@ class StoredResultMasks:
                 self._plans[key] = self.for_session(session_id).plan(query, served)
             return self._plans[key]
 
-        return _remask(results_json, plan_for), served
+        expected = self.for_session(session_id).row_filter_fingerprint
+        return _remask(results_json, plan_for, expected), served
 
     async def serve_all(
         self, messages: Sequence[tuple[str, dict | None, str | None]]

@@ -3,9 +3,11 @@
 
 """Tests for the MySQL / MariaDB data source adapter."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiomysql
 import pytest
 
 from app.datasources.adapters.mysql import (
@@ -14,6 +16,7 @@ from app.datasources.adapters.mysql import (
     _parse_enum_values,
     _serialize,
 )
+from app.datasources.errors import ExplainError
 from app.datasources.models import PrivacySettings
 
 # ── aiomysql mock helpers ─────────────────────────────────────────────────────
@@ -410,6 +413,7 @@ class TestIntrospect:
 
         col = result.tables[0].columns[0]
         assert col.sample_values == ["pending", "shipped", "delivered"]
+        assert col.sample_source == "type"
 
     async def test_foreign_key_relationship(self) -> None:
         adapter, conn = _make_adapter()
@@ -497,6 +501,7 @@ class TestIntrospect:
 
         col = result.tables[0].columns[0]
         assert col.sample_values is None
+        assert col.sample_source is None
         assert col.native_type == "enum(…)"
 
     async def test_enum_labels_withheld_for_a_sensitive_column_even_when_on(self) -> None:
@@ -512,6 +517,7 @@ class TestIntrospect:
 
         col = result.tables[0].columns[0]
         assert col.sample_values is None
+        assert col.sample_source is None
         assert col.native_type == "enum(…)"
 
     async def test_enum_labels_kept_when_allowed(self) -> None:
@@ -878,3 +884,93 @@ class TestReadOnlySession:
         statements = _executed_statements(plain)
         assert "SET SESSION TRANSACTION READ ONLY" in statements
         assert statements[-1] == "SET SESSION TRANSACTION READ WRITE"
+
+
+class TestExplain:
+    async def test_plans_inside_the_read_only_session_and_reads_no_row(self) -> None:
+        adapter, conn = _make_adapter()
+        await adapter.explain("SELECT 1", timeout=7)
+        statements = [c.args[0] for c in conn._cursor.execute.call_args_list]
+        assert statements == [
+            "SET SESSION TRANSACTION READ ONLY",
+            "SET SESSION sql_notes = 0",
+            "EXPLAIN SELECT 1",
+            "SET SESSION sql_notes = DEFAULT",
+            "SET SESSION TRANSACTION READ WRITE",
+        ]
+        conn._cursor.fetchall.assert_not_called()
+
+    async def test_mariadb_bounds_the_plan_with_max_statement_time(self) -> None:
+        adapter, conn = _make_adapter(version="10.11.6-MariaDB")
+        await adapter.explain("SELECT 1", timeout=7)
+        calls = [c.args for c in conn._cursor.execute.call_args_list]
+        assert calls[0] == ("SET SESSION max_statement_time = %s", (7,))
+        assert ("EXPLAIN SELECT 1",) in calls
+        assert calls[-1] == ("SET SESSION max_statement_time = 0",)
+
+    async def test_engine_error_becomes_explain_error_with_the_cause(self) -> None:
+        adapter, conn = _make_adapter()
+        cause = RuntimeError("Unknown column 'nosuch' in 'field list'")
+        # READ ONLY and sql_notes succeed, the EXPLAIN raises, both resets still run.
+        conn._cursor.execute.side_effect = [None, None, cause, None, None]
+        with pytest.raises(ExplainError, match="nosuch") as info:
+            await adapter.explain("SELECT nosuch FROM t", timeout=7)
+        assert info.value.__cause__ is cause
+        calls = [c.args for c in conn._cursor.execute.call_args_list]
+        assert calls[-2:] == [
+            ("SET SESSION sql_notes = DEFAULT",),
+            ("SET SESSION TRANSACTION READ WRITE",),
+        ]
+
+    async def test_reserved_word_aliases_are_quoted_like_execute_query(self) -> None:
+        adapter, conn = _make_adapter()
+        await adapter.explain("SELECT 1 AS rank FROM t", timeout=7)
+        statements = [c.args[0] for c in conn._cursor.execute.call_args_list]
+        assert "EXPLAIN SELECT 1 AS `rank` FROM t" in statements
+
+    async def test_mariadb_engine_error_still_resets_the_session(self) -> None:
+        adapter, conn = _make_adapter(version="10.11.6-MariaDB")
+        cause = RuntimeError("Unknown column 'nosuch' in 'field list'")
+        # max_statement_time, READ ONLY and sql_notes succeed, the EXPLAIN raises, all three
+        # resets still run.
+        conn._cursor.execute.side_effect = [None, None, None, cause, None, None, None]
+        with pytest.raises(ExplainError, match="nosuch"):
+            await adapter.explain("SELECT nosuch FROM t", timeout=7)
+        calls = [c.args for c in conn._cursor.execute.call_args_list]
+        assert calls[-3:] == [
+            ("SET SESSION sql_notes = DEFAULT",),
+            ("SET SESSION TRANSACTION READ WRITE",),
+            ("SET SESSION max_statement_time = 0",),
+        ]
+
+    async def test_a_cancelled_plan_closes_the_connection_and_sends_no_reset(self) -> None:
+        """The router cancels a plan that outlives its budget (Task 4). aiomysql closes the
+        connection when a read is cancelled, so a reset sent afterwards raises
+        InterfaceError, which would replace the CancelledError that asyncio.wait_for turns
+        into a timeout. No reset is sent; the connection is closed."""
+        adapter, conn = _make_adapter(version="10.11.6-MariaDB")
+        planning = asyncio.Event()
+
+        async def execute(statement: str, args: object = None) -> None:
+            if planning.is_set():
+                # The driver already dropped the connection when the read was cancelled.
+                raise aiomysql.InterfaceError("Cancelled during execution")
+            if statement.startswith("EXPLAIN"):
+                planning.set()
+                # The server is still planning (waiting on a lock) until the task is cancelled.
+                await asyncio.Event().wait()
+
+        conn._cursor.execute = AsyncMock(side_effect=execute)
+        task = asyncio.create_task(adapter.explain("SELECT 1", timeout=7))
+        await planning.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        statements = [c.args[0] for c in conn._cursor.execute.call_args_list]
+        assert statements[-1] == "EXPLAIN SELECT 1"
+        conn.close.assert_called_once_with()
+
+    async def test_not_connected_raises(self) -> None:
+        adapter = MySQLDataSource()
+        with pytest.raises(RuntimeError):
+            await adapter.explain("SELECT 1", timeout=7)

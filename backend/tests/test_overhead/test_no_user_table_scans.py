@@ -142,6 +142,7 @@ class TestIntrospectOnlyReadsCatalog:
         orders = next(t for t in schema.tables if t.name == "orders")
         status_col = next(c for c in orders.columns if c.name == "status")
         assert status_col.sample_values == ["pending", "shipped", "delivered"]
+        assert status_col.sample_source == "stats"
 
     async def test_sample_values_disabled_means_no_pg_stats_query(self):
         """When include_sample_values=False, pg_stats must NOT be queried."""
@@ -177,7 +178,7 @@ class TestIntrospectOnlyReadsCatalog:
             [],  # pg_class relations
         ]
 
-        await adapter.introspect(
+        schema = await adapter.introspect(
             PrivacySettings(
                 include_sample_values=False,
                 include_column_comments=False,
@@ -185,6 +186,9 @@ class TestIntrospectOnlyReadsCatalog:
             )
         )
 
+        columns = [c for t in schema.tables for c in t.columns]
+        assert columns
+        assert all(c.sample_source is None for c in columns)
         sql_calls = [str(call.args[0]) for call in conn.fetch.call_args_list]
         assert not any("pg_stats" in s.lower() for s in sql_calls), (
             "pg_stats must not be queried when include_sample_values=False"
@@ -270,3 +274,17 @@ class TestGetSampleValuesUsesSafePaths:
         adapter = PostgreSQLDataSource()  # no pool
         with pytest.raises(RuntimeError, match="Not connected"):
             await adapter.get_sample_values("public", "users", "id")
+
+
+class TestExplainOverhead:
+    async def test_explain_issues_exactly_one_statement_against_the_query(self):
+        """explain() plans through fetch (one statement, extended protocol); it never
+        issues a statement of its own that names a user table and never reads a row."""
+        adapter, conn = make_adapter()
+        await adapter.explain("SELECT * FROM public.orders WHERE (tenant_id = 7)", timeout=5)
+        executed = [c.args[0] for c in conn.execute.call_args_list]
+        assert not any("orders" in s for s in executed)
+        conn.fetch.assert_awaited_once_with(
+            "EXPLAIN SELECT * FROM public.orders WHERE (tenant_id = 7)"
+        )
+        conn.fetchrow.assert_not_called()

@@ -15,6 +15,7 @@ from ..base import BaseDataSource, _serialize
 from ..errors import (
     NAME_ECHOING_CATEGORIES,
     ErrorCategory,
+    ExplainError,
     category_for_sqlstate,
     classify_chain,
     refine_undefined_function,
@@ -527,6 +528,7 @@ class PostgreSQLDataSource(BaseDataSource):
                     vals = sample_values.get(key, [])
                     if vals:
                         col.sample_values = [str(v) for v in vals[:5]]
+                        col.sample_source = "stats"
 
         return DataSourceSchema(
             source_type="postgresql",
@@ -632,6 +634,25 @@ class PostgreSQLDataSource(BaseDataSource):
             truncated=truncated,
             execution_time_ms=elapsed_ms,
         )
+
+    async def explain(self, sql: str, timeout: int) -> None:  # noqa: ASYNC109
+        """Plan *sql* inside a read-only transaction under ``statement_timeout``.
+
+        No table row is read, but the planner evaluates constant immutable and stable
+        expressions (``1/0`` fails here); volatile functions are not evaluated. Nothing is
+        returned. The plan rows asyncpg returns are discarded.
+        """
+        if self._pool is None:
+            raise RuntimeError("Not connected.")
+        async with self._pool.acquire() as conn, conn.transaction(readonly=True):
+            await conn.execute(f"SET LOCAL statement_timeout = {timeout * 1000}")
+            await conn.execute("SET LOCAL standard_conforming_strings = on")
+            try:
+                # fetch runs through the extended query protocol: exactly one statement,
+                # unlike execute without arguments (simple protocol, several statements).
+                await conn.fetch(f"EXPLAIN {sql}")
+            except Exception as exc:
+                raise ExplainError(str(exc) or type(exc).__name__) from exc
 
     async def execute_query_stream(
         self,

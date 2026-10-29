@@ -2,7 +2,8 @@
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 """Per-table row filtering: every base-table reference the admin configured a filter for
-becomes a filtered derived table, ``(SELECT * FROM t WHERE (<condition>)) AS t``.
+becomes a filtered derived table, ``(SELECT * FROM t WHERE (<condition>) OFFSET 0) AS t`` on
+PostgreSQL (``LIMIT 18446744073709551615`` on MySQL), fenced so the condition runs first.
 
 The statement is parsed with sqlglot, the matching ``Table`` nodes are replaced and the
 tree is regenerated; no text is spliced. Anything the rewriter cannot read or write with
@@ -11,6 +12,7 @@ certainty raises ``RowFilterRejectedError`` and the statement is never sent.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import re
 
@@ -23,6 +25,15 @@ from .row_filter_errors import RowFilterRejectedError
 
 # Adapter ``query_dialect`` (lower-cased) -> sqlglot dialect name.
 _SQLGLOT_DIALECT = {"postgresql": "postgres", "mysql": "mysql"}
+
+# sqlglot dialect -> how a filtered derived table is fenced. PostgreSQL neither pulls up nor
+# pushes quals into a subquery with OFFSET/LIMIT; MySQL neither merges a derived table with
+# LIMIT nor pushes conditions into it (18446744073709551615 is its documented "all rows";
+# MySQL has no bare OFFSET). A dialect absent here is refused, never fenced by guess.
+_FENCE: dict[str, Callable[[exp.Select], exp.Select]] = {
+    "postgres": lambda select: select.offset(0),
+    "mysql": lambda select: select.limit(18446744073709551615),
+}
 
 
 # Functions that run SQL passed as a string, or read a whole table named by a string: their
@@ -216,13 +227,31 @@ def _match(table: exp.Table, filters: list[_Filter], dialect: Dialect, read: str
     return None
 
 
-def _filtered(table: exp.Table, condition: exp.Expression) -> exp.Subquery:
-    """``(SELECT * FROM <table without alias> WHERE (<condition>)) AS <alias or table name>``."""
+def _filtered(table: exp.Table, condition: exp.Expression, read: str) -> exp.Subquery:
+    """``(SELECT * FROM <table without alias> WHERE (<condition>) <fence>) AS <alias or table
+    name>``.
+
+    The fence (``_FENCE``) makes the engine evaluate the condition before anything the outer
+    query does with the rows. Without it a predicate the model wrote can run on hidden rows,
+    and a data-dependent error (``1/0`` on PostgreSQL, a bad regular expression or JSON path
+    on MySQL) tells whether such a row exists, one bit per query, in text the correction
+    prompt sees. Neither fence changes a result. Cost: the model's predicates cannot use an
+    index on the base table unless the condition itself does; on MySQL every filtered
+    reference is materialized in full per query, so an outer LIMIT does not reduce the work,
+    and on PostgreSQL a correlated subquery over a filtered table rescans the filtered rows
+    per outer row.
+    """
     alias = table.args.get("alias")
     alias = alias.copy() if alias else exp.TableAlias(this=table.this.copy())
     inner = table.copy()
     inner.set("alias", None)
     select = exp.select("*").from_(inner).where(exp.Paren(this=condition.copy()))
+    fence = _FENCE.get(read)
+    if fence is None:
+        raise RowFilterRejectedError(
+            "Row filters have no fence for this database dialect, so the query was not run."
+        )
+    select = fence(select)
     return exp.Subquery(this=select, alias=alias)
 
 
@@ -298,7 +327,7 @@ def _apply(sql: str, row_filters: dict[str, str], read: str) -> str:
                 "The query nests a join inside a filtered table reference, which the row"
                 " filter cannot rewrite, so it was not run."
             )
-        table.replace(_filtered(table, matched.condition))
+        table.replace(_filtered(table, matched.condition, read))
     try:
         return _generate(tree, read)
     except UnsupportedError as exc:

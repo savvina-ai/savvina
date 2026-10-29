@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 from app.services.row_filter import RowFilterInvalidError, validate_row_filter, validate_row_filters
+from app.services.row_filter_rewrite import apply_row_filters
 
 _SEMICOLON = "must be a single condition without ';'"
 _COMMENTS = "must not contain comment markers, even inside quotes"
@@ -103,21 +104,36 @@ class TestValidateRowFilters:
             ('"public"."Orders"', "PostgreSQL", "public.Orders"),
             ('public."Orders"', "PostgreSQL", "public.Orders"),
             ("`sample_delivery`.`Orders`", "MySQL", "sample_delivery.Orders"),
-            ("Public.Orders", "PostgreSQL", "Public.Orders"),
+            ("Public.Orders", "PostgreSQL", "public.orders"),
+            ("Sample_Delivery.Orders", "MySQL", "Sample_Delivery.Orders"),
             ("s_1.t$2", "PostgreSQL", "s_1.t$2"),
         ],
     )
-    def test_quoted_parts_are_stored_without_quotes_and_casing_is_kept(
+    def test_unquoted_parts_fold_as_the_engine_folds_and_quoted_parts_keep_their_case(
         self, key: str, dialect: str, stored: str
     ) -> None:
         assert validate_row_filters({key: "x = 1"}, dialect) == {stored: "x = 1"}
 
-    def test_keys_differing_only_in_case_are_both_kept(self) -> None:
-        raw = {"public.orders": "a = 1", "public.Orders": "b = 2"}
-        assert validate_row_filters(raw, "PostgreSQL") == raw
+    def test_mixed_case_unquoted_key_filters_the_folded_reference_end_to_end(self) -> None:
+        row_filters = validate_row_filters({"Public.Orders": "x = 1"}, "PostgreSQL")
+        sql = apply_row_filters("SELECT * FROM Orders", row_filters, "PostgreSQL")
+        assert "WHERE (x = 1)" in sql
+
+    def test_keys_differing_only_in_case_are_both_kept_on_mysql(self) -> None:
+        raw = {"db.orders": "a = 1", "db.Orders": "b = 2"}
+        assert validate_row_filters(raw, "MySQL") == raw
+
+    def test_unquoted_keys_differing_only_in_case_are_a_duplicate_on_postgresql(self) -> None:
+        with pytest.raises(RowFilterInvalidError, match=r'"public\.orders" appears twice'):
+            validate_row_filters({"public.orders": "a = 1", "public.Orders": "b = 2"}, "PostgreSQL")
 
     def test_empty_map_is_allowed(self) -> None:
         assert validate_row_filters({}, "PostgreSQL") == {}
+
+    def test_a_newline_at_the_end_of_a_bare_key_part_is_an_invalid_name(self) -> None:
+        # re.match with "$" accepts a trailing newline; the key must match in full.
+        with pytest.raises(RowFilterInvalidError, match="has an invalid name"):
+            validate_row_filters({"public\n.orders": "x = 1"}, "postgresql")
 
     @pytest.mark.parametrize(
         ("raw", "dialect", "message"),

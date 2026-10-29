@@ -9,6 +9,9 @@ The rewrite itself (per-table derived tables) lives in ``row_filter_rewrite``.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import re
 
 import sqlglot
@@ -124,17 +127,23 @@ _MAX_NAME = {"postgresql": ("bytes", 63), "mysql": ("characters", 64)}
 
 
 def _key_part(part: str, dialect: str) -> str | None:
-    """*part* as a bare name, or the inside of a correctly quoted one; ``None`` if neither.
+    """*part* as the engine stores the name: a bare part folded as the engine folds an
+    unquoted identifier (PostgreSQL lowercases, MySQL keeps the case), or the inside of a
+    correctly quoted part with its case kept; ``None`` if neither.
 
-    A quoted part may not start or end with whitespace: the rewriter refuses such a key at
-    every execution, so it is refused here first."""
+    The stored key is thus the engine-normalised name, which the rewriter compares exactly
+    with the engine-normalised reference and ``schema_utils`` compares with the cached
+    table. A quoted part may not start or end with whitespace: the rewriter refuses such a
+    key at every execution, so it is refused here first."""
     quote = _QUOTE_BY_DIALECT.get((dialect or "").lower())
     if quote and len(part) >= 2 and part[0] == quote and part[-1] == quote:
         inner = part[1:-1]
         ok = inner and quote not in inner and inner == inner.strip()
         ok = ok and not _CONTROL_CHARACTER.search(inner)
         return inner if ok else None
-    return part if _BARE_NAME.match(part) else None
+    if not _BARE_NAME.fullmatch(part):
+        return None
+    return part.lower() if (dialect or "").lower() == "postgresql" else part
 
 
 def _too_long(name: str, dialect: str) -> bool:
@@ -147,10 +156,13 @@ def validate_row_filters(raw: object, dialect: str) -> dict[str, str]:
     """The clean per-table map, or ``RowFilterInvalidError`` naming the key and the reason.
 
     Keys: ``schema.table``, each part a bare name (``[A-Za-z_][A-Za-z0-9_$]*``) or a quoted
-    identifier of the dialect with no quote inside, stored without the quotes and with the
-    casing given (the rewriter compares it exactly with the engine-normalised reference).
+    identifier of the dialect with no quote inside, stored without the quotes; an
+    unquoted part is folded as the engine folds it (PostgreSQL lowercases), a quoted part keeps
+    its case, so the stored key is the engine-normalised name the rewriter compares exactly with
+    the engine-normalised reference.
     Values: ``validate_row_filter``'s textual rules, then a sqlglot parse as one condition.
-    Nothing is checked against the schema (spec section 6).
+    Nothing is checked against the cached schema; the connections router verifies new or changed
+    pairs with a live EXPLAIN (Phase 3a, section 6).
     """
     if not isinstance(raw, dict):
         raise RowFilterInvalidError(_SHAPE)
@@ -299,3 +311,28 @@ def _executable(sql: str, privacy: PrivacySettings | None, dialect: str) -> str:
     if privacy.row_filters:
         return apply_row_filters(sql, privacy.row_filters, dialect)
     return sql
+
+
+# Domain separation for the fingerprint MAC: the encryption key is the app's one secret, so
+# the message is labelled to keep this MAC distinct from any other HMAC under that key.
+# Changing the label (or the version in it) retires every stored result.
+_FINGERPRINT_DOMAIN = b"savvina.row_filter_fingerprint.v1\x00"
+
+
+def row_filter_fingerprint(row_filters: dict[str, str], key: str) -> str:
+    """``""`` for no filters, else 16 hex characters of HMAC-SHA256 under *key* over
+    ``_FINGERPRINT_DOMAIN`` followed by the canonical JSON of the map (sorted keys, no
+    whitespace).
+
+    Stored with every result so a stored result can be refused when the connection's map
+    has changed since (``stored_results``). Keyed, not a plain hash: the value travels in
+    ``results_json`` to the history and to anyone with a share link, and a plain hash of a
+    low-entropy map (``{"public.orders": "tenant_id = 7"}``) would let them confirm a guess
+    of the admin's condition. *key* is the app's encryption key; rotating it makes every
+    stored result stale, the fail-closed direction.
+    """
+    if not row_filters:
+        return ""
+    canonical = json.dumps(row_filters, sort_keys=True, separators=(",", ":"))
+    message = _FINGERPRINT_DOMAIN + canonical.encode()
+    return hmac.new(key.encode(), message, hashlib.sha256).hexdigest()[:16]

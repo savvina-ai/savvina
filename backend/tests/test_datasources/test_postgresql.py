@@ -10,6 +10,7 @@ import pytest
 
 import app.datasources.adapters.postgresql as _pg_module
 from app.datasources.adapters.postgresql import PostgreSQLDataSource, _quote_pg_ident
+from app.datasources.errors import ExplainError
 from app.datasources.models import (
     ColumnInfo,
     DataSourceSchema,
@@ -1150,3 +1151,30 @@ class TestConnectPoolTimeout:
             await PostgreSQLDataSource().connect(self._cfg)
 
         assert _pg_module._pool_cache == {}
+
+
+class TestExplain:
+    async def test_plans_inside_a_read_only_transaction_with_the_timeout(self):
+        adapter, conn = make_adapter_with_pool()
+        await adapter.explain("SELECT 1", timeout=7)
+        assert conn.transaction_kwargs == {"readonly": True}
+        statements = [c.args[0] for c in conn.execute.call_args_list]
+        assert statements == [
+            "SET LOCAL statement_timeout = 7000",
+            "SET LOCAL standard_conforming_strings = on",
+        ]
+        # fetch uses the extended query protocol, which runs exactly one statement.
+        conn.fetch.assert_awaited_once_with("EXPLAIN SELECT 1")
+
+    async def test_engine_error_becomes_explain_error_with_the_cause(self):
+        adapter, conn = make_adapter_with_pool()
+        cause = RuntimeError('column "nosuch" does not exist')
+        conn.fetch.side_effect = cause
+        with pytest.raises(ExplainError, match="nosuch") as info:
+            await adapter.explain("SELECT nosuch FROM t", timeout=7)
+        assert info.value.__cause__ is cause
+
+    async def test_not_connected_raises(self):
+        adapter = PostgreSQLDataSource()
+        with pytest.raises(RuntimeError):
+            await adapter.explain("SELECT 1", timeout=7)

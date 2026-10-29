@@ -3,6 +3,7 @@
 
 """MySQL / MariaDB data source adapter."""
 
+import asyncio
 from collections.abc import AsyncGenerator
 import logging
 import re
@@ -12,7 +13,7 @@ from typing import Any
 import aiomysql
 
 from ..base import BaseDataSource, _serialize
-from ..errors import ErrorCategory, classify_chain
+from ..errors import ErrorCategory, ExplainError, classify_chain
 from ..models import (
     ColumnInfo,
     ConnectionResult,
@@ -347,6 +348,7 @@ class MySQLDataSource(BaseDataSource):
                     is_primary_key=row["column_key"] == "PRI",
                     description=comment if privacy.include_column_comments else None,
                     sample_values=sample_values,
+                    sample_source="type" if sample_values is not None else None,
                 )
             )
 
@@ -493,6 +495,54 @@ class MySQLDataSource(BaseDataSource):
             truncated=truncated,
             execution_time_ms=elapsed_ms,
         )
+
+    async def explain(self, sql: str, timeout: int) -> None:  # noqa: ASYNC109
+        """Plan *sql* with ``EXPLAIN`` inside the read-only session ``execute_query`` uses:
+        the optimizer may evaluate constant subqueries, and stored functions declared
+        ``DETERMINISTIC``, while planning (volatile functions are not evaluated), and the
+        engine refuses a write among them. MySQL's ``MAX_EXECUTION_TIME`` applies to ``SELECT``
+        only and aiomysql has no read timeout, so on MySQL the adapter
+        itself bounds nothing once connected (the connections router bounds the call with
+        ``asyncio.wait_for``);
+        ``sql_notes`` is off while planning, so the note that quotes the rewritten statement
+        is never raised;
+        MariaDB's ``max_statement_time`` applies to every statement and is set to *timeout*.
+        A plan takes milliseconds and may read a single row by unique key while planning
+        (const tables); nothing is returned. A cancelled plan (the caller's
+        ``asyncio.wait_for``) closes the connection and skips the session resets, so the
+        cancellation, not a driver error from a reset on the closed connection, reaches the
+        caller."""
+        if self._pool is None:
+            raise RuntimeError("Not connected.")
+        async with self._pool.acquire() as conn, conn.cursor() as cur:
+            if self._is_mariadb:
+                await cur.execute("SET SESSION max_statement_time = %s", (timeout,))
+            await cur.execute("SET SESSION TRANSACTION READ ONLY")
+            # A successful EXPLAIN raises Note 1003, which quotes the rewritten statement with
+            # the condition's literals. aiomysql would fetch it with SHOW WARNINGS and pass it
+            # to warnings.warn, so it would reach the logs; with notes off it is never raised.
+            await cur.execute("SET SESSION sql_notes = 0")
+            cancelled = False
+            try:
+                await cur.execute(f"EXPLAIN {_fix_reserved_aliases(sql)}")
+            except asyncio.CancelledError:
+                # The caller stopped waiting (the router's budget). aiomysql closes the
+                # connection when a read is cancelled, so a reset here would raise
+                # InterfaceError and replace the CancelledError that asyncio.wait_for turns
+                # into a timeout. The explicit close() is defensive (a cancellation at an
+                # await that is not a packet read); it is synchronous, and the pool discards
+                # a closed connection on release.
+                cancelled = True
+                conn.close()
+                raise
+            except Exception as exc:
+                raise ExplainError(str(exc) or type(exc).__name__) from exc
+            finally:
+                if not cancelled:
+                    await cur.execute("SET SESSION sql_notes = DEFAULT")
+                    await cur.execute("SET SESSION TRANSACTION READ WRITE")
+                    if self._is_mariadb:
+                        await cur.execute("SET SESSION max_statement_time = 0")
 
     async def execute_query_stream(
         self,

@@ -20,8 +20,12 @@ import openpyxl
 import pytest
 
 from app.auth.limiter import limiter
+from app.config import get_settings
 from app.database import get_db
 from app.main import app
+from app.services import report_service
+from app.services.row_filter import row_filter_fingerprint
+from app.services.stored_results import STALE_ROW_FILTER_TEXT
 
 from .conftest import MockResult, _mock_db
 
@@ -246,3 +250,191 @@ class TestExport:
         assert [s["results_json"]["rows"] for s in sections] == [[[1, _R], [2, _R]]] * 2
         assert [s["sql"] for s in sections] == [_CLEAN, _CLEAN]
         assert db.execute.await_count == 2  # messages + one privacy load
+
+
+_FILTERS = {"public.users": "tenant_id = 7"}
+
+
+def _filtered_rows():
+    return _privacy_rows({"row_filters": _FILTERS})
+
+
+def _fresh_results() -> dict:
+    return {
+        **_results(),
+        "row_filter_fingerprint": row_filter_fingerprint(_FILTERS, get_settings().encryption_key),
+    }
+
+
+class TestStaleRowFilter:
+    """A result stored without a fingerprint is stale once the connection has filters."""
+
+    async def test_history_serves_empty_rows_and_the_flag(self, http_client: AsyncClient):
+        db = _mock_db(MockResult(rows=[_message()]), _filtered_rows())
+        db.scalar = AsyncMock(return_value=1)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/chat/sessions/sess-1/history")
+        item = resp.json()["items"][0]["results_json"]
+        assert item["rows"] == []
+        assert item["row_count"] == 0
+        assert item["stale_row_filter"] is True
+
+    async def test_history_serves_a_fresh_result(self, http_client: AsyncClient):
+        db = _mock_db(MockResult(rows=[_message(results_json=_fresh_results())]), _filtered_rows())
+        db.scalar = AsyncMock(return_value=1)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/chat/sessions/sess-1/history")
+        item = resp.json()["items"][0]["results_json"]
+        assert item["rows"] == [[1, _R], [2, _R]]
+        assert not item.get("stale_row_filter")
+
+    @pytest.mark.parametrize("path", ["", "/csv", "/xlsx"])
+    async def test_single_shared_result_is_410(self, http_client: AsyncClient, path: str):
+        db = _mock_db(_filtered_rows())
+        db.scalar = AsyncMock(return_value=_message())
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get(f"/api/v1/public/share/tok{path}")
+        assert resp.status_code == 410
+        assert resp.json()["detail"] == STALE_ROW_FILTER_TEXT
+
+    @pytest.mark.parametrize("path", ["", "/csv", "/xlsx"])
+    async def test_the_migration_state_makes_a_single_share_410(
+        self, http_client: AsyncClient, path: str
+    ):
+        db = _mock_db(_privacy_rows({"row_filter_sql": "tenant_id = 7"}))
+        db.scalar = AsyncMock(return_value=_message(results_json=_fresh_results()))
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get(f"/api/v1/public/share/tok{path}")
+        assert resp.status_code == 410
+        assert resp.json()["detail"] == STALE_ROW_FILTER_TEXT
+
+    async def test_shared_session_carries_the_flag_per_message(self, http_client: AsyncClient):
+        db = _mock_db(
+            MockResult(rows=[_message(), _message(id="msg-2", results_json=_fresh_results())]),
+            _filtered_rows(),
+        )
+        db.scalar = AsyncMock(return_value=_session())
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/public/share/session/tok")
+        assert resp.status_code == 200
+        stale, fresh = resp.json()["messages"]
+        assert stale["results_json"]["rows"] == []
+        assert stale["results_json"]["stale_row_filter"] is True
+        assert fresh["results_json"]["rows"] == [[1, _R], [2, _R]]
+
+    async def test_a_tampered_fingerprint_in_a_shared_session_is_served_stale_without_it(
+        self, http_client: AsyncClient
+    ):
+        tampered = _message(results_json={**_results(), "row_filter_fingerprint": 123})
+        db = _mock_db(MockResult(rows=[tampered]), _filtered_rows())
+        db.scalar = AsyncMock(return_value=_session())
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/public/share/session/tok")
+        assert resp.status_code == 200
+        [served] = resp.json()["messages"]
+        assert served["results_json"]["rows"] == []
+        assert served["results_json"]["stale_row_filter"] is True
+        assert served["results_json"]["row_filter_fingerprint"] is None
+
+    async def test_single_shared_fresh_result_is_served(self, http_client: AsyncClient):
+        db = _mock_db(_filtered_rows())
+        db.scalar = AsyncMock(return_value=_message(results_json=_fresh_results()))
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/public/share/tok")
+        assert resp.status_code == 200
+        assert resp.json()["results"]["rows"] == [[1, _R], [2, _R]]
+
+    async def test_an_expired_stale_share_is_410_before_any_privacy_load(
+        self, http_client: AsyncClient
+    ):
+        msg = _message()
+        msg.share_expires_at = datetime(2000, 1, 1, tzinfo=UTC)
+        db = _mock_db(_filtered_rows())
+        db.scalar = AsyncMock(return_value=msg)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/public/share/tok")
+        assert resp.status_code == 410
+        assert resp.json()["detail"] == "Share link has expired"
+        assert db.execute.await_count == 0
+
+    @pytest.mark.parametrize("path", ["csv", "xlsx"])
+    async def test_single_export_is_410(self, http_client: AsyncClient, path: str):
+        db = _mock_db(_filtered_rows())
+        db.scalar = AsyncMock(return_value=_message())
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get(f"/api/v1/export/messages/msg-12345678/{path}")
+        assert resp.status_code == 410
+        assert resp.json()["detail"] == STALE_ROW_FILTER_TEXT
+
+    async def test_report_section_carries_the_flag(self, http_client: AsyncClient):
+        db = _mock_db(MockResult(rows=[_message()]), _filtered_rows())
+        app.dependency_overrides[get_db] = lambda: db
+        captured: dict = {}
+
+        def fake_report(title: str, sections: list[dict]) -> bytes:
+            captured["sections"] = sections
+            return b"%PDF-1.4"
+
+        with patch("app.routers.export.generate_report", side_effect=fake_report):
+            resp = await http_client.post(
+                "/api/v1/export/report",
+                json={"title": "Users", "sections": [{"message_id": "msg-12345678"}]},
+            )
+        assert resp.status_code == 200
+        rj = captured["sections"][0]["results_json"]
+        assert rj["rows"] == []
+        assert rj["stale_row_filter"] is True
+
+
+class TestReportStaleSection:
+    def test_the_section_shows_the_notice_instead_of_a_table(self) -> None:
+        rj = {**_results(), "stale_row_filter": True}
+        with (
+            patch.object(report_service, "Paragraph", wraps=report_service.Paragraph) as para,
+            patch.object(report_service, "Table", wraps=report_service.Table) as table,
+        ):
+            pdf = report_service.generate_report(
+                "T",
+                [
+                    {
+                        "heading": "H",
+                        "sql": "SELECT 1",
+                        "results_json": rj,
+                        "chart_image": None,
+                        "chart_title": None,
+                    }
+                ],
+            )
+        assert pdf.startswith(b"%PDF")
+        texts = [call.args[0] for call in para.call_args_list]
+        assert STALE_ROW_FILTER_TEXT in texts
+        table.assert_not_called()
+        assert not any("jane@example.com" in str(t) for t in texts)
+
+    # A 1x1 PNG, enough for _png_dimensions and RLImage.
+    _PNG = (
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+        "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+    )
+
+    def _section(self, rj: dict) -> dict:
+        return {
+            "heading": "H",
+            "sql": "SELECT 1",
+            "results_json": rj,
+            "chart_image": self._PNG,
+            "chart_title": "Chart",
+        }
+
+    def test_a_stale_section_embeds_no_chart(self) -> None:
+        # The chart was drawn in the browser from the stale rows; it must not reach the PDF.
+        rj = {**_results(), "stale_row_filter": True}
+        with patch.object(report_service, "RLImage") as image:
+            pdf = report_service.generate_report("T", [self._section(rj)])
+        assert pdf.startswith(b"%PDF")
+        image.assert_not_called()
+
+    def test_a_fresh_section_still_embeds_its_chart(self) -> None:
+        with patch.object(report_service, "RLImage", wraps=report_service.RLImage) as image:
+            report_service.generate_report("T", [self._section(_results())])
+        image.assert_called_once()

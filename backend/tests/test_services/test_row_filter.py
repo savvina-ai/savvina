@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import re
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,11 +22,12 @@ from app.services.execution import (
     _executable,
     _execute_auto_query,
 )
-from app.services.row_filter import _MIGRATION_MESSAGE
+from app.services.row_filter import _MIGRATION_MESSAGE, row_filter_fingerprint
 from app.services.row_filter_rewrite import apply_row_filters
 
 _F = "tenant_id = 7"
 _FILTERS = {"public.users": _F}
+_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
 
 class TestExecutable:
@@ -223,3 +227,45 @@ class TestRejectedErrorHint:
 
         assert row_filter.RowFilterRejectedError is row_filter_errors.RowFilterRejectedError
         assert row_filter.RowFilterInvalidError is row_filter_errors.RowFilterInvalidError
+
+
+class TestRowFilterFingerprint:
+    def test_empty_map_is_the_empty_string(self) -> None:
+        assert row_filter_fingerprint({}, _KEY) == ""
+
+    def test_sixteen_hex_characters(self) -> None:
+        fp = row_filter_fingerprint({"public.orders": "tenant_id = 7"}, _KEY)
+        assert len(fp) == 16
+        assert re.fullmatch(r"[0-9a-f]{16}", fp)
+
+    def test_stable_and_independent_of_key_order(self) -> None:
+        a = row_filter_fingerprint({"public.a": "x = 1", "public.b": "y = 2"}, _KEY)
+        b = row_filter_fingerprint({"public.b": "y = 2", "public.a": "x = 1"}, _KEY)
+        assert a == b == row_filter_fingerprint({"public.a": "x = 1", "public.b": "y = 2"}, _KEY)
+
+    def test_a_different_condition_or_table_changes_it(self) -> None:
+        base = row_filter_fingerprint({"public.orders": "tenant_id = 7"}, _KEY)
+        assert row_filter_fingerprint({"public.orders": "tenant_id = 8"}, _KEY) != base
+        assert row_filter_fingerprint({"public.items": "tenant_id = 7"}, _KEY) != base
+
+    def test_a_different_secret_changes_it(self) -> None:
+        filters = {"public.orders": "tenant_id = 7"}
+        assert row_filter_fingerprint(filters, _KEY) != row_filter_fingerprint(filters, "other")
+
+    def test_canonical_form_and_domain_label_are_pinned(self) -> None:
+        canonical = b'{"public.a":"x = 1","public.b":"y = 2"}'
+        message = b"savvina.row_filter_fingerprint.v1\x00" + canonical
+        expected = hmac.new(_KEY.encode(), message, hashlib.sha256).hexdigest()[:16]
+        assert row_filter_fingerprint({"public.b": "y = 2", "public.a": "x = 1"}, _KEY) == expected
+
+    def test_differs_from_a_plain_hmac_of_the_map(self) -> None:
+        # The encryption key is shared with other uses; the label keeps this MAC from
+        # colliding with any other HMAC-SHA256 computed over the same JSON under it.
+        canonical = b'{"public.a":"x = 1"}'
+        plain = hmac.new(_KEY.encode(), canonical, hashlib.sha256).hexdigest()[:16]
+        assert row_filter_fingerprint({"public.a": "x = 1"}, _KEY) != plain
+
+    def test_non_ascii_keys_and_conditions(self) -> None:
+        fp = row_filter_fingerprint({"public.ü": "name = 'Ω'"}, _KEY)
+        assert re.fullmatch(r"[0-9a-f]{16}", fp)
+        assert fp != row_filter_fingerprint({"public.u": "name = 'Ω'"}, _KEY)

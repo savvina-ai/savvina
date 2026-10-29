@@ -5,16 +5,33 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.config import get_settings
 from app.database import get_db
+from app.datasources.errors import ErrorCategory, ExplainError
 from app.datasources.models import ConnectionResult
 from app.main import app
+from app.services.row_filter import RowFilterRejectedError
 
 from .conftest import MockResult, _make_conn, _mock_db
+
+
+@pytest.fixture
+def no_verification():
+    """Row-filter saves verify every new or changed pair against the live database; these
+    tests are about the rest of the handler. A PUT decrypts the stored config before it
+    verifies, so the fake connection's config is stubbed too."""
+    with (
+        patch("app.routers.connections._verify_row_filters", new=AsyncMock()) as verify,
+        patch("app.routers.connections.decrypt_value", return_value="{}"),
+    ):
+        yield verify
+
 
 # ── POST /api/v1/connections/test ────────────────────────────────────────────────
 
@@ -117,7 +134,9 @@ class TestCreateConnection:
         )
         db.add.assert_not_called()
 
-    async def test_row_filters_are_stored_clean_and_row_filter_sql_is_dropped(self, http_client):
+    async def test_row_filters_are_stored_clean_and_row_filter_sql_is_dropped(
+        self, http_client, no_verification
+    ):
         db = _mock_db()
         app.dependency_overrides[get_db] = lambda: db
         resp = await http_client.post(
@@ -561,7 +580,7 @@ class TestUpdatePrivacy:
     def _touches_schema_cache(db) -> bool:
         return any("user_schema_caches" in str(c.args[0]) for c in db.execute.call_args_list)
 
-    async def test_sets_the_map_and_keeps_the_schema_cache(self, http_client):
+    async def test_sets_the_map_and_keeps_the_schema_cache(self, http_client, no_verification):
         conn = _make_conn(privacy_settings={"include_sample_values": False})
         db = self._db_for_update(conn)
         self._use_db(db)
@@ -579,7 +598,7 @@ class TestUpdatePrivacy:
         assert self._executes(db) == 4
         assert not self._touches_schema_cache(db)
 
-    async def test_any_other_key_still_flushes_the_schema_cache(self, http_client):
+    async def test_any_other_key_still_flushes_the_schema_cache(self, http_client, no_verification):
         conn = _make_conn(privacy_settings={})
         db = self._db_for_update(conn)
         self._use_db(db)
@@ -591,7 +610,7 @@ class TestUpdatePrivacy:
         assert self._executes(db) == 5
 
     async def test_whole_form_with_only_a_condition_changed_keeps_the_schema_cache(
-        self, http_client
+        self, http_client, no_verification
     ):
         stored = {
             "include_sample_values": False,
@@ -627,7 +646,9 @@ class TestUpdatePrivacy:
         assert self._executes(db) == 4
         assert not self._touches_schema_cache(db)
 
-    async def test_whole_form_with_another_key_changed_flushes_the_schema_cache(self, http_client):
+    async def test_whole_form_with_another_key_changed_flushes_the_schema_cache(
+        self, http_client, no_verification
+    ):
         stored = {
             "include_sample_values": False,
             "excluded_tables": ["a"],
@@ -684,7 +705,7 @@ class TestUpdatePrivacy:
         assert self._executes(db) == 1
         db.commit.assert_not_called()
 
-    async def test_non_empty_map_ends_the_migration_state(self, http_client):
+    async def test_non_empty_map_ends_the_migration_state(self, http_client, no_verification):
         conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
         db = self._db_for_update(conn)
         self._use_db(db)
@@ -773,7 +794,7 @@ class TestUpdatePrivacy:
         assert self._executes(db) == 1
         db.commit.assert_not_called()
 
-    async def test_validation_uses_the_connections_dialect(self, http_client):
+    async def test_validation_uses_the_connections_dialect(self, http_client, no_verification):
         # "#" starts a comment on MySQL only.
         for source_type, expected in (("postgresql", 200), ("mysql", 422)):
             conn = _make_conn(source_type=source_type, privacy_settings={})
@@ -1054,3 +1075,397 @@ class TestConnectionResponseShape:
 
         assert "semantic_model_updated_at" not in ConnectionResponse.model_fields
         assert "semantic_model_updated_at" not in ConnectionDetail.model_fields
+
+
+# ── Row-filter verification against the live database ────────────────────────────
+
+
+def _verifying_adapter(explain=None) -> MagicMock:
+    adapter = MagicMock()
+    adapter.connect = AsyncMock(return_value=MagicMock(success=True))
+    adapter.disconnect = AsyncMock()
+    adapter.explain = explain or AsyncMock()
+    adapter.classify_error = MagicMock(return_value=ErrorCategory.UNKNOWN_NAME)
+    return adapter
+
+
+class TestRowFilterVerification:
+    @pytest.fixture(autouse=True)
+    def _config(self):
+        with patch("app.routers.connections.decrypt_value", return_value='{"host": "db"}'):
+            yield
+
+    def _db(self, conn):
+        return TestUpdatePrivacy._db_for_update(conn)
+
+    async def test_new_pair_is_planned_as_the_rewriter_writes_it(self, http_client):
+        """The statement planned is ``SELECT * FROM "s"."t"`` after ``apply_row_filters``:
+        the condition as sqlglot writes it back, inside the fenced derived table."""
+        conn = _make_conn(privacy_settings={})
+        adapter = _verifying_adapter()
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "tenant_id = 42"}},
+            )
+        assert resp.status_code == 200
+        adapter.explain.assert_awaited_once_with(
+            'SELECT * FROM (SELECT * FROM "public"."orders" WHERE (tenant_id = 42) OFFSET 0)'
+            ' AS "orders"',
+            timeout=get_settings().default_query_timeout,
+        )
+        adapter.disconnect.assert_awaited_once()
+
+    async def test_a_mysql_pair_is_planned_with_backticks_and_the_limit_fence(self, http_client):
+        conn = _make_conn(source_type="mysql", privacy_settings={})
+        adapter = _verifying_adapter()
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"shop.orders": "tenant_id = 42"}},
+            )
+        assert resp.status_code == 200
+        adapter.explain.assert_awaited_once_with(
+            "SELECT * FROM (SELECT * FROM `shop`.`orders` WHERE (tenant_id = 42)"
+            " LIMIT 18446744073709551615) AS `orders`",
+            timeout=get_settings().default_query_timeout,
+        )
+
+    async def test_a_quoted_key_is_planned_with_its_case(self, http_client):
+        conn = _make_conn(privacy_settings={})
+        adapter = _verifying_adapter()
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {'public."Orders"': "tenant_id = 42"}},
+            )
+        assert resp.status_code == 200
+        planned = adapter.explain.await_args.args[0]
+        assert '"public"."Orders" WHERE (tenant_id = 42) OFFSET 0) AS "Orders"' in planned
+
+    async def test_a_pair_the_rewriter_refuses_is_422_and_nothing_is_planned(self, http_client):
+        conn = _make_conn(privacy_settings={})
+        adapter = _verifying_adapter()
+        db = self._db(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        with (
+            patch("app.routers.connections.create_datasource", return_value=adapter),
+            patch(
+                "app.routers.connections.apply_row_filters",
+                side_effect=RowFilterRejectedError(
+                    "The query uses a construct the row-filter rewriter cannot write back"
+                    " for this dialect, so it was not run."
+                ),
+            ),
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "tenant_id = 42"}},
+            )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            'row_filters["public.orders"]: The query uses a construct the row-filter rewriter'
+            " cannot write back for this dialect, so it was not run."
+        )
+        adapter.connect.assert_not_awaited()  # the statements are built before connecting
+        adapter.explain.assert_not_awaited()
+        assert db.execute.call_count == 1  # the lookup only; no UPDATE
+
+    async def test_a_pair_the_rewriter_does_not_match_is_422_and_nothing_is_planned(
+        self, http_client
+    ):
+        conn = _make_conn(privacy_settings={})
+        adapter = _verifying_adapter()
+        db = self._db(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        with (
+            patch("app.routers.connections.create_datasource", return_value=adapter),
+            patch(
+                "app.routers.connections.apply_row_filters",
+                side_effect=lambda sql, filters, dialect: sql,
+            ),
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "tenant_id = 42"}},
+            )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            'row_filters["public.orders"]: the filter could not be applied to the table,'
+            " so it was not saved."
+        )
+        adapter.connect.assert_not_awaited()
+        adapter.explain.assert_not_awaited()
+        assert db.execute.call_count == 1  # the lookup only; no UPDATE
+
+    async def test_only_new_or_changed_pairs_are_explained(self, http_client):
+        stored = {"public.a": "x = 1", "public.b": "y = 2"}
+        conn = _make_conn(privacy_settings={"row_filters": dict(stored)})
+        adapter = _verifying_adapter()
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={
+                    "row_filters": {"public.a": "x = 1", "public.b": "y = 3", "public.c": "z = 1"}
+                },
+            )
+        assert resp.status_code == 200
+        explained = [c.args[0] for c in adapter.explain.await_args_list]
+        assert len(explained) == 2
+        assert any('"b" WHERE (y = 3)' in s for s in explained)
+        assert any('"c" WHERE (z = 1)' in s for s in explained)
+
+    async def test_unchanged_map_opens_no_connection(self, http_client):
+        stored = {"public.a": "x = 1"}
+        conn = _make_conn(privacy_settings={"row_filters": dict(stored)})
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource") as create:
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": dict(stored), "include_sample_values": True},
+            )
+        assert resp.status_code == 200
+        create.assert_not_called()
+
+    async def test_put_without_row_filters_opens_no_connection(self, http_client):
+        conn = _make_conn(privacy_settings={"row_filters": {"public.a": "x = 1"}})
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource") as create:
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy", json={"include_sample_values": True}
+            )
+        assert resp.status_code == 200
+        create.assert_not_called()
+
+    async def test_engine_error_is_422_with_the_redacted_text_and_nothing_stored(self, http_client):
+        conn = _make_conn(privacy_settings={})
+        cause = RuntimeError('column "nosuch" does not exist')
+        explain = AsyncMock(side_effect=ExplainError(str(cause)))
+        explain.side_effect.__cause__ = cause
+        adapter = _verifying_adapter(explain)
+        db = self._db(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "nosuch = 1"}},
+            )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            'row_filters["public.orders"]: rejected by the database: column "nosuch" does not exist'
+        )
+        assert db.execute.call_count == 1  # the lookup only; no UPDATE
+        adapter.disconnect.assert_awaited_once()
+
+    async def test_a_value_quoting_category_is_redacted(self, http_client):
+        conn = _make_conn(privacy_settings={})
+        explain = AsyncMock(
+            side_effect=ExplainError('invalid input syntax for type integer: "abc"')
+        )
+        adapter = _verifying_adapter(explain)
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.DATA)
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "id = 'abc'"}},
+            )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            'row_filters["public.orders"]: rejected by the database:'
+            " invalid input syntax for type integer: [REDACTED]"
+        )
+
+    async def test_a_timeout_is_unverified_not_rejected(self, http_client):
+        conn = _make_conn(privacy_settings={})
+        adapter = _verifying_adapter(AsyncMock(side_effect=ExplainError("canceling statement")))
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.TIMEOUT)
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "tenant_id = 42"}},
+            )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            "row filters could not be verified against the database: canceling statement"
+        )
+
+    async def test_a_plan_that_does_not_return_is_unverified_within_the_budget(self, http_client):
+        """MySQL applies no timeout to an EXPLAIN, so the router bounds the wait itself."""
+        conn = _make_conn(privacy_settings={})
+
+        cancelled: list[bool] = []
+
+        async def hang(sql: str, **kwargs: int) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+        adapter = _verifying_adapter(AsyncMock(side_effect=hang))
+        db = self._db(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        # The outer timeout makes a missing wait_for fail in seconds instead of hanging.
+        with (
+            patch("app.routers.connections.create_datasource", return_value=adapter),
+            patch("app.routers.connections._explain_budget", return_value=0.01),
+        ):
+            async with asyncio.timeout(5):
+                resp = await http_client.put(
+                    "/api/v1/connections/conn-123/privacy",
+                    json={"row_filters": {"public.orders": "tenant_id = 42"}},
+                )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            "row filters could not be verified against the database:"
+            " the planning check did not finish within 0.01 seconds"
+        )
+        assert cancelled == [True]
+        assert db.execute.call_count == 1
+        adapter.disconnect.assert_awaited_once()
+
+    def test_the_budget_is_the_query_timeout_plus_the_grace(self):
+        from app.routers.connections import _EXPLAIN_GRACE_SECONDS, _explain_budget
+
+        assert _explain_budget() == get_settings().default_query_timeout + _EXPLAIN_GRACE_SECONDS
+        assert _EXPLAIN_GRACE_SECONDS == 5
+
+    async def test_unreachable_database_is_422_and_nothing_stored(self, http_client):
+        conn = _make_conn(privacy_settings={})
+        adapter = _verifying_adapter()
+        adapter.connect = AsyncMock(return_value=MagicMock(success=False, message="refused"))
+        db = self._db(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "tenant_id = 42"}},
+            )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            "row filters could not be verified against the database: refused"
+        )
+        assert db.execute.call_count == 1
+        adapter.disconnect.assert_awaited_once()
+
+    async def test_connect_raising_is_422(self, http_client):
+        conn = _make_conn(privacy_settings={})
+        adapter = _verifying_adapter()
+        adapter.connect = AsyncMock(side_effect=OSError("no route to host"))
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "tenant_id = 42"}},
+            )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            "row filters could not be verified against the database: no route to host"
+        )
+        adapter.disconnect.assert_awaited_once()
+
+    async def test_a_driver_error_during_explain_is_unverified(self, http_client):
+        conn = _make_conn(privacy_settings={})
+        adapter = _verifying_adapter(AsyncMock(side_effect=RuntimeError("driver boom")))
+        db = self._db(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "tenant_id = 42"}},
+            )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            "row filters could not be verified against the database: driver boom"
+        )
+        assert db.execute.call_count == 1
+        adapter.disconnect.assert_awaited_once()
+
+    async def test_post_verifies_before_the_connection_is_created(self, http_client):
+        db = _mock_db()
+        db.refresh = AsyncMock()
+        app.dependency_overrides[get_db] = lambda: db
+        adapter = _verifying_adapter(
+            AsyncMock(side_effect=ExplainError('relation "public.ordres" does not exist'))
+        )
+        with (
+            patch("app.routers.connections.create_datasource", return_value=adapter),
+            patch("app.routers.connections.encrypt_value", return_value=b"enc"),
+        ):
+            resp = await http_client.post(
+                "/api/v1/connections",
+                json={
+                    "name": "My DB",
+                    "source_type": "postgresql",
+                    "config": {"host": "localhost"},
+                    "privacy_settings": {"row_filters": {"public.ordres": "tenant_id = 1"}},
+                },
+            )
+        assert resp.status_code == 422
+        assert resp.json()["detail"].startswith(
+            'row_filters["public.ordres"]: rejected by the database:'
+        )
+        db.add.assert_not_called()
+        db.commit.assert_not_called()
+
+    async def test_post_with_verified_filters_is_created(self, http_client):
+        db = _mock_db()
+        db.refresh = AsyncMock()
+        app.dependency_overrides[get_db] = lambda: db
+        adapter = _verifying_adapter()
+        with (
+            patch("app.routers.connections.create_datasource", return_value=adapter),
+            patch("app.routers.connections.encrypt_value", return_value=b"enc"),
+        ):
+            resp = await http_client.post(
+                "/api/v1/connections",
+                json={
+                    "name": "My DB",
+                    "source_type": "postgresql",
+                    "config": {"host": "localhost"},
+                    "privacy_settings": {"row_filters": {"public.orders": "tenant_id = 1"}},
+                },
+            )
+        assert resp.status_code == 201
+        adapter.explain.assert_awaited_once()
+        db.add.assert_called_once()
+
+    async def test_a_failed_disconnect_keeps_the_422(self, http_client, caplog):
+        conn = _make_conn(privacy_settings={})
+        cause = RuntimeError('column "nosuch" does not exist')
+        explain = AsyncMock(side_effect=ExplainError(str(cause)))
+        explain.side_effect.__cause__ = cause
+        adapter = _verifying_adapter(explain)
+        adapter.disconnect = AsyncMock(side_effect=RuntimeError("pool already closed"))
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with (
+            patch("app.routers.connections.create_datasource", return_value=adapter),
+            caplog.at_level("WARNING", logger="app.routers.connections"),
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "nosuch = 1"}},
+            )
+        assert resp.status_code == 422
+        assert resp.json()["detail"].startswith('row_filters["public.orders"]: rejected')
+        assert any("verify row filters" in r.getMessage() for r in caplog.records)
+        adapter.disconnect.assert_awaited_once()
+
+    async def test_a_failed_disconnect_keeps_the_200(self, http_client):
+        conn = _make_conn(privacy_settings={})
+        adapter = _verifying_adapter()
+        adapter.disconnect = AsyncMock(side_effect=RuntimeError("pool already closed"))
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "tenant_id = 42"}},
+            )
+        assert resp.status_code == 200
+        adapter.disconnect.assert_awaited_once()

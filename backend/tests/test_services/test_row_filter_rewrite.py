@@ -546,3 +546,64 @@ def test_a_query_too_deep_to_parse_is_a_rejection() -> None:
 def test_a_lone_surrogate_in_a_reference_does_not_raise_unicode_encode_error() -> None:
     with contextlib.suppress(RowFilterRejectedError):
         apply_row_filters('SELECT * FROM s."\ud800"', {"s.t": "x = 1"}, "PostgreSQL")
+
+
+class TestFence:
+    """The derived table is fenced so the engine evaluates the admin's condition before any
+    predicate the model wrote: a data-dependent error can otherwise tell whether a hidden row
+    exists."""
+
+    def test_postgres_derived_table_ends_in_offset_0(self) -> None:
+        out = apply_row_filters(
+            "SELECT id FROM orders", _filters("PostgreSQL", "orders"), "postgresql"
+        )
+        select = _derived(out, "PostgreSQL")["orders"]
+        assert select.args["offset"].sql(dialect="postgres") == "OFFSET 0"
+        assert select.args.get("limit") is None
+
+    def test_mysql_derived_table_ends_in_the_all_rows_limit(self) -> None:
+        out = apply_row_filters("SELECT id FROM orders", _filters("MySQL", "orders"), "mysql")
+        select = _derived(out, "MySQL")["orders"]
+        assert select.args["limit"].sql(dialect="mysql") == "LIMIT 18446744073709551615"
+        assert select.args.get("offset") is None
+
+    @pytest.mark.parametrize("dialect", _DIALECTS)
+    def test_the_fence_is_inside_the_derived_table_not_on_the_statement(self, dialect: str) -> None:
+        sql = "SELECT id FROM orders ORDER BY id LIMIT 3 OFFSET 2"
+        out = apply_row_filters(sql, _filters(dialect, "orders"), dialect.lower())
+        tree = _tree(out, dialect)
+        assert tree.args["limit"].sql() == "LIMIT 3"
+        assert tree.args["offset"].sql() == "OFFSET 2"
+
+    @pytest.mark.parametrize("dialect", _DIALECTS)
+    def test_every_filtered_reference_is_fenced(self, dialect: str) -> None:
+        sql = "SELECT o.id FROM orders o JOIN items i ON i.order_id = o.id"
+        out = apply_row_filters(sql, _filters(dialect, "orders", "items"), dialect.lower())
+        derived = _derived(out, dialect)
+        assert len(derived) == 2
+        for select in derived.values():
+            if dialect == "PostgreSQL":
+                assert select.args["offset"].sql(dialect="postgres") == "OFFSET 0"
+                assert select.args.get("limit") is None
+            else:
+                assert select.args["limit"].sql(dialect="mysql") == "LIMIT 18446744073709551615"
+                assert select.args.get("offset") is None
+
+
+class TestFenceMap:
+    def test_every_supported_dialect_has_a_fence(self) -> None:
+        assert set(row_filter_rewrite._FENCE) == set(row_filter_rewrite._SQLGLOT_DIALECT.values())
+
+    def test_an_unknown_dialect_is_rejected_not_fenced_like_mysql(self) -> None:
+        table = sqlglot.parse_one("SELECT * FROM t", read="sqlite").find(exp.Table)
+        with pytest.raises(RowFilterRejectedError, match="no fence"):
+            row_filter_rewrite._filtered(table, parse_condition("x = 1", "sqlite"), "sqlite")
+
+    @pytest.mark.parametrize(
+        ("read", "fence"),
+        [("postgres", " OFFSET 0)"), ("mysql", " LIMIT 18446744073709551615)")],
+    )
+    def test_the_fence_per_dialect(self, read: str, fence: str) -> None:
+        table = sqlglot.parse_one("SELECT * FROM t", read=read).find(exp.Table)
+        out = row_filter_rewrite._filtered(table, parse_condition("x = 1", read), read)
+        assert fence in out.sql(dialect=read)
