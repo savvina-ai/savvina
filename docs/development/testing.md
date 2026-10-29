@@ -42,11 +42,17 @@ docker compose run --rm --no-deps --entrypoint sh -v ./backend:/src -w /src back
 
 **Note:** `ENCRYPTION_KEY`, `JWT_SECRET_KEY` and `DATABASE_URL` are all set by `tests/conftest.py` at collection time — you don't need to set them yourself, and no real database is contacted.
 
-### Live row-filter test (opt-in)
+### Live row-filter tests (opt-in)
 
 `backend/tests/test_datasources/test_row_filter_live.py` runs rewritten statements against
-the sample databases and checks that only the filtered tenant's rows come back. It is
-skipped unless `SAVVINA_LIVE_TEST_DBS=1` is set:
+the sample databases and checks that only the filtered tenant's rows come back, that the
+fence keeps the model's predicates off hidden rows (side-channel probes: a division by zero
+on PostgreSQL, a bad regular expression or JSON path on MySQL, each raising only on a hidden
+row; every probe must raise with the fence stripped and return the visible count with it),
+that `explain` refuses a column the table does not have, and that the connections router's
+whole verification (`_verify_row_filters`: connect, rewrite, plan, classify, disconnect)
+accepts a real column and refuses a missing one with a 422 naming the key. They are skipped unless
+`SAVVINA_LIVE_TEST_DBS=1` is set:
 
 ```bash
 docker compose --profile test-dbs up -d          # sample-postgres :5435, sample-mysql :3307

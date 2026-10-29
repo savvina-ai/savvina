@@ -220,11 +220,11 @@ Create and save a new data source connection.
 
 **Execution mode values:** `auto_execute`, `review_first`, `generate_only`
 
-`row_filters` is optional, `{"schema.table": "<condition>"}`; `row_filter_sql` is no longer accepted and is dropped. Each entry is validated as described under [Row Filters](../user-guide/04_privacy-controls.md#row-filters); a 422 names the key and the reason.
+`row_filters` is optional, `{"schema.table": "<condition>"}`; `row_filter_sql` is no longer accepted and is dropped. Each entry is validated as described under [Row Filters](../user-guide/04_privacy-controls.md#row-filters); a 422 names the key and the reason. Every pair is then planned on the database with `EXPLAIN` before the connection is created; the statement planned is the one queries will run (`SELECT * FROM "schema"."table"` rewritten by the row-filter rewriter); a pair the rewriter refuses (a construct it cannot write back, or a statistics catalog view such as `pg_catalog.pg_stats`) is 422 `row_filters["schema.table"]: <reason>`; an engine error (a missing table or column) is 422 `row_filters["schema.table"]: rejected by the database: <text>`, an unreachable database, an engine timeout, or a plan that does not return within the query timeout plus 5 seconds 422 `row filters could not be verified against the database: <reason>`, and the connection is not created. Unquoted key parts are stored folded as the engine folds them (PostgreSQL lowercase).
 
 **Response `201`:** `ConnectionResponse`
 
-**Response `422`:** `Row filter …` (the filter is invalid; the detail gives the reason)
+**Response `422`:** `Row filter …` (the filter is invalid; the detail gives the reason), `row_filters["…"]: rejected by the database: …` or `row filters could not be verified against the database: …`
 
 ---
 
@@ -326,11 +326,13 @@ Update privacy settings for a connection. Partial updates are supported — omit
 
 `row_filters`: an object sets the map after validation, `{}` clears it, and an absent field leaves it unchanged. On a connection that still stores the legacy `row_filter_sql`, `{}` is refused (422) unless `clear_legacy_row_filter: true` is sent as well; that flag alone also removes the legacy filter. `row_filter_sql` in the body is ignored. Changing privacy settings invalidates the connection's caches; a change that only touches `row_filters` keeps the cached schema.
 
+New or changed pairs are planned on the database with `EXPLAIN`, as the rewriter writes them (same 422s as on `POST`, and nothing is stored); unchanged pairs are not re-checked and a body without `row_filters` opens no database connection. Unquoted key parts are stored folded as the engine folds them (PostgreSQL lowercase).
+
 The connection response carries `row_filter_needs_migration: true` while a legacy `row_filter_sql` is stored and no `row_filters` map has been saved; every query on such a connection is refused until one of the two actions above.
 
 **Response `200`:** `ConnectionDetail`
 
-**Response `422`:** `Row filter …` (the filter is invalid; the detail gives the reason)
+**Response `422`:** `Row filter …` (the filter is invalid; the detail gives the reason), `row_filters["…"]: rejected by the database: …` or `row filters could not be verified against the database: …`
 
 ---
 
@@ -650,7 +652,9 @@ Run the full NL-to-SQL pipeline: cache lookup → LLM → validate → execute (
     "row_count": 1,
     "truncated": false,
     "execution_time_ms": 12.4,
-    "bytes_scanned": null
+    "bytes_scanned": null,
+    "row_filter_fingerprint": "",
+    "stale_row_filter": false
   },
   "execution_time_ms": 12.4,
   "status": "executed",
@@ -660,6 +664,8 @@ Run the full NL-to-SQL pipeline: cache lookup → LLM → validate → execute (
 ```
 
 **Status values:** `executed`, `cached`, `pending_approval`, `query_only`, `error`
+
+`results.row_filter_fingerprint` (string or null) identifies the row filters the rows were computed under: `""` for none, `null` on a re-sort response; on results stored by earlier versions it is absent (history, session share) or `null` (single-result share JSON). `results.stale_row_filter` (boolean) is `true` only on a stored result served after the connection's row filters changed: the rows are empty (`row_count: 0`) because the result was computed under a different row filter.
 
 ---
 
@@ -734,7 +740,7 @@ Get a single session.
 
 Get all messages in a session, ordered chronologically.
 
-**Response `200`:** `MessageResponse[]`
+**Response `200`:** `MessageResponse[]`. A message whose result was computed under a different row filter than the connection has now comes back with empty `results_json.rows` and `results_json.stale_row_filter: true`.
 
 ---
 
@@ -908,13 +914,15 @@ These endpoints take **no `Authorization` header**. They are the redemption side
 
 Every one of them returns `410 Gone` once `share_expires_at` has passed, and `404` for an unknown token — the two are distinguished deliberately, so a recipient can tell "this link expired" from "this link was never valid".
 
+Every single-result endpoint also returns `410 Gone` with `These results were computed under a different row filter. Re-run the question.` when the connection's row filters changed after the result was stored; the session share serves such a message with empty rows and `stale_row_filter: true`. The two 410s are told apart by `detail`: `Share link has expired` for an expired link, the text above for a stale result. A stale result stays 410 until the connection's row filters return to the map it was computed under; to share it again, re-run the question and share the new message. A stored result whose fingerprint field is neither a string nor null is served as stale (the session share) or 410 (single-result endpoints), not as an error; while the connection is in the row-filter migration state every stored result is stale.
+
 ### `GET /api/v1/public/share/{token}`
 
 Return the results behind a shared message link. Rows are truncated to the `DEFAULT_ROW_LIMIT` setting.
 
 **Response `200`:** `PublicShareResult` — the result set plus the generated SQL
 **Response `404`:** Shared result not found
-**Response `410`:** Share link has expired
+**Response `410`:** Share link has expired, or result computed under a different row filter (see [Public](#public-unauthenticated))
 
 ---
 
@@ -923,6 +931,7 @@ Return the results behind a shared message link. Rows are truncated to the `DEFA
 Download the shared message's results as CSV. Not row-limited — this serves the full stored result set.
 
 **Response `200`:** `text/csv` attachment, `shared-results.csv`
+**Response `410`:** Share link has expired, or result computed under a different row filter (see [Public](#public-unauthenticated))
 
 ---
 
@@ -931,6 +940,7 @@ Download the shared message's results as CSV. Not row-limited — this serves th
 Download the shared message's results as XLSX.
 
 **Response `200`:** `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` attachment, `shared-results.xlsx`
+**Response `410`:** Share link has expired, or result computed under a different row filter (see [Public](#public-unauthenticated))
 
 ---
 
@@ -955,6 +965,7 @@ Download one message's query results as CSV. Rate limited to 30/minute.
 **Response `200`:** `text/csv` attachment, `query-<first 8 chars of id>.csv`
 **Response `400`:** Message has no query results
 **Response `404`:** Message not found
+**Response `410`:** Result computed under a different row filter (see [Public](#public-unauthenticated))
 
 ---
 
@@ -963,6 +974,7 @@ Download one message's query results as CSV. Rate limited to 30/minute.
 Same, as a formatted XLSX workbook. Rate limited to 30/minute.
 
 **Response `200`:** XLSX attachment, `query-<first 8 chars of id>.xlsx`
+**Response `410`:** Result computed under a different row filter (see [Public](#public-unauthenticated))
 
 ---
 
@@ -987,7 +999,7 @@ Generate a PDF combining several query results into one document. Rate limited t
 }
 ```
 
-`title` is 1–255 characters; `sections` holds 1–50 entries.
+`title` is 1–255 characters; `sections` holds 1–50 entries. A section whose result is stale (computed under a different row filter) carries the notice in place of the table and embeds no chart, even when `chart_image` is sent.
 
 **Response `200`:** `application/pdf` attachment, named from a sanitised `title`
 **Response `404`:** A referenced message was not found

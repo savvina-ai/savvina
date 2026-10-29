@@ -9,9 +9,9 @@ Savvina AI is designed on a **privacy-by-design** principle. **A value read from
 The system prompt always includes the schema DDL and, if one has been generated, the semantic model. Items 2 to 4 are each controlled by their own toggle:
 
 1. **Schema DDL** — `CREATE TABLE` statements listing table names, column names, data types, primary keys and foreign-key relationships
-2. **Sample values** — up to 3 example values per column, only when **Include sample values** is on (**off by default**). On PostgreSQL they come from the catalog's most-common-values statistics (`pg_stats`); on MySQL/MariaDB only ENUM and SET columns have them, taken from the column's declared members
+2. **Sample values** — up to 3 example values per column, only when **Include sample values** is on (**off by default**). On PostgreSQL they come from the catalog's most-common-values statistics (`pg_stats`); on MySQL/MariaDB only ENUM and SET columns have them, taken from the column's declared members. A table under a row filter sends no sample values (a MySQL ENUM/SET column keeps its declared members; see [Row Filters](#row-filters)).
 3. **Column comments** — PostgreSQL `COMMENT ON` text and MySQL column comments, only when **Include column comments** is on (**off by default**)
-4. **Approximate row counts** — from the catalog, only when **Include row counts** is on
+4. **Approximate row counts** — from the catalog, only when **Include row counts** is on. A table under a row filter sends no row count (see [Row Filters](#row-filters)).
 5. **Semantic model** — your business glossary, if one has been generated, including its value mappings
 6. **Few-shot examples** — question and SQL pairs from the Example Library (answers you marked 👍) that are similar to the current question
 
@@ -49,9 +49,9 @@ Each connection has independent privacy settings. Configure them at **Connection
 
 | Setting | Default | Effect |
 |---|---|---|
-| **Include sample values** | Off | When off, no sample value reaches the LLM by any route: not in the schema, not as an ENUM member list, not as a filter hint. This reduces accuracy for enum-like columns. When on, the system also runs **Named Entity Resolution**: quoted strings and capitalised proper nouns in your question are matched against column sample values, and the stored spelling is added as a filter hint (e.g. resolving `"Acme Corp"` → `'acme corp'`). Sensitive columns, excluded columns and excluded tables are never matched |
+| **Include sample values** | Off | When off, no sample value reaches the LLM by any route: not in the schema, not as an ENUM member list, not as a filter hint. This reduces accuracy for enum-like columns. When on, the system also runs **Named Entity Resolution**: quoted strings and capitalised proper nouns in your question are matched against column sample values, and the stored spelling is added as a filter hint (e.g. resolving `"Acme Corp"` → `'acme corp'`). Sensitive columns, excluded columns and excluded tables are never matched. A table under a row filter sends no sample values (a MySQL ENUM/SET column keeps its declared members; see [Row Filters](#row-filters)). |
 | **Include column comments** | Off | When off, column and table comments are omitted from the LLM prompt |
-| **Include row counts** | On (a connection created in the UI starts with it off) | When off, approximate row counts are omitted from the LLM prompt |
+| **Include row counts** | On (a connection created in the UI starts with it off) | When off, approximate row counts are omitted from the LLM prompt. A table under a row filter sends no row count (see [Row Filters](#row-filters)). |
 
 ### Sensitive Column Patterns
 
@@ -59,7 +59,7 @@ A list of case-insensitive patterns. Any column whose name **contains** a matchi
 
 **The column itself is not hidden, and the query is not restricted.** The name and type stay visible so the LLM can use the column in `WHERE`, a join or an aggregate. For example, "all orders for the customer with email `someone@example.com`" filters on the column and returns rows normally.
 
-**Result masking:** when a sensitive column's value appears in a query's output, it is replaced with `[REDACTED]` before the response reaches your browser. This covers the streamed rows and the saved message. Stored results are masked again with the connection's current settings every time they are read: in the chat history, through a share link, and in CSV, Excel and PDF exports. Tightening the settings therefore also applies to results saved earlier.
+**Result masking:** when a sensitive column's value appears in a query's output, it is replaced with `[REDACTED]` before the response reaches your browser. This covers the streamed rows and the saved message. Stored results are masked again with the connection's current settings every time they are read: in the chat history, through a share link, and in CSV, Excel and PDF exports. Tightening the settings therefore also applies to results saved earlier. Changing row filters goes further: earlier results are withheld entirely (see [Row Filters](#row-filters)).
 
 Masking follows what the SELECT list exposes, not what the column is called:
 
@@ -142,9 +142,23 @@ re-run after a query returns no rows, approved queries, edited queries, re-sorts
 answers served from the cache. The SQL shown to you, stored with the message, kept as a
 verified example and sent to the LLM is the query as the model wrote it.
 
+**Before you change row filters.** Three things happen when you add, change or remove a
+filter:
+
+1. Every earlier result on the connection stops being shown. The chat history, share links,
+   CSV and Excel exports and PDF reports show *These results were computed under a
+   different row filter. Re-run the question.* instead. Re-run what you need and share it
+   again; links you already sent stay broken.
+2. The database must be reachable when you save a filter change. Otherwise the whole save
+   is refused and nothing changes.
+3. Filtered tables are queried more slowly, especially on MySQL with large tenants. Index
+   the column your condition uses (see **The fence** below).
+
 **Keys.** `schema.table`, written as the database stores the names. Quote a part the way
 the engine does (`public."Orders"` on PostgreSQL, `` `db`.`Orders` `` on MySQL) to keep its
-case; the stored key has no quotes. A query that names a filtered table in a different case
+case; the stored key has no quotes. The Privacy Settings form shows such a key quoted
+(`public."Orders"`), as you would type it, so saving sends the same key back; the API
+returns it without quotes. A query that names a filtered table in a different case
 is rejected rather than run unfiltered (PostgreSQL folds unquoted names to lowercase, so
 `Orders` there means `orders`; MySQL keeps the case). A table in two schemas needs the
 schema in the query, or the query is rejected as ambiguous. A column written as
@@ -165,13 +179,28 @@ Saving filters clears the connection's cached answers but keeps the cached schem
 naming the key and the reason) when it contains `;`, a comment (`--`, `/*`, or `#` on
 MySQL), a `$`, starts with `WHERE`, is longer than 1000 characters, or is not a single
 well-formed condition for the connection's dialect (so `tenant_id = 7 UNION SELECT 1`,
-`... LIMIT 5` and an unbalanced parenthesis are refused). Keys are not checked against the
-schema: a typo filters a table nothing reads. A wrong column name fails at the database on
-the first query, with the error shown.
+`... LIMIT 5` and an unbalanced parenthesis are refused).
 Keys are limited to the database's own identifier length (63 bytes on PostgreSQL, 64
 characters on MySQL); conditions may not contain control characters other than tab and
 newlines, placeholders (`:tenant`, `?`), data-modifying statements, or more than 20 levels
 of nested parentheses.
+An unquoted key part is folded as the engine folds it (PostgreSQL lowercases, MySQL keeps
+the case), so `Public.Orders` on PostgreSQL is stored as `public.orders`; quote a part to
+keep its case. Every new or changed filter is then **checked against your database** before
+it is stored, with a planning check (`EXPLAIN`) of the condition exactly as queries will run
+it, which reads none of your data. A condition the rewriter cannot apply is refused with
+`row_filters["public.orders"]: <reason>`; so is a filter on a catalog view the rewriter
+never lets a query read, such as `pg_catalog.pg_stats` or MySQL's
+`information_schema.column_statistics`. A table that does not exist or a column the table
+does not have is refused with
+`row_filters["public.orders"]: rejected by the database: <the engine's message>` (shown as
+described under [Error Messages You See](#error-messages-you-see)). On MySQL a type
+mismatch such as `id = 'abc'` is only a warning, so it is not refused. If the database
+cannot be reached, or the check has not finished within the query timeout plus five
+seconds, the save is refused with
+`row filters could not be verified against the database: <reason>` and nothing changes.
+Unchanged filters are not re-checked, so you can save other settings while the database is
+down as long as the filters stay as they are.
 
 **How a condition runs.** The condition is read with the connection's SQL dialect and
 written back into each query from that reading, so what runs is that reading of your text.
@@ -179,6 +208,42 @@ On MySQL servers with `PIPES_AS_CONCAT` or `ANSI_QUOTES` enabled, `||` and `"...
 condition are read as `OR` and as a string, not as the server would read them; avoid both.
 The condition is trusted as written: it runs inside the read-only transaction and the
 statement timeout, and a subquery in it reads its own tables unfiltered.
+
+**What the LLM is told about a filtered table.** The schema sent to the model normally
+carries, when you allow it, sample values and an approximate row count per table. Both
+describe the whole table, hidden rows included, so for a filtered table neither is sent:
+no sample values from the catalog's statistics (PostgreSQL), no `(≈N rows)` header, and no
+entity-resolution hint from its values. A MySQL ENUM or SET column keeps its declared
+members: they are part of the type, not of any row. Value mappings in the semantic model
+are not affected (see [Semantic value mappings](#semantic-value-mappings)). Turning a filter
+off restores the hints at once; no schema refresh is needed. A filter whose table name
+differs from the database's only in letter case withholds the hints as well. While a
+connection is in the migration state (see below) no table sends them.
+
+**The fence.** Queries on a filtered table are slower than the same queries without a
+filter. Savvina makes the database apply your condition before anything the model wrote
+touches the rows, so an error raised by the model's own expressions cannot reveal that a
+hidden row exists. The cost: the model's predicates on a filtered table cannot use an index
+on that table unless your condition itself does, so `WHERE id = 5` on a tenant with
+millions of rows scans that tenant's rows. On MySQL every filtered table is read in full
+into a temporary table on each query before the rest of the query runs, so a `LIMIT 10`
+preview of a large tenant costs a scan of the whole tenant. On PostgreSQL a correlated
+subquery over a filtered table rescans the tenant's rows once per outer row. Index the
+column your condition filters on (for `tenant_id = 42`, an index on `tenant_id`). On
+MariaDB this protection is unverified: MariaDB's optimizer is not MySQL's.
+
+**Results computed under an earlier filter.** Every result is stored with a fingerprint of
+the row filters it was computed under. When you add, change or remove a filter, results
+stored before the change are no longer served: the chat history shows *These results were
+computed under a different row filter. Re-run the question.* in place of the table. Anyone
+opening a share link to a single result, or downloading its CSV or Excel file, gets that
+message instead of the data; a CSV or Excel export from the chat does the same, a shared
+session shows the notice per message, and a PDF report carries it in place of the table.
+The rule is "same filters or nothing": loosening a filter also retires older results.
+Results saved before this version are treated as computed with no filters, so on a
+connection that has row filters every older result shows the notice until it is re-run.
+Answers served from the cache are unaffected, because saving filters clears the cache. A
+report section built from such a result shows the notice and no chart.
 
 **Fail-closed.** A statement the rewriter cannot parse, a query with more than one
 statement, a CTE named like a filtered table (inside its own body that name would be the
@@ -193,6 +258,8 @@ So are functions that read rows from SQL or a table name given as a string
 from a string and is not on the list above (an extension, a function defined in your
 database) can still read a filtered table unfiltered. If the connection's database user can
 call such functions, restrict them at the database, or rely on native row-level security.
+The fence does not hide *how long* a query takes: the time still depends on the rows your
+condition excludes.
 
 **Three controls, three jobs.** Row filters decide which rows the database reads. Excluded
 schemas, tables and columns decide what the model is told about. Sensitive patterns and
@@ -204,7 +271,9 @@ that still has one and no `row_filters` is in a migration state: every query is 
 with "Row filter needs migration" until you open its privacy settings. The form shows a
 banner with the previous condition. Either add the per-table rows and save, or click
 **Remove the old filter** (after a confirmation) to run unfiltered. A save that would drop
-the old filter without doing either is refused.
+the old filter without doing either is refused. While the connection is in the migration
+state every stored result shows the stale-filter notice, and once you save per-table
+filters, results from before the migration keep showing it and must be re-run.
 
 ---
 
