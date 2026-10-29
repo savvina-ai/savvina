@@ -2,7 +2,7 @@
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass
@@ -15,6 +15,11 @@ class ColumnInfo:
     is_partition_key: bool = False
     description: str | None = None
     sample_values: list[str] | None = None
+    # Where sample_values came from: "stats" (catalog statistics over the rows, PostgreSQL
+    # pg_stats) or "type" (the column's declared ENUM/SET members on MySQL). None when there
+    # are no sample values, or on a cache written before the field existed; readers treat
+    # None as "stats".
+    sample_source: Literal["stats", "type"] | None = None
 
 
 @dataclass

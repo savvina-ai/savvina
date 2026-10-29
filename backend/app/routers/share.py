@@ -25,7 +25,7 @@ from ..schemas.chat import (
     QueryResultsResponse,
 )
 from ..services.export_service import generate_csv, generate_xlsx
-from ..services.stored_results import load_result_masks
+from ..services.stored_results import STALE_ROW_FILTER_TEXT, load_result_masks
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,7 +40,7 @@ router = APIRouter(prefix="/public", tags=["share"])
 async def _shared_message(token: str, db: AsyncSession) -> tuple[dict, str | None]:
     """The shared message's stored results re-masked with the owning connection's current
     privacy settings (``stored_results``) and its served SQL; 404 / 410 as the share
-    dictates."""
+    dictates, and 410 for a result computed under another row-filter map."""
     msg = await db.scalar(select(ChatMessage).where(ChatMessage.share_token == token))
     if not msg or msg.results_json is None:
         raise HTTPException(status_code=404, detail="Shared result not found")
@@ -50,6 +50,10 @@ async def _shared_message(token: str, db: AsyncSession) -> tuple[dict, str | Non
     [(results_data, query)] = await masks.serve_all(
         [(msg.session_id, msg.results_json, msg.query_generated)]
     )
+    if results_data.get("stale_row_filter"):
+        # Computed under another row-filter map than the connection has now: gone, as an
+        # expired link is. The session share serves the flag per message instead.
+        raise HTTPException(status_code=410, detail=STALE_ROW_FILTER_TEXT)
     return results_data, query
 
 

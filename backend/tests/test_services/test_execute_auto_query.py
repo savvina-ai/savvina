@@ -7,11 +7,13 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.config import get_settings
 from app.datasources.errors import ErrorCategory
 from app.datasources.models import DataSourceSchema, PrivacySettings, QueryResult, ValidationResult
 from app.providers.base import LLMResponse
 from app.services.execution import _execute_auto_query
 from app.services.intent_classifier import QueryIntent
+from app.services.row_filter import row_filter_fingerprint
 from app.services.row_filter_rewrite import apply_row_filters
 
 _FILTER = "tenant_id = 7"
@@ -362,3 +364,23 @@ class TestUserFacingErrorText:
         exe = await _run(adapter, generated_query="SELECT amont FROM orders")
 
         assert exe.error == 'column "amont" does not exist'
+
+
+class TestFingerprint:
+    async def test_result_carries_the_fingerprint_of_the_filters_it_ran_under(self) -> None:
+        adapter = _adapter(_result(["id"], [[1]]))
+        privacy = PrivacySettings(row_filters=_FILTERS)
+        exe = await _run(adapter, generated_query="SELECT id FROM t", privacy=privacy)
+        expected = row_filter_fingerprint(_FILTERS, get_settings().encryption_key)
+        assert exe.results_response.row_filter_fingerprint == expected
+        assert exe.results_response.stale_row_filter is False
+
+    async def test_no_filters_gives_the_empty_fingerprint(self) -> None:
+        adapter = _adapter(_result(["id"], [[1]]))
+        exe = await _run(adapter, generated_query="SELECT id FROM t", privacy=PrivacySettings())
+        assert exe.results_response.row_filter_fingerprint == ""
+
+    async def test_no_privacy_gives_the_empty_fingerprint(self) -> None:
+        adapter = _adapter(_result(["id"], [[1]]))
+        exe = await _run(adapter, generated_query="SELECT id FROM t", privacy=None)
+        assert exe.results_response.row_filter_fingerprint == ""

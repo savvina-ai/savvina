@@ -90,6 +90,12 @@ class QueryResultsResponse(BaseModel):
     truncated: bool
     execution_time_ms: float
     bytes_scanned: int | None = None
+    # The row-filter map the rows were computed under (services/row_filter.py:
+    # row_filter_fingerprint; "" for none). Stored with the message; a stored result whose
+    # value differs from the connection's current map is served with no rows and
+    # stale_row_filter set (services/stored_results.py).
+    row_filter_fingerprint: str | None = None
+    stale_row_filter: bool = False
 
 
 class ChatResponse(BaseModel):

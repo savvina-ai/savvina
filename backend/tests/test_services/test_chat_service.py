@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.cache.query_cache import CacheHit
+from app.config import get_settings
 from app.datasources.errors import ErrorCategory
 from app.datasources.models import (
     DataSourceSchema,
@@ -38,6 +39,7 @@ from app.semantic.models import SemanticModel
 from app.services.chat_service import ChatService
 from app.services.execution import _results_to_response
 from app.services.result_masking import _mask_sensitive_result_columns
+from app.services.row_filter import row_filter_fingerprint
 from app.services.row_filter_rewrite import apply_row_filters
 from app.services.schema_utils import (
     LARGE_TABLE_ROW_THRESHOLD,
@@ -945,6 +947,25 @@ class TestExecutePending:
         with pytest.raises(ValueError, match="not found"):
             await service.execute_pending(message_id="ghost", db=db)
 
+    async def test_stored_result_carries_the_row_filter_fingerprint(self):
+        filters = {"public.users": "tenant_id = 7"}
+        msg = _make_msg(status="pending_approval")
+        conn = _make_connection(privacy_settings={"row_filters": filters})
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)), MockResult())
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(_make_adapter(execute_result=_make_query_result(row_count=3))),
+        ):
+            resp = await service.execute_pending(message_id="msg-1", db=db)
+
+        expected = row_filter_fingerprint(filters, get_settings().encryption_key)
+        assert resp.results.row_filter_fingerprint == expected
+        stored = db.execute.await_args_list[1].args[0].compile().params["results_json"]
+        assert stored["row_filter_fingerprint"] == expected
+
 
 # ── Scenario 5: edit_and_execute ──────────────────────────────────────────────
 
@@ -1002,6 +1023,27 @@ class TestEditAndExecute:
         db = _make_db(MockResult(row=None))
         with pytest.raises(ValueError, match="not found"):
             await service.edit_and_execute("ghost", "SELECT 1", db)
+
+    async def test_stored_result_carries_the_row_filter_fingerprint(self):
+        filters = {"public.users": "tenant_id = 7"}
+        msg = _make_msg(status="pending_approval")
+        conn = _make_connection(privacy_settings={"row_filters": filters})
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)), MockResult())
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(_make_adapter()),
+        ):
+            resp = await service.edit_and_execute(
+                message_id="msg-1", edited_query="SELECT * FROM users LIMIT 10", db=db
+            )
+
+        expected = row_filter_fingerprint(filters, get_settings().encryption_key)
+        assert resp.results.row_filter_fingerprint == expected
+        stored = db.execute.await_args_list[1].args[0].compile().params["results_json"]
+        assert stored["row_filter_fingerprint"] == expected
 
 
 class TestUserFacingErrorOnReExecution:

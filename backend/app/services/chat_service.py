@@ -49,6 +49,7 @@ from ..utils.encryption import decrypt_value
 from .execution import (
     _executable,
     _execute_auto_query,
+    _fingerprint,
     _inject_order_by,
     _results_to_response,
     _stream_execute_with_correction,
@@ -1081,7 +1082,7 @@ class ChatService:
             sql=approved_query,
             original_sql=clean_query,
             double_quote_is_string_literal=_double_quote_is_literal(adapter),
-        )
+        ).model_copy(update={"row_filter_fingerprint": _fingerprint(privacy)})
 
         # 4. Update the message with results
         await db.execute(
@@ -1236,7 +1237,7 @@ class ChatService:
             sql=run_query,
             original_sql=edited_query,
             double_quote_is_string_literal=_double_quote_is_literal(adapter),
-        )
+        ).model_copy(update={"row_filter_fingerprint": _fingerprint(privacy)})
 
         # 4. Update the message with the edited query + results
         await db.execute(

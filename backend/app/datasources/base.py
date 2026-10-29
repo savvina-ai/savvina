@@ -118,6 +118,19 @@ class BaseDataSource(ABC):
             )
 
     @abstractmethod
+    async def explain(self, sql: str, timeout: int) -> None:  # noqa: ASYNC109
+        """Plan *sql* (``EXPLAIN <sql>``) under the read-only guards ``execute_query`` uses.
+
+        Returns nothing. Raises ``ExplainError`` with the engine's text when the engine refuses
+        the statement: an unknown table or column, and on PostgreSQL a type error (MySQL only
+        warns). A connection failure raises the driver's exception, and ``RuntimeError`` when
+        not connected. The statement is not run, but planning can evaluate constant
+        expressions (PostgreSQL: immutable and stable ones, so ``1/0`` fails; MySQL: it may
+        read one row by unique key); volatile functions are not evaluated. Nothing is returned.
+        """
+        ...
+
+    @abstractmethod
     def validate_query(self, query: str) -> ValidationResult:
         """Validate query is safe (read-only, no dangerous patterns)."""
         ...

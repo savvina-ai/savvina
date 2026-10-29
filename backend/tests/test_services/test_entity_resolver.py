@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from app.datasources.models import ColumnInfo, DataSourceSchema, PrivacySettings, TableInfo
 from app.services.entity_resolver import extract_entity_candidates, resolve_entities
+from app.services.schema_utils import _apply_privacy_to_schema
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -213,3 +214,19 @@ class TestResolveEntitiesRespectsPrivacy:
     def test_no_privacy_keeps_the_old_behaviour(self):
         schema = _make_schema("customers", "company_name", ["Acme Corp"])
         assert len(resolve_entities(["Acme Corp"], schema)) == 1
+
+
+class TestRowFilteredTables:
+    def test_a_value_from_a_filtered_table_yields_no_hint(self):
+        schema = _make_schema("customers", "name", ["Acme Corp", "Globex"])
+        privacy = PrivacySettings(
+            include_sample_values=True, row_filters={"public.customers": "tenant_id = 7"}
+        )
+        narrowed = _apply_privacy_to_schema(schema, privacy)
+        assert resolve_entities(["Acme Corp"], narrowed, privacy) == []
+
+    def test_the_same_value_resolves_without_the_filter(self):
+        schema = _make_schema("customers", "name", ["Acme Corp", "Globex"])
+        privacy = PrivacySettings(include_sample_values=True)
+        narrowed = _apply_privacy_to_schema(schema, privacy)
+        assert resolve_entities(["Acme Corp"], narrowed, privacy) != []

@@ -22,6 +22,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
+from ..config import get_settings
 from ..datasources.errors import ErrorCategory, classify_builtin
 from ..datasources.models import DataSourceSchema, PrivacySettings, QueryResult
 from ..providers.base import BaseLLMProvider
@@ -43,6 +44,7 @@ from .result_masking import (
 from .row_filter import (  # noqa: F401 — re-exported for existing importers
     RowFilterRejectedError,
     _executable,
+    row_filter_fingerprint,
     unwrap_row_filter,
 )
 
@@ -75,6 +77,12 @@ def _results_to_response(result: QueryResult) -> QueryResultsResponse:
         execution_time_ms=result.execution_time_ms,
         bytes_scanned=result.bytes_scanned,
     )
+
+
+def _fingerprint(privacy: PrivacySettings | None) -> str:
+    """The fingerprint of the row-filter map a result is computed under."""
+    filters = privacy.row_filters if privacy is not None else {}
+    return row_filter_fingerprint(filters, get_settings().encryption_key)
 
 
 def _exec_error_text(exc: BaseException) -> str:
@@ -250,13 +258,14 @@ async def _execute_auto_query(
         )
 
     def _masked(query_result: QueryResult, executed: str, clean: str) -> QueryResultsResponse:
-        return _mask_sensitive_result_columns(
+        masked = _mask_sensitive_result_columns(
             _results_to_response(query_result),
             privacy,
             sql=executed,
             original_sql=clean,
             double_quote_is_string_literal=dq_literal,
         )
+        return masked.model_copy(update={"row_filter_fingerprint": _fingerprint(privacy)})
 
     for attempt in range(max_exec_attempts):
         try:
@@ -381,6 +390,8 @@ class _BatchAccumulator:
     batch_index: int = 0
     # The mask of the statement whose rows these are; set by _stream_statement.
     mask_plan: _ResultMaskPlan | None = None
+    # The fingerprint of the row-filter map the statement ran under; set by _stream_statement.
+    row_filter_fingerprint: str = ""
 
     def reset_rows(self) -> None:
         """Clear accumulated rows and batch counter before a retry execution."""
@@ -453,6 +464,7 @@ async def _stream_statement(
         privacy, executed, clean_query, double_quote_is_string_literal=dq_literal
     )
     acc.mask_plan = plan
+    acc.row_filter_fingerprint = _fingerprint(privacy)
     async for event in _stream_cursor_batches(
         adapter, executed, timeout=timeout, max_rows=max_rows, acc=acc
     ):
@@ -473,6 +485,7 @@ def _stream_payload(acc: _BatchAccumulator) -> QueryResultsResponse:
         row_count=len(acc.rows),
         truncated=acc.truncated,
         execution_time_ms=acc.execution_time_ms or 0.0,
+        row_filter_fingerprint=acc.row_filter_fingerprint,
     )
 
 

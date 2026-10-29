@@ -59,6 +59,8 @@ class TestDefaultExecuteQueryStream:
             async def execute_query(self, query, timeout=30, max_rows=1000):  # noqa: ASYNC109
                 return result  # type: ignore[override]
 
+            async def explain(self, sql, timeout): ...  # type: ignore[override]  # noqa: ASYNC109
+
             def validate_query(self, query): ...  # type: ignore[override]
             def format_schema_for_llm(self, schema, privacy=None): ...  # type: ignore[override]
             def get_system_prompt_additions(self):
@@ -102,6 +104,8 @@ class TestDefaultExecuteQueryStream:
             async def execute_query(self, query, timeout=30, max_rows=1000):  # noqa: ASYNC109
                 return result  # type: ignore[override]
 
+            async def explain(self, sql, timeout): ...  # type: ignore[override]  # noqa: ASYNC109
+
             def validate_query(self, query): ...  # type: ignore[override]
             def format_schema_for_llm(self, schema, privacy=None): ...  # type: ignore[override]
             def get_system_prompt_additions(self):
@@ -144,6 +148,8 @@ class TestDefaultExecuteQueryStream:
             async def get_sample_values(self, schema, table, column, limit=5): ...  # type: ignore[override]
             async def execute_query(self, query, timeout=30, max_rows=1000):  # noqa: ASYNC109
                 return result  # type: ignore[override]
+
+            async def explain(self, sql, timeout): ...  # type: ignore[override]  # noqa: ASYNC109
 
             def validate_query(self, query): ...  # type: ignore[override]
             def format_schema_for_llm(self, schema, privacy=None): ...  # type: ignore[override]

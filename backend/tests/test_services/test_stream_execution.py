@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.config import get_settings
 from app.datasources.errors import ErrorCategory
 from app.datasources.models import (
     ConnectionResult,
@@ -31,6 +32,7 @@ from app.services.execution import (
     _StreamResult,
 )
 from app.services.intent_classifier import QueryIntent
+from app.services.row_filter import row_filter_fingerprint
 from app.services.row_filter_errors import RowFilterRejectedError
 from app.services.row_filter_rewrite import apply_row_filters
 
@@ -1182,3 +1184,21 @@ class TestStreamUserFacingErrorText:
 
         assert "Jane" not in result_out.result.error
         assert result_out.result.error.endswith("\n\nNote: gave up")
+
+
+class TestFingerprintOnTheStreamingPath:
+    async def test_payload_carries_the_fingerprint(self) -> None:
+        adapter = _make_adapter([_make_batch(rows=[[1]], columns=("id",))])
+        filters = {"public.t": "tenant_id = 7"}
+        _events, result_out = await _run_stream(
+            adapter=adapter,
+            generated_query="SELECT id FROM t",
+            privacy=PrivacySettings(row_filters=filters),
+        )
+        expected = row_filter_fingerprint(filters, get_settings().encryption_key)
+        assert result_out.result.results_response.row_filter_fingerprint == expected
+
+    async def test_no_filters_gives_the_empty_fingerprint(self) -> None:
+        adapter = _make_adapter([_make_batch(rows=[[1]], columns=("id",))])
+        _events, result_out = await _run_stream(adapter=adapter, generated_query="SELECT id FROM t")
+        assert result_out.result.results_response.row_filter_fingerprint == ""

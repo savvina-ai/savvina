@@ -33,6 +33,12 @@ class ErrorCategory(StrEnum):
     OTHER = "other"
 
 
+class ExplainError(Exception):
+    """``BaseDataSource.explain`` could not plan the statement. The message is the engine's
+    text (it may quote a value; redact by category before showing it) and ``__cause__`` is
+    the driver exception, for ``classify_error``."""
+
+
 # Categories whose engine messages quote names (columns, tables, functions, types) and not
 # stored values. The user sees their text as is and the LLM is told the names in it that it
 # already has (``services/error_feedback``); every other category can quote a value. An

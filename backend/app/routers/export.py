@@ -21,7 +21,7 @@ from ..models.user import User
 from ..schemas.export import ReportRequest
 from ..services.export_service import generate_csv, generate_xlsx
 from ..services.report_service import generate_report
-from ..services.stored_results import load_result_masks
+from ..services.stored_results import STALE_ROW_FILTER_TEXT, load_result_masks
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,7 +36,8 @@ async def _load_masked_results(
     db: AsyncSession,
 ) -> dict:
     """The stored results of a message that belongs to the user, re-masked with its
-    connection's current privacy settings (``stored_results``)."""
+    connection's current privacy settings (``stored_results``); 410 for a result computed
+    under another row-filter map."""
     stmt = (
         select(ChatMessage)
         .join(ChatSession, ChatSession.id == ChatMessage.session_id)
@@ -54,6 +55,8 @@ async def _load_masked_results(
     [(results, _query)] = await masks.serve_all(
         [(msg.session_id, msg.results_json, msg.query_generated)]
     )
+    if results.get("stale_row_filter"):
+        raise HTTPException(status_code=410, detail=STALE_ROW_FILTER_TEXT)
     return results
 
 
