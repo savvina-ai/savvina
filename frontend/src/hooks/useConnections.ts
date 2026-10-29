@@ -6,6 +6,7 @@ import {
   connectionsApi,
   type CreateConnectionPayload,
 } from '../api/connections';
+import { datasourcesApi } from '../api/datasources';
 import { useAppStore } from '../store/appStore';
 import type { PrivacySettingsUpdate, Connection, SchemaResponse } from '../types';
 
@@ -130,5 +131,14 @@ export function useConnectionTableNames(id: string | null) {
     },
     enabled: !!id,
     staleTime: 5 * 60_000,
+  });
+}
+
+/** The registered datasource types (`DataSourceInfo[]`): static for the life of the app. */
+export function useDataSources() {
+  return useQuery({
+    queryKey: ['datasources'],
+    queryFn: datasourcesApi.getAvailable,
+    staleTime: Infinity,
   });
 }

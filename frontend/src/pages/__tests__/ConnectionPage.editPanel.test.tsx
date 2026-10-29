@@ -6,7 +6,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router';
-import { http, HttpResponse } from 'msw';
+import { http, HttpResponse, delay } from 'msw';
 import { server } from '../../test/server';
 import { makeConnection } from '../../test/factories';
 import ConnectionPage from '../ConnectionPage';
@@ -202,7 +202,7 @@ describe('ConnectionPage edit settings panel', () => {
     expect(describedBy).toBeTruthy();
     expect(document.getElementById(describedBy!)).toHaveTextContent(hint);
 
-    await userEvent.click(screen.getByRole('button', { name: /Privacy Settings/ }));
+    await userEvent.click(await screen.findByRole('button', { name: /Privacy Settings/ }));
 
     expect(screen.getByText(hint)).toBeVisible();
     expect(screen.getByLabelText('Table 1')).toBeVisible();
@@ -297,5 +297,110 @@ describe('ConnectionPage edit settings panel', () => {
     fireEvent.change(screen.getByLabelText('Condition 1'), { target: { value: 'tenant_id = 7' } });
 
     expect(screen.getByRole('button', { name: 'Remove the old filter' })).toBeDisabled();
+  });
+
+  it('shows a stored PostgreSQL key with the quotes the next save needs', async () => {
+    renderPage({
+      detail: { privacy_settings: { row_filters: { 'public.Orders': 'tenant_id = 42' } } },
+    });
+    // msw answers with the most recently added handler: this one must come after
+    // renderPage, which registers a datasources handler that returns [].
+    server.use(
+      http.get(`${API}/api/v1/datasources`, () =>
+        HttpResponse.json([
+          {
+            source_type: 'postgresql',
+            display_name: 'PostgreSQL',
+            icon: '',
+            query_dialect: 'PostgreSQL',
+            config_schema: { fields: [] },
+          },
+        ]),
+      ),
+    );
+    await openEditPanel();
+    await userEvent.click(await screen.findByRole('button', { name: /Privacy Settings/ }));
+    expect(await screen.findByLabelText('Table 1')).toHaveValue('public."Orders"');
+  });
+
+  it('waits for a slow datasource list before showing the stored keys', async () => {
+    renderPage({
+      detail: { privacy_settings: { row_filters: { 'public.Orders': 'tenant_id = 42' } } },
+    });
+    server.use(
+      http.get(`${API}/api/v1/datasources`, async () => {
+        await delay(150);
+        return HttpResponse.json([
+          {
+            source_type: 'postgresql',
+            display_name: 'PostgreSQL',
+            icon: '',
+            query_dialect: 'PostgreSQL',
+            config_schema: { fields: [] },
+          },
+        ]);
+      }),
+    );
+    await openEditPanel();
+    await userEvent.click(await screen.findByRole('button', { name: /Privacy Settings/ }));
+    expect(await screen.findByLabelText('Table 1')).toHaveValue('public."Orders"');
+  });
+
+  it('saves a stored PostgreSQL key quoted when only another setting changed', async () => {
+    // The form shows the key quoted; the save must send what the form shows, or the server
+    // folds public.Orders to public.orders for a filter the admin never touched.
+    const { privacyPuts } = renderPage({
+      detail: { privacy_settings: { row_filters: { 'public.Orders': 'tenant_id = 42' } } },
+      privacyResponse: () => HttpResponse.json(makeConnection()),
+    });
+    server.use(
+      http.get(`${API}/api/v1/datasources`, () =>
+        HttpResponse.json([
+          {
+            source_type: 'postgresql',
+            display_name: 'PostgreSQL',
+            icon: '',
+            query_dialect: 'PostgreSQL',
+            config_schema: { fields: [] },
+          },
+        ]),
+      ),
+    );
+    await openEditPanel();
+    await userEvent.click(await screen.findByRole('button', { name: /Privacy Settings/ }));
+    expect(await screen.findByLabelText('Table 1')).toHaveValue('public."Orders"');
+    await userEvent.click(screen.getByRole('checkbox', { name: /Include row counts/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(privacyPuts).toHaveLength(1));
+    expect(privacyPuts[0]).toMatchObject({
+      include_row_counts: true,
+      row_filters: { 'public."Orders"': 'tenant_id = 42' },
+    });
+  });
+
+  it('saves a stored PostgreSQL key quoted even when the datasource list fails to load', async () => {
+    // Without the list there is no query_dialect; the connection's own source_type stands in,
+    // or an untouched save would send public.Orders and the server would fold it.
+    const { privacyPuts } = renderPage({
+      detail: { privacy_settings: { row_filters: { 'public.Orders': 'tenant_id = 42' } } },
+      privacyResponse: () => HttpResponse.json(makeConnection()),
+    });
+    server.use(
+      http.get(`${API}/api/v1/datasources`, () =>
+        HttpResponse.json({ detail: 'boom' }, { status: 500 }),
+      ),
+    );
+    await openEditPanel();
+    await userEvent.click(await screen.findByRole('button', { name: /Privacy Settings/ }));
+    expect(await screen.findByLabelText('Table 1')).toHaveValue('public."Orders"');
+    await userEvent.click(screen.getByRole('checkbox', { name: /Include row counts/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(privacyPuts).toHaveLength(1));
+    expect(privacyPuts[0]).toMatchObject({
+      include_row_counts: true,
+      row_filters: { 'public."Orders"': 'tenant_id = 42' },
+    });
   });
 });

@@ -1,8 +1,7 @@
 // Copyright (c) 2025 Savvina AI Ltd
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-import { useQuery } from '@tanstack/react-query';
-import { datasourcesApi } from '../api/datasources';
+import { useDataSources } from '../hooks/useConnections';
 import { getDatasourceIcon } from '@/lib/datasourceIcons';
 import type { DataSourceInfo } from '../types';
 
@@ -11,10 +10,7 @@ interface Props {
 }
 
 export default function DataSourceSelector({ onSelect }: Props) {
-  const { data: sources, isLoading, error } = useQuery({
-    queryKey: ['datasources'],
-    queryFn: datasourcesApi.getAvailable,
-  });
+  const { data: sources, isLoading, error } = useDataSources();
 
   if (isLoading) {
     return (

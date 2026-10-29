@@ -10,6 +10,7 @@ import { useAuthStore } from '../store/authStore';
 import DataSourceSelector from '../components/DataSourceSelector';
 import DynamicConnectionForm from '../components/DynamicConnectionForm';
 import PrivacySettingsForm from '../components/PrivacySettings';
+import { displayRowFilterMap } from '../lib/rowFilterKeys';
 import ExecutionModeSelector from '../components/ExecutionModeSelector';
 import {
   DropdownMenu,
@@ -36,6 +37,7 @@ import {
   useUpdatePrivacySettings,
   useUpdateExecutionMode,
   useConnectionTableNames,
+  useDataSources,
 } from '../hooks/useConnections';
 import { useAppStore } from '../store/appStore';
 import { cn } from '@/lib/utils';
@@ -65,6 +67,14 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
   const updatePrivacy = useUpdatePrivacySettings();
   const updateMode = useUpdateExecutionMode();
   const { data: knownTables } = useConnectionTableNames(connId);
+  const { data: dataSources, isPending: sourcesPending } = useDataSources();
+  // The listed dialect is preferred. When the datasource list failed to load, the connection's
+  // source_type stands in: for the engines that support row filters (postgresql, mysql) it
+  // equals the lower-cased query_dialect, and the key helpers lower-case the dialect and leave
+  // keys alone for any dialect they do not know, so a different source_type is harmless.
+  const dialect =
+    dataSources?.find((s) => s.source_type === detail?.source_type)?.query_dialect ??
+    detail?.source_type;
   const [privacy, setPrivacy] = useState<PrivacySettings>(DEFAULT_PRIVACY);
   const [execMode, setExecMode] = useState<Connection['execution_mode']>('auto_execute');
   const [privacyOpen, setPrivacyOpen] = useState(false);
@@ -73,16 +83,21 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (detail && !initialized) {
+    // Wait for the datasource list too (it settles on success or error): the stored row-filter
+    // keys are held in the form's displayed form, which depends on the dialect. On an error
+    // the dialect falls back to the connection's source_type.
+    if (detail && !sourcesPending && !initialized) {
       if (detail.privacy_settings) {
         // A stored legacy row (row_filter_sql, no map) starts with an empty list, and the
         // map is sent on every save so the server can refuse to drop the old filter
         // silently. The legacy value is never part of the form state (the banner reads
-        // it from `detail`), so a save never sends row_filter_sql.
+        // it from `detail`), so a save never sends row_filter_sql. The keys are held as the
+        // form shows them (quoted where the dialect needs it), so a save that touches only
+        // another setting sends each key back unchanged instead of letting the server fold it.
         setPrivacy({
           ...DEFAULT_PRIVACY,
           ...detail.privacy_settings,
-          row_filters: detail.privacy_settings.row_filters ?? {},
+          row_filters: displayRowFilterMap(detail.privacy_settings.row_filters ?? {}, dialect),
           row_filter_sql: undefined,
         });
       }
@@ -91,7 +106,7 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
       if (detail.row_filter_needs_migration) setPrivacyOpen(true);
       setInitialized(true);
     }
-  }, [detail, initialized]);
+  }, [detail, sourcesPending, dialect, initialized]);
 
   // A disabled Save must always have a visible reason: reopen a collapsed section so the
   // invalid row and its error are in view.
@@ -127,7 +142,9 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
     }
   };
 
-  if (isLoading) {
+  // The form is not shown before the state above is initialised from the detail, so a Save
+  // can never send the defaults.
+  if (isLoading || (detail && !initialized)) {
     return (
       <div className="border-t border-border px-4 py-3 text-sm text-muted-foreground">
         Loading…
@@ -173,6 +190,7 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
             settings={privacy}
             onChange={setPrivacy}
             knownTables={knownTables ?? undefined}
+            dialect={dialect}
             onValidityChange={setFormValid}
           />
         </div>

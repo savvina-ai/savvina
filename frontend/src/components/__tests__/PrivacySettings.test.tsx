@@ -141,6 +141,87 @@ describe('PrivacySettingsForm row filters', () => {
     expect(next.row_filters).toEqual({ 'public.orders': 'tenant_id = 42' });
     expect(next.excluded_tables).toEqual([]);
   });
+
+  it('shows a PostgreSQL key part with quotes where an unquoted save would fold it', () => {
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({
+          row_filters: { 'public.Orders': 'x = 1', 'public.orders_2024': 'y = 1' },
+        })}
+        onChange={vi.fn()}
+        dialect="postgresql"
+      />,
+    );
+    expect(screen.getByLabelText('Table 1')).toHaveValue('public."Orders"');
+    expect(screen.getByLabelText('Table 2')).toHaveValue('public.orders_2024');
+  });
+
+  it('shows a MySQL key as stored unless a part needs quoting', () => {
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({ row_filters: { 'db.Orders': 'x = 1', 'db.order-items': 'y = 1' } })}
+        onChange={vi.fn()}
+        dialect="mysql"
+      />,
+    );
+    expect(screen.getByLabelText('Table 1')).toHaveValue('db.Orders');
+    expect(screen.getByLabelText('Table 2')).toHaveValue('db.`order-items`');
+  });
+
+  it('shows a key as stored when the dialect is unknown', () => {
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({ row_filters: { 'public.Orders': 'x = 1' } })}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByLabelText('Table 1')).toHaveValue('public.Orders');
+  });
+
+  it('a quoted key the admin types is emitted as typed and kept after the parent stores it', async () => {
+    function Parent() {
+      const [settings, setSettings] = useState(makeSettings());
+      return (
+        <PrivacySettingsForm settings={settings} onChange={setSettings} dialect="postgresql" />
+      );
+    }
+    render(<Parent />);
+    await userEvent.click(screen.getByRole('button', { name: 'Add filter' }));
+    fireEvent.change(screen.getByLabelText('Table 1'), { target: { value: 'public."Orders"' } });
+    fireEvent.change(screen.getByLabelText('Condition 1'), { target: { value: 'x = 1' } });
+    // The parent now holds {'public."Orders"': 'x = 1'}; the row must not be re-quoted.
+    expect(screen.getByLabelText('Table 1')).toHaveValue('public."Orders"');
+  });
+
+  it('leaves a bare key alone while the admin is typing it', async () => {
+    // Each keystroke hands the parent the raw map; quoting applies to a stored key,
+    // never to what the rows themselves just emitted.
+    function Parent() {
+      const [settings, setSettings] = useState(makeSettings());
+      return (
+        <PrivacySettingsForm settings={settings} onChange={setSettings} dialect="postgresql" />
+      );
+    }
+    render(<Parent />);
+    await userEvent.click(screen.getByRole('button', { name: 'Add filter' }));
+    await userEvent.type(screen.getByLabelText('Table 1'), 'public.Order-items');
+    expect(screen.getByLabelText('Table 1')).toHaveValue('public.Order-items');
+  });
+
+  it('lists the known tables with the dialect quotes', () => {
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings()}
+        onChange={vi.fn()}
+        knownTables={['public.Orders', 'public.items']}
+        dialect="postgresql"
+      />,
+    );
+    const options = Array.from(document.querySelectorAll('datalist option')).map(
+      (o) => (o as HTMLOptionElement).value,
+    );
+    expect(options).toEqual(['public."Orders"', 'public.items']);
+  });
 });
 
 describe('PrivacySettingsForm row filter validation', () => {

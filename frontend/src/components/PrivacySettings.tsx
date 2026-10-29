@@ -2,6 +2,7 @@
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { displayRowFilterKey, displayRowFilterMap } from '../lib/rowFilterKeys';
 import type { PrivacySettings } from '../types';
 
 const DEFAULTS: PrivacySettings = {
@@ -26,6 +27,10 @@ interface Props {
   onChange: (settings: PrivacySettings) => void;
   /** `schema.table` names offered by the table input; free text when absent. */
   knownTables?: string[];
+  /** The connection's SQL dialect (`DataSourceInfo.query_dialect`). A stored key part the
+   *  engine would fold or refuse unquoted is shown with the dialect's quotes, so the next
+   *  save sends the same key back. Keys are shown as stored when absent. */
+  dialect?: string;
   /** Called with `false` while a row filter is incomplete or duplicated, so the parent can
    *  block saving; `true` otherwise. */
   onValidityChange?: (valid: boolean) => void;
@@ -135,8 +140,12 @@ interface RowFilterRow {
   condition: string;
 }
 
-function rowsFromMap(map: Record<string, string>): RowFilterRow[] {
-  return Object.entries(map).map(([table, condition], id) => ({ id, table, condition }));
+function rowsFromMap(map: Record<string, string>, dialect?: string): RowFilterRow[] {
+  return Object.entries(map).map(([table, condition], id) => ({
+    id,
+    table: displayRowFilterKey(table, dialect),
+    condition,
+  }));
 }
 
 function mapFromRows(rows: RowFilterRow[]): Record<string, string> {
@@ -179,30 +188,38 @@ function RowFilterList({
   filters,
   onChange,
   knownTables,
+  dialect,
   onValidityChange,
 }: {
   filters: Record<string, string>;
   onChange: (filters: Record<string, string>) => void;
   knownTables?: string[];
+  dialect?: string;
   onValidityChange?: (valid: boolean) => void;
 }) {
   // Rows are local so a half-typed row (empty table name) survives without being emitted;
   // when the parent hands in a map the rows do not already describe (the initial load),
   // the rows are rebuilt from it.
-  const [rows, setRows] = useState<RowFilterRow[]>(() => rowsFromMap(filters));
+  const [rows, setRows] = useState<RowFilterRow[]>(() => rowsFromMap(filters, dialect));
   const nextId = useRef(rows.length);
   const listId = useId();
 
   useEffect(() => {
     setRows((current) => {
-      if (sameMap(mapFromRows(current), filters)) return current;
-      const rebuilt = rowsFromMap(filters);
+      const emitted = mapFromRows(current);
+      // The rows already describe the map when the parent holds what they just emitted
+      // (the admin is typing: the raw keys) or the stored map whose keys they show in
+      // displayed form (after a load or a save). Only another map rebuilds them.
+      if (sameMap(emitted, filters) || sameMap(emitted, displayRowFilterMap(filters, dialect))) {
+        return current;
+      }
+      const rebuilt = rowsFromMap(filters, dialect);
       // Ids restart at 0 on a rebuild: keep the counter ahead of them so a row added
       // afterwards never shares an id with a stored one.
       nextId.current = Math.max(nextId.current, rebuilt.length);
       return rebuilt;
     });
-  }, [filters]);
+  }, [filters, dialect]);
 
   const errors = useMemo(() => rowErrors(rows), [rows]);
   const valid = errors.size === 0;
@@ -227,13 +244,16 @@ function RowFilterList({
       <p className="text-sm font-medium text-foreground mb-1">Row filters</p>
       <p className="text-xs text-muted-foreground mb-2">
         One condition per table, applied to every query that reads the table. Name the table
-        as the database stores it (schema.table); tables not listed are unfiltered.
+        as the database stores it (schema.table); quote a part that has uppercase letters or
+        other characters the database would not accept bare. Tables not listed are unfiltered.
       </p>
       {knownTables && (
         <datalist id={listId}>
-          {knownTables.map((t) => (
-            <option key={t} value={t} />
-          ))}
+          {knownTables
+            .map((t) => displayRowFilterKey(t, dialect))
+            .map((t) => (
+              <option key={t} value={t} />
+            ))}
         </datalist>
       )}
       <div className="space-y-2">
@@ -297,6 +317,7 @@ export default function PrivacySettingsForm({
   settings,
   onChange,
   knownTables,
+  dialect,
   onValidityChange,
 }: Props) {
   const set = <K extends keyof PrivacySettings>(key: K, val: PrivacySettings[K]) =>
@@ -353,6 +374,7 @@ export default function PrivacySettingsForm({
         filters={settings.row_filters ?? {}}
         onChange={(row_filters) => set('row_filters', row_filters)}
         knownTables={knownTables}
+        dialect={dialect}
         onValidityChange={onValidityChange}
       />
       <button
