@@ -89,8 +89,10 @@ Additional checks layered on top of the base:
 
 | Dialect | Blocked functions / patterns |
 |---|---|
-| **PostgreSQL** | `pg_sleep`, `pg_terminate_backend`, `pg_cancel_backend`, `pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`, `lo_export`, `lo_import`, `dblink`, `dblink_exec`; `COPY … TO`, `SET ROLE`, `SET SESSION` |
-| **MySQL** | `SLEEP`, `BENCHMARK`, `LOAD_FILE`, `GET_LOCK`, `RELEASE_LOCK`, `MASTER_POS_WAIT`; `LOAD DATA`, `SET GLOBAL`, `SET SESSION`, `FLUSH` |
+| **PostgreSQL** | `pg_sleep`, `pg_terminate_backend`, `pg_cancel_backend`, `pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`, `lo_export`, `lo_import`, `dblink`, `dblink_exec`, `set_config`; `COPY … TO`, `SET ROLE`, `SET SESSION` |
+| **MySQL** | `SLEEP`, `BENCHMARK`, `LOAD_FILE`, `GET_LOCK`, `RELEASE_LOCK`, `MASTER_POS_WAIT`, `SOURCE_POS_WAIT`; user-variable assignment `:=`; `LOAD DATA`, `SET GLOBAL`, `SET SESSION`, `FLUSH` |
+
+`set_config` and `:=` are refused because a value stored in a setting or a user variable can be read back in the same statement under another column (`current_setting('x')`, `@v`), which result masking cannot follow. The `:=` check is on the raw text, so the two characters inside a string literal are refused too.
 
 ### Layer 3 — Database-enforced read-only transaction (`datasources/adapters/`)
 The text validator is not the last line. Every statement runs inside a read-only transaction the adapter opens itself: asyncpg `transaction(readonly=True)` on PostgreSQL, and on MySQL/MariaDB `SET SESSION TRANSACTION READ ONLY` before each statement, restored to `READ WRITE` afterwards so the pooled connection is clean. A write the keyword scan cannot see, such as `nextval()`, `setval()` or a function with side effects, is refused by the engine (SQLSTATE `25006` on PostgreSQL, errno 1792 on MySQL). A dedicated read-only database role remains recommended as a further layer.
@@ -159,7 +161,7 @@ Prompt hints: a filtered table loses its data-derived sample values and row coun
 ### Correction prompts never carry database error text
 When a query fails at execution, the correction prompt receives Savvina's own description (`services/error_feedback.py`): an error category derived from the engine's documented code (`datasources/errors.py`, `BaseDataSource.classify_error`), a fixed hint keyed by that category (`services/correction.py`) and, for the categories whose messages quote names rather than values (unknown name, ambiguous name, grouping, type mismatch, permission, syntax), the names the error refers to that the LLM already has: names it wrote in its SQL or, for an unknown or ambiguous name, names in the schema it was shown. Every other category lists no names. The engine's message, which can quote stored values, is never sent to the LLM.
 
-The error the user sees (`redact_error_for_user`) keeps the engine's message for the name-quoting categories above. For every other category it keeps only the first line, with every quoted literal (and a PostgreSQL key detail `=(…)`, and the unquoted name after `operator does not exist:`) replaced by `[REDACTED]`. The raw text is not logged; the server log holds the same redacted text.
+The error the user sees (`redact_error_for_user`) keeps the engine's message for the name-quoting categories above. For every other category it keeps only the first line, with every quoted literal (and a PostgreSQL key detail `=(…)`, and the unquoted name after `operator does not exist:`) replaced by `[REDACTED]`. The raw text is not logged; the server log holds the same redacted text. The MySQL adapter's cursors skip aiomysql's `SHOW WARNINGS` read, which would pass each warning to `warnings.warn` and so to stderr: a MySQL warning quotes stored values (1292 `Truncated incorrect DOUBLE value: '…'`, one per row).
 
 PostgreSQL reports a stored value it failed to look up or parse under the same SQLSTATEs as a mistake in the query (`ssn::regclass` → 42P01 `relation "123456789" does not exist`; `to_tsquery(col)` → 42601). `PostgreSQLDataSource._classify_one` therefore classifies a name-quoting SQLSTATE as DATA when the error has no position in the query (permission errors excepted: most have none), or when it carries an error context or an internal query (`::regtype` parses the stored text and points into it). The measured table is in a comment next to `_may_quote_a_value`.
 

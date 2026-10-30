@@ -689,8 +689,10 @@ Execute a user-edited version of a pending query. The edited query goes through 
 
 **Request body:**
 ```json
-{"edited_query": "SELECT COUNT(*) FROM customers WHERE created_at >= NOW() - INTERVAL '30 days'"}
+{"message_id": "uuid", "edited_query": "SELECT COUNT(*) FROM customers WHERE created_at >= NOW() - INTERVAL '30 days'"}
 ```
+
+`message_id` is required in the body (422 without it); the message that is run is the one named in the path.
 
 **Response `200`:** Updated `ChatResponse` with edited query and results
 

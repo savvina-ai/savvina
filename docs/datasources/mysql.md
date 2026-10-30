@@ -61,6 +61,7 @@ All generated SQL passes through `MySQLSQLValidator` before execution:
 | DML blocking | `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REPLACE` are rejected |
 | DDL blocking | `CREATE`, `DROP`, `ALTER`, `RENAME` are rejected |
 | Dangerous statements | `LOAD DATA`, `SELECT INTO OUTFILE`, `CALL` are blocked |
+| Variable assignment | `@v := …` is rejected: the value could be read back as `@v` past result masking |
 | Writing keywords | Any `SELECT … INTO` (`@var`, `OUTFILE`, `DUMPFILE`) is rejected (`INTO` as a keyword; the word in a comment, string or quoted identifier is allowed) |
 | Auto-limit | A `LIMIT` clause is injected if none is present (default: 1,000 rows) |
 

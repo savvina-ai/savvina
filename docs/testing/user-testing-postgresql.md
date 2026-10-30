@@ -57,7 +57,7 @@ queries, complex JOINs, aggregations, and the full semantic layer.
 | Port     | 5432              |
 | Database | savvina_test     |
 | Username | savvina          |
-| Password | *(value of `SAMPLE_POSTGRES_PASSWORD` in your `.env`)* |
+| Password | *(value of `SAMPLE_POSTGRES_PASSWORD` in your `.env`; `savvina_demo` when it is empty)* |
 | SSL      | disable           |
 
 ### Sample Questions

@@ -49,7 +49,7 @@ quoting in generated SQL, AUTO_INCREMENT PKs, and MySQL-specific syntax (`DATE_F
 | Port     | 3306             |
 | Database | sample_delivery  |
 | Username | savvina_analyst |
-| Password | *(value of `SAMPLE_MYSQL_PASSWORD` in your `.env`)* |
+| Password | analyst_readonly_2024 |
 | SSL      | off              |
 
 **Accessible:** `restaurants`, `menu_items`, `orders`, `order_items`, `reviews`,

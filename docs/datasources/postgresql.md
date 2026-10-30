@@ -55,7 +55,7 @@ All generated SQL passes through `PostgreSQLValidator` before execution:
 | Statement type | Only `SELECT` and `WITH` (CTE) are permitted |
 | DML blocking | `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `MERGE` are rejected |
 | DDL blocking | `CREATE`, `DROP`, `ALTER`, `RENAME` are rejected |
-| Dangerous functions | `pg_sleep`, `pg_read_file`, `pg_write_file`, `lo_export`, `copy_to` are blocked |
+| Dangerous functions | `pg_sleep`, `pg_read_file`, `pg_write_file`, `lo_export`, `copy_to`, `set_config` are blocked |
 | Privilege escalation | `SET ROLE`, `SET SESSION AUTHORIZATION`, `RESET` are blocked |
 | Writing keywords | `SELECT … INTO` is rejected (`INTO` as a keyword; the word in a comment, string or quoted identifier is allowed) |
 | Auto-limit | A `LIMIT` clause is injected if none is present (default: 1,000 rows) |

@@ -99,6 +99,8 @@ national_id, passport, license_number, tax_id
 
 You can add custom patterns. For example, to treat any column containing `internal` as sensitive, add `internal` to the list.
 
+You can also remove default patterns. The privacy form then lists the removed defaults under the patterns: a column that only they matched loses the `[SENSITIVE]` tag, so its values are no longer masked and its sample values are sent while **Include sample values** is on. **Reset to defaults** restores them.
+
 ### Sensitive Columns
 
 A list of column names matched exactly, case-insensitively, in every table that has them. Use it for names too common for a pattern: `name` as a pattern would also match `username` and `first_name`; as a sensitive column it matches only a column called `name`. The effect is the same as a pattern match: `[SENSITIVE]` in the schema, no sample values, masked results, re-masked stored results. Entries are column names only; `table.column` is not recognised. An entry such as `customers.notes` is kept but never matches anything, so list the bare name.
@@ -329,7 +331,9 @@ column with **Excluded columns** so the model never sees it, restrict the databa
 account itself, or turn on **Strict sensitive columns**, which refuses most such queries
 before they run. Statistical aggregates (`COUNT`, `SUM`, `AVG`) over a sensitive column are
 returned unmasked on purpose (with strict mode off; strict mode refuses them); a group of
-one row reveals its value.
+one row reveals its value. A query that stores a value and reads it back under another
+column in the same statement is refused whatever the strict setting: `set_config` on
+PostgreSQL, a user-variable assignment (`@v := email`) on MySQL.
 
 A query under row filters is regenerated before it runs, and a function column without an
 alias comes back under the engine function's name (`strpos(email, '@')` is shown as
@@ -419,7 +423,7 @@ The check does not enumerate the tables under an excluded schema when it looks f
 
 ## Error Messages You See
 
-When a query fails at the database, the error shown in the chat and stored with the message depends on the kind of error. For an unknown or ambiguous name, a grouping error, a type mismatch, a permission error or a syntax error, you see the database's message as is: these messages quote names from the query, not stored values. For any other error, such as a value that could not be converted, you see only the first line of the message, with every quoted part replaced by `[REDACTED]`. Savvina does not log the full text; the server log holds the same redacted line. Savvina's own rejections (a row filter that cannot be applied, the strict sensitive-column rule) are shown as written; they quote names from the query or the settings, never a value.
+When a query fails at the database, the error shown in the chat and stored with the message depends on the kind of error. For an unknown or ambiguous name, a grouping error, a type mismatch, a permission error or a syntax error, you see the database's message as is: these messages quote names from the query, not stored values. For any other error, such as a value that could not be converted, you see only the first line of the message, with every quoted part replaced by `[REDACTED]`. Savvina does not log the full text; the server log holds the same redacted line. MySQL warnings, which also quote stored values (`Truncated incorrect DOUBLE value: '…'` for a query that compares a text column with a number), are not read at all, so they reach neither the chat nor the log. Savvina's own rejections (a row filter that cannot be applied, the strict sensitive-column rule) are shown as written; they quote names from the query or the settings, never a value.
 
 PostgreSQL also reports a stored value that a query looked up or parsed under these name and syntax codes: `SELECT ssn::regclass …` fails with `relation "123456789" does not exist`. So on PostgreSQL such an error counts as a name or syntax error only when the database points to a place in the query text. An error without that position, or one raised while the database parsed a stored value (as for `::regtype`), is treated as a value error and redacted. Permission errors usually carry no position and always keep their text.
 
