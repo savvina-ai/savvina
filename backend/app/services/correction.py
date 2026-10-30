@@ -11,7 +11,7 @@ from ..datasources.base import BaseDataSource
 from ..datasources.errors import ErrorCategory
 from ..datasources.models import DataSourceSchema
 from ..providers.base import BaseLLMProvider
-from .error_feedback import describe_error_for_llm
+from .error_feedback import describe_error_for_llm, redact_error_for_user
 from .schema_utils import _check_query_complexity, _validate_columns_against_schema
 
 logger = logging.getLogger(__name__)
@@ -348,7 +348,7 @@ async def _attempt_sql_execution_correction(
     hint) back to the LLM. The database's error text is read here to pick a hint and is
     never copied into the prompt: it can quote a value stored in the tables. Re-validates
     the corrected query before returning it. Returns (corrected_query, explanation) on
-    success, or (None, "") if still invalid. *llm_hint* is a ``RowFilterRejectedError.llm_hint``,
+    success, or (None, "") if still invalid. *llm_hint* is a ``QueryRejectedError.llm_hint``,
     appended to the description as it is.
     """
     hint = ""
@@ -381,7 +381,11 @@ async def _attempt_sql_execution_correction(
         f"Please correct the query to fix the above error. "
         f"The original question was: {original_question}"
     )
-    logger.debug("SQL execution self-correction attempt %d for: %s", attempt_num, exec_error)
+    logger.debug(
+        "SQL execution self-correction attempt %d for: %s",
+        attempt_num,
+        redact_error_for_user(error_category, exec_error),
+    )
     try:
         llm_response = await provider.generate_response(
             system_prompt=system_prompt,

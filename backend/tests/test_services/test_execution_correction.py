@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 from app.datasources.errors import ErrorCategory
@@ -184,6 +185,28 @@ class TestAttemptSqlExecutionCorrection:
         )
 
         assert result_query is None
+
+
+class TestSelfCorrectionLog:
+    async def test_the_attempt_is_logged_redacted(self, caplog) -> None:
+        provider = _make_provider(_make_llm_response("SELECT id FROM orders", "Fixed"))
+        with caplog.at_level(logging.DEBUG, logger="app.services.correction"):
+            await _attempt_sql_execution_correction(
+                original_question="Show order ids",
+                failed_query="SELECT 1 / 0 FROM orders",
+                exec_error='division by zero for "secret-value"',
+                system_prompt="You are an assistant.",
+                history=[],
+                provider=provider,
+                configured_model="test-model",
+                configured_max_tokens=4096,
+                schema=DataSourceSchema(source_type="postgresql"),
+                adapter=_make_adapter(valid=True),
+                error_category=ErrorCategory.DATA,
+            )
+        assert "secret-value" not in caplog.text
+        assert "self-correction attempt 1 for: " in caplog.text
+        assert "[REDACTED]" in caplog.text
 
 
 class TestCorrectionPromptComposition:

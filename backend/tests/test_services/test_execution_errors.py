@@ -1,16 +1,32 @@
 # Copyright (c) 2025 Savvina AI Ltd
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-"""Unit tests for _classify() and _exec_error_text() in services.execution."""
+"""Unit tests for the error helpers in services.execution: _classify(), _exec_error_text(),
+the rejection helpers _is_rejection() and _llm_hint(), and the logging of
+_user_facing_error()."""
 
 from __future__ import annotations
 
 import gc
+import logging
 from unittest.mock import AsyncMock, MagicMock
 import warnings
 
+import pytest
+
 from app.datasources.errors import ErrorCategory
-from app.services.execution import _classify, _exec_error_text
+from app.services.execution import (
+    _classify,
+    _exec_error_text,
+    _is_rejection,
+    _llm_hint,
+    _user_facing_error,
+)
+from app.services.row_filter_errors import (
+    QueryRejectedError,
+    RowFilterRejectedError,
+    SensitiveColumnRejectedError,
+)
 
 
 class _Hook:
@@ -68,3 +84,42 @@ class TestExecErrorText:
 
     def test_other_empty_exception_names_its_type(self) -> None:
         assert _exec_error_text(ValueError()) == "Query failed (ValueError)"
+
+
+class TestUserFacingErrorLogging:
+    def test_the_log_holds_the_redacted_text_only(self, caplog) -> None:
+        raw = 'invalid input syntax for type integer: "secret-value"\nDETAIL: more secret-value'
+        with caplog.at_level(logging.DEBUG, logger="app.services.execution"):
+            shown = _user_facing_error(raw, ErrorCategory.DATA)
+        assert "secret-value" not in shown
+        assert "secret-value" not in caplog.text
+        assert "[REDACTED]" in caplog.text
+        assert "Execution failed (data): " in caplog.text
+
+    def test_a_verbatim_rejection_is_logged_as_shown(self, caplog) -> None:
+        with caplog.at_level(logging.DEBUG, logger="app.services.execution"):
+            _user_facing_error(
+                "Row filter 'x' needs migration\nmore", ErrorCategory.DATA, verbatim=True
+            )
+        assert "Row filter 'x' needs migration\nmore" in caplog.text
+
+
+class TestRejectionBase:
+    @pytest.mark.parametrize(
+        ("exc", "expected_hint"),
+        [
+            pytest.param(RowFilterRejectedError("row", llm_hint="h1"), "h1", id="row_filter"),
+            pytest.param(
+                SensitiveColumnRejectedError("sensitive", llm_hint="h2"), "h2", id="sensitive"
+            ),
+        ],
+    )
+    def test_every_rejection_is_verbatim_syntax_with_its_hint(self, exc, expected_hint) -> None:
+        assert isinstance(exc, QueryRejectedError)
+        assert _is_rejection(exc) is True
+        assert _llm_hint(exc) == expected_hint
+        assert _classify(object(), exc) is ErrorCategory.SYNTAX
+
+    def test_a_plain_error_is_not_a_rejection(self) -> None:
+        assert _is_rejection(ValueError("x")) is False
+        assert _llm_hint(ValueError("x")) is None

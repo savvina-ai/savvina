@@ -101,7 +101,7 @@ def redact_error_for_user(category: ErrorCategory, error: str) -> str:
     engine does not say which column it came from, so only the first line is kept
     (``DETAIL:``/``HINT:`` lines can carry unquoted values), every quoted span becomes
     ``[REDACTED]`` and a key detail ``=(…)`` becomes ``=([REDACTED])``. Never empty: the
-    category's own sentence stands in. The raw text belongs in the server log only.
+    category's own sentence stands in. The raw text is not logged: callers log this result.
     """
     if category in _NAME_ECHOING_CATEGORIES:
         return error
@@ -207,7 +207,7 @@ def describe_error_for_llm(
     """The execution-error text for a correction prompt, composed only from known parts.
 
     *error* — the engine's text — is read for names and never copied. *hint* is our own
-    sentence for a rejection the model can act on (``RowFilterRejectedError.llm_hint``).
+    sentence for a rejection the model can act on (``QueryRejectedError.llm_hint``).
     """
     parts = [_CATEGORY_SENTENCE[category], _WITHHELD]
     names = mentioned_names(error, sql=sql, schema=schema, category=category)

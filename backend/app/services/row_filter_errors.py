@@ -1,27 +1,37 @@
 # Copyright (c) 2025 Savvina AI Ltd
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-"""The two row-filter exceptions, in their own module so that ``row_filter`` (the facade)
-and ``row_filter_rewrite`` (the sqlglot rewriter) can both import them."""
+"""The query-rejection exceptions (a row-filter rejection, a strict sensitive-column
+rejection, an invalid filter), in their own module so that ``row_filter``,
+``row_filter_rewrite`` and ``sensitive_guard`` can all import them."""
 
 from __future__ import annotations
 
 
-class RowFilterRejectedError(ValueError):
-    """The statement cannot be run under the connection's row filters, so it is never sent.
+class QueryRejectedError(ValueError):
+    """The statement cannot be run under the connection's privacy settings, so it is never
+    sent.
 
     ``str(exc)`` is shown to the user verbatim (``execution._user_facing_error`` skips the
-    redaction for this class). That is a guard in case the category ever changes: today
-    rejections are classified ``ErrorCategory.SYNTAX``, which is not redacted. The fixed
-    parts of every message are plain sentences with no apostrophe or quote character; names
-    taken from the query or from the filter keys are interpolated as written. ``llm_hint``
-    is set only when the model can act on the rejection (an ambiguous or mis-cased table
-    name, a parse failure); the correction prompt appends it.
+    redaction for this class) and the failure is classified SYNTAX. The fixed parts of every
+    message are plain sentences with no apostrophe or quote character; names taken from the
+    query or from the settings are interpolated as written. ``llm_hint`` is set only when
+    the model can act on the rejection; the correction prompt appends it.
     """
 
     def __init__(self, message: str, *, llm_hint: str | None = None) -> None:
         super().__init__(message)
         self.llm_hint = llm_hint
+
+
+class RowFilterRejectedError(QueryRejectedError):
+    """The statement cannot be run under the connection's row filters (an ambiguous or
+    mis-cased table name, a parse failure, the migration state)."""
+
+
+class SensitiveColumnRejectedError(QueryRejectedError):
+    """Strict sensitive-column mode: the statement uses a sensitive column outside its
+    SELECT list (``services/sensitive_guard``)."""
 
 
 class RowFilterInvalidError(ValueError):

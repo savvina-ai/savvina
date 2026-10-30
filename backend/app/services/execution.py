@@ -48,6 +48,10 @@ from .row_filter import (  # noqa: F401 — re-exported for existing importers
     unwrap_row_filter,
 )
 
+# The base is imported from its defining module: the row_filter facade re-exports only the
+# row-filter names.
+from .row_filter_errors import QueryRejectedError
+
 if TYPE_CHECKING:
     from ..datasources.base import BaseDataSource
 
@@ -106,14 +110,14 @@ def _user_facing_error(
 
     *exec_error* is the engine's text, redacted by category (``redact_error_for_user``):
     value-quoting categories lose their quoted spans and extra lines. With *verbatim* the
-    text is ours (a ``RowFilterRejectedError``) and is shown as it is. This is a guard in
+    text is ours (a ``QueryRejectedError``) and is shown as it is. This is a guard in
     case the category ever changes: today rejections are classified SYNTAX, which is not
     redacted, but a redacting category would cut the text at the first apostrophe. The raw
-    text goes to the server log only. The
+    text is not logged: the log holds what the user sees. The
     self-correction's note, when it gave one, follows the text.
     """
-    logger.debug("Execution failed (%s): %s", category, exec_error)
     shown = exec_error if verbatim else redact_error_for_user(category, exec_error)
+    logger.debug("Execution failed (%s): %s", category, shown)
     return f"{shown}\n\nNote: {note}" if note else shown
 
 
@@ -126,11 +130,11 @@ def _user_error_text(adapter: object, exc: BaseException) -> str:
 
 
 def _is_rejection(exc: BaseException) -> bool:
-    return isinstance(exc, RowFilterRejectedError)
+    return isinstance(exc, QueryRejectedError)
 
 
 def _llm_hint(exc: BaseException) -> str | None:
-    return exc.llm_hint if isinstance(exc, RowFilterRejectedError) else None
+    return exc.llm_hint if isinstance(exc, QueryRejectedError) else None
 
 
 def _classify(adapter: object, exc: BaseException) -> ErrorCategory:
@@ -139,7 +143,7 @@ def _classify(adapter: object, exc: BaseException) -> ErrorCategory:
     A mock or wrapper without the hook (or returning something that is not an
     ``ErrorCategory``) reads OTHER rather than failing the turn.
     """
-    if isinstance(exc, RowFilterRejectedError):
+    if isinstance(exc, QueryRejectedError):
         return ErrorCategory.SYNTAX
     try:
         category = adapter.classify_error(exc)  # type: ignore[attr-defined]
@@ -352,8 +356,14 @@ async def _execute_auto_query(
                     query_result.row_count,
                 )
             except Exception as e:
-                # Keep the original 0-row result; the correction failed at DB level.
-                logger.debug("Zero-result corrected query failed at execution: %s", e)
+                # Keep the original 0-row result; the correction failed at DB level. The log
+                # holds the redacted text, as the user-facing path does.
+                category = _classify(adapter, e)
+                logger.debug(
+                    "Zero-result corrected query failed at execution (%s): %s",
+                    category,
+                    redact_error_for_user(category, _exec_error_text(e)),
+                )
         elif zero_expl:
             explanation = zero_expl
 
@@ -521,9 +531,9 @@ async def _stream_self_correction_phase(
     - ``out["exec_error"]``     — set to None on success; the latest failure's text when
                                   all correction attempts are exhausted
     - ``out["exec_category"]``  — the category of the latest failure
-    - ``out["exec_hint"]``      — the latest failure's ``RowFilterRejectedError.llm_hint``,
+    - ``out["exec_hint"]``      — the latest failure's ``QueryRejectedError.llm_hint``,
                                   else None
-    - ``out["exec_verbatim"]``  — True when the latest failure was a ``RowFilterRejectedError``
+    - ``out["exec_verbatim"]``  — True when the latest failure was a ``QueryRejectedError``
     - ``out["error_note"]``     — the correction's note when it gave up with one
     """
     for _attempt in range(1, _MAX_SELF_CORRECTION_ATTEMPTS + 1):
@@ -640,8 +650,14 @@ async def _stream_zero_result_phase(
                 yield event
         except Exception as exc:
             # Keep the original 0-row result, query and explanation, as _execute_auto_query
-            # does: the refined query is adopted only once it has run.
-            logger.debug("Zero-result re-execution failed, keeping original: %s", exc)
+            # does: the refined query is adopted only once it has run. The log holds the
+            # redacted text, as the user-facing path does.
+            category = _classify(adapter, exc)
+            logger.debug(
+                "Zero-result re-execution failed, keeping original (%s): %s",
+                category,
+                redact_error_for_user(category, _exec_error_text(exc)),
+            )
             out["zero_result_reexecuted"] = False
         else:
             out["clean_query"] = zero_query

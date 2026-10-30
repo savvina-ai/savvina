@@ -1043,7 +1043,7 @@ class ChatService:
         exec_error: str | None = None
         query_result: QueryResult | None = None
         try:
-            # The row-filter rewrite can reject the query (RowFilterRejectedError): handled like any
+            # The row-filter rewrite can reject the query (QueryRejectedError): handled like any
             # execution failure below.
             approved_query = _executable(approved_query, privacy, adapter.query_dialect)
             await adapter.connect(config_dict)

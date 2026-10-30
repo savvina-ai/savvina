@@ -13,6 +13,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.config import get_settings
@@ -1138,6 +1139,37 @@ class TestZeroResultReexecutionFailure:
         assert result_out.result.generated_query == "SELECT id FROM t WHERE x = 1"
         assert result_out.result.explanation == "original"
         assert result_out.result.results_response.rows == []
+
+    async def test_failed_refinement_is_logged_redacted(self, caplog) -> None:
+        executed: list[str] = []
+
+        async def _stream_gen(query, **_kwargs):
+            executed.append(query)
+            if len(executed) == 1:
+                yield _make_batch([], columns=("id",))
+                return
+            raise RuntimeError('value "secret-value" out of range')
+            yield  # pragma: no cover
+
+        adapter = MagicMock()
+        adapter.query_dialect = "postgresql"
+        adapter.execute_query_stream = _stream_gen
+        adapter.validate_query = MagicMock(
+            return_value=ValidationResult(is_valid=True, error_message=None)
+        )
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.DATA)
+        provider = _sequenced_provider("SELECT id FROM t WHERE x = 2")
+
+        with caplog.at_level(logging.DEBUG, logger="app.services.execution"):
+            await _run_stream(
+                generated_query="SELECT id FROM t WHERE x = 1",
+                adapter=adapter,
+                provider=provider,
+            )
+
+        assert len(executed) == 2
+        assert "secret-value" not in caplog.text
+        assert "Zero-result re-execution failed, keeping original (data): " in caplog.text
 
 
 class TestStreamUserFacingErrorText:

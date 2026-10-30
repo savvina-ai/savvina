@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.config import get_settings
@@ -384,3 +385,18 @@ class TestFingerprint:
         adapter = _adapter(_result(["id"], [[1]]))
         exe = await _run(adapter, generated_query="SELECT id FROM t", privacy=None)
         assert exe.results_response.row_filter_fingerprint == ""
+
+
+class TestZeroResultLog:
+    async def test_a_failed_refinement_is_logged_redacted(self, caplog) -> None:
+        adapter = _adapter(_result(["id"], []), RuntimeError('value "secret-value" out of range'))
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.DATA)
+        provider = _provider("SELECT id FROM t WHERE id > 0")
+        with caplog.at_level(logging.DEBUG, logger="app.services.execution"):
+            exe = await _run(
+                adapter, generated_query="SELECT id FROM t WHERE id < 0", provider=provider
+            )
+        assert exe.results_response.rows == []
+        assert exe.generated_query == "SELECT id FROM t WHERE id < 0"
+        assert "secret-value" not in caplog.text
+        assert "Zero-result corrected query failed at execution (data): " in caplog.text
