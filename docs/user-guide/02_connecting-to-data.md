@@ -91,24 +91,26 @@ See [MySQL](../datasources/mysql.md) for read-only user setup and MariaDB compat
 
 Always connect Savvina AI using a read-only role. All generated SQL is validated before execution and runs inside a database-enforced read-only transaction; a read-only role is a third layer that also limits what the connection can *read*.
 
-**PostgreSQL example:**
+**PostgreSQL example** (replace `myapp` and `public` with your database and schema, and run the last three statements for each schema Savvina should read):
 
 ```sql
-CREATE ROLE savvina_reader WITH LOGIN PASSWORD 'secure-password';
-GRANT CONNECT ON DATABASE myapp TO savvina_reader;
-GRANT USAGE ON SCHEMA public TO savvina_reader;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO savvina_reader;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-  GRANT SELECT ON TABLES TO savvina_reader;
+CREATE ROLE savvina_reader LOGIN PASSWORD '<choose a password>';
+GRANT CONNECT ON DATABASE "myapp" TO savvina_reader;
+GRANT USAGE ON SCHEMA "public" TO savvina_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA "public" TO savvina_reader;
+ALTER DEFAULT PRIVILEGES IN SCHEMA "public" GRANT SELECT ON TABLES TO savvina_reader;
 ```
+
+`ALTER DEFAULT PRIVILEGES` covers the tables that the role running it creates later; for tables another role creates, run it with `FOR ROLE <that role>`.
 
 **MySQL example:**
 
 ```sql
-CREATE USER 'savvina_reader'@'%' IDENTIFIED BY 'secure-password';
-GRANT SELECT ON myapp.* TO 'savvina_reader'@'%';
-FLUSH PRIVILEGES;
+CREATE USER `savvina_reader`@`%` IDENTIFIED BY '<choose a password>';
+GRANT SELECT ON `myapp`.* TO `savvina_reader`@`%`;
 ```
+
+The privilege check generates this script for your schemas when the connection role is a superuser or owns the tables it reads (see [Privilege Check](04_privacy-controls.md#privilege-check)). It names your database and schemas, and keeps the tables the connection excludes out of the new role where the engine allows it.
 
 ---
 

@@ -73,16 +73,24 @@ Always connect with a dedicated read-only MySQL user:
 
 ```sql
 -- Create a read-only user
-CREATE USER 'savvina_reader'@'%' IDENTIFIED BY 'your-password';
+CREATE USER `savvina_reader`@`%` IDENTIFIED BY '<choose a password>';
 
 -- Grant read access to all tables in your database
-GRANT SELECT ON myapp.* TO 'savvina_reader'@'%';
-
--- Apply changes
-FLUSH PRIVILEGES;
+GRANT SELECT ON `myapp`.* TO `savvina_reader`@`%`;
 ```
 
 Savvina validates every statement as a read-only SELECT and also runs it inside a database-enforced read-only transaction, so a write cannot succeed even if the text check is fooled. A read-only user is a third layer: it also limits what the connection can *read*.
+
+Savvina checks the account when a connection is created or its details are saved, on **Check again** (a connection test), and on a privacy save that changes the row filters or the excluded tables, and shows the findings in the connection panel (see [Privacy Controls](../user-guide/04_privacy-controls.md#privilege-check)). It reads:
+
+- `SHOW GRANTS` for the account, naming it explicitly (`` SHOW GRANTS FOR `u`@`h` `` with the value of `CURRENT_USER()`), because on MySQL 8 `SHOW GRANTS FOR CURRENT_USER()` folds the active roles in. If that statement fails, it falls back to `SHOW GRANTS FOR CURRENT_USER()` and the roles' share is attributed to the account;
+- `SELECT CURRENT_ROLE()` for the active roles and, per active role, `` SHOW GRANTS FOR `u`@`h` USING role `` (MariaDB: `SHOW GRANTS FOR role`). What the role adds beyond the account's own grants is the role's share, so each `REVOKE` names the account or the role that holds the grant. A privilege held both directly and through a role is shown on the account, and a role whose grants cannot be read is attributed to the account. When MySQL prints the account's and a role's privileges together as `ALL PRIVILEGES`, the role's `REVOKE` can also name a privilege only the account holds; MySQL accepts it. A role the account holds but has not activated does not apply to the session and is not read;
+- `information_schema.tables` for the row-filtered and excluded tables;
+- `information_schema.schemata` for the databases of the dedicated-account script.
+
+Column-level grants are kept with their columns.
+
+It reports `ALL PRIVILEGES` at the global level, or `SUPER` together with every privilege of the write set below (MySQL 8 lists `ALL` one privilege at a time), as a superuser; `SUPER` without that as its own finding; any privilege of the write set granted at the global, database, table or column level; and `SELECT` on a table the connection excludes. The write set is every privilege that changes data, structure or files: `INSERT`, `UPDATE`, `DELETE`, `DROP`, `FILE`, `ALTER`, `CREATE`, `INDEX`, `TRIGGER`, `CREATE ROUTINE`, `ALTER ROUTINE`, `EVENT`, `LOCK TABLES`, `CREATE VIEW`, `CREATE TEMPORARY TABLES`, `REFERENCES`, `CREATE TABLESPACE`, and `ALL PRIVILEGES` at any level; on MariaDB also `DELETE HISTORY`, which removes the history rows of a system-versioned table (the superuser rule does not need it). `SELECT`, `SHOW VIEW`, `EXECUTE`, `PROCESS`, `RELOAD`, `SHUTDOWN`, `REPLICATION *`, `CREATE USER`, `GRANT OPTION` and `USAGE` are not writes. At most 500 write grants are read. Each finding comes with a `REVOKE` for the grant level and the grantee it found, one line per level, so a table-level grant under a database-level one gets its own line. A database-level grant is revoked as `SHOW GRANTS` prints it: MySQL keeps the pattern escapes of the grant (`` `sample\_delivery`.* ``) and a `REVOKE` must name it that way. An unescaped `_` or `%` in a database-level grant is a wildcard; the check reads it as a literal name, so a table the pattern covers reads no privilege from it. `ALL PRIVILEGES` on a database is revoked as the write set minus the global-only `FILE` and `CREATE TABLESPACE`, and on a table as `INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, INDEX, TRIGGER, CREATE VIEW, REFERENCES`, so `SELECT` stays (MariaDB adds `DELETE HISTORY` at both levels); global `ALL PRIVILEGES` is the superuser finding. Grants `ON FUNCTION` and `ON PROCEDURE` are not read. `SUPER` is revoked from each grantee that holds it (the account or an active role). Column-level `SELECT` grants are not read.
 
 ---
 
