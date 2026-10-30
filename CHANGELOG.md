@@ -2,6 +2,140 @@
 
 <!-- version list -->
 
+## v3.0.0 (2026-10-30)
+
+### Bug Fixes
+
+- **deps**: Bump vitest to 4.1.12 and postcss-selector-parser to 6.1.5 to clear the moderate npm
+  advisories ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **frontend**: Size the rotated chart x-axis from its labels so full names show and the legend no
+  longer overlaps them ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **pipeline**: Tell degenerate LLM output apart from a real truncation and report the output budget
+  that was hit ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Add a read-only explain to the datasources, record where sample values came from, and
+  treat stale stored results in the share, export and chat paths
+  ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Classify result masks by column position from the engine tokens and fail closed on
+  ambiguous scopes ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Close strict-mode bypasses, detect MySQL quoting modes, refuse SET statements,
+  classify own refusals as REJECTED and let an unreadable connection be re-entered
+  ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Close the phase 3a review findings in row-filter verification, prompt hints,
+  fingerprints and stale stored results ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Keep MySQL warnings out of the log, refuse set_config and user-variable assignment
+  that bypass masking, warn on removed default patterns, show only a refusal's explanation and drop
+  the backtick hint from PostgreSQL prompts ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Log execution errors in their redacted form and give query rejections a shared
+  QueryRejectedError base ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Save row-filter keys in their quoted form and handle stale results in the report
+  builder and share page ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Show the stale-result notice in the results view, the chat message and the shared
+  session page ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Withhold sensitive columns' comments from the LLM, document that a MySQL connection
+  sees every database its account can read, and drop the sample-values wording from the generation
+  prompt ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+### Chores
+
+- **frontend**: Bundle the fonts with @fontsource instead of loading them from Google Fonts and
+  tighten the CSP ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Commit the earlier backend work this branch depends on
+  ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+### Documentation
+
+- Describe the new masking and log protections and the removed-defaults warning, add message_id to
+  the edit request, state the savvina_demo default and fix the MySQL analyst password
+  ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- Describe the read-only transaction, the sample-value sources, the key-rotation effect on stored
+  results and the generation path ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Describe the exact-name sensitive columns, the strict mode and its limits, and the
+  redacted log line ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Describe the privilege audit, its findings, remediation and limits per engine, and
+  note that value mappings reach the LLM by design
+  ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Describe the rewriter-planned verification, its time budget, the stale rules and the
+  quoted keys ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Per-table row filters, the migration state, masking limits and the live row-filter
+  test ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Row filter is editable and validated; LIMIT/OFFSET shapes hoisted
+  ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+### Features
+
+- **frontend**: Add the exact-name sensitive columns list and the strict sensitive-columns toggle to
+  the privacy settings ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **frontend**: Show the privilege audit findings with copyable remediation SQL on the connection
+  page ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Add exact-name sensitive columns and the opt-in strict sensitive-column guard on
+  every executed statement ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Audit the connection role's privileges on PostgreSQL and MySQL/MariaDB and store the
+  findings with their REVOKE remediation on the connection
+  ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Editable, validated row filter with LIMIT/OFFSET hoisting and clean verified examples
+  ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Per-table row filters in the Privacy Settings form with validation and a migration
+  banner ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Per-table row filters rewritten with sqlglot replace the whole-query filter, which
+  now puts a connection in a migration state ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+- **privacy**: Row filter input in the Privacy Settings form with the save error shown inline
+  ([#22](https://github.com/savvina-ai/savvina/pull/22),
+  [`d7d5d29`](https://github.com/savvina-ai/savvina/commit/d7d5d2987d87a0a5219d18d25300571131d3a5fb))
+
+
 ## v2.2.0 (2026-10-26)
 
 ### Bug Fixes
