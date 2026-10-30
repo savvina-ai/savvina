@@ -129,7 +129,7 @@ class PromptBuilder:
         parts.append(self._output_format_instructions())
 
         # 8. Safety rules
-        parts.append(self._safety_rules())
+        parts.append(self._safety_rules(privacy))
 
         return "\n\n".join(parts)
 
@@ -212,9 +212,19 @@ class PromptBuilder:
             "Brief explanation of what the query does and why you chose this approach."
         )
 
-    def _safety_rules(self) -> str:
+    def _safety_rules(self, privacy: PrivacySettings | None = None) -> str:
+        strict = bool(privacy and privacy.strict_sensitive_columns)
+        strict_sentence = (
+            " This connection is strict: never use a [SENSITIVE] column in WHERE, JOIN,"
+            " GROUP BY, HAVING or ORDER BY, inside any expression, through an alias or"
+            " by position either, and do not use NATURAL joins, JOIN ... USING or"
+            " whole-row references (t::text, to_jsonb(t)). If the question needs such a"
+            " filter, say so in the EXPLANATION and do not generate a QUERY block."
+            if strict
+            else ""
+        )
         return (
-            "## Rules\n"
+            "## Rules\n"  # noqa: S608 - prompt text, not SQL
             "1. Generate ONLY read-only queries. NEVER generate INSERT, UPDATE, DELETE, "
             "DROP, CREATE, ALTER, TRUNCATE, or any data modification statements.\n"
             "2. ONLY reference tables and columns that are explicitly listed in the "
@@ -233,7 +243,9 @@ class PromptBuilder:
             "naturally include a sensitive column (e.g. email, SSN), simply omit it and use "
             "non-sensitive identifiers instead (e.g. customer_id, display_name). Only refuse "
             "with an EXPLANATION and no QUERY block if the sensitive column IS the core data "
-            "the user is explicitly asking for (e.g. 'show me all customer emails').\n"
+            "the user is explicitly asking for (e.g. 'show me all customer emails')."
+            + strict_sentence
+            + "\n"
             "11. Only add WHERE clause filters that are explicitly stated in the user's question. "
             "Never infer or assume filters (e.g. cuisine type, city, status, category) that the "
             "user did not mention. If the user asks for 'top 10 restaurants by rating', do not "

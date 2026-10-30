@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.datasources.models import PrivacySettings
 from app.providers.base import LLMResponse
 from app.schemas.sse import DoneEvent
 from app.services.pipeline import _generate_query
@@ -276,6 +277,60 @@ class TestTpmWarning:
         assert result.cache_hit is True
         assert result.generated_query == "SELECT cached"
         assert result.tpm_warning is None  # no TPM hit on cache path
+
+
+class TestCacheBypassForSensitiveColumns:
+    """A cache hit whose query names a sensitive column is regenerated, not served."""
+
+    @staticmethod
+    async def _generate_with_cache_hit(privacy: PrivacySettings, provider: MagicMock):
+        cache_entry = MagicMock()
+        cache_entry.generated_query = "SELECT name FROM t"
+        cache_entry.cached_question = "list the names"
+        cache = MagicMock()
+        cache.lookup = AsyncMock(return_value=cache_entry)
+        cache.compute_embedding_async = AsyncMock(return_value=[0.1])
+        examples = MagicMock()
+        examples.find_similar_examples = AsyncMock(return_value=[])
+
+        with contextlib.ExitStack() as stack:
+            for p in _base_patches(provider, _make_db()):
+                stack.enter_context(p)
+            return await _generate_query(
+                cache=cache,
+                examples=examples,
+                connection_id="conn-1",
+                message="list the names",
+                session_id=None,
+                adapter=_make_adapter(),
+                schema=MagicMock(),
+                privacy=privacy,
+                semantic_model=None,
+                provider_name="openai",
+                options={},
+                settings=_make_settings(cache_enabled=True),
+                bypass_cache=False,
+            )
+
+    async def test_a_query_naming_an_explicit_sensitive_column_is_regenerated(self):
+        privacy = PrivacySettings(sensitive_column_patterns=[], sensitive_columns=["name"])
+        provider = _make_provider(side_effects=[_make_llm_response("SELECT 1")])
+
+        result = await self._generate_with_cache_hit(privacy, provider)
+
+        assert result.cache_hit is False
+        assert result.generated_query == "SELECT 1"
+        provider.generate_response.assert_awaited_once()
+
+    async def test_the_same_query_is_served_from_cache_without_a_sensitive_setting(self):
+        privacy = PrivacySettings(sensitive_column_patterns=[], sensitive_columns=[])
+        provider = _make_provider(side_effects=[])  # must not be called
+
+        result = await self._generate_with_cache_hit(privacy, provider)
+
+        assert result.cache_hit is True
+        assert result.generated_query == "SELECT name FROM t"
+        provider.generate_response.assert_not_awaited()
 
 
 class TestDoneEventSchema:

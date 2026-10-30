@@ -21,8 +21,10 @@ from app.services.execution import (
     _classify,
     _executable,
     _execute_auto_query,
+    _is_rejection,
 )
 from app.services.row_filter import _MIGRATION_MESSAGE, row_filter_fingerprint
+from app.services.row_filter_errors import SensitiveColumnRejectedError
 from app.services.row_filter_rewrite import apply_row_filters
 
 _F = "tenant_id = 7"
@@ -45,6 +47,37 @@ class TestExecutable:
         )
         assert "WHERE (tenant_id = 7)" in out
         assert out == apply_row_filters("SELECT id FROM users", _FILTERS, "postgresql")
+
+    def test_strict_mode_rejects_before_the_rewrite(self) -> None:
+        privacy = PrivacySettings(
+            strict_sensitive_columns=True, row_filters=_FILTERS, sensitive_column_patterns=["email"]
+        )
+        with pytest.raises(SensitiveColumnRejectedError) as info:
+            _executable("SELECT id FROM users WHERE email = 'x'", privacy, "postgresql")
+        assert _is_rejection(info.value)
+
+    def test_strict_mode_passes_a_plain_projection_and_still_rewrites(self) -> None:
+        privacy = PrivacySettings(
+            strict_sensitive_columns=True, row_filters=_FILTERS, sensitive_column_patterns=["email"]
+        )
+        out = _executable("SELECT email FROM users", privacy, "postgresql")
+        assert "WHERE (tenant_id = 7)" in out
+
+    def test_strict_mode_checks_the_clean_query_not_the_rewritten_one(self) -> None:
+        # The admin's filter names a sensitive-looking column in its WHERE; run after the
+        # rewrite, the guard would reject the statement the admin's own filter produced.
+        privacy = PrivacySettings(
+            strict_sensitive_columns=True,
+            sensitive_column_patterns=["email"],
+            row_filters={"public.users": "owner_email = 'a@b.c'"},
+        )
+        out = _executable("SELECT id FROM users", privacy, "postgresql")
+        assert "owner_email = 'a@b.c'" in out
+
+    def test_the_migration_state_wins_over_strict(self) -> None:
+        privacy = PrivacySettings(strict_sensitive_columns=True, row_filter_sql=_F)
+        with pytest.raises(RowFilterRejectedError):
+            _executable("SELECT id FROM users WHERE email = 'x'", privacy, "postgresql")
 
     def test_legacy_filter_without_a_map_is_the_migration_state(self) -> None:
         privacy = PrivacySettings(row_filter_sql=_F)

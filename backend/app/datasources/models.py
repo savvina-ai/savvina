@@ -279,6 +279,16 @@ class PrivacySettings:
             "tax_id",
         ]
     )
+    # Column names matched whole, case-insensitively, in every table: for names too common
+    # for a substring pattern (name, notes, comment). Same effect as a pattern match
+    # everywhere, through is_column_sensitive. An entry containing a dot never matches.
+    sensitive_columns: list[str] = field(default_factory=list)
+    # Strict mode: a sensitive column may appear only as a plain item of a SELECT list
+    # (where it is masked); any other use (WHERE, JOIN, GROUP BY, HAVING, ORDER BY, an
+    # expression, an alias or a position that reaches it, a whole-row reference) is
+    # rejected before execution (services/sensitive_guard). Off by default: on, a
+    # question that filters on such a column stops working.
+    strict_sensitive_columns: bool = False
     excluded_schemas: list[str] = field(default_factory=list)
     excluded_tables: list[str] = field(default_factory=list)
     excluded_columns: list[str] = field(default_factory=list)  # format: "schema.table.column"
@@ -305,8 +315,14 @@ class PrivacySettings:
         return bool(self.row_filter_sql) and not self.row_filters
 
     def is_column_sensitive(self, column_name: str) -> bool:
-        """Check if a column name matches any sensitive pattern."""
+        """A sensitive pattern is contained in the name, or the name is one of the explicit
+        ``sensitive_columns`` (whole, case-insensitive). The one rule every consumer reads:
+        the [SENSITIVE] annotation, value withholding, result masking, entity hints."""
         col_lower = column_name.lower()
+        # An entry with a dot is a qualified name (table.column), not a column name: it
+        # never matches, so a qualified entry cannot be mistaken for a bare one.
+        if any(col_lower == name.lower() for name in self.sensitive_columns if "." not in name):
+            return True
         return any(pattern in col_lower for pattern in self.sensitive_column_patterns)
 
     def column_values_allowed(self, column_name: str) -> bool:
@@ -314,7 +330,7 @@ class PrivacySettings:
 
         The single rule every value channel reads — sample values, ENUM/SET member lists,
         entity-resolution hints, catalog statistics: the toggle must be on and the column
-        must not match a sensitive pattern.
+        must not be sensitive (a pattern or an explicit name).
         """
         return self.include_sample_values and not self.is_column_sensitive(column_name)
 

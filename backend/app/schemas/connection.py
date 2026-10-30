@@ -24,6 +24,10 @@ class PrivacySettingsUpdate(BaseModel):
     include_column_comments: bool | None = None
     include_row_counts: bool | None = None
     sensitive_column_patterns: list[str] | None = None
+    # Exact column names (case-insensitive), trimmed; empty strings are dropped.
+    sensitive_columns: list[str] | None = None
+    # Reject queries that use a sensitive column anywhere but as a plain SELECT item.
+    strict_sensitive_columns: bool | None = None
     excluded_schemas: list[str] | None = None
     excluded_tables: list[str] | None = None
     excluded_columns: list[str] | None = None

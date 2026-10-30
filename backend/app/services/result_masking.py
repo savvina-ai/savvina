@@ -148,8 +148,11 @@ def _excluded_bare_names(privacy: PrivacySettings | None) -> frozenset[str]:
     return _excluded_names_for(tuple(privacy.excluded_columns))
 
 
-def _is_sensitive_name(privacy: PrivacySettings, value: str) -> bool:
-    """A column name whose values are masked: a sensitive pattern or an excluded column."""
+def is_sensitive_name(privacy: PrivacySettings, value: str) -> bool:
+    """A column name whose values are masked: a sensitive pattern, an explicit sensitive column
+    name or an excluded column.
+
+    Shared with ``sensitive_guard``."""
     return privacy.is_column_sensitive(value) or value.lower() in _excluded_bare_names(privacy)
 
 
@@ -378,7 +381,7 @@ def _token_references_sensitive(
         is_reference = tok.ttype is sql_tokens.Name or (
             tok.ttype is sql_tokens.String.Symbol and not double_quote_is_string_literal
         )
-        if is_reference and _is_sensitive_name(privacy, unquote_ident(tok.value)):
+        if is_reference and is_sensitive_name(privacy, unquote_ident(tok.value)):
             return True
     return False
 
@@ -799,8 +802,10 @@ MASK_ALL_COLUMNS: frozenset[str] = _AllColumns()
 _IDENTIFIER_WORD = re.compile(r'"((?:[^"]|"")+)"|`((?:[^`]|``)+)`|([A-Za-z_][A-Za-z0-9_$]*)')
 
 
-def _sql_mentions_sensitive(sql: str, privacy: PrivacySettings) -> bool:
-    """Whether any identifier-like word in *sql* names a sensitive or excluded column."""
+def sql_mentions_sensitive(sql: str, privacy: PrivacySettings) -> bool:
+    """Whether any identifier-like word in *sql* names a sensitive or excluded column.
+
+    Shared with the pipeline's cache bypass."""
     for match in _IDENTIFIER_WORD.finditer(sql):
         double_quoted, backticked, bare = match.groups()
         if double_quoted is not None:
@@ -809,7 +814,7 @@ def _sql_mentions_sensitive(sql: str, privacy: PrivacySettings) -> bool:
             word = backticked.replace("``", "`")
         else:
             word = bare
-        if _is_sensitive_name(privacy, word):
+        if is_sensitive_name(privacy, word):
             return True
     return False
 
@@ -940,7 +945,7 @@ def _lex_like_the_engine(sql: str, dq: bool) -> str:
 def _classification_failed(
     sql: str, privacy: PrivacySettings, exc: BaseException
 ) -> tuple[frozenset[str], set[str]] | None:
-    mask_all = _sql_mentions_sensitive(sql, privacy)
+    mask_all = sql_mentions_sensitive(sql, privacy)
     logger.warning(
         "Result-column classification failed (%s) on SQL of length %d; %s",
         type(exc).__name__,
@@ -1768,7 +1773,7 @@ def _references_sensitive(
         if not is_ref:
             continue
         value = unquote_ident(tok.value)
-        if _is_sensitive_name(privacy, value):
+        if is_sensitive_name(privacy, value):
             return True
         low = value.lower()
         after = toks[idx + 1].value if idx + 1 < len(toks) else ""

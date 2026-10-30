@@ -22,6 +22,7 @@ from ..providers.base import BaseLLMProvider, is_degenerate_output
 from ..semantic.models import SemanticModel
 from .execution import unwrap_row_filter
 from .prompt_builder import PromptBuilder
+from .result_masking import sql_mentions_sensitive
 from .schema_utils import _is_fallback_query, _validate_columns_against_schema
 
 if TYPE_CHECKING:
@@ -143,15 +144,14 @@ def _compress_prompt(
     compact_semantic = (
         _compact_semantic_model(semantic_model) if semantic_model is not None else None
     )
-    # Level 5: preserve user exclusions but drop all optional per-column annotations.
-    _min_pvt = PrivacySettings(
+    # Level 5: drop the three optional annotations and keep everything else (exclusions,
+    # sensitive patterns and names, the strict flag), so the compact prompt marks the same
+    # columns and states the same rules as the full one.
+    _min_pvt = replace(
+        privacy or PrivacySettings(),
         include_sample_values=False,
         include_column_comments=False,
         include_row_counts=False,
-        excluded_schemas=privacy.excluded_schemas if privacy else [],
-        excluded_tables=privacy.excluded_tables if privacy else [],
-        excluded_columns=privacy.excluded_columns if privacy else [],
-        sensitive_column_patterns=privacy.sensitive_column_patterns if privacy else [],
     )
     for examples, semantic, pvt in [
         (few_shot_examples, semantic_model, privacy),  # full
@@ -324,16 +324,18 @@ async def _generate_query(
         # If the cached query references sensitive columns, bypass the cache and regenerate.
         # Column-level visibility restrictions are not reflected in INFORMATION_SCHEMA, so the
         # schema check above cannot catch them. Checking the query text against the connection's
-        # sensitive_column_patterns is the only way to detect whether a privileged user's cached
-        # result would fail for a less-privileged user.
-        if cache_result is not None and privacy is not None:
-            _cached_lower = cache_result.generated_query.lower()
-            if any(pat in _cached_lower for pat in privacy.sensitive_column_patterns):
-                logger.info(
-                    "Cache hit references sensitive column(s) — bypassing cache to allow "
-                    "privacy rules to apply for this user"
-                )
-                cache_result = None
+        # sensitive patterns and names is the only way to detect whether a privileged user's
+        # cached result would fail for a less-privileged user.
+        if (
+            cache_result is not None
+            and privacy is not None
+            and sql_mentions_sensitive(cache_result.generated_query, privacy)
+        ):
+            logger.info(
+                "Cache hit references sensitive column(s) — bypassing cache to allow "
+                "privacy rules to apply for this user"
+            )
+            cache_result = None
 
         if cache_result is not None:
             generated_query = cache_result.generated_query

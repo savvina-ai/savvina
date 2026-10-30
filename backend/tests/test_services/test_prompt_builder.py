@@ -167,6 +167,12 @@ class TestPromptBuilderSafetyRules:
     def test_contains_rules_header(self):
         assert "## Rules" in self.prompt
 
+    def test_strict_sentence_only_with_the_flag(self):
+        strict = PrivacySettings(strict_sensitive_columns=True)
+        assert "This connection is strict" in _build_prompt(privacy=strict)
+        assert "This connection is strict" not in _build_prompt(privacy=PrivacySettings())
+        assert "This connection is strict" not in _build_prompt(privacy=None)
+
     def test_contains_read_only_restriction(self):
         # Must mention the dangerous statements that are forbidden
         assert "INSERT" in self.prompt

@@ -25,6 +25,7 @@ import sqlparse.tokens as sql_tokens
 from ..datasources.models import PrivacySettings
 from .row_filter_errors import RowFilterInvalidError, RowFilterRejectedError
 from .row_filter_rewrite import apply_row_filters, parse_condition, sqlglot_dialect
+from .sensitive_guard import check_strict_sensitive
 
 __all__ = ["RowFilterInvalidError", "RowFilterRejectedError"]
 
@@ -313,11 +314,17 @@ def _executable(sql: str, privacy: PrivacySettings | None, dialect: str) -> str:
     A connection in the migration state (a legacy ``row_filter_sql`` and no map) runs
     nothing: ``RowFilterRejectedError`` with ``_MIGRATION_MESSAGE``. The chat paths check
     that state before generating; this is the safety net for every other caller.
+
+    With strict sensitive-column mode on, ``check_strict_sensitive`` parses and checks the
+    clean query first (``SensitiveColumnRejectedError``), so the rewritten form, which names
+    the admin's filter columns, is never inspected; the sort path's injected ``ORDER BY`` on a
+    masked column is rejected here too.
     """
     if privacy is None:
         return sql
     if privacy.row_filter_needs_migration:
         raise RowFilterRejectedError(_MIGRATION_MESSAGE)
+    check_strict_sensitive(sql, privacy, dialect)
     if privacy.row_filters:
         return apply_row_filters(sql, privacy.row_filters, dialect)
     return sql

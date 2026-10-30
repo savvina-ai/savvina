@@ -43,6 +43,10 @@ class TestClassifySelectColumns:
     def test_direct_sensitive_column(self) -> None:
         assert _masked("SELECT salary FROM employees") == {"salary"}
 
+    def test_an_explicit_sensitive_column_is_masked_like_a_pattern(self) -> None:
+        privacy = PrivacySettings(sensitive_column_patterns=[], sensitive_columns=["name"])
+        assert _masked("SELECT name, username FROM t", privacy) == {"name"}
+
     def test_aliased_sensitive_column(self) -> None:
         assert _masked("SELECT email AS contact FROM users") == {"contact"}
 

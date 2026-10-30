@@ -714,6 +714,33 @@ class TestUpdatePrivacy:
     def _touches_schema_cache(db) -> bool:
         return any("user_schema_caches" in str(c.args[0]) for c in db.execute.call_args_list)
 
+    async def test_privacy_save_stores_sensitive_columns_trimmed(self, http_client):
+        conn = _make_conn(privacy_settings={"include_sample_values": False})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={"sensitive_columns": [" name ", "notes", "", "  ", "name"]},
+        )
+        assert resp.status_code == 200
+        assert self._stored_privacy(db)["sensitive_columns"] == ["name", "notes"]
+        assert resp.json()["privacy_settings"]["sensitive_columns"] == ["name", "notes"]
+        # The [SENSITIVE] annotation lives in the formatted schema, so the schema cache goes.
+        assert self._touches_schema_cache(db)
+
+    async def test_privacy_save_stores_the_strict_toggle(self, http_client):
+        conn = _make_conn(privacy_settings={"include_sample_values": False})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={"strict_sensitive_columns": True}
+        )
+        assert resp.status_code == 200
+        assert self._stored_privacy(db)["strict_sensitive_columns"] is True
+        assert resp.json()["privacy_settings"]["strict_sensitive_columns"] is True
+        # The toggle changes no grant, so the stored privilege audit is left alone.
+        assert "privilege_audit" not in db.execute.call_args_list[1].args[0].compile().params
+
     async def test_sets_the_map_and_keeps_the_schema_cache(self, http_client, no_verification):
         conn = _make_conn(privacy_settings={"include_sample_values": False})
         db = self._db_for_update(conn)

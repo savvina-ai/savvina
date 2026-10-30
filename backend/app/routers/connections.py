@@ -609,6 +609,10 @@ async def update_privacy(
     prior: dict = dict(conn.privacy_settings) if conn.privacy_settings else {}
     existing: dict = dict(prior)
     changes = body.model_dump(exclude_none=True, exclude={"clear_legacy_row_filter"})
+    if body.sensitive_columns is not None:
+        changes["sensitive_columns"] = list(
+            dict.fromkeys(c.strip() for c in body.sensitive_columns if c and c.strip())
+        )
     existing.update(changes)
     legacy = bool(existing.get("row_filter_sql"))
     # Decrypted at most once: by the verification (which needs it and fails the save when
