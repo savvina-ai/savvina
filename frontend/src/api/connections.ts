@@ -2,7 +2,7 @@
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 import apiClient from './client';
-import type { Connection, ConnectionDetail, PaginatedResponse, PrivacySettings } from '../types';
+import type { Connection, ConnectionDetail, PaginatedResponse, PrivacySettings, PrivacySettingsUpdate } from '../types';
 
 export interface CreateConnectionPayload {
   name: string;
@@ -48,7 +48,7 @@ export const connectionsApi = {
   refreshSchema: (id: string) =>
     apiClient.post(`/api/v1/connections/${id}/schema/refresh`).then(r => r.data),
 
-  updatePrivacySettings: (id: string, settings: Partial<PrivacySettings>) =>
+  updatePrivacySettings: (id: string, settings: PrivacySettingsUpdate) =>
     apiClient
       .put<PrivacySettings>(`/api/v1/connections/${id}/privacy`, settings)
       .then(r => r.data),

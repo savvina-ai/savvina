@@ -31,6 +31,8 @@ from reportlab.platypus import (
     Image as RLImage,
 )
 
+from .stored_results import STALE_ROW_FILTER_TEXT
+
 logger = logging.getLogger(__name__)
 
 _MAX_TABLE_ROWS = 200
@@ -198,8 +200,13 @@ def generate_report(
         heading = section.get("heading") or "Query Result"
         elements.append(Paragraph(_escape(heading), heading_style))
 
+        rj = section.get("results_json")
+        # Rows computed under another row-filter map: the notice replaces the table below,
+        # and a chart drawn from those rows must not be embedded either.
+        stale = bool(rj and rj.get("stale_row_filter"))
+
         chart_b64 = section.get("chart_image")
-        if chart_b64:
+        if chart_b64 and not stale:
             try:
                 raw = base64.b64decode(chart_b64.split(",", 1)[-1])
 
@@ -226,9 +233,13 @@ def generate_report(
         if sql:
             elements.append(Preformatted(sql, sql_style))
 
-        rj = section.get("results_json")
         if not rj:
             elements.append(Paragraph("No results available.", styles["Normal"]))
+            elements.append(Spacer(1, 12))
+            continue
+
+        if rj.get("stale_row_filter"):
+            elements.append(Paragraph(_escape(STALE_ROW_FILTER_TEXT), styles["Normal"]))
             elements.append(Spacer(1, 12))
             continue
 

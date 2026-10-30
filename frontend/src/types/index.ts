@@ -40,10 +40,28 @@ export interface PrivacySettings {
   include_column_comments: boolean;
   include_row_counts: boolean;
   sensitive_column_patterns: string[];
+  /** Column names matched exactly (case-insensitive) in every table; same effect as a
+   *  pattern match. */
+  sensitive_columns: string[];
+  /** Reject a query that uses a sensitive column anywhere but as a plain SELECT item. */
+  strict_sensitive_columns: boolean;
   excluded_schemas: string[];
   excluded_tables: string[];
   excluded_columns: string[];
+  /** Per-table row filters: {"schema.table": "<condition without WHERE>"}. Tables not
+   *  listed are unfiltered. On PUT, an absent field leaves the map unchanged and {} clears
+   *  it (refused while a legacy row_filter_sql is stored, unless clear_legacy_row_filter). */
+  row_filters: Record<string, string>;
+  /** Legacy whole-query filter (before 2.3). Read only, shown in the migration banner;
+   *  the server ignores it on PUT. */
+  row_filter_sql?: string | null;
 }
+
+/** Payload of PUT /connections/{id}/privacy: any subset of the settings plus the command
+ *  that removes the legacy whole-query filter. */
+export type PrivacySettingsUpdate = Partial<PrivacySettings> & {
+  clear_legacy_row_filter?: boolean;
+};
 
 // ── Connections ──
 export interface Connection {
@@ -56,8 +74,47 @@ export interface Connection {
   created_at: string;
 }
 
+// ── Privilege audit ──
+export type PrivilegeFindingCode =
+  | 'superuser'
+  | 'super_privilege'
+  | 'bypassrls'
+  | 'owner_without_force'
+  | 'write_privileges'
+  | 'reads_excluded_tables'
+  | 'sql_from_string';
+
+export interface AuditFinding {
+  code: PrivilegeFindingCode;
+  /** `schema.table` keys; empty for a role-level finding. */
+  tables: string[];
+  /** `sql_from_string` only: `schema.name(argtypes)`. */
+  functions: string[];
+  /** Tables beyond the 50 listed in `tables`. */
+  more_tables: number;
+  /** The SQL the admin runs; one statement per line. */
+  remediation: string;
+}
+
+/** The last privilege audit of the connection role (stored on the connection; written on
+ *  create, Test, a privacy save that changes the filtered or excluded tables, and a config
+ *  save). `unavailable`: the catalog could not be read, `error` says why. */
+export interface PrivilegeAudit {
+  checked_at: string;
+  role: string;
+  status: 'ok' | 'unavailable';
+  error: string | null;
+  findings: AuditFinding[];
+  /** Some row-filtered table has native row-level security enabled: the superuser,
+   *  bypassrls and owner findings are then about RLS, otherwise about least privilege. */
+  rls_in_use: boolean;
+  rls_effective: Record<string, boolean>;
+}
+
 export interface ConnectionDetail extends Connection {
   privacy_settings: PrivacySettings | null;
+  row_filter_needs_migration: boolean;
+  privilege_audit: PrivilegeAudit | null;
   schema_cache: Record<string, unknown> | null;
 }
 
@@ -103,6 +160,10 @@ export interface QueryResults {
   row_count: number;
   truncated: boolean;
   bytes_scanned: number | null;
+  /** The row-filter map the rows were computed under; "" for none. */
+  row_filter_fingerprint?: string | null;
+  /** Set by the server on a stored result computed under a different row filter: rows are empty. */
+  stale_row_filter?: boolean;
 }
 
 export interface ChatSession {

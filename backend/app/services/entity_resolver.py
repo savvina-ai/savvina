@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 
-from ..datasources.models import DataSourceSchema
+from ..datasources.models import DataSourceSchema, PrivacySettings
 
 # Content inside single or double quotes (at least 2 chars).
 _RE_QUOTED = re.compile(r"""["']([^"']{2,})["']""")
@@ -81,15 +81,16 @@ def extract_entity_candidates(question: str) -> list[str]:
 def resolve_entities(
     candidates: list[str],
     schema: DataSourceSchema,
+    privacy: PrivacySettings | None = None,
 ) -> list[str]:
     """Match entity candidates against column sample_values already loaded in schema.
 
-    For each candidate, scans every column's sample_values list for a
-    case-insensitive substring match. Returns human-readable resolution notes
-    suitable for injecting into the LLM prompt.
+    For each candidate, scans every column's sample_values list for a case-insensitive
+    substring match and returns human-readable notes for the LLM prompt. No DB queries.
 
-    No DB queries are performed — only uses sample_values already in memory.
-    Returns an empty list if no matches are found.
+    A sensitive column, an excluded column or a column of an excluded table is never
+    matched, even if a stale schema still carries values for it: a hint such as
+    ``customers.email = 'jane@example.com'`` is a value leaving the deployment.
     """
     notes: list[str] = []
 
@@ -98,6 +99,8 @@ def resolve_entities(
         matches: list[str] = []
 
         for table in schema.tables:
+            if privacy is not None and privacy.is_table_excluded(table.schema_name, table.name):
+                continue
             table_label = (
                 table.name
                 if table.schema_name in ("public", "", None)
@@ -105,6 +108,11 @@ def resolve_entities(
             )
             for col in table.columns:
                 if not col.sample_values:
+                    continue
+                if privacy is not None and (
+                    privacy.is_column_sensitive(col.name)
+                    or privacy.is_column_excluded(table.schema_name, table.name, col.name)
+                ):
                     continue
                 for sv in col.sample_values:
                     sv_str = str(sv)

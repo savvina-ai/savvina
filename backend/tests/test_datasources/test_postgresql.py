@@ -4,12 +4,13 @@
 """Tests for the PostgreSQL data source adapter."""
 
 from typing import ClassVar
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
 
 import app.datasources.adapters.postgresql as _pg_module
 from app.datasources.adapters.postgresql import PostgreSQLDataSource, _quote_pg_ident
+from app.datasources.errors import ExplainError
 from app.datasources.models import (
     ColumnInfo,
     DataSourceSchema,
@@ -294,9 +295,15 @@ class TestFormatSchemaForLLM:
 
     # ── Privacy: sample values ─────────────────────────────────────────────────
 
-    def test_sample_values_shown_by_default(self):
-        out = self.adapter.format_schema_for_llm(self.schema)
+    def test_sample_values_shown_when_enabled(self):
+        out = self.adapter.format_schema_for_llm(
+            self.schema, PrivacySettings(include_sample_values=True)
+        )
         assert "Alice" in out
+
+    def test_sample_values_hidden_by_default(self):
+        out = self.adapter.format_schema_for_llm(self.schema)
+        assert "Alice" not in out
 
     def test_sample_values_hidden_when_disabled(self):
         p = PrivacySettings(include_sample_values=False)
@@ -333,6 +340,16 @@ class TestFormatSchemaForLLM:
     def test_table_description_hidden_when_comments_disabled(self):
         p = PrivacySettings(include_column_comments=False)
         assert "User accounts" not in self.adapter.format_schema_for_llm(self.schema, p)
+
+    def test_sensitive_column_comment_never_shown(self):
+        # A comment can spell out a sensitive column's values; the render drops it too.
+        users = self.schema.tables[0]
+        for col in users.columns:
+            col.description = {"email": "work=a@x.com", "name": "Full name"}.get(col.name)
+        p = PrivacySettings(include_column_comments=True, include_sample_values=True)
+        out = self.adapter.format_schema_for_llm(self.schema, p)
+        assert "work=a@x.com" not in out
+        assert "Full name" in out
 
     def test_empty_schema_returns_string(self):
         out = self.adapter.format_schema_for_llm(DataSourceSchema(source_type="postgresql"))
@@ -762,6 +779,118 @@ class TestIntrospect:
             await adapter.introspect()
 
 
+# ── Rows are read by position ─────────────────────────────────────────────────
+
+
+class DupNameRecord:
+    """An asyncpg Record with repeated output names: ``keys()`` and ``values()`` keep every
+    field in order, while a lookup by name returns the *last* field of that name."""
+
+    def __init__(self, fields: list[tuple[str, object]]):
+        self._fields = fields
+
+    def keys(self):
+        return [k for k, _ in self._fields]
+
+    def values(self):
+        return [v for _, v in self._fields]
+
+    def __iter__(self):
+        return iter(self.values())
+
+    def __len__(self):
+        return len(self._fields)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._fields[key][1]
+        return [v for k, v in self._fields if k == key][-1]
+
+
+class _Cursor:
+    def __init__(self, records):
+        self._records = records
+
+    def __aiter__(self):
+        return self._gen()
+
+    async def _gen(self):
+        for r in self._records:
+            yield r
+
+
+def _real_dup_record(names: list[str], values: tuple):
+    """A genuine asyncpg Record whose descriptor repeats names, built the way asyncpg's
+    prepared statement builds one (name -> last index, plus the full name tuple)."""
+    import collections
+
+    protocol = pytest.importorskip("asyncpg.protocol.protocol")
+    create = getattr(protocol, "_create_record", None)
+    if create is None:
+        pytest.skip("asyncpg no longer exposes _create_record")
+
+    class _Mapping(collections.OrderedDict):
+        def __iter__(self):
+            return iter(names)
+
+    return create(_Mapping((n, i) for i, n in enumerate(names)), values)
+
+
+class TestRowsByPosition:
+    """``SELECT count(*), count(DISTINCT x)`` names both columns ``count``; reading the row
+    by name returned the second value twice."""
+
+    _RECORDS: ClassVar[list] = [
+        DupNameRecord([("count", 10), ("count", 3)]),
+        DupNameRecord([("count", 11), ("count", None)]),
+    ]
+
+    async def test_execute_query_keeps_duplicate_names_apart(self):
+        adapter, conn = make_adapter_with_pool()
+        conn.fetch = AsyncMock(return_value=self._RECORDS)
+
+        result = await adapter.execute_query("SELECT count(*), count(DISTINCT x) FROM t")
+
+        assert result.columns == ["count", "count"]
+        assert result.rows == [[10, 3], [11, None]]
+        assert result.column_types == ["int", "int"]
+
+    async def test_execute_query_stream_keeps_duplicate_names_apart(self):
+        adapter, conn = make_adapter_with_pool()
+        conn.cursor = lambda *_a, **_k: _Cursor(self._RECORDS)
+
+        batches = [
+            b
+            async for b in adapter.execute_query_stream("SELECT count(*), count(DISTINCT x) FROM t")
+        ]
+
+        assert batches[0].columns == ["count", "count"]
+        assert [row for b in batches for row in b.rows] == [[10, 3], [11, None]]
+        assert batches[0].column_types == ["int", "int"]
+
+    async def test_column_types_follow_position(self):
+        adapter, conn = make_adapter_with_pool()
+        conn.fetch = AsyncMock(return_value=[DupNameRecord([("lower", "ann"), ("lower", None)])])
+
+        result = await adapter.execute_query("SELECT lower(name), lower(email) FROM users")
+
+        assert result.column_types == ["str", "unknown"]
+
+    async def test_real_asyncpg_record(self):
+        record = _real_dup_record(["count", "count"], (10, 3))
+        assert record["count"] == 3  # the driver's name lookup: last match wins
+        adapter, conn = make_adapter_with_pool()
+        conn.fetch = AsyncMock(return_value=[record])
+        conn.cursor = lambda *_a, **_k: _Cursor([record])
+
+        result = await adapter.execute_query("SELECT count(*), count(DISTINCT x) FROM t")
+        batches = [b async for b in adapter.execute_query_stream("SELECT 1")]
+
+        assert result.columns == ["count", "count"]
+        assert result.rows == [[10, 3]]
+        assert batches[0].rows == [[10, 3]]
+
+
 # ── execute_query ─────────────────────────────────────────────────────────────
 
 
@@ -836,20 +965,31 @@ class TestExecuteQuery:
 
         assert result.execution_time_ms >= 0.0
 
-    async def test_statement_timeout_set_locally(self):
+    async def test_statement_timeout_and_standard_strings_set_locally(self):
         """Bug fix #2: SET LOCAL used inside a transaction for pool safety."""
         adapter, conn = make_adapter_with_pool()
         conn.fetch = AsyncMock(return_value=[])
 
         await adapter.execute_query("SELECT 1", timeout=15)
 
-        # The execute call should set LOCAL statement_timeout (15 * 1000 ms)
-        conn.execute.assert_called_once_with("SET LOCAL statement_timeout = 15000")
+        assert conn.execute.call_args_list == [
+            call("SET LOCAL statement_timeout = 15000"),
+            call("SET LOCAL standard_conforming_strings = on"),
+        ]
 
     async def test_not_connected_raises_runtime_error(self):
         adapter = PostgreSQLDataSource()
         with pytest.raises(RuntimeError, match="Not connected"):
             await adapter.execute_query("SELECT 1")
+
+    async def test_runs_in_a_read_only_transaction(self):
+        """The engine, not just the text validator, refuses any write that slips through."""
+        adapter, conn = make_adapter_with_pool()
+        conn.fetch = AsyncMock(return_value=[])
+
+        await adapter.execute_query("SELECT 1")
+
+        assert conn.transaction_kwargs == {"readonly": True}
 
 
 # ── disconnect ────────────────────────────────────────────────────────────────
@@ -1021,3 +1161,30 @@ class TestConnectPoolTimeout:
             await PostgreSQLDataSource().connect(self._cfg)
 
         assert _pg_module._pool_cache == {}
+
+
+class TestExplain:
+    async def test_plans_inside_a_read_only_transaction_with_the_timeout(self):
+        adapter, conn = make_adapter_with_pool()
+        await adapter.explain("SELECT 1", timeout=7)
+        assert conn.transaction_kwargs == {"readonly": True}
+        statements = [c.args[0] for c in conn.execute.call_args_list]
+        assert statements == [
+            "SET LOCAL statement_timeout = 7000",
+            "SET LOCAL standard_conforming_strings = on",
+        ]
+        # fetch uses the extended query protocol, which runs exactly one statement.
+        conn.fetch.assert_awaited_once_with("EXPLAIN SELECT 1")
+
+    async def test_engine_error_becomes_explain_error_with_the_cause(self):
+        adapter, conn = make_adapter_with_pool()
+        cause = RuntimeError('column "nosuch" does not exist')
+        conn.fetch.side_effect = cause
+        with pytest.raises(ExplainError, match="nosuch") as info:
+            await adapter.explain("SELECT nosuch FROM t", timeout=7)
+        assert info.value.__cause__ is cause
+
+    async def test_not_connected_raises(self):
+        adapter = PostgreSQLDataSource()
+        with pytest.raises(RuntimeError):
+            await adapter.explain("SELECT 1", timeout=7)

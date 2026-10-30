@@ -10,6 +10,9 @@ import { useAuthStore } from '../store/authStore';
 import DataSourceSelector from '../components/DataSourceSelector';
 import DynamicConnectionForm from '../components/DynamicConnectionForm';
 import PrivacySettingsForm from '../components/PrivacySettings';
+import { PRIVACY_DEFAULTS } from '../lib/privacyDefaults';
+import PrivilegeAuditBanner from '../components/PrivilegeAuditBanner';
+import { displayRowFilterMap } from '../lib/rowFilterKeys';
 import ExecutionModeSelector from '../components/ExecutionModeSelector';
 import {
   DropdownMenu,
@@ -33,8 +36,11 @@ import {
   useCreateConnection,
   useDeleteConnection,
   useTestNewConnection,
+  useTestConnection,
   useUpdatePrivacySettings,
   useUpdateExecutionMode,
+  useConnectionTableNames,
+  useDataSources,
 } from '../hooks/useConnections';
 import { useAppStore } from '../store/appStore';
 import { cn } from '@/lib/utils';
@@ -42,48 +48,99 @@ import { getDatasourceIcon } from '@/lib/datasourceIcons';
 import { apiErrorMessage } from '@/lib/apiError';
 import type { DataSourceInfo, PrivacySettings, Connection } from '../types';
 
-const DEFAULT_PRIVACY: PrivacySettings = {
-  include_sample_values: false,
-  include_column_comments: false,
-  include_row_counts: false,
-  sensitive_column_patterns: [
-    'password', 'passwd', 'secret', 'token', 'api_key',
-    'email', 'ssn', 'social_security', 'credit_card', 'card_number', 'cvv',
-    'phone', 'mobile', 'address', 'salary', 'wage', 'income',
-    'bank_account', 'routing_number', 'dob', 'date_of_birth',
-    'national_id', 'passport', 'license_number', 'tax_id',
-  ],
-  excluded_schemas: [],
-  excluded_tables: [],
-  excluded_columns: [],
-};
-
 function EditPanel({ connId, onClose }: { connId: string; onClose: () => void }) {
   const { data: detail, isLoading } = useConnection(connId);
   const updatePrivacy = useUpdatePrivacySettings();
   const updateMode = useUpdateExecutionMode();
-  const [privacy, setPrivacy] = useState<PrivacySettings>(DEFAULT_PRIVACY);
+  const recheck = useTestConnection();
+  const { data: knownTables } = useConnectionTableNames(connId);
+  const { data: dataSources, isPending: sourcesPending } = useDataSources();
+  // The listed dialect is preferred. When the datasource list failed to load, the connection's
+  // source_type stands in: for the engines that support row filters (postgresql, mysql) it
+  // equals the lower-cased query_dialect, and the key helpers lower-case the dialect and leave
+  // keys alone for any dialect they do not know, so a different source_type is harmless.
+  const dialect =
+    dataSources?.find((s) => s.source_type === detail?.source_type)?.query_dialect ??
+    detail?.source_type;
+  const [privacy, setPrivacy] = useState<PrivacySettings>(PRIVACY_DEFAULTS);
   const [execMode, setExecMode] = useState<Connection['execution_mode']>('auto_execute');
   const [privacyOpen, setPrivacyOpen] = useState(false);
   const [initialized, setInitialized] = useState(false);
+  const [formValid, setFormValid] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (detail && !initialized) {
-      if (detail.privacy_settings) setPrivacy(detail.privacy_settings);
+    // Wait for the datasource list too (it settles on success or error): the stored row-filter
+    // keys are held in the form's displayed form, which depends on the dialect. On an error
+    // the dialect falls back to the connection's source_type.
+    if (detail && !sourcesPending && !initialized) {
+      if (detail.privacy_settings) {
+        // A stored legacy row (row_filter_sql, no map) starts with an empty list, and the
+        // map is sent on every save so the server can refuse to drop the old filter
+        // silently. The legacy value is never part of the form state (the banner reads
+        // it from `detail`), so a save never sends row_filter_sql. The keys are held as the
+        // form shows them (quoted where the dialect needs it), so a save that touches only
+        // another setting sends each key back unchanged instead of letting the server fold it.
+        setPrivacy({
+          ...PRIVACY_DEFAULTS,
+          ...detail.privacy_settings,
+          row_filters: displayRowFilterMap(detail.privacy_settings.row_filters ?? {}, dialect),
+          row_filter_sql: undefined,
+        });
+      }
       setExecMode(detail.execution_mode);
+      // A legacy connection needs its row filters redefined: show the form with the banner.
+      if (detail.row_filter_needs_migration) setPrivacyOpen(true);
       setInitialized(true);
     }
-  }, [detail, initialized]);
+  }, [detail, sourcesPending, dialect, initialized]);
+
+  // A disabled Save must always have a visible reason: reopen a collapsed section so the
+  // invalid row and its error are in view.
+  useEffect(() => {
+    if (!formValid && !privacyOpen) setPrivacyOpen(true);
+  }, [formValid, privacyOpen]);
 
   const handleSave = async () => {
-    await Promise.all([
-      updatePrivacy.mutateAsync({ id: connId, settings: privacy }),
-      updateMode.mutateAsync({ id: connId, mode: execMode }),
-    ]);
-    onClose();
+    setError(null);
+    try {
+      // Privacy first: a rejected row filter (422) stops before the execution mode changes.
+      await updatePrivacy.mutateAsync({ id: connId, settings: privacy });
+      await updateMode.mutateAsync({ id: connId, mode: execMode });
+      onClose();
+    } catch (e: unknown) {
+      setError(apiErrorMessage(e, 'Failed to save'));
+    }
   };
 
-  if (isLoading) {
+  const handleClearLegacy = async () => {
+    const ok = window.confirm(
+      'Remove the old whole-query filter? The per-table filters in the form are saved with it; tables without one run unfiltered.',
+    );
+    if (!ok) return;
+    setError(null);
+    try {
+      await updatePrivacy.mutateAsync({
+        id: connId,
+        settings: { row_filters: privacy.row_filters ?? {}, clear_legacy_row_filter: true },
+      });
+    } catch (e: unknown) {
+      setError(apiErrorMessage(e, 'Failed to remove the old filter'));
+    }
+  };
+
+  const handleRecheck = async () => {
+    setError(null);
+    try {
+      await recheck.mutateAsync(connId);
+    } catch (e: unknown) {
+      setError(apiErrorMessage(e, 'Could not check the privileges'));
+    }
+  };
+
+  // The form is not shown before the state above is initialised from the detail, so a Save
+  // can never send the defaults.
+  if (isLoading || (detail && !initialized)) {
     return (
       <div className="border-t border-border px-4 py-3 text-sm text-muted-foreground">
         Loading…
@@ -95,6 +152,31 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
 
   return (
     <div className="space-y-4 border-t border-border bg-muted/30 px-4 py-4">
+      {detail?.row_filter_needs_migration && (
+        <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm">
+          <p className="text-foreground">
+            Queries on this connection are rejected until the row filter is redefined per
+            table. Add the filters below and save, or remove the old filter.
+          </p>
+          <p className="mt-1 text-muted-foreground">
+            Previous filter: <code className="break-all">{detail.privacy_settings?.row_filter_sql ?? ''}</code>
+          </p>
+          <button
+            type="button"
+            onClick={handleClearLegacy}
+            disabled={isSaving || !formValid}
+            className="mt-2 rounded-md border border-border px-3 py-1 text-sm text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
+          >
+            Remove the old filter
+          </button>
+        </div>
+      )}
+      <PrivilegeAuditBanner
+        audit={detail?.privilege_audit ?? null}
+        dialect={dialect}
+        onRecheck={handleRecheck}
+        rechecking={recheck.isPending}
+      />
       <div>
         <button
           onClick={() => setPrivacyOpen((o) => !o)}
@@ -103,21 +185,41 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
           <span>{privacyOpen ? '▼' : '▶'}</span>
           Privacy Settings
         </button>
-        {privacyOpen && (
-          <div className="mt-4 border-l-2 border-border pl-4">
-            <PrivacySettingsForm settings={privacy} onChange={setPrivacy} />
-          </div>
-        )}
+        {/* Stays mounted while collapsed: the form's rows are local state, and unmounting it
+            would drop an invalid row the Save button is waiting on. */}
+        <div hidden={!privacyOpen} className="mt-4 border-l-2 border-border pl-4">
+          <PrivacySettingsForm
+            settings={privacy}
+            onChange={setPrivacy}
+            knownTables={knownTables ?? undefined}
+            dialect={dialect}
+            onValidityChange={setFormValid}
+            audit={detail?.privilege_audit ?? null}
+          />
+        </div>
       </div>
       <div>
         <p className="mb-3 text-sm font-medium text-foreground">Execution Mode</p>
         <ExecutionModeSelector value={execMode} onChange={setExecMode} />
       </div>
-      <div className="flex gap-2">
+      {!detail && (
+        <div className="flex items-start gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3">
+          <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+          <p className="text-sm text-destructive">Could not load this connection&apos;s settings.</p>
+        </div>
+      )}
+      {error && (
+        <div className="flex items-start gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3">
+          <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+          <p className="text-sm text-destructive">{error}</p>
+        </div>
+      )}
+      <div className="flex items-center gap-2">
         <Button
           variant="gradient"
           onClick={handleSave}
-          disabled={isSaving}
+          disabled={isSaving || !detail || !formValid}
+          aria-describedby={formValid ? undefined : 'row-filter-invalid-hint'}
         >
           {isSaving ? 'Saving…' : 'Save'}
         </Button>
@@ -127,6 +229,11 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
         >
           Cancel
         </button>
+        {!formValid && (
+          <p id="row-filter-invalid-hint" className="text-sm text-destructive">
+            Fix the row filters in Privacy Settings to save.
+          </p>
+        )}
       </div>
     </div>
   );
@@ -144,6 +251,9 @@ function EditConnectionPanel({ conn, onClose }: { conn: Connection; onClose: () 
   const [schema, setSchema] = useState<DataSourceInfo | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  // Set when the stored config cannot be read (a 422 from GET /config): the form opens
+  // empty so the admin can enter every field again.
+  const [unreadableNotice, setUnreadableNotice] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{
@@ -169,11 +279,20 @@ function EditConnectionPanel({ conn, onClose }: { conn: Connection; onClose: () 
 
     Promise.all([
       dsPromise,
-      apiClient.get<{ name: string; source_type: string; config: Record<string, unknown> }>(
-        `/api/v1/connections/${conn.id}/config`,
-      ),
+      apiClient
+        .get<{ name: string; source_type: string; config: Record<string, unknown> }>(
+          `/api/v1/connections/${conn.id}/config`,
+        )
+        .catch((e: unknown) => {
+          if ((e as { response?: { status?: number } })?.response?.status === 422) {
+            setUnreadableNotice(apiErrorMessage(e));
+            return null;
+          }
+          throw e;
+        }),
     ])
       .then(([, cfgRes]) => {
+        if (!cfgRes) return;
         setConfigValues(cfgRes.data.config);
         setName(cfgRes.data.name);
       })
@@ -244,6 +363,12 @@ function EditConnectionPanel({ conn, onClose }: { conn: Connection; onClose: () 
           <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Server Settings
           </h3>
+          {unreadableNotice && (
+            <div className="flex items-start gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3">
+              <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+              <p className="text-sm text-destructive">{unreadableNotice}</p>
+            </div>
+          )}
           <div>
             <label htmlFor="conn-name-edit" className="mb-1.5 block text-sm font-medium text-foreground">
               Connection name
@@ -430,7 +555,7 @@ export default function ConnectionPage() {
 
   const [name, setName] = useState('');
   const [config, setConfig] = useState<Record<string, unknown>>({});
-  const [privacy, setPrivacy] = useState<PrivacySettings>(DEFAULT_PRIVACY);
+  const [privacy, setPrivacy] = useState<PrivacySettings>(PRIVACY_DEFAULTS);
   const [execMode, setExecMode] = useState<Connection['execution_mode']>('auto_execute');
   const [testResult, setTestResult] = useState<{
     success: boolean;

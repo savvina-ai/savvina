@@ -44,7 +44,7 @@ function SharedMessage({ msg, idx }: { msg: PublicMessageSummary; idx: number })
                 <span className="rounded bg-badge-bg px-1.5 py-0.5 font-mono text-[10px] font-medium uppercase text-badge-text">
                   {msg.query_dialect ?? 'SQL'}
                 </span>
-                {msg.results_json && (
+                {msg.results_json && !msg.results_json.stale_row_filter && (
                   <span className="font-mono text-[10px] text-muted-foreground">
                     {msg.results_json.row_count} row{msg.results_json.row_count !== 1 ? 's' : ''}
                   </span>
@@ -64,14 +64,16 @@ function SharedMessage({ msg, idx }: { msg: PublicMessageSummary; idx: number })
                 <div className="border-t border-border">
                   <ResultsTable results={msg.results_json} />
                 </div>
-                <div className="flex items-center gap-1 border-t border-border px-3 py-1.5">
-                  <button
-                    onClick={() => downloadCsv(msg.results_json!, `result-${idx}.csv`)}
-                    className="rounded px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                  >
-                    Download CSV
-                  </button>
-                </div>
+                {!msg.results_json.stale_row_filter && (
+                  <div className="flex items-center gap-1 border-t border-border px-3 py-1.5">
+                    <button
+                      onClick={() => downloadCsv(msg.results_json!, `result-${idx}.csv`)}
+                      className="rounded px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    >
+                      Download CSV
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </div>

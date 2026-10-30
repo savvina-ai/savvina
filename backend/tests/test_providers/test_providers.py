@@ -9,7 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.providers.base import LLMResponse, _extract_sql, parse_llm_response
+from app.providers.base import (
+    LLMResponse,
+    _extract_sql,
+    is_degenerate_output,
+    parse_llm_response,
+)
 from app.providers.cerebras_provider import CerebrasProvider
 from app.providers.claude_provider import ClaudeProvider
 from app.providers.gemini_provider import GeminiProvider
@@ -159,6 +164,36 @@ class TestParseLLMResponse:
         assert r.query == ""
 
 
+# ── is_degenerate_output ──────────────────────────────────────────────────────
+
+
+class TestIsDegenerateOutput:
+    """Detects inference failures that emit one token repeated until max_tokens.
+
+    Seen on Cloudflare Workers AI with gpt-oss-120b: 4096 tokens of ``!`` (token id 0)
+    with finish_reason=length. That is not a truncated query and must not be reported
+    as one.
+    """
+
+    def test_long_run_of_one_character_is_degenerate(self):
+        assert is_degenerate_output("!" * 4096)
+
+    def test_whitespace_between_repeats_is_ignored(self):
+        assert is_degenerate_output("  \n" + "!!!! " * 20 + "\n")
+
+    def test_short_run_is_not_degenerate(self):
+        assert not is_degenerate_output("!!!")
+
+    def test_real_sql_is_not_degenerate(self):
+        assert not is_degenerate_output(
+            "SELECT 1 FROM t WHERE id = 1 AND x = 'aaaaaaaaaaaaaaaaaaaaa'"
+        )
+
+    def test_empty_is_not_degenerate(self):
+        assert not is_degenerate_output("")
+        assert not is_degenerate_output("   \n  ")
+
+
 # ── parse_llm_response fallback logging ───────────────────────────────────────
 
 
@@ -258,6 +293,98 @@ class TestParseLLMResponseExplanationBeforeQuery:
         raw = "EXPLANATION: Simple.\nQUERY:\nSELECT 1"
         r = parse_llm_response(raw, "test-model")
         assert r.query == "SELECT 1"
+
+
+_COT_REFUSAL = """\
+REASONING:
+1. Tables needed: `customers`
+2. Rule 10 says to refuse with an EXPLANATION and no QUERY block when the sensitive
+   column is the core data asked for, so I must refuse.
+
+EXPLANATION:
+I cannot list customer emails because the column is marked sensitive."""
+
+
+class TestParseLLMResponseRefusalWithReasoning:
+    def test_no_query(self):
+        r = parse_llm_response(_COT_REFUSAL, "test-model")
+        assert r.query == ""
+
+    def test_explanation_is_only_the_explanation_section(self):
+        r = parse_llm_response(_COT_REFUSAL, "test-model")
+        assert r.explanation == (
+            "I cannot list customer emails because the column is marked sensitive."
+        )
+
+    def test_explanation_label_alone_is_stripped(self):
+        r = parse_llm_response("EXPLANATION:\nThe schema has no drivers table.", "test-model")
+        assert r.explanation == "The schema has no drivers table."
+
+    def test_refusal_without_markers_is_kept_whole(self):
+        r = parse_llm_response("I cannot answer that from this schema.", "test-model")
+        assert r.explanation == "I cannot answer that from this schema."
+
+
+class TestRefusalExplanationOffset:
+    def test_the_explanation_is_cut_on_the_original_text(self):
+        # "ΐ".upper() is three characters: an offset found on an upper-cased copy lands two
+        # characters too far on the original per "ΐ" before the marker and loses the start of
+        # the explanation.
+        raw = "REASONING:\nΗ ερώτηση αφορά ναΐς ΐΐ\n\nEXPLANATION:\nΔεν μπορώ να απαντήσω."  # noqa: RUF001
+        r = parse_llm_response(raw, "test-model")
+        assert r.query == ""
+        assert r.explanation == "Δεν μπορώ να απαντήσω."  # noqa: RUF001
+
+    def test_a_lower_case_marker_is_honoured(self):
+        r = parse_llm_response("reasoning: thinking\n\nexplanation:\nNo such table.", "m")
+        assert r.explanation == "No such table."
+
+    def test_the_last_marker_wins(self):
+        raw = "REASONING: the EXPLANATION: label above is quoted\n\nEXPLANATION:\nFinal."
+        assert parse_llm_response(raw, "m").explanation == "Final."
+
+
+class TestStructuredResponseOffsets:
+    """Markers are found on the original text: upper-casing "ΐ" or "ß" changes its length."""
+
+    @pytest.mark.parametrize("odd", ["ΐΐ", "ßß", "ναΐς ßß ΐ"])
+    def test_query_then_explanation_after_odd_characters(self, odd):
+        raw = (
+            f"REASONING:\nΗ ερώτηση {odd} αφορά πελάτες\n\n"  # noqa: RUF001
+            "QUERY:\n```sql\nSELECT id FROM customers\n```\n\n"
+            "EXPLANATION:\nΛίστα πελατών."  # noqa: RUF001
+        )
+        r = parse_llm_response(raw, "test-model")
+        assert r.query == "SELECT id FROM customers"
+        assert r.explanation == "Λίστα πελατών."
+
+    @pytest.mark.parametrize("odd", ["ΐΐ", "ßß"])
+    def test_explanation_before_query_after_odd_characters(self, odd):
+        raw = (
+            f"EXPLANATION:\nΛίστα {odd} πελατών.\n\n"  # noqa: RUF001
+            "QUERY:\n```sql\nSELECT id FROM customers\n```"
+        )
+        r = parse_llm_response(raw, "test-model")
+        assert r.query == "SELECT id FROM customers"
+        assert r.explanation == f"Λίστα {odd} πελατών."
+
+    def test_a_leaked_reasoning_after_a_greek_string_is_stripped_in_place(self):
+        raw = (
+            "QUERY:\nSELECT id FROM customers WHERE city = 'ΐΐΐ' REASONING: leaked\n\n"
+            "EXPLANATION:\nΛίστα."  # noqa: RUF001
+        )
+        r = parse_llm_response(raw, "test-model")
+        assert r.query == "SELECT id FROM customers WHERE city = 'ΐΐΐ'"
+        assert r.explanation == "Λίστα."
+
+    def test_a_leaked_reasoning_after_an_odd_string_is_stripped_in_place(self):
+        raw = (
+            "QUERY:\nSELECT id FROM customers WHERE city = 'ßß' reasoning: leaked\n\n"
+            "EXPLANATION:\nDone."
+        )
+        r = parse_llm_response(raw, "test-model")
+        assert r.query == "SELECT id FROM customers WHERE city = 'ßß'"
+        assert r.explanation == "Done."
 
 
 # ── Provider registry ─────────────────────────────────────────────────────────

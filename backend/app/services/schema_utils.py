@@ -29,6 +29,7 @@ from ..datasources.models import (
     table_key,
 )
 from ..datasources.registry import create_datasource
+from ..datasources.sampling import withhold_enum_labels
 from ..models.cache import QueryCacheEntry
 from ..models.connection import Connection
 from ..models.table_embedding_cache import TableEmbeddingCache
@@ -79,9 +80,12 @@ async def get_or_refresh_schema(
         schema = await refresh_user_schema_cache(conn, user_id, db, encryption_key, flush="never")
         await db.commit()
 
-    privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
-    if privacy:
-        schema = _apply_privacy_to_schema(schema, privacy)
+    privacy = (
+        PrivacySettings.from_dict(conn.privacy_settings)
+        if conn.privacy_settings
+        else PrivacySettings()
+    )
+    schema = _apply_privacy_to_schema(schema, privacy)
     return schema
 
 
@@ -278,6 +282,64 @@ def _schema_from_dict(d: dict) -> DataSourceSchema:
     )
 
 
+def _withhold_column_values(table: TableInfo, privacy: PrivacySettings) -> TableInfo:
+    """Drop sample values and ENUM/SET member lists from columns whose values may not reach the LLM.
+
+    The column itself stays — the sensitive patterns mark a column, they do not hide it.
+    A sensitive column also loses its comment, whatever the toggles: a comment often
+    spells out the values (``bike=pedal, scooter=motor``) the member list was withheld for.
+    Runs on every cached read, so a schema cached under older settings, or before this
+    rule existed, needs no migration. Returns a new TableInfo; the cached one is untouched.
+    ``sample_source`` goes with the values: a column without values has no source.
+    """
+
+    def withhold(col: ColumnInfo) -> ColumnInfo:
+        if privacy.column_values_allowed(col.name):
+            return col
+        col = replace(
+            col,
+            sample_values=None,
+            sample_source=None,
+            native_type=withhold_enum_labels(col.native_type),
+        )
+        return replace(col, description=None) if privacy.is_column_sensitive(col.name) else col
+
+    return replace(table, columns=[withhold(col) for col in table.columns])
+
+
+def _row_filtered_keys(privacy: PrivacySettings) -> set[str] | None:
+    """The casefolded ``schema.table`` keys whose hints are withheld; ``None`` when every
+    table's are (the migration state: a legacy whole-query filter whose tables are
+    unknown, and no map)."""
+    if privacy.row_filter_needs_migration:
+        return None
+    return {key.casefold() for key in privacy.row_filters}
+
+
+def _withhold_row_filtered_hints(table: TableInfo, filtered: set[str] | None) -> TableInfo:
+    """Drop the hints that describe rows outside the table's row filter.
+
+    Sample values read from the catalog's statistics (``sample_source == "stats"``, or a
+    cached column written before the field existed) and the approximate row count describe
+    the whole table, hidden rows included; a filtered table shows neither, so the row count
+    header and the large-table warning are gone and entity resolution finds nothing. Values
+    a type defines (MySQL ENUM/SET members, ``sample_source == "type"``) describe no row and
+    stay. *filtered* is ``_row_filtered_keys``: the table's key is compared casefolded, so a
+    key that differs from the cached name only in case (the rewriter refuses such a
+    reference rather than run it unfiltered) withholds too; ``None`` withholds from every
+    table. Returns a new TableInfo; the cached one is untouched.
+    """
+    if filtered is not None and table_key(table).casefold() not in filtered:
+        return table
+    columns = [
+        col
+        if col.sample_values is None or col.sample_source == "type"
+        else replace(col, sample_values=None)
+        for col in table.columns
+    ]
+    return replace(table, columns=columns, row_count_approx=None)
+
+
 def _apply_privacy_to_schema(
     schema: DataSourceSchema, privacy: PrivacySettings
 ) -> DataSourceSchema:
@@ -293,7 +355,13 @@ def _apply_privacy_to_schema(
     them, and every consumer of this function — chat validation and pruning,
     drift, generation — must not see one. The sensitive-name patterns are
     deliberately not applied here: the adapters still introspect those columns.
+    Their *values* are withheld, though: sample values and ENUM/SET member lists survive only
+    on columns ``column_values_allowed`` admits. A table under a row filter (its key compared
+    case-insensitively), or every table while the connection is in the row-filter migration
+    state, also loses its data-derived sample values and its row count
+    (``_withhold_row_filtered_hints``).
     """
+    filtered = _row_filtered_keys(privacy)
     visible = {
         (t.schema_name, t.name)
         for t in schema.tables
@@ -303,9 +371,17 @@ def _apply_privacy_to_schema(
         source_type=schema.source_type,
         schemas=[s for s in schema.schemas if s.name not in privacy.excluded_schemas],
         tables=[
-            replace(
-                t,
-                columns=[c for c in t.columns if not privacy.hides_column(table_key(t), c.name)],
+            _withhold_row_filtered_hints(
+                _withhold_column_values(
+                    replace(
+                        t,
+                        columns=[
+                            c for c in t.columns if not privacy.hides_column(table_key(t), c.name)
+                        ],
+                    ),
+                    privacy,
+                ),
+                filtered,
             )
             for t in schema.tables
             if (t.schema_name, t.name) in visible

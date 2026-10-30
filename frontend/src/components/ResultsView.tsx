@@ -37,6 +37,7 @@ import { exportApi } from '../api/export';
 import ChartView from './ChartView';
 import ChartEditor from './ChartEditor';
 import ColumnStatsView from './ColumnStatsView';
+import { STALE_ROW_FILTER_TEXT } from './ResultsTable';
 import { shareApi } from '../api/share';
 import { cn } from '@/lib/utils';
 import {
@@ -498,6 +499,17 @@ export default function ResultsView({ results, messageId, isStreaming = false }:
   );
 
   // ── Render ──────────────────────────────────────────────────────────────────
+
+  if (results.stale_row_filter) {
+    return (
+      <div
+        role="status"
+        className="border-t border-border px-4 py-6 text-center text-sm text-muted-foreground"
+      >
+        {STALE_ROW_FILTER_TEXT}
+      </div>
+    );
+  }
 
   return (
     <>

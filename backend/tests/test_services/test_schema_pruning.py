@@ -584,6 +584,37 @@ class TestResolveSchemaNarrowsStaleCache:
         orders = next(t for t in result.schema.tables if t.name == "orders")
         assert [c.name for c in orders.columns] == ["id", "amount"]
 
+    async def test_no_privacy_settings_means_the_defaults_not_no_filter(self) -> None:
+        """``privacy=None`` is "never configured": sample values and ENUM/SET member
+        lists stay withheld, as under ``PrivacySettings()``."""
+        table = _make_table("store", "orders", ["id", "status"])
+        table.columns[1] = ColumnInfo(
+            name="status",
+            data_type="enum",
+            native_type="enum('a','b')",
+            sample_values=["a", "b"],
+        )
+        usc = MagicMock()
+        usc.schema_cache = _schema_to_dict(_make_schema(table))
+        db = MagicMock()
+        db.execute = AsyncMock(
+            return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=usc))
+        )
+
+        result = await _resolve_schema(
+            conn=MagicMock(id="conn-1"),
+            adapter=MagicMock(),
+            config_dict={},
+            privacy=None,
+            connected=False,
+            db=db,
+            user_id="u1",
+        )
+
+        status = next(c for c in result.schema.tables[0].columns if c.name == "status")
+        assert status.sample_values is None
+        assert status.native_type == "enum(…)"
+
 
 # ── Domain-aware schema pruning ────────────────────────────────────────────────
 

@@ -6,6 +6,7 @@ from typing import ClassVar
 
 import sqlparse
 from sqlparse.exceptions import SQLParseError
+import sqlparse.tokens as sql_tokens
 
 from ..models import ValidationResult
 
@@ -37,6 +38,15 @@ class BaseSQLValidator:
 
     MULTI_STATEMENT_PATTERN: ClassVar[str] = r";\s*\w"
 
+    # INTO in clause position writes: PostgreSQL's SELECT … INTO creates a table, MySQL's
+    # SELECT … INTO @var / OUTFILE / DUMPFILE writes a variable or a file. Checked on
+    # sqlparse tokens rather than the raw text so the word inside a comment, a string
+    # literal or a quoted identifier ('%logged into%', -- split into buckets) is not
+    # rejected — a rejection there would push the correction loop to alter the user's
+    # literal. A tokenizer miss is backstopped by the read-only transaction each adapter
+    # opens (Task 11).
+    WRITING_KEYWORDS: ClassVar[frozenset[str]] = frozenset({"INTO"})
+
     def validate(self, query: str, default_limit: int = 1000) -> ValidationResult:
         """Run shared validation: parse, check type, check patterns, add LIMIT.
 
@@ -44,6 +54,7 @@ class BaseSQLValidator:
         1. Parse with sqlparse (type detection only — not statement count)
         2. Check statement type is SELECT or WITH (CTE)
         3. Scan for BLOCKED_STATEMENT_TYPES as whole words in query text
+           3b. Reject WRITING_KEYWORDS (INTO) where sqlparse tokenises them as keywords
         4. Regex scan for multi-statement injection and DANGEROUS_PATTERNS
         5. Add LIMIT if missing
         6. Return ValidationResult
@@ -107,6 +118,19 @@ class BaseSQLValidator:
                     is_valid=False,
                     error_message=f"Query contains blocked keyword: {blocked}",
                 )
+
+        # 4b. Keywords that write when they are SQL, checked on tokens so the same word in
+        #     a comment, literal or quoted identifier is not mistaken for a clause.
+        for statement in non_empty:
+            for token in statement.flatten():
+                if (
+                    token.ttype in sql_tokens.Keyword
+                    and token.normalized.upper() in self.WRITING_KEYWORDS
+                ):
+                    return ValidationResult(
+                        is_valid=False,
+                        error_message="SELECT … INTO is not allowed: it writes to the database",
+                    )
 
         # 5. Regex scan for dangerous patterns
         if re.search(self.MULTI_STATEMENT_PATTERN, query, re.IGNORECASE):

@@ -15,7 +15,9 @@ import { CHART_TYPE_LABELS } from '../types/charts';
 import { suggestChart } from '../lib/chartDetection';
 import ChartView from '../components/ChartView';
 import ChartEditor from '../components/ChartEditor';
+import { STALE_ROW_FILTER_TEXT } from '../components/ResultsTable';
 import { shareApi } from '../api/share';
+import { apiErrorMessage } from '@/lib/apiError';
 import { cn } from '@/lib/utils';
 
 function triggerDownload(url: string, filename: string): void {
@@ -64,7 +66,17 @@ export default function SharePage() {
         const suggestion = suggestChart(r);
         setChart({ ...suggestion, id: `share-${++_id}` });
       })
-      .catch(() => setError('This shared result is unavailable or has expired.'))
+      .catch((err: unknown) => {
+        const status = (err as { response?: { status?: number } }).response?.status;
+        const detail = apiErrorMessage(err, '');
+        // Only the stale-filter 410 carries text worth showing; an expired link is a 410
+        // too and keeps the generic line, as does everything else.
+        setError(
+          status === 410 && detail === STALE_ROW_FILTER_TEXT
+            ? detail
+            : 'This shared result is unavailable or has expired.',
+        );
+      })
       .finally(() => setLoading(false));
   }, [token]);
 

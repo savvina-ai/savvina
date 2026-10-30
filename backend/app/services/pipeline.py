@@ -5,22 +5,24 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
 
-from ..cache.example_library import ExampleLibrary
+from ..cache.example_library import ExampleEntry, ExampleLibrary
 from ..cache.query_cache import QueryCache
 from ..database import async_session_maker
 from ..datasources.base import BaseDataSource
 from ..datasources.models import DataSourceSchema, PrivacySettings
 from ..models.chat import ChatMessage
 from ..providers._factory import resolve_provider_config
-from ..providers.base import BaseLLMProvider
+from ..providers.base import BaseLLMProvider, is_degenerate_output
 from ..semantic.models import SemanticModel
 from .prompt_builder import PromptBuilder
+from .result_masking import sql_mentions_sensitive
+from .row_filter import unwrap_row_filter
 from .schema_utils import _is_fallback_query, _validate_columns_against_schema
 
 if TYPE_CHECKING:
@@ -142,15 +144,14 @@ def _compress_prompt(
     compact_semantic = (
         _compact_semantic_model(semantic_model) if semantic_model is not None else None
     )
-    # Level 5: preserve user exclusions but drop all optional per-column annotations.
-    _min_pvt = PrivacySettings(
+    # Level 5: drop the three optional annotations and keep everything else (exclusions,
+    # sensitive patterns and names, the strict flag), so the compact prompt marks the same
+    # columns and states the same rules as the full one.
+    _min_pvt = replace(
+        privacy or PrivacySettings(),
         include_sample_values=False,
         include_column_comments=False,
         include_row_counts=False,
-        excluded_schemas=privacy.excluded_schemas if privacy else [],
-        excluded_tables=privacy.excluded_tables if privacy else [],
-        excluded_columns=privacy.excluded_columns if privacy else [],
-        sensitive_column_patterns=privacy.sensitive_column_patterns if privacy else [],
     )
     for examples, semantic, pvt in [
         (few_shot_examples, semantic_model, privacy),  # full
@@ -207,11 +208,24 @@ async def _build_provider(
     return provider, model, max_tokens
 
 
+def _without_row_filter_wrap(found: list[ExampleEntry] | None) -> list[ExampleEntry] | None:
+    """Few-shot examples with the row-filter wrap removed from their SQL: a thumbs-up on a
+    message stored before Task 9 saved the wrapped query, and the LLM must not see it."""
+    if not found:
+        return found
+    return [
+        replace(ex, query=unwrap_row_filter(ex.query)) if isinstance(ex, ExampleEntry) else ex
+        for ex in found
+    ]
+
+
 async def _load_history(session_id: str, db: AsyncSession) -> list[dict]:
     """Load the most recent N chat turns as role/content dicts for the LLM history.
 
     Capped at _HISTORY_TURN_LIMIT to prevent unbounded memory growth on long sessions.
     The prompt compression step handles context-window overflow from large individual turns.
+    A query stored before Task 9 may hold the row-filter wrap; the LLM sees it unwrapped,
+    so the filter's columns and literals never reach it.
     """
     result = await db.execute(
         select(ChatMessage)
@@ -223,7 +237,8 @@ async def _load_history(session_id: str, db: AsyncSession) -> list[dict]:
     history = []
     for msg in messages:
         if msg.role == "assistant" and msg.query_generated:
-            content = f"QUERY:\n```sql\n{msg.query_generated}\n```\n\nEXPLANATION:\n{msg.content}"
+            query = unwrap_row_filter(msg.query_generated)
+            content = f"QUERY:\n```sql\n{query}\n```\n\nEXPLANATION:\n{msg.content}"
         else:
             content = msg.content
         history.append({"role": msg.role, "content": content})
@@ -276,6 +291,10 @@ async def _generate_query(
         cache_result = None
         if settings.cache_enabled and not bypass_cache and not force_refresh:
             cache_result = await cache.lookup(connection_id, message, db)
+        if cache_result is not None:
+            # A row stored before Task 9 may hold the row-filter wrap: every check below,
+            # the execution (wrapped once) and the correction prompt get the clean query.
+            cache_result.generated_query = unwrap_row_filter(cache_result.generated_query)
 
         # If the cached query references tables not visible in this user's schema, treat it as a
         # cache miss and regenerate. Prevents a privileged user's cached query from being served
@@ -305,16 +324,18 @@ async def _generate_query(
         # If the cached query references sensitive columns, bypass the cache and regenerate.
         # Column-level visibility restrictions are not reflected in INFORMATION_SCHEMA, so the
         # schema check above cannot catch them. Checking the query text against the connection's
-        # sensitive_column_patterns is the only way to detect whether a privileged user's cached
-        # result would fail for a less-privileged user.
-        if cache_result is not None and privacy is not None:
-            _cached_lower = cache_result.generated_query.lower()
-            if any(pat in _cached_lower for pat in privacy.sensitive_column_patterns):
-                logger.info(
-                    "Cache hit references sensitive column(s) — bypassing cache to allow "
-                    "privacy rules to apply for this user"
-                )
-                cache_result = None
+        # sensitive patterns and names is the only way to detect whether a privileged user's
+        # cached result would fail for a less-privileged user.
+        if (
+            cache_result is not None
+            and privacy is not None
+            and sql_mentions_sensitive(cache_result.generated_query, privacy)
+        ):
+            logger.info(
+                "Cache hit references sensitive column(s) — bypassing cache to allow "
+                "privacy rules to apply for this user"
+            )
+            cache_result = None
 
         if cache_result is not None:
             generated_query = cache_result.generated_query
@@ -324,8 +345,10 @@ async def _generate_query(
             cache_hit = True
         else:
             embedding = await cache.compute_embedding_async(message)
-            similar_examples = await examples.find_similar_examples(
-                connection_id, message, embedding, db, query_dialect=adapter.query_dialect
+            similar_examples = _without_row_filter_wrap(
+                await examples.find_similar_examples(
+                    connection_id, message, embedding, db, query_dialect=adapter.query_dialect
+                )
             )
 
             system_prompt = PromptBuilder().build_system_prompt(
@@ -490,17 +513,42 @@ async def _generate_query(
             input_tokens = llm_response.input_tokens
             output_tokens = llm_response.output_tokens
 
-            # If the model ran out of tokens, the SQL is incomplete — do not execute it.
-            if llm_response.truncated:
+            # One token repeated until max_tokens is an inference failure on the
+            # provider's side (e.g. 4096 x "!" from gpt-oss-120b on Workers AI). It
+            # arrives with finish_reason=length, so check it before the truncation path
+            # or the user is told to shrink a prompt that was never the problem.
+            if not llm_response.query and is_degenerate_output(llm_response.raw_response):
                 logger.warning(
-                    "LLM response truncated (finish_reason=length, tokens_used=%s) — "
-                    "discarding partial query",
-                    tokens_used,
+                    "LLM returned degenerate output from %s (%d chars of repeated %r, "
+                    "truncated=%s) — discarding",
+                    llm_response.model,
+                    len(llm_response.raw_response),
+                    llm_response.raw_response.strip()[:1],
+                    llm_response.truncated,
                 )
                 error = (
-                    f"The model hit its output token limit ({tokens_used} tokens) and produced "
-                    "an incomplete query. Try a provider with a larger context window "
-                    "(e.g. Claude, Gemini, OpenAI), or reduce the number of tables in scope."
+                    "The model returned an unusable response (the same character repeated "
+                    "instead of a query). This is usually a transient failure on the "
+                    "provider's side. Try again, or switch to another model."
+                )
+                status = "error"
+                generated_query = ""
+            # If the model ran out of tokens, the SQL is incomplete — do not execute it.
+            elif llm_response.truncated:
+                output_limit = output_tokens or min(
+                    configured_max_tokens, provider.max_output_tokens
+                )
+                logger.warning(
+                    "LLM response truncated (finish_reason=length, output_tokens=%s, "
+                    "input_tokens=%s) — discarding partial query",
+                    output_tokens,
+                    input_tokens,
+                )
+                error = (
+                    f"The model hit its {output_limit}-token output limit and produced an "
+                    "incomplete query. Raise the provider's max tokens setting, switch to a "
+                    "model with a larger output budget, or reduce the number of tables in "
+                    "scope."
                 )
                 status = "error"
                 generated_query = llm_response.query  # keep for display, but won't execute

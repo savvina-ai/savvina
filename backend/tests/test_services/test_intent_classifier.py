@@ -110,3 +110,9 @@ class TestGetIntentPromptHint:
 
     def test_unknown_intent_returns_empty_string(self) -> None:
         assert self.clf.get_intent_prompt_hint(QueryIntent.UNKNOWN) == ""
+
+    def test_hints_prescribe_no_dialect_quoting(self) -> None:
+        # The hints go into every dialect's prompt; a backtick is invalid on PostgreSQL.
+        # Quoting is left to the adapter's own instructions.
+        for intent in QueryIntent:
+            assert "`" not in self.clf.get_intent_prompt_hint(intent), intent

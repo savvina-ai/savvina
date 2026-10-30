@@ -99,9 +99,8 @@ class IntentClassifier:
             QueryIntent.RANKING: (
                 "This is a RANKING query. Use ORDER BY with DESC/ASC and LIMIT. "
                 "Consider RANK() or ROW_NUMBER() window functions for dense rankings. "
-                "Always backtick-quote the result alias: RANK() OVER (...) AS `rank`, "
-                "ROW_NUMBER() OVER (...) AS `row_num` — RANK/ROW_NUMBER/DENSE_RANK are "
-                "reserved keywords and cause syntax errors without backticks."
+                "An alias that is a reserved word (rank, row_number) must be quoted the way "
+                "the dialect instructions below say."
             ),
             QueryIntent.COMPARISON: (
                 "This is a COMPARISON query. Use CTEs or subqueries to compute each "

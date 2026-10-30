@@ -3,7 +3,6 @@
 
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router'
-import { useQuery } from '@tanstack/react-query'
 import { Check, CheckCircle, Database, RefreshCw, XCircle, Zap } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '../components/ui/button'
@@ -18,10 +17,10 @@ import {
   SelectValue,
 } from '../components/ui/select'
 import DynamicConnectionForm from '../components/DynamicConnectionForm'
-import { datasourcesApi } from '../api/datasources'
 import { getDatasourceIcon } from '@/lib/datasourceIcons'
 import { apiErrorMessage } from '@/lib/apiError'
 import { useProviders, useCreateProvider, useFetchModels } from '../hooks/useProviders'
+import { useDataSources } from '../hooks/useConnections'
 import type { DataSourceInfo } from '../types'
 
 const WIZARD_DONE_KEY = 'savvina-wizard-done'
@@ -133,10 +132,7 @@ function Step1Database({ onSave, onSkip }: StepProps) {
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<TestResult | null>(null)
 
-  const { data: sources, isLoading: sourcesLoading } = useQuery({
-    queryKey: ['datasources'],
-    queryFn: datasourcesApi.getAvailable,
-  })
+  const { data: sources, isLoading: sourcesLoading } = useDataSources()
 
   useEffect(() => {
     if (sources && sources.length > 0 && !selectedSource) {

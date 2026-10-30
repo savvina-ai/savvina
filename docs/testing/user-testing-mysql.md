@@ -49,7 +49,7 @@ quoting in generated SQL, AUTO_INCREMENT PKs, and MySQL-specific syntax (`DATE_F
 | Port     | 3306             |
 | Database | sample_delivery  |
 | Username | savvina_analyst |
-| Password | *(value of `SAMPLE_MYSQL_PASSWORD` in your `.env`)* |
+| Password | analyst_readonly_2024 |
 | SSL      | off              |
 
 **Accessible:** `restaurants`, `menu_items`, `orders`, `order_items`, `reviews`,
@@ -113,7 +113,8 @@ the analyst role.
 
 **Steps**
 
-1. Add Connection 6 (MySQL analyst user) and trigger schema introspection.
+1. Add Connection 6 (MySQL analyst user) with **Include sample values** turned on (it is off by
+   default, and ENUM members count as sample values) and trigger schema introspection.
 2. Open the schema viewer and confirm ENUM columns show sample values
    (e.g. `cuisine_type` shows `Italian, Asian, Mexican…`; `status` shows `placed, confirmed…`).
 3. Open a new chat session.

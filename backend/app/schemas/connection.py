@@ -8,7 +8,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field, field_validator
+
+from ..datasources.models import PrivacySettings
+from ..services.privilege_audit import from_dict as audit_from_dict
+from ..services.privilege_audit import to_dict as audit_to_dict
 
 # ── Privacy Settings ───────────────────────────────────────────────────────────
 
@@ -20,9 +24,21 @@ class PrivacySettingsUpdate(BaseModel):
     include_column_comments: bool | None = None
     include_row_counts: bool | None = None
     sensitive_column_patterns: list[str] | None = None
+    # Exact column names (case-insensitive), trimmed; empty strings are dropped.
+    sensitive_columns: list[str] | None = None
+    # Reject queries that use a sensitive column anywhere but as a plain SELECT item.
+    strict_sensitive_columns: bool | None = None
     excluded_schemas: list[str] | None = None
     excluded_tables: list[str] | None = None
     excluded_columns: list[str] | None = None
+    # Per-table row filters, {"schema.table": "<condition>"} (see services/row_filter.py:
+    # validate_row_filters). None (or absent) leaves the stored map unchanged; {} clears it,
+    # which a connection with a legacy row_filter_sql refuses unless clear_legacy_row_filter
+    # is sent too.
+    row_filters: dict[str, str] | None = None
+    # A command, not a setting: remove the legacy whole-query filter (row_filter_sql) and
+    # leave the connection unfiltered unless row_filters is sent as well. Never stored.
+    clear_legacy_row_filter: bool = False
 
 
 # ── Execution Mode ──────────────────────────────────────────────────────────────
@@ -55,6 +71,31 @@ class ConnectionTest(BaseModel):
     config: dict[str, Any]
 
 
+# ── Privilege audit ────────────────────────────────────────────────────────────
+
+
+class AuditFindingResponse(BaseModel):
+    """One finding of the privilege audit (``services/privilege_audit.AuditFinding``)."""
+
+    code: str
+    tables: list[str] = []
+    functions: list[str] = []
+    remediation: str
+    more_tables: int = 0  # tables beyond the cut of ``tables``
+
+
+class PrivilegeAuditResponse(BaseModel):
+    """The stored privilege audit (``services/privilege_audit.PrivilegeAudit``)."""
+
+    checked_at: datetime
+    role: str
+    status: Literal["ok", "unavailable"]
+    error: str | None
+    findings: list[AuditFindingResponse]
+    rls_in_use: bool
+    rls_effective: dict[str, bool]
+
+
 # ── Connection responses ───────────────────────────────────────────────────────
 
 
@@ -75,6 +116,25 @@ class ConnectionDetail(ConnectionResponse):
     """Full detail response — includes cached metadata."""
 
     privacy_settings: dict | None
+    # The last privilege audit; None when the audit never ran. The stored JSON passes
+    # through privilege_audit.from_dict, so a tampered or outdated column serves None, not
+    # a 500, and a finding code this version does not know is dropped.
+    privilege_audit: PrivilegeAuditResponse | None = None
+
+    @field_validator("privilege_audit", mode="before")
+    @classmethod
+    def _well_formed_audit(cls, value: object) -> object:
+        if value is None:
+            return None
+        audit = audit_from_dict(value)
+        return None if audit is None else audit_to_dict(audit)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def row_filter_needs_migration(self) -> bool:
+        """True while the stored settings hold a legacy ``row_filter_sql`` and no
+        ``row_filters`` map: every execution is refused until the admin acts."""
+        return PrivacySettings.from_dict(self.privacy_settings or {}).row_filter_needs_migration
 
 
 class ConnectionConfigResponse(BaseModel):

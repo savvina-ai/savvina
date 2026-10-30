@@ -8,7 +8,7 @@ investigating a regression. Sessions are independent — run them in any order.
 
 > **Credentials note:**
 > Passwords for the `savvina` superuser on `sample-postgres` (Connections 1–2) are set via the
-> `SAMPLE_POSTGRES_PASSWORD` env var in your `.env` file. The `analyst_readonly_2024` read-only
+> `SAMPLE_POSTGRES_PASSWORD` env var in your `.env` file (`savvina_demo` when it is empty or unset). The `analyst_readonly_2024` read-only
 > role password is seeded by the PostgreSQL init scripts and is fixed unless you re-seed the
 > container.
 

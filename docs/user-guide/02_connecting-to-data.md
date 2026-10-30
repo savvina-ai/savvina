@@ -29,11 +29,11 @@ Expand **Privacy Settings** to control what metadata reaches the LLM:
 
 | Setting | Default | Description |
 |---|---|---|
-| Include sample values | On | Sends 5 distinct values per column to the LLM for better accuracy |
-| Include column comments | On | Sends database column description text |
-| Include row counts | On | Sends approximate row counts |
-| Sensitive column patterns | (list) | Columns matching these patterns are never sampled (e.g., `email`, `ssn`, `password`) |
-| Excluded schemas | (empty) | Schemas to completely hide from the LLM |
+| Include sample values | Off | Sends up to 3 example values per column (on MySQL, an ENUM/SET column's members) to the LLM for better accuracy |
+| Include column comments | Off | Sends database column description text, except a sensitive column's |
+| Include row counts | Off | Sends approximate row counts |
+| Sensitive column patterns | (list) | Columns matching these patterns are never sampled and their values are masked in results (e.g., `email`, `ssn`, `password`) |
+| Excluded schemas | (empty) | Schemas to completely hide from the LLM. On MySQL a schema is a database, and the connection sees every database its account can read |
 | Excluded tables | (empty) | Tables to completely hide |
 | Excluded columns | (empty) | Individual columns to hide, format: `schema.table.column` |
 
@@ -89,26 +89,28 @@ See [MySQL](../datasources/mysql.md) for read-only user setup and MariaDB compat
 
 ## Using a Read-Only Database Role
 
-Always connect Savvina AI using a read-only role. All generated SQL is validated before execution, but a read-only role provides defence in depth.
+Always connect Savvina AI using a read-only role. All generated SQL is validated before execution and runs inside a database-enforced read-only transaction; a read-only role is a third layer that also limits what the connection can *read*.
 
-**PostgreSQL example:**
+**PostgreSQL example** (replace `myapp` and `public` with your database and schema, and run the last three statements for each schema Savvina should read):
 
 ```sql
-CREATE ROLE savvina_reader WITH LOGIN PASSWORD 'secure-password';
-GRANT CONNECT ON DATABASE myapp TO savvina_reader;
-GRANT USAGE ON SCHEMA public TO savvina_reader;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO savvina_reader;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-  GRANT SELECT ON TABLES TO savvina_reader;
+CREATE ROLE savvina_reader LOGIN PASSWORD '<choose a password>';
+GRANT CONNECT ON DATABASE "myapp" TO savvina_reader;
+GRANT USAGE ON SCHEMA "public" TO savvina_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA "public" TO savvina_reader;
+ALTER DEFAULT PRIVILEGES IN SCHEMA "public" GRANT SELECT ON TABLES TO savvina_reader;
 ```
+
+`ALTER DEFAULT PRIVILEGES` covers the tables that the role running it creates later; for tables another role creates, run it with `FOR ROLE <that role>`.
 
 **MySQL example:**
 
 ```sql
-CREATE USER 'savvina_reader'@'%' IDENTIFIED BY 'secure-password';
-GRANT SELECT ON myapp.* TO 'savvina_reader'@'%';
-FLUSH PRIVILEGES;
+CREATE USER `savvina_reader`@`%` IDENTIFIED BY '<choose a password>';
+GRANT SELECT ON `myapp`.* TO `savvina_reader`@`%`;
 ```
+
+The privilege check generates this script for your schemas when the connection role is a superuser or owns the tables it reads (see [Privilege Check](04_privacy-controls.md#privilege-check)). It names your database and schemas, and keeps the tables the connection excludes out of the new role where the engine allows it.
 
 ---
 

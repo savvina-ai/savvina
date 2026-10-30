@@ -5,6 +5,7 @@ sqlalchemy==2.0.36
 asyncpg==0.30.0
 aiomysql==0.3.0
 sqlparse==0.6.0
+sqlglot==30.25.0
 cryptography==50.0.0
 httpx==0.28.1
 pydantic==2.10.4

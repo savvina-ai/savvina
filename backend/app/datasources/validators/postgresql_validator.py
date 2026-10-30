@@ -22,6 +22,9 @@ class PostgreSQLValidator(BaseSQLValidator):
         "lo_import",
         "dblink",
         "dblink_exec",
+        # A value stored with set_config is read back with current_setting under another
+        # column in the same statement, past result masking.
+        "set_config",
     ]
 
     PG_DANGEROUS_PATTERNS: ClassVar[list[str]] = [

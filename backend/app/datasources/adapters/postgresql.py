@@ -12,15 +12,27 @@ from typing import Any
 import asyncpg
 
 from ..base import BaseDataSource, _serialize
+from ..errors import (
+    NAME_ECHOING_CATEGORIES,
+    ErrorCategory,
+    ExplainError,
+    category_for_sqlstate,
+    classify_chain,
+    refine_undefined_function,
+)
 from ..models import (
     ColumnInfo,
     ConnectionResult,
     DataSourceSchema,
     PrivacySettings,
+    PrivilegeFacts,
+    PrivilegeGrant,
     QueryResult,
     RelationshipInfo,
+    RoleMembership,
     SchemaInfo,
     TableInfo,
+    TablePrivilegeFacts,
     ValidationResult,
 )
 from ..registry import register_datasource
@@ -77,9 +89,198 @@ async def close_all_pools() -> None:
             await pool.close()
 
 
+def _column_types(record: Any) -> list[str]:
+    """Python type name of each field of *record*, by position (``unknown`` for NULL)."""
+    return [type(v).__name__ if v is not None else "unknown" for v in record.values()]
+
+
 def _quote_pg_ident(name: str) -> str:
     """Return a double-quoted PostgreSQL identifier with any embedded quotes escaped."""
     return '"' + name.replace('"', '""') + '"'
+
+
+# The functions that run SQL from a string or read a table named by a string, the names
+# ``services/row_filter_rewrite._UNFILTERABLE_FUNCTION`` denies, as a regular expression
+# for ``proname ~*``. pg_catalog's own members (query_to_xml, ts_stat ...) are not reported:
+# every role can execute them through PUBLIC, revoking them is a cluster-wide change, and the
+# rewriter denies them by name. What is reported is the extension functions (dblink,
+# tablefunc) and any user function of those names.
+_SQL_FROM_STRING_FUNCTIONS = (
+    r"^((query|table|cursor|schema|database)_to_xml\w*"
+    r"|ts_stat|ts_rewrite|crosstab\d*|connectby|dblink\w*)$"
+)
+
+_ROLE_FACTS_SQL = (
+    "SELECT rolname, rolsuper, rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = current_user"
+)
+
+# $1/$2: the qualified pairs as two parallel arrays; $3: the bare names, matched in every
+# schema but the system ones. One policy applies to the role when its role list names
+# PUBLIC or a role whose privileges current_user inherits (pg_has_role ... 'USAGE', not
+# 'MEMBER': a NOINHERIT membership does not make a policy apply). A CASE, not an OR: the
+# planner does not promise the operands' order and pg_has_role raises for 'public', which
+# is not a role. is_owner is the engine's own rule (check_enable_rls: has_privs_of_role),
+# so a role that inherits the owner bypasses RLS like the owner and reads True. For a
+# superuser that rule is true of every role (its bypass is the SUPERUSER finding), so only
+# the tables it owns by oid read True; the CASE keeps that order. can_select
+# needs USAGE on the schema as well: the table privilege alone is true for a table the
+# role cannot reach; can_write stays the table privilege, a write grant is worth revoking
+# either way. select_grantees: the grantees of the SELECT entries of the table's ACL that
+# the role is or inherits (PUBLIC for grantee 0), the owner's own entry left out (a non-null
+# ACL lists the owner; ownership is is_owner); NULL for a NULL ACL (default privileges: only
+# the owner reads).
+_TABLE_FACTS_SQL = """
+SELECT n.nspname AS schema_name,
+       c.relname AS table_name,
+       CASE WHEN c.relowner = me.oid THEN true
+            WHEN me.rolsuper THEN false
+            ELSE pg_has_role(current_user, c.relowner, 'USAGE') END AS is_owner,
+       c.relrowsecurity AS rls_enabled,
+       c.relforcerowsecurity AS rls_forced,
+       has_schema_privilege(current_user, c.relnamespace, 'USAGE')
+           AND has_table_privilege(current_user, c.oid, 'SELECT') AS can_select,
+       has_table_privilege(current_user, c.oid, 'INSERT, UPDATE, DELETE') AS can_write,
+       EXISTS (
+           SELECT 1
+           FROM pg_catalog.pg_policies p
+           WHERE p.schemaname = n.nspname
+             AND p.tablename = c.relname
+             AND p.cmd IN ('SELECT', 'ALL')
+             AND EXISTS (
+                 SELECT 1 FROM unnest(p.roles) AS r(name)
+                 WHERE CASE WHEN r.name = 'public' THEN true
+                            ELSE pg_has_role(current_user, r.name, 'USAGE') END
+             )
+       ) AS select_policy_applies,
+       (SELECT array_agg(v.name ORDER BY v.name)
+        FROM (SELECT CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE g.rolname END AS name
+              FROM aclexplode(c.relacl) a
+              LEFT JOIN pg_catalog.pg_roles g ON g.oid = a.grantee
+              WHERE a.privilege_type = 'SELECT'
+                AND a.grantee <> c.relowner
+                AND (a.grantee = 0 OR pg_has_role(current_user, a.grantee, 'USAGE'))) v
+       ) AS select_grantees
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_roles me ON me.rolname = current_user
+WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+  AND (
+      (n.nspname, c.relname) IN (SELECT * FROM unnest($1::text[], $2::text[]))
+      OR (c.relname = ANY($3::text[])
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND n.nspname NOT LIKE 'pg\\_toast%'
+          AND n.nspname NOT LIKE 'pg\\_temp%')
+  )
+ORDER BY 1, 2
+"""
+
+# The most write grants the audit keeps; the query reads one more to tell truncation.
+_WRITES_CAP = 500
+
+# Every write grant the role holds on a non-system relation (materialized views left out:
+# no INSERT/UPDATE/DELETE runs against one): the table-level entries of the
+# relation ACL, the column-level entries of the attribute ACLs (INSERT/UPDATE only: DELETE
+# has no column form), and one ownership row per table the role owns or inherits (the
+# owner's own ACL entry is left out of the ACL branches: it is that ownership row). Not run
+# for a superuser (pg_has_role answers true for every role when asked about one, so every
+# grant in the database would match; its bypass is the SUPERUSER finding and evaluate skips
+# tier 2 for it). Grouped per (table, grantee, column privilege); privileges aggregated,
+# columns in table order. One more row than the cap so the adapter can tell truncation.
+_WRITE_GRANTS_SQL = f"""
+WITH rels AS (
+    SELECT c.oid, c.relowner, c.relacl, n.nspname AS schema_name, c.relname AS table_name
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r', 'p', 'v', 'f')
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+      AND n.nspname NOT LIKE 'pg\\_toast%'
+      AND n.nspname NOT LIKE 'pg\\_temp%'
+),
+grants AS (
+    SELECT r.schema_name, r.table_name,
+           CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE g.rolname END AS grantee,
+           a.privilege_type, NULL::name AS column_name, NULL::smallint AS column_order
+    FROM rels r
+    CROSS JOIN LATERAL aclexplode(r.relacl) a
+    LEFT JOIN pg_catalog.pg_roles g ON g.oid = a.grantee
+    WHERE a.privilege_type IN ('INSERT', 'UPDATE', 'DELETE')
+      AND a.grantee <> r.relowner
+      AND (a.grantee = 0 OR pg_has_role(current_user, a.grantee, 'USAGE'))
+    UNION ALL
+    SELECT r.schema_name, r.table_name,
+           CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE g.rolname END,
+           a.privilege_type, att.attname, att.attnum
+    FROM rels r
+    JOIN pg_catalog.pg_attribute att
+      ON att.attrelid = r.oid AND att.attnum > 0 AND NOT att.attisdropped
+     AND att.attacl IS NOT NULL
+    CROSS JOIN LATERAL aclexplode(att.attacl) a
+    LEFT JOIN pg_catalog.pg_roles g ON g.oid = a.grantee
+    WHERE a.privilege_type IN ('INSERT', 'UPDATE')
+      AND a.grantee <> r.relowner
+      AND (a.grantee = 0 OR pg_has_role(current_user, a.grantee, 'USAGE'))
+    UNION ALL
+    SELECT r.schema_name, r.table_name, NULL, p.privilege, NULL, NULL
+    FROM rels r
+    CROSS JOIN (VALUES ('INSERT'), ('UPDATE'), ('DELETE')) AS p(privilege)
+    WHERE pg_has_role(current_user, r.relowner, 'USAGE')
+)
+SELECT schema_name, table_name, grantee,
+       CASE WHEN column_name IS NULL THEN NULL ELSE privilege_type END AS column_privilege,
+       array_agg(DISTINCT privilege_type) AS privileges,
+       array_agg(column_name ORDER BY column_order) FILTER (WHERE column_name IS NOT NULL)
+           AS columns
+FROM grants
+GROUP BY 1, 2, 3, 4
+ORDER BY 1, 2, 3 NULLS FIRST, 4 NULLS FIRST
+LIMIT {_WRITES_CAP + 1}
+"""  # noqa: S608 -- the LIMIT is an int constant, not input
+
+# The predefined roles that read or write every table with no ACL entry (PostgreSQL 14+):
+# a membership in pg_read_all_data or pg_write_all_data held by the role or a role it
+# inherits, so neither the table ACLs above nor the write query see it. Joined by name, so
+# a pre-14 server returns no row. The membership edge itself must be inherited: PostgreSQL 16
+# stores that per edge (inherit_option), read through to_jsonb so PostgreSQL 14/15, which
+# lack the column, fall back to the member's rolinherit. grantor is the role a
+# REVOKE ... GRANTED BY must name, NULL for the bootstrap superuser (oid 10, the grantor a
+# plain REVOKE run by a superuser matches); a LEFT JOIN so a dangling pre-16 grantor keeps
+# the row. DISTINCT: one row per (role, member, grantor), several grantors each need their
+# REVOKE. Not run for a superuser (pg_has_role is true for every role; its bypass is the
+# SUPERUSER finding).
+_PREDEFINED_ROLES_SQL = """
+SELECT DISTINCT p.rolname AS role, m.rolname AS member,
+       CASE WHEN am.grantor = 10 THEN NULL ELSE g.rolname END AS grantor
+FROM pg_catalog.pg_roles p
+JOIN pg_catalog.pg_auth_members am ON am.roleid = p.oid
+JOIN pg_catalog.pg_roles m ON m.oid = am.member
+LEFT JOIN pg_catalog.pg_roles g ON g.oid = am.grantor
+WHERE p.rolname IN ('pg_read_all_data', 'pg_write_all_data')
+  AND pg_has_role(current_user, m.oid, 'USAGE')
+  AND COALESCE((to_jsonb(am) ->> 'inherit_option')::boolean, m.rolinherit)
+ORDER BY 1, 2, 3 NULLS FIRST
+"""
+
+_SCHEMAS_SQL = """
+SELECT nspname
+FROM pg_catalog.pg_namespace
+WHERE nspname NOT IN ('pg_catalog', 'information_schema')
+  AND nspname NOT LIKE 'pg\\_toast%'
+  AND nspname NOT LIKE 'pg\\_temp%'
+ORDER BY 1
+"""
+
+# %I quotes a part only when it needs it, so the signature is REVOKE-ready and resolves
+# regardless of search_path: public.dblink(text).
+_FUNCTION_FACTS_SQL = """
+SELECT format('%I.%I(%s)', n.nspname, p.proname, pg_get_function_identity_arguments(p.oid))
+           AS signature
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname <> 'pg_catalog'
+  AND p.proname ~* $1
+  AND has_function_privilege(current_user, p.oid, 'EXECUTE')
+ORDER BY 1
+"""
 
 
 @register_datasource("postgresql")
@@ -515,6 +716,7 @@ class PostgreSQLDataSource(BaseDataSource):
                     vals = sample_values.get(key, [])
                     if vals:
                         col.sample_values = [str(v) for v in vals[:5]]
+                        col.sample_source = "stats"
 
         return DataSourceSchema(
             source_type="postgresql",
@@ -569,47 +771,6 @@ class PostgreSQLDataSource(BaseDataSource):
             except Exception:
                 return []
 
-    # OVERHEAD: catalog-read only
-    async def get_column_statistics(
-        self,
-        schema: str,
-        table: str,
-        column: str,
-    ) -> dict:
-        """Read column statistics from pg_stats (populated by autovacuum/ANALYZE).
-
-        Zero impact on production workload. Returns empty dict if no stats exist.
-        """
-        if self._pool is None:
-            raise RuntimeError("Not connected.")
-        query = """
-            SELECT
-                n_distinct,
-                null_frac,
-                avg_width,
-                most_common_vals::text,
-                most_common_freqs,
-                correlation
-            FROM pg_stats
-            WHERE schemaname = $1
-              AND tablename  = $2
-              AND attname    = $3
-        """
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(query, schema, table, column)
-            if not row:
-                return {}
-            return {
-                "n_distinct": row["n_distinct"],
-                "null_frac": row["null_frac"],
-                "avg_width": row["avg_width"],
-                "most_common_vals": self._parse_pg_text_array(row["most_common_vals"]),
-                "most_common_freqs": list(row["most_common_freqs"])
-                if row["most_common_freqs"]
-                else [],
-                "correlation": row["correlation"],
-            }
-
     # ── Query execution ────────────────────────────────────────────────────────
 
     async def execute_query(
@@ -623,8 +784,14 @@ class PostgreSQLDataSource(BaseDataSource):
             raise RuntimeError("Not connected.")
 
         start = time.monotonic()
-        async with self._pool.acquire() as conn, conn.transaction():
+        # READ ONLY is enforced by the engine: a write the text validator missed — including
+        # SELECT … INTO, nextval()/setval() and CREATE TABLE AS — is refused with SQLSTATE 25006.
+        async with self._pool.acquire() as conn, conn.transaction(readonly=True):
             await conn.execute(f"SET LOCAL statement_timeout = {timeout * 1000}")
+            # The row-filter rewriter reads string literals as standard strings (a backslash
+            # is an ordinary character). Pin that here so a server, database or role default
+            # of off cannot make the engine read a literal differently from the rewriter.
+            await conn.execute("SET LOCAL standard_conforming_strings = on")
             records = await conn.fetch(query)
 
         elapsed_ms = (time.monotonic() - start) * 1000
@@ -638,16 +805,14 @@ class PostgreSQLDataSource(BaseDataSource):
                 execution_time_ms=elapsed_ms,
             )
 
+        # By position, never by name: an asyncpg Record looked up by name returns the last
+        # field of that name, so ``SELECT count(*), count(DISTINCT x)`` (two columns named
+        # ``count``) would show the second value twice. keys()/values() keep every field.
         columns = list(records[0].keys())
-        column_types = [
-            type(records[0][col]).__name__ if records[0][col] is not None else "unknown"
-            for col in columns
-        ]
+        column_types = _column_types(records[0])
 
         truncated = len(records) > max_rows
-        rows: list[list[Any]] = [
-            [_serialize(r[col]) for col in columns] for r in records[:max_rows]
-        ]
+        rows: list[list[Any]] = [[_serialize(v) for v in r.values()] for r in records[:max_rows]]
 
         return QueryResult(
             columns=columns,
@@ -657,6 +822,124 @@ class PostgreSQLDataSource(BaseDataSource):
             truncated=truncated,
             execution_time_ms=elapsed_ms,
         )
+
+    async def explain(self, sql: str, timeout: int) -> None:  # noqa: ASYNC109
+        """Plan *sql* inside a read-only transaction under ``statement_timeout``.
+
+        No table row is read, but the planner evaluates constant immutable and stable
+        expressions (``1/0`` fails here); volatile functions are not evaluated. Nothing is
+        returned. The plan rows asyncpg returns are discarded.
+        """
+        if self._pool is None:
+            raise RuntimeError("Not connected.")
+        async with self._pool.acquire() as conn, conn.transaction(readonly=True):
+            await conn.execute(f"SET LOCAL statement_timeout = {timeout * 1000}")
+            await conn.execute("SET LOCAL standard_conforming_strings = on")
+            try:
+                # fetch runs through the extended query protocol: exactly one statement,
+                # unlike execute without arguments (simple protocol, several statements).
+                await conn.fetch(f"EXPLAIN {sql}")
+            except Exception as exc:
+                raise ExplainError(str(exc) or type(exc).__name__) from exc
+
+    async def audit_privileges(
+        self,
+        tables: list[tuple[str | None, str]],
+        timeout: int,  # noqa: ASYNC109
+    ) -> PrivilegeFacts:
+        """The role facts, the table facts, the write grants, the predefined-role memberships,
+        the schemas and the executable SQL-from-string functions, in six catalog queries (role,
+        tables, writes, predefined roles, schemas, functions; writes and predefined roles
+        skipped for a superuser) on one connection inside a read-only transaction under
+        ``statement_timeout`` (so a cancellation by the router's budget rolls back before the
+        connection returns to the shared pool). See ``BaseDataSource.audit_privileges``."""
+        if self._pool is None:
+            raise RuntimeError("Not connected.")
+        wanted = list(dict.fromkeys(tables))
+        qualified = [(s, t) for s, t in wanted if s is not None]
+        bare = [t for s, t in wanted if s is None]
+        async with self._pool.acquire() as conn, conn.transaction(readonly=True):
+            await conn.execute(f"SET LOCAL statement_timeout = {timeout * 1000}")
+            role_row = await conn.fetchrow(_ROLE_FACTS_SQL)
+            rows = (
+                await conn.fetch(
+                    _TABLE_FACTS_SQL,
+                    [s for s, _ in qualified],
+                    [t for _, t in qualified],
+                    bare,
+                )
+                if wanted
+                else []
+            )
+            # A superuser matches every grant and membership (pg_has_role) and skips tier 2
+            # in evaluate: the scans would be wasted.
+            superuser = bool(role_row and role_row["rolsuper"])
+            write_rows = [] if superuser else await conn.fetch(_WRITE_GRANTS_SQL)
+            predefined_rows = [] if superuser else await conn.fetch(_PREDEFINED_ROLES_SQL)
+            schema_rows = await conn.fetch(_SCHEMAS_SQL)
+            function_rows = await conn.fetch(_FUNCTION_FACTS_SQL, _SQL_FROM_STRING_FUNCTIONS)
+        facts = PrivilegeFacts(
+            role=str(role_row["rolname"]) if role_row else "",
+            is_superuser=superuser,
+            bypasses_rls=bool(role_row and role_row["rolbypassrls"]),
+            schemas=[str(r["nspname"]) for r in schema_rows],
+            predefined_roles=[
+                RoleMembership(
+                    str(r["role"]),
+                    str(r["member"]),
+                    None if r["grantor"] is None else str(r["grantor"]),
+                )
+                for r in predefined_rows
+            ],
+            sql_from_string_functions=[str(r["signature"]) for r in function_rows],
+        )
+        for r in write_rows[:_WRITES_CAP]:
+            facts.writes.append(
+                PrivilegeGrant(
+                    schema_name=str(r["schema_name"]),
+                    table_name=str(r["table_name"]),
+                    privileges=sorted(str(p) for p in r["privileges"]),
+                    grantee=None if r["grantee"] is None else str(r["grantee"]),
+                    columns=[str(c) for c in (r["columns"] or [])],
+                )
+            )
+        facts.writes_truncated = len(write_rows) > _WRITES_CAP
+        written = {g.key for g in facts.writes}
+        found: set[tuple[str, str]] = set()
+        for r in rows:
+            found.add((r["schema_name"], r["table_name"]))
+            is_owner = bool(r["is_owner"])
+            can_select = bool(r["can_select"])
+            grantees = [str(g) for g in (r["select_grantees"] or [])]
+            # Ownership is a SELECT path to revoke only for a non-superuser: a superuser's
+            # bypass is its own finding (spec 2.1).
+            via: list[str | None] = ([None] if is_owner and not superuser else []) + grantees
+            key = f"{r['schema_name']}.{r['table_name']}"
+            facts.tables.append(
+                TablePrivilegeFacts(
+                    schema_name=r["schema_name"],
+                    table_name=r["table_name"],
+                    exists=True,
+                    can_select=can_select,
+                    can_write=bool(r["can_write"]) or key in written,
+                    is_owner=is_owner,
+                    rls_enabled=bool(r["rls_enabled"]),
+                    rls_forced=bool(r["rls_forced"]),
+                    select_policy_applies=bool(r["select_policy_applies"]),
+                    select_grants=[
+                        PrivilegeGrant(r["schema_name"], r["table_name"], ["SELECT"], g)
+                        for g in via
+                    ]
+                    if can_select
+                    else [],
+                )
+            )
+        found_names = {t for _, t in found}
+        for schema, table in wanted:
+            missing = table not in found_names if schema is None else (schema, table) not in found
+            if missing:
+                facts.tables.append(TablePrivilegeFacts(schema, table, False))
+        return facts
 
     async def execute_query_stream(
         self,
@@ -682,21 +965,24 @@ class PostgreSQLDataSource(BaseDataSource):
         column_types: list[str] | None = None
         first_batch = True
 
-        async with self._pool.acquire() as conn, conn.transaction():
+        # READ ONLY is enforced by the engine: a write the text validator missed — including
+        # SELECT … INTO, nextval()/setval() and CREATE TABLE AS — is refused with SQLSTATE 25006.
+        async with self._pool.acquire() as conn, conn.transaction(readonly=True):
             await conn.execute(f"SET LOCAL statement_timeout = {timeout * 1000}")
+            # The row-filter rewriter reads string literals as standard strings (a backslash
+            # is an ordinary character). Pin that here so a server, database or role default
+            # of off cannot make the engine read a literal differently from the rewriter.
+            await conn.execute("SET LOCAL standard_conforming_strings = on")
             async for record in conn.cursor(query, prefetch=batch_size):
                 if columns is None:
                     columns = list(record.keys())
-                    column_types = [
-                        type(record[col]).__name__ if record[col] is not None else "unknown"
-                        for col in columns
-                    ]
+                    column_types = _column_types(record)
 
                 if total >= max_rows:
                     # We've hit the limit; yield remaining batch then stop
                     break
 
-                batch.append([_serialize(record[col]) for col in columns])
+                batch.append([_serialize(v) for v in record.values()])  # by position
                 total += 1
 
                 if len(batch) >= batch_size:
@@ -752,6 +1038,26 @@ class PostgreSQLDataSource(BaseDataSource):
     def validate_query(self, query: str) -> ValidationResult:
         """Delegate to the PostgreSQL-specific validator."""
         return self._validator.validate(query)
+
+    def classify_error(self, exc: BaseException) -> ErrorCategory:
+        """Map an asyncpg failure via its SQLSTATE (PostgreSQL docs, Appendix A "Error Codes")."""
+        return classify_chain(exc, self._classify_one)
+
+    @staticmethod
+    def _classify_one(err: BaseException) -> ErrorCategory | None:
+        # Restricted to asyncpg's own hierarchy: an unrelated exception can carry a
+        # same-named `.sqlstate` attribute and must not be read as a database verdict.
+        if not isinstance(err, asyncpg.PostgresError):
+            return None
+        state = getattr(err, "sqlstate", None)
+        if not state:
+            return None
+        category = category_for_sqlstate(state)
+        if category in NAME_ECHOING_CATEGORIES and _may_quote_a_value(err, category):
+            return ErrorCategory.DATA
+        if state.upper() == "42883":
+            return refine_undefined_function(str(err))
+        return category
 
     def get_system_prompt_additions(self) -> str:
         """Return PostgreSQL-specific instructions for the LLM."""
@@ -828,3 +1134,58 @@ You are querying a PostgreSQL database. Use PostgreSQL-specific syntax:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+# PostgreSQL reports a stored value it failed to look up or parse under the same SQLSTATEs
+# as a mistake in the query: ``ssn::regclass`` -> 42P01 ``relation "123456789" does not
+# exist``. A name-quoting category (``NAME_ECHOING_CATEGORIES``) keeps the engine's text
+# for the user and lists matching names for the LLM, so such an error must read as DATA.
+# What tells them apart, measured on PostgreSQL 16 (asyncpg 0.30: ``.position`` is the
+# server's 'P' field, a 1-based offset as a str, or None; ``.context`` is 'W'):
+#
+#   SQLSTATE  genuine error in the query           pos   value-driven error            pos
+#   42703     column "nope" does not exist         8     has_column_privilege('u', col) -
+#   42P01     relation "nope" does not exist       15    col::regclass                  -
+#   42883     function nofunc(integer) …; operator 8/10  col::regproc, col::regoper     -
+#             does not exist: integer + boolean;
+#             could not identify an equality op…   17
+#   42704     type "nosuchtype" does not exist     11    current_setting(col),          -
+#             current_setting('nosuch')            -     col::regconfig/regrole/regtype
+#   3F000     nosch.f()                            8     col::regnamespace,             -
+#             has_schema_privilege('nosch', …)     -     has_table_privilege(col, …)
+#   3D000     has_database_privilege('nodb', …)    -     pg_database_size(col)          -
+#   42702     column reference "id" is ambiguous   8     (none found)
+#   42725     function amb(integer) is not unique  8     '+'::text::regoper             -
+#   42601     syntax error at end of input         22    to_tsquery(col), col::tsquery, -
+#                                                        col::jsonpath
+#                                                        col::regtype, to_regtype(col)  6 *
+#             query_to_xml(col, …)                 -     (internal_position 1)
+#   42803     … must appear in the GROUP BY clause 8     (none found)
+#   42804     argument of WHERE must be boolean    23    (none found)
+#   42846     cannot cast type integer to date     9     (none found)
+#   42P18     cannot determine type of empty array 8     (none found)
+#   42501     permission denied for table hidden   -     set_config(col, …) when col   -
+#             permission denied for schema s       15    names a superuser-only setting;
+#             (direct reference); for function     -     col::regclass when col names a
+#                                                        schema the role cannot use
+#
+# * regtype input runs the SQL parser on the stored text: the position points into the
+#   value, and the server adds the context line 'invalid type name "<value>"'.
+#
+# Every genuine error found has a position and no context, except permission errors (most
+# have no position, so 42501/28xxx are exempt from the position test) and a few lookups of a
+# literal the model wrote (current_setting('nosuch'), has_schema_privilege('nosch', …)),
+# which read as DATA: the safe direction. So a name-quoting SQLSTATE is DATA when the error
+# has no position (PERMISSION excepted), or when it has an error context or an internal
+# query (the failing text came from a function or the data, not the model's SQL).
+# Residual: a permission error caused by a stored value that names an existing schema or a
+# superuser-only setting keeps PERMISSION; it can only echo such a name.
+def _may_quote_a_value(err: BaseException, category: ErrorCategory) -> bool:
+    """Whether a PostgreSQL error under a name-quoting *category* may quote a stored value."""
+    if getattr(err, "context", None) or getattr(err, "internal_query", None):
+        return True
+    if getattr(err, "internal_position", None):
+        return True
+    if category is ErrorCategory.PERMISSION:
+        return False
+    return not getattr(err, "position", None)

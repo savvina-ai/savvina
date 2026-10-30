@@ -24,6 +24,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.cache.query_cache import CacheHit
+from app.config import get_settings
+from app.datasources.errors import ErrorCategory
 from app.datasources.models import (
     DataSourceSchema,
     PrivacySettings,
@@ -35,7 +37,10 @@ from app.providers.base import LLMResponse
 from app.schemas.chat import ChatResponse, QueryResultsResponse
 from app.semantic.models import SemanticModel
 from app.services.chat_service import ChatService
-from app.services.execution import _mask_sensitive_result_columns, _results_to_response
+from app.services.execution import _results_to_response
+from app.services.result_masking import _mask_sensitive_result_columns
+from app.services.row_filter import row_filter_fingerprint
+from app.services.row_filter_rewrite import apply_row_filters
 from app.services.schema_utils import (
     LARGE_TABLE_ROW_THRESHOLD,
     _check_query_complexity,
@@ -616,6 +621,38 @@ class TestProcessMessageFullPipeline:
         assert resp.error is not None
         adapter.execute_query.assert_not_called()
 
+    async def test_row_filter_rewrites_execution_but_message_and_cache_carry_clean_sql(self):
+        clean = "SELECT id, tenant_id FROM users"
+        filters = {"public.users": "tenant_id = 7"}
+        conn = _make_connection(privacy_settings={"row_filters": filters})
+        adapter = _make_adapter()
+        provider = _make_llm_provider(_make_llm_response(query=clean))
+        db = self._make_full_db(conn)
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.lookup = AsyncMock(return_value=None)
+        service.cache.store = AsyncMock()
+        service.cache.compute_embedding_async = AsyncMock(return_value=[0.1])
+        service.examples.find_similar_examples = AsyncMock(return_value=[])
+        save = AsyncMock(return_value=MagicMock(id="msg-1"))
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            _patch_create_provider(provider),
+            _patch_pipeline_session(),
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, _make_null_db())),
+            patch(f"{_MODULE}._save_assistant_message", new=save),
+        ):
+            resp = await service.process_message("conn-1", None, "q?", "claude", {})
+
+        executed = adapter.execute_query.await_args.args[0]
+        assert executed == apply_row_filters(clean, filters, "postgresql")
+        assert "WHERE (tenant_id = 7)" in executed
+        assert resp.query == clean
+        assert save.await_args.kwargs["query"] == clean
+        assert service.cache.store.await_args.kwargs["generated_query"] == clean
+
 
 # ── Scenario 2: Cache hit ──────────────────────────────────────────────────────
 
@@ -910,6 +947,25 @@ class TestExecutePending:
         with pytest.raises(ValueError, match="not found"):
             await service.execute_pending(message_id="ghost", db=db)
 
+    async def test_stored_result_carries_the_row_filter_fingerprint(self):
+        filters = {"public.users": "tenant_id = 7"}
+        msg = _make_msg(status="pending_approval")
+        conn = _make_connection(privacy_settings={"row_filters": filters})
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)), MockResult())
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(_make_adapter(execute_result=_make_query_result(row_count=3))),
+        ):
+            resp = await service.execute_pending(message_id="msg-1", db=db)
+
+        expected = row_filter_fingerprint(filters, get_settings().encryption_key)
+        assert resp.results.row_filter_fingerprint == expected
+        stored = db.execute.await_args_list[1].args[0].compile().params["results_json"]
+        assert stored["row_filter_fingerprint"] == expected
+
 
 # ── Scenario 5: edit_and_execute ──────────────────────────────────────────────
 
@@ -967,6 +1023,218 @@ class TestEditAndExecute:
         db = _make_db(MockResult(row=None))
         with pytest.raises(ValueError, match="not found"):
             await service.edit_and_execute("ghost", "SELECT 1", db)
+
+    async def test_stored_result_carries_the_row_filter_fingerprint(self):
+        filters = {"public.users": "tenant_id = 7"}
+        msg = _make_msg(status="pending_approval")
+        conn = _make_connection(privacy_settings={"row_filters": filters})
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)), MockResult())
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(_make_adapter()),
+        ):
+            resp = await service.edit_and_execute(
+                message_id="msg-1", edited_query="SELECT * FROM users LIMIT 10", db=db
+            )
+
+        expected = row_filter_fingerprint(filters, get_settings().encryption_key)
+        assert resp.results.row_filter_fingerprint == expected
+        stored = db.execute.await_args_list[1].args[0].compile().params["results_json"]
+        assert stored["row_filter_fingerprint"] == expected
+
+
+class TestUserFacingErrorOnReExecution:
+    """Approve, edit-and-execute and sort run SQL against the same columns: a DATA failure
+    that quotes a stored value must not hand that value back to the user."""
+
+    _RAW = 'invalid input syntax for type integer: "Jane Doe"'
+
+    def _failing_adapter(self) -> MagicMock:
+        adapter = _make_adapter()
+        adapter.execute_query = AsyncMock(side_effect=RuntimeError(self._RAW))
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.DATA)
+        return adapter
+
+    async def test_execute_pending(self):
+        msg = _make_msg(status="pending_approval")
+        db = _make_db(MockResult(row=(msg, _make_session(), _make_connection())), MockResult())
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(self._failing_adapter()),
+        ):
+            resp = await service.execute_pending(message_id="msg-1", db=db)
+
+        assert resp.status == "error"
+        assert "Jane" not in resp.error
+        assert "invalid input syntax for type integer" in resp.error
+
+    async def test_edit_and_execute(self):
+        msg = _make_msg(status="pending_approval")
+        db = _make_db(MockResult(row=(msg, _make_session(), _make_connection())), MockResult())
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(self._failing_adapter()),
+        ):
+            resp = await service.edit_and_execute(
+                message_id="msg-1", edited_query="SELECT CAST(name AS int) FROM c", db=db
+            )
+
+        assert resp.status == "error"
+        assert "Jane" not in resp.error
+        stored = db.execute.await_args_list[1].args[0].compile().params
+        assert "Jane" not in str(stored)
+
+    async def test_sort_and_execute(self):
+        msg = _make_msg(status="executed")
+        msg.results_json = {"columns": ["n"], "rows": []}
+        db = _make_db(MockResult(row=(msg, _make_session(), _make_connection())))
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(self._failing_adapter()),
+            pytest.raises(ValueError, match="Sort execution failed") as excinfo,
+        ):
+            await service.sort_and_execute(
+                message_id="msg-1", sort_column="n", sort_order="asc", db=db
+            )
+
+        assert "Jane" not in str(excinfo.value)
+
+
+class TestRowFilterRejectionOnReExecution:
+    async def test_unparsable_edit_is_rejected_without_running(self):
+        msg = _make_msg(status="pending_approval")
+        conn = _make_connection(privacy_settings={"row_filters": {"public.users": "tenant_id = 7"}})
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)), MockResult())
+        adapter = _make_adapter()
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+        ):
+            resp = await service.edit_and_execute(
+                message_id="msg-1", edited_query="SELECT * FROM users WHERE (", db=db
+            )
+
+        assert resp.status == "error"
+        assert "could not be parsed by the row-filter rewriter" in resp.error
+        adapter.execute_query.assert_not_called()
+
+
+class TestModesAreReadFromTheConnectedAdapter:
+    """Approve, edit-and-execute and sort read the sql_mode flags off the adapter after
+    connect(): a fresh MySQL adapter holds the class defaults until connect reads @@sql_mode."""
+
+    _DQ = "SELECT id FROM users WHERE \"email\" = 'x'"
+    _BS = "SELECT 'a\\' AS k, email AS x FROM users -- '"
+
+    @staticmethod
+    def _mysql_adapter(**connected_modes: bool) -> MagicMock:
+        adapter = _make_adapter()
+        adapter.query_dialect = "MySQL"
+        # The class defaults a fresh MySQLDataSource holds before connect.
+        adapter.double_quote_is_string_literal = True
+        adapter.backslash_is_escape = True
+
+        async def _connect(_config: dict) -> None:
+            for name, value in connected_modes.items():
+                setattr(adapter, name, value)
+
+        adapter.connect = AsyncMock(side_effect=_connect)
+        return adapter
+
+    _CASES = (
+        pytest.param(
+            {"double_quote_is_string_literal": False},
+            {"strict_sensitive_columns": True, "sensitive_column_patterns": ["email"]},
+            _DQ,
+            "ANSI_QUOTES",
+            id="ansi_quotes",
+        ),
+        pytest.param(
+            {"backslash_is_escape": False},
+            {},
+            _BS,
+            "NO_BACKSLASH_ESCAPES",
+            id="no_backslash_escapes",
+        ),
+    )
+
+    @pytest.mark.parametrize(("modes", "privacy", "query", "word"), _CASES)
+    async def test_execute_pending(self, modes, privacy, query, word):
+        msg = _make_msg(status="pending_approval", query_generated=query, query_dialect="MySQL")
+        conn = _make_connection(privacy_settings=privacy or None)
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)), MockResult())
+        adapter = self._mysql_adapter(**modes)
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+        ):
+            resp = await service.execute_pending(message_id="msg-1", db=db)
+
+        assert resp.status == "error"
+        assert word in resp.error
+        adapter.execute_query.assert_not_awaited()
+        adapter.disconnect.assert_awaited_once()
+
+    @pytest.mark.parametrize(("modes", "privacy", "query", "word"), _CASES)
+    async def test_edit_and_execute(self, modes, privacy, query, word):
+        msg = _make_msg(status="pending_approval", query_dialect="MySQL")
+        conn = _make_connection(privacy_settings=privacy or None)
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)), MockResult())
+        adapter = self._mysql_adapter(**modes)
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+        ):
+            resp = await service.edit_and_execute(message_id="msg-1", edited_query=query, db=db)
+
+        assert resp.status == "error"
+        assert word in resp.error
+        adapter.execute_query.assert_not_awaited()
+        adapter.disconnect.assert_awaited_once()
+
+    @pytest.mark.parametrize(("modes", "privacy", "query", "word"), _CASES)
+    async def test_sort_and_execute(self, modes, privacy, query, word):
+        msg = _make_msg(status="executed", query_generated=query, query_dialect="MySQL")
+        msg.results_json = {"columns": ["id", "k"], "rows": []}
+        conn = _make_connection(privacy_settings=privacy or None)
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)))
+        adapter = self._mysql_adapter(**modes)
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            pytest.raises(ValueError, match="Sort execution failed") as excinfo,
+        ):
+            await service.sort_and_execute(
+                message_id="msg-1", sort_column="id", sort_order="asc", db=db
+            )
+
+        assert word in str(excinfo.value)
+        adapter.execute_query.assert_not_awaited()
+        adapter.disconnect.assert_awaited_once()
 
 
 # ── Scenario 7: submit_feedback ───────────────────────────────────────────────
@@ -1060,6 +1328,108 @@ class TestSubmitFeedback:
         db = _make_db(MockResult(row=None))
         with pytest.raises(ValueError, match="not found"):
             await service.submit_feedback("ghost", "thumbs_up", db)
+
+    async def test_thumbs_up_stores_the_query_without_the_row_filter_wrap(self):
+        wrapped = (
+            "SELECT * FROM (\nSELECT id, tenant_id FROM users\n)"
+            " AS _sift_q WHERE tenant_id = 7 LIMIT 10"
+        )
+        msg = _make_msg(query_generated=wrapped)
+        db = _make_db(
+            MockResult(row=(msg, _make_session())),
+            MockResult(single=self._make_user_msg()),
+        )
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.compute_embedding_async = AsyncMock(return_value=[0.1])
+        service.examples.add_example = AsyncMock()
+
+        await service.submit_feedback(message_id="msg-1", feedback="thumbs_up", db=db)
+
+        assert service.examples.add_example.call_args.kwargs["query"] == (
+            "SELECT id, tenant_id FROM users LIMIT 10"
+        )
+
+
+class TestRetractFeedback:
+    """Retracting a thumbs-up deletes the example whether it was stored wrapped (rows from
+    before clean storage) or clean."""
+
+    def _delete_params(self, db) -> dict:
+        delete_stmt = db.execute.call_args_list[2].args[0]
+        return delete_stmt.compile().params
+
+    def _deleted_queries(self, db) -> list[str]:
+        lists = [v for v in self._delete_params(db).values() if isinstance(v, list)]
+        assert len(lists) == 1
+        return lists[0]
+
+    def _assert_scoped(self, db) -> None:
+        params = self._delete_params(db)
+        assert "conn-1" in params.values()
+        assert "Users" in params.values()
+
+    async def test_deletes_both_the_wrapped_and_the_clean_form(self):
+        wrapped = (
+            "SELECT * FROM (\nSELECT id, tenant_id FROM users\n) AS _sift_q WHERE tenant_id = 7"
+        )
+        msg = _make_msg(query_generated=wrapped)
+        msg.feedback = "thumbs_up"
+        user_msg = _make_msg(id="user-msg-1", role="user", content="Users", query_generated=None)
+        db = _make_db(
+            MockResult(row=(msg, _make_session())),
+            MockResult(single=user_msg),
+            MockResult(),  # delete(VerifiedExample)
+        )
+        service = ChatService(MagicMock(), MagicMock())
+
+        await service.retract_feedback(message_id="msg-1", db=db)
+
+        assert self._deleted_queries(db) == [wrapped, "SELECT id, tenant_id FROM users"]
+        self._assert_scoped(db)
+        assert msg.feedback is None
+
+    async def test_a_clean_query_is_matched_once(self):
+        msg = _make_msg(query_generated="SELECT id, tenant_id FROM users")
+        msg.feedback = "thumbs_up"
+        user_msg = _make_msg(id="user-msg-1", role="user", content="Users", query_generated=None)
+        db = _make_db(
+            MockResult(row=(msg, _make_session())),
+            MockResult(single=user_msg),
+            MockResult(),
+        )
+        service = ChatService(MagicMock(), MagicMock())
+
+        await service.retract_feedback(message_id="msg-1", db=db)
+
+        assert self._deleted_queries(db) == ["SELECT id, tenant_id FROM users"]
+        self._assert_scoped(db)
+
+    async def test_no_preceding_user_message_deletes_nothing_and_clears_feedback(self):
+        msg = _make_msg(query_generated="SELECT id, tenant_id FROM users")
+        msg.feedback = "thumbs_up"
+        db = _make_db(
+            MockResult(row=(msg, _make_session())),
+            MockResult(single=None),
+        )
+        service = ChatService(MagicMock(), MagicMock())
+
+        await service.retract_feedback(message_id="msg-1", db=db)
+
+        assert db.execute.call_count == 2
+        assert msg.feedback is None
+        db.commit.assert_awaited()
+
+    async def test_retracting_thumbs_down_runs_no_delete_and_clears_feedback(self):
+        msg = _make_msg(query_generated="SELECT id, tenant_id FROM users")
+        msg.feedback = "thumbs_down"
+        db = _make_db(MockResult(row=(msg, _make_session())))
+        service = ChatService(MagicMock(), MagicMock())
+
+        await service.retract_feedback(message_id="msg-1", db=db)
+
+        assert db.execute.call_count == 1
+        assert msg.feedback is None
+        db.commit.assert_awaited()
 
 
 # ── IDOR ownership tests ──────────────────────────────────────────────────────
@@ -1318,3 +1688,214 @@ class TestMaskSensitiveResultColumns:
         resp = _make_response(["id", "name"], [[1, "Alice"]])
         result = _mask_sensitive_result_columns(resp, privacy)
         assert result is resp
+
+
+# ── Stored wrapped SQL is unwrapped and rewritten once ────────────────────────
+
+_FILTER = "tenant_id = 7"
+_FILTERS = {"public.users": _FILTER}
+_CLEAN_SQL = "SELECT id, tenant_id FROM users"
+# What the pre-Task-9 non-streaming path stored in ChatMessage.query_generated and in
+# cache rows: the Phase 1 row-filter wrap around the model's query.
+_OLD_WRAPPED_SQL = "SELECT * FROM (SELECT id, tenant_id FROM users) AS _sift_q WHERE tenant_id = 7"
+
+
+class TestStoredWrappedSqlRunsRewrittenOnce:
+    """A row stored under the old wrap is unwrapped, then rewritten per table: the database
+    never sees ``_sift_q`` and the filter is applied exactly once."""
+
+    def _conn(self, **kwargs) -> MagicMock:
+        return _make_connection(privacy_settings={"row_filters": _FILTERS}, **kwargs)
+
+    async def test_cache_hit_on_a_stored_wrapped_query(self):
+        adapter = _make_adapter()
+        db = _make_db(
+            MockResult(single=self._conn()),
+            MockResult(single=_make_usc()),
+            MockResult(),
+            MockResult(),
+        )
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.lookup = AsyncMock(return_value=_make_cache_hit(query=_OLD_WRAPPED_SQL))
+        service.cache.compute_embedding_async = AsyncMock(return_value=[0.1])
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, _make_null_db())),
+        ):
+            resp = await service.process_message("conn-1", None, "q?", "claude", {})
+
+        assert resp.cache_hit is True
+        assert resp.query == _CLEAN_SQL
+        executed = adapter.execute_query.await_args.args[0]
+        assert "_sift_q" not in executed
+        assert executed == apply_row_filters(_CLEAN_SQL, _FILTERS, "postgresql")
+        assert "WHERE (tenant_id = 7)" in executed
+
+    async def test_execute_pending_on_a_stored_wrapped_query(self):
+        msg = _make_msg(status="pending_approval", query_generated=_OLD_WRAPPED_SQL)
+        adapter = _make_adapter()
+        db = _make_db(MockResult(row=(msg, _make_session(), self._conn())), MockResult())
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+        ):
+            resp = await service.execute_pending(message_id="msg-1", db=db)
+
+        assert resp.status == "executed"
+        executed = adapter.execute_query.await_args.args[0]
+        assert executed == apply_row_filters(_CLEAN_SQL, _FILTERS, "postgresql")
+        assert "WHERE (tenant_id = 7)" in executed
+        assert resp.query == _CLEAN_SQL
+
+    async def test_sort_on_a_stored_wrapped_query(self):
+        msg = _make_msg(status="executed", query_generated=_OLD_WRAPPED_SQL)
+        msg.results_json = {"columns": ["id", "tenant_id"], "rows": []}
+        adapter = _make_adapter()
+        db = _make_db(MockResult(row=(msg, _make_session(), self._conn())))
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+        ):
+            await service.sort_and_execute(
+                message_id="msg-1", sort_column="id", sort_order="DESC", db=db
+            )
+
+        executed = adapter.execute_query.await_args.args[0]
+        sorted_sql = 'SELECT id, tenant_id FROM users\nORDER BY "id" DESC'
+        assert executed == apply_row_filters(sorted_sql, _FILTERS, "postgresql")
+        assert "WHERE (tenant_id = 7)" in executed
+
+
+# ── Migration state: a legacy row_filter_sql and no row_filters ───────────────
+
+_LEGACY_PRIVACY = {"row_filter_sql": "tenant_id = 7"}
+
+
+class TestRowFilterMigrationState:
+    async def test_load_connection_stage_raises_before_any_generation(self):
+        from app.services.chat_service import _RowFilterMigrationError, _stage_load_connection
+        from app.services.row_filter import _MIGRATION_MESSAGE
+
+        conn = _make_connection(privacy_settings=_LEGACY_PRIVACY)
+        db = _make_db(MockResult(single=conn))
+        with (
+            _patch_decrypt({"host": "localhost"}),
+            pytest.raises(_RowFilterMigrationError) as excinfo,
+        ):
+            await _stage_load_connection("conn-1", db, _make_settings())
+        assert str(excinfo.value) == _MIGRATION_MESSAGE
+
+    async def test_process_message_is_a_400_without_an_llm_call(self):
+        conn = _make_connection(privacy_settings=_LEGACY_PRIVACY)
+        adapter = _make_adapter()
+        provider = _make_llm_provider()
+        db = _make_db(MockResult(single=conn))
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            _patch_create_provider(provider),
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, _make_null_db())),
+            pytest.raises(ValueError, match="needs migration"),
+        ):
+            await service.process_message("conn-1", None, "q?", "claude", {})
+
+        provider.generate_response.assert_not_called()
+        adapter.execute_query.assert_not_called()
+
+    async def test_stream_message_emits_the_error_without_an_llm_call(self):
+        conn = _make_connection(privacy_settings=_LEGACY_PRIVACY)
+        adapter = _make_adapter()
+        provider = _make_llm_provider()
+        db = _make_db(MockResult(single=conn))
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            _patch_create_provider(provider),
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, _make_null_db())),
+        ):
+            events = [e async for e in service.stream_message("conn-1", None, "q?", "claude", {})]
+
+        errors = [e for e in events if e["type"] == "error"]
+        assert len(errors) == 1 and "needs migration" in errors[0]["message"]
+        assert events[-1]["type"] == "done" and events[-1]["status"] == "error"
+        provider.generate_response.assert_not_called()
+
+    async def test_execute_pending_is_rejected_verbatim(self):
+        from app.services.row_filter import _MIGRATION_MESSAGE
+
+        msg = _make_msg(status="pending_approval", query_generated="SELECT id FROM users")
+        conn = _make_connection(privacy_settings=_LEGACY_PRIVACY)
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)), MockResult())
+        adapter = _make_adapter()
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+        ):
+            resp = await service.execute_pending(message_id="msg-1", db=db)
+
+        assert resp.status == "error"
+        assert resp.error == _MIGRATION_MESSAGE
+        adapter.execute_query.assert_not_called()
+
+    async def test_edit_and_execute_is_rejected_verbatim(self):
+        from app.services.row_filter import _MIGRATION_MESSAGE
+
+        msg = _make_msg(status="pending_approval")
+        conn = _make_connection(privacy_settings=_LEGACY_PRIVACY)
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)), MockResult())
+        adapter = _make_adapter()
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+        ):
+            resp = await service.edit_and_execute(
+                message_id="msg-1", edited_query="SELECT id FROM users", db=db
+            )
+
+        assert resp.status == "error"
+        assert resp.error == _MIGRATION_MESSAGE
+        adapter.execute_query.assert_not_called()
+
+    async def test_sort_and_execute_is_rejected_verbatim(self):
+        from app.services.row_filter import _MIGRATION_MESSAGE
+
+        msg = _make_msg(status="executed", query_generated="SELECT id, tenant_id FROM users")
+        msg.results_json = {"columns": ["id", "tenant_id"], "rows": []}
+        conn = _make_connection(privacy_settings=_LEGACY_PRIVACY)
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)))
+        adapter = _make_adapter()
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            pytest.raises(ValueError, match="Sort execution failed") as excinfo,
+        ):
+            await service.sort_and_execute(
+                message_id="msg-1", sort_column="id", sort_order="DESC", db=db
+            )
+
+        assert _MIGRATION_MESSAGE in str(excinfo.value)
+        adapter.execute_query.assert_not_called()

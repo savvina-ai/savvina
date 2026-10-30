@@ -78,10 +78,12 @@ class MockConnection:
         self.fetchrow = AsyncMock(return_value=None)
         self.execute = AsyncMock(return_value=None)
         self.close = AsyncMock()
+        self.transaction_kwargs: dict | None = None
 
     @asynccontextmanager
-    async def transaction(self):
-        """Simulate an asyncpg transaction context manager."""
+    async def transaction(self, **kwargs):
+        """Simulate an asyncpg transaction context manager, recording its options."""
+        self.transaction_kwargs = kwargs
         yield
 
 

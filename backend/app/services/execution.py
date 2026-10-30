@@ -1,16 +1,28 @@
 # Copyright (c) 2025 Savvina AI Ltd
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-"""Query execution, result masking, SQL injection helpers, and execution correction."""
+"""Query execution, ORDER BY injection, and execution correction.
+
+Result masking lives in ``result_masking``. The streaming path builds one
+``_ResultMaskPlan`` per executed statement and applies it to every row batch and to the
+final payload; the non-streaming path masks the complete result with
+``_mask_sensitive_result_columns``.
+
+The row-filter rewrite lives in ``row_filter``.
+"""
 
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+import contextlib
 from dataclasses import dataclass, field
+import inspect
 import logging
 import re
 from typing import TYPE_CHECKING, Any
 
+from ..config import get_settings
+from ..datasources.errors import ErrorCategory, classify_builtin
 from ..datasources.models import DataSourceSchema, PrivacySettings, QueryResult
 from ..providers.base import BaseLLMProvider
 from ..schemas.chat import QueryResultsResponse
@@ -20,7 +32,20 @@ from .correction import (
     _attempt_sql_execution_correction,
     _attempt_zero_result_correction,
 )
+from .error_feedback import redact_error_for_user
 from .intent_classifier import QueryIntent
+from .result_masking import (
+    _backslash_is_escape,
+    _double_quote_is_literal,
+    _mask_sensitive_result_columns,
+    _plan_result_mask,
+    _ResultMaskPlan,
+)
+from .row_filter import _executable, row_filter_fingerprint
+
+# The base is imported from its defining module: the row_filter facade re-exports only the
+# row-filter names.
+from .row_filter_errors import QueryRejectedError
 
 if TYPE_CHECKING:
     from ..datasources.base import BaseDataSource
@@ -53,49 +78,99 @@ def _results_to_response(result: QueryResult) -> QueryResultsResponse:
     )
 
 
-def _inject_row_filter(sql: str, row_filter_sql: str, dialect: str) -> str:
-    """Enforce a mandatory row-level filter by wrapping the query in a derived table.
+def _fingerprint(privacy: PrivacySettings | None) -> str:
+    """The fingerprint of the row-filter map a result is computed under."""
+    filters = privacy.row_filters if privacy is not None else {}
+    return row_filter_fingerprint(filters, get_settings().encryption_key)
 
-    LIMIT is hoisted outside the subquery so the filter applies before row truncation.
-    Safe for CTEs: all SQL dialects supported by Savvina allow inline CTEs in subqueries.
 
-    Trust model: ``row_filter_sql`` is sourced exclusively from the connection's
-    privacy settings, which are written by an authenticated org-admin through the
-    settings UI.  It is never derived from user-supplied chat input, so the
-    injection risk is limited to a compromised admin account.
+def _exec_error_text(exc: BaseException) -> str:
+    """User-facing text for a failed execution: never empty, since empty reads as success.
+
+    Shown to the user and stored on the message; never sent to the LLM, except for a
+    ``QueryRejectedError``, whose own text the correction prompt carries
+    (``ErrorCategory.REJECTED``, ``services/error_feedback.describe_error_for_llm``). Every
+    other correction prompt is composed by ``describe_error_for_llm`` from known parts.
     """
-    sql = sql.rstrip(";").rstrip()
-    limit_match = re.search(r"(\s+LIMIT\s+\d+)\s*$", sql, re.IGNORECASE)
-    limit_clause = ""
-    if limit_match:
-        limit_clause = limit_match.group(1)
-        sql = sql[: limit_match.start()]
-    return f"SELECT * FROM ({sql}) AS _sift_q WHERE {row_filter_sql}{limit_clause}"  # noqa: S608
+    text = str(exc)
+    if text:
+        return text
+    if isinstance(exc, TimeoutError):
+        return "Query timed out"
+    return f"Query failed ({type(exc).__name__})"
 
 
-def _mask_sensitive_result_columns(
-    response: QueryResultsResponse, privacy: PrivacySettings | None
-) -> QueryResultsResponse:
-    """Replace values in sensitive or explicitly excluded columns with a redaction marker.
+def _user_facing_error(
+    exec_error: str, category: ErrorCategory, note: str | None = None, *, verbatim: bool = False
+) -> str:
+    """The error shown to the user and stored on the message for a failed execution.
 
-    Applied before results are returned to the client or persisted to results_json,
-    so sensitive values never leave the server in plaintext.
+    *exec_error* is the engine's text, redacted by category (``redact_error_for_user``):
+    value-quoting categories lose their quoted spans and extra lines. With *verbatim* the
+    text is ours (a ``QueryRejectedError``) and is shown as it is. Rejections are classified
+    ``REJECTED``, a name-echoing category that is not redacted; *verbatim* is the guard
+    should that ever change, since a redacting category would cut the text at the first
+    apostrophe. The raw text is not logged: the log holds what the user sees. The
+    self-correction's note, when it gave one, follows the text.
     """
-    if not privacy:
-        return response
-    excluded_bare = {c.split(".")[-1].lower() for c in privacy.excluded_columns}
-    sensitive_indices = {
-        i
-        for i, col in enumerate(response.columns)
-        if privacy.is_column_sensitive(col) or col.lower() in excluded_bare
-    }
-    if not sensitive_indices:
-        return response
-    masked_rows = [
-        ["[REDACTED]" if j in sensitive_indices else val for j, val in enumerate(row)]
-        for row in response.rows
-    ]
-    return response.model_copy(update={"rows": masked_rows})
+    shown = exec_error if verbatim else redact_error_for_user(category, exec_error)
+    logger.debug("Execution failed (%s): %s", category, shown)
+    return f"{shown}\n\nNote: {note}" if note else shown
+
+
+def _user_error_text(adapter: object, exc: BaseException) -> str:
+    """``_user_facing_error`` for a single execution with no correction loop (approve,
+    edit-and-execute, sort)."""
+    return _user_facing_error(
+        _exec_error_text(exc), _classify(adapter, exc), verbatim=_is_rejection(exc)
+    )
+
+
+def _is_rejection(exc: BaseException) -> bool:
+    return isinstance(exc, QueryRejectedError)
+
+
+def _llm_hint(exc: BaseException) -> str | None:
+    return exc.llm_hint if isinstance(exc, QueryRejectedError) else None
+
+
+def _correctable(rejected: bool, hint: str | None) -> bool:
+    """Whether a correction attempt can help with the latest failure.
+
+    *rejected* is True when the failure is a ``QueryRejectedError``. Such a rejection
+    without an ``llm_hint`` (``None`` or empty, as ``describe_error_for_llm`` reads it) is
+    nothing the model can change (a row filter that needs migration, a malformed key, a
+    missing fence): every correction loop ends at once, with no LLM call, and the user sees
+    the rejection text.
+    """
+    return not rejected or bool(hint)
+
+
+def _classify(adapter: object, exc: BaseException) -> ErrorCategory:
+    """``adapter.classify_error`` with a never-raise guard, then the builtin timeout fallback.
+
+    A mock or wrapper without the hook (or returning something that is not an
+    ``ErrorCategory``) reads OTHER rather than failing the turn. An adapter's ``REJECTED``
+    also reads OTHER: that category is reserved for ``QueryRejectedError``, whose text is
+    ours and is shown and sent to the LLM unredacted.
+    """
+    if isinstance(exc, QueryRejectedError):
+        return ErrorCategory.REJECTED
+    try:
+        category = adapter.classify_error(exc)  # type: ignore[attr-defined]
+    except Exception:
+        category = ErrorCategory.OTHER
+    if inspect.isawaitable(category):
+        # An AsyncMock adapter hands back a coroutine: close it so it is not reported as
+        # "never awaited", then read it as OTHER.
+        close = getattr(category, "close", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()
+        category = ErrorCategory.OTHER
+    if not isinstance(category, ErrorCategory) or category is ErrorCategory.REJECTED:
+        category = ErrorCategory.OTHER
+    return classify_builtin(exc) if category is ErrorCategory.OTHER else category
 
 
 def _inject_order_by(sql: str, column: str, direction: str, dialect: str) -> str:
@@ -162,46 +237,83 @@ async def _execute_auto_query(
     privacy: PrivacySettings | None = None,
     intent: QueryIntent = QueryIntent.UNKNOWN,
 ) -> _ExecutionResult:
-    """Step 12 auto_execute: run query, handle errors, attempt execution correction."""
+    """Step 12 auto_execute: run query, handle errors, attempt execution correction.
+
+    Every executed statement is rewritten by the row filter (``_executable``), including each
+    corrected and zero-result-refined query; the returned ``generated_query`` (stored on the
+    message and in the cache) and every correction prompt carry the clean SQL. Each result is
+    masked by the plan of the statement that produced it.
+    """
     if not connected:
         await adapter.connect(config_dict)
         connected = True
     max_rows = min(options.get("max_rows", settings.default_row_limit), settings.default_row_limit)
-    if privacy and privacy.row_filter_sql:
-        generated_query = _inject_row_filter(
-            generated_query, privacy.row_filter_sql, adapter.query_dialect
-        )
+    dialect = adapter.query_dialect
+    dq_literal = _double_quote_is_literal(adapter)
+    bs_escape = _backslash_is_escape(adapter)
     results_response: QueryResultsResponse | None = None
     execution_time_ms: float | None = None
     bytes_scanned_val: int | None = None
     status = "cached" if cache_hit else "executed"
     error: str | None = None
-    exec_error_str: str | None = None
-    current_query = generated_query
+    # The engine's text: read by the correction-prompt builder (which never copies it into
+    # the prompt) and, through _user_facing_error, the basis of what the user is shown.
+    exec_error: str | None = None
+    error_note: str | None = None
+    exec_category = ErrorCategory.OTHER
+    exec_verbatim = False
+    exec_hint: str | None = None
+    clean_query = generated_query  # the model's SQL: prompts, storage and the cache use this
     max_exec_attempts = _MAX_SELF_CORRECTION_ATTEMPTS + 1  # initial + retries
+
+    async def _run(executed: str) -> QueryResult:
+        return await adapter.execute_query(
+            executed,
+            timeout=settings.default_query_timeout,
+            max_rows=max_rows,
+        )
+
+    def _masked(query_result: QueryResult, executed: str, clean: str) -> QueryResultsResponse:
+        masked = _mask_sensitive_result_columns(
+            _results_to_response(query_result),
+            privacy,
+            sql=executed,
+            original_sql=clean,
+            double_quote_is_string_literal=dq_literal,
+        )
+        return masked.model_copy(update={"row_filter_fingerprint": _fingerprint(privacy)})
 
     for attempt in range(max_exec_attempts):
         try:
-            query_result = await adapter.execute_query(
-                current_query,
-                timeout=settings.default_query_timeout,
-                max_rows=max_rows,
+            executed = _executable(
+                clean_query,
+                privacy,
+                dialect,
+                double_quote_is_string_literal=dq_literal,
+                backslash_is_escape=bs_escape,
             )
-            results_response = _mask_sensitive_result_columns(
-                _results_to_response(query_result), privacy
-            )
+            query_result = await _run(executed)
+            results_response = _masked(query_result, executed, clean_query)
             execution_time_ms = query_result.execution_time_ms
             bytes_scanned_val = query_result.bytes_scanned
-            exec_error_str = None
+            exec_error = None
             break
         except Exception as e:
-            exec_error_str = str(e)
+            exec_error = _exec_error_text(e)
+            exec_category = _classify(adapter, e)
+            exec_verbatim = _is_rejection(e)
+            exec_hint = _llm_hint(e)
 
-        if attempt < max_exec_attempts - 1 and not cache_hit and provider is not None:
+        if (
+            attempt < max_exec_attempts - 1
+            and not cache_hit
+            and provider is not None
+            and _correctable(exec_verbatim, exec_hint)
+        ):
             corrected_query, corrected_explanation = await _attempt_sql_execution_correction(
                 original_question=message,
-                failed_query=current_query,
-                exec_error=exec_error_str,
+                failed_query=clean_query,
+                exec_error=exec_error,
                 system_prompt=system_prompt,
                 history=history,
                 provider=provider,
@@ -210,22 +322,23 @@ async def _execute_auto_query(
                 schema=schema,
                 adapter=adapter,
                 attempt_num=attempt + 1,
+                error_category=exec_category,
+                llm_hint=exec_hint,
             )
             if corrected_query:
-                current_query = corrected_query
+                clean_query = corrected_query
                 explanation = corrected_explanation or explanation
                 logger.debug(
                     "Execution self-correction attempt %d succeeded; re-executing", attempt + 1
                 )
             else:
-                if corrected_explanation:
-                    exec_error_str = f"{exec_error_str}\n\nNote: {corrected_explanation}"
+                error_note = corrected_explanation or None
                 break
         else:
             break
 
-    if exec_error_str:
-        error = exec_error_str
+    if exec_error:
+        error = _user_facing_error(exec_error, exec_category, error_note, verbatim=exec_verbatim)
         status = "error"
 
     # ── Zero-result detection ──────────────────────────────────────────────────
@@ -234,7 +347,7 @@ async def _execute_auto_query(
     # cause and optionally provide a corrected query.  EXISTENCE queries ("are
     # there any…") intentionally produce 0 rows, so they are excluded.
     if (
-        exec_error_str is None
+        exec_error is None
         and results_response is not None
         and results_response.row_count == 0
         and intent != QueryIntent.EXISTENCE
@@ -243,7 +356,7 @@ async def _execute_auto_query(
     ):
         zero_query, zero_expl = await _attempt_zero_result_correction(
             original_question=message,
-            query=current_query,
+            query=clean_query,
             system_prompt=system_prompt,
             history=history,
             provider=provider,
@@ -254,25 +367,32 @@ async def _execute_auto_query(
         )
         if zero_query:
             try:
-                query_result = await adapter.execute_query(
+                zero_executed = _executable(
                     zero_query,
-                    timeout=settings.default_query_timeout,
-                    max_rows=max_rows,
+                    privacy,
+                    dialect,
+                    double_quote_is_string_literal=dq_literal,
+                    backslash_is_escape=bs_escape,
                 )
-                results_response = _mask_sensitive_result_columns(
-                    _results_to_response(query_result), privacy
-                )
+                query_result = await _run(zero_executed)
+                results_response = _masked(query_result, zero_executed, zero_query)
                 execution_time_ms = query_result.execution_time_ms
                 bytes_scanned_val = query_result.bytes_scanned
-                current_query = zero_query
+                clean_query = zero_query
                 explanation = zero_expl or explanation
                 logger.debug(
                     "Zero-result correction succeeded; re-executed query returned %d rows",
                     query_result.row_count,
                 )
             except Exception as e:
-                # Keep the original 0-row result; the correction failed at DB level.
-                logger.debug("Zero-result corrected query failed at execution: %s", e)
+                # Keep the original 0-row result; the correction failed at DB level. The log
+                # holds the redacted text, as the user-facing path does.
+                category = _classify(adapter, e)
+                logger.debug(
+                    "Zero-result corrected query failed at execution (%s): %s",
+                    category,
+                    redact_error_for_user(category, _exec_error_text(e)),
+                )
         elif zero_expl:
             explanation = zero_expl
 
@@ -282,7 +402,7 @@ async def _execute_auto_query(
         bytes_scanned=bytes_scanned_val,
         status=status,
         error=error,
-        generated_query=current_query,
+        generated_query=clean_query,
         explanation=explanation,
         connected=connected,
     )
@@ -307,6 +427,10 @@ class _BatchAccumulator:
     truncated: bool = False
     execution_time_ms: float | None = None
     batch_index: int = 0
+    # The mask of the statement whose rows these are; set by _stream_statement.
+    mask_plan: _ResultMaskPlan | None = None
+    # The fingerprint of the row-filter map the statement ran under; set by _stream_statement.
+    row_filter_fingerprint: str = ""
 
     def reset_rows(self) -> None:
         """Clear accumulated rows and batch counter before a retry execution."""
@@ -358,6 +482,58 @@ async def _stream_cursor_batches(
         acc.batch_index += 1
 
 
+async def _stream_statement(
+    adapter: BaseDataSource,
+    clean_query: str,
+    *,
+    privacy: PrivacySettings | None,
+    dq_literal: bool,
+    timeout: int,  # noqa: ASYNC109
+    max_rows: int,
+    acc: _BatchAccumulator,
+) -> AsyncGenerator[RowBatchEvent, None]:
+    """Execute one statement on the streaming path and yield its masked ``row_batch`` events.
+
+    The database receives *clean_query* rewritten by the row filter; the result mask is
+    planned once for this statement (from the clean SQL) and stored on *acc*, so every
+    batch here and the final payload built from *acc* are redacted by the same plan.
+    """
+    executed = _executable(
+        clean_query,
+        privacy,
+        adapter.query_dialect,
+        double_quote_is_string_literal=dq_literal,
+        backslash_is_escape=_backslash_is_escape(adapter),
+    )
+    plan = _plan_result_mask(
+        privacy, executed, clean_query, double_quote_is_string_literal=dq_literal
+    )
+    acc.mask_plan = plan
+    acc.row_filter_fingerprint = _fingerprint(privacy)
+    async for event in _stream_cursor_batches(
+        adapter, executed, timeout=timeout, max_rows=max_rows, acc=acc
+    ):
+        if plan is not None:
+            rows = plan.redact(event["rows"], event["columns"])
+            if rows is not event["rows"]:
+                event = {**event, "rows": rows}
+        yield event
+
+
+def _stream_payload(acc: _BatchAccumulator) -> QueryResultsResponse:
+    """The final result from *acc*, masked by the plan of the statement that produced it."""
+    rows = acc.rows if acc.mask_plan is None else acc.mask_plan.redact(acc.rows, acc.columns)
+    return QueryResultsResponse(
+        columns=acc.columns,
+        column_types=acc.column_types,
+        rows=rows,
+        row_count=len(acc.rows),
+        truncated=acc.truncated,
+        execution_time_ms=acc.execution_time_ms or 0.0,
+        row_filter_fingerprint=acc.row_filter_fingerprint,
+    )
+
+
 async def _stream_self_correction_phase(
     *,
     adapter: BaseDataSource,
@@ -372,23 +548,39 @@ async def _stream_self_correction_phase(
     history: list[dict],
     message: str,
     schema: DataSourceSchema,
+    privacy: PrivacySettings | None = None,
+    dq_literal: bool = False,
 ) -> AsyncGenerator[SseEvent, None]:
     """Yield SSE events for the self-correction retry loop.
 
     Preconditions: out["exec_error"] is truthy, provider is not None, and
     cache_hit is False — the caller should skip this generator otherwise.
 
+    Each corrected query is executed through _stream_statement: rewritten by the row filter,
+    its batches masked by a plan built for it. The prompt and the ``sql`` event carry the
+    clean query.
+
     Mutates *out* in-place:
-    - ``out["current_query"]``  — updated to the corrected query on success
+    - ``out["clean_query"]``    — the corrected query as the model wrote it, on success
     - ``out["explanation"]``    — updated to the corrected explanation on success
-    - ``out["exec_error"]``     — set to None on success; unchanged (or appended)
-                                  when all correction attempts are exhausted
+    - ``out["exec_error"]``     — set to None on success; the latest failure's text when
+                                  all correction attempts are exhausted
+    - ``out["exec_category"]``  — the category of the latest failure
+    - ``out["exec_hint"]``      — the latest failure's ``QueryRejectedError.llm_hint``,
+                                  else None
+    - ``out["exec_verbatim"]``  — True when the latest failure was a ``QueryRejectedError``
+    - ``out["error_note"]``     — the correction's note when it gave up with one
+
+    A failure that ``_correctable`` rules out (a rejection without a hint) ends the loop
+    before its LLM call, leaving *out* as it is.
     """
     for _attempt in range(1, _MAX_SELF_CORRECTION_ATTEMPTS + 1):
+        if not _correctable(out["exec_verbatim"], out["exec_hint"]):
+            return
         yield StatusEvent(type="status", message="Correcting query…")
         corrected_query, corrected_explanation = await _attempt_sql_execution_correction(
             original_question=message,
-            failed_query=out["current_query"],
+            failed_query=out["clean_query"],
             exec_error=out["exec_error"],
             system_prompt=system_prompt,
             history=history,
@@ -398,28 +590,37 @@ async def _stream_self_correction_phase(
             schema=schema,
             adapter=adapter,
             attempt_num=_attempt,
+            error_category=out["exec_category"],
+            llm_hint=out["exec_hint"],
         )
         if not corrected_query:
-            if corrected_explanation:
-                out["exec_error"] = f"{out['exec_error']}\n\nNote: {corrected_explanation}"
+            out["error_note"] = corrected_explanation or None
             return
-        out["current_query"] = corrected_query
+        out["clean_query"] = corrected_query
         out["explanation"] = corrected_explanation or out["explanation"]
-        yield SqlEvent(type="sql", query=out["current_query"], dialect=adapter.query_dialect)
+        yield SqlEvent(type="sql", query=out["clean_query"], dialect=adapter.query_dialect)
         yield StatusEvent(type="status", message="Re-executing corrected query…")
         acc.reset_rows()
         out["exec_error"] = None
+        out["exec_category"] = ErrorCategory.OTHER
+        out["exec_hint"] = None
+        out["exec_verbatim"] = False
         try:
-            async for event in _stream_cursor_batches(
+            async for event in _stream_statement(
                 adapter,
-                out["current_query"],
+                out["clean_query"],
+                privacy=privacy,
+                dq_literal=dq_literal,
                 timeout=settings.default_query_timeout,
                 max_rows=max_rows,
                 acc=acc,
             ):
                 yield event
         except Exception as exc:
-            out["exec_error"] = str(exc)
+            out["exec_error"] = _exec_error_text(exc)
+            out["exec_category"] = _classify(adapter, exc)
+            out["exec_hint"] = _llm_hint(exc)
+            out["exec_verbatim"] = _is_rejection(exc)
         if not out["exec_error"]:
             return
 
@@ -439,6 +640,8 @@ async def _stream_zero_result_phase(
     message: str,
     schema: DataSourceSchema,
     intent: QueryIntent,
+    privacy: PrivacySettings | None = None,
+    dq_literal: bool = False,
 ) -> AsyncGenerator[SseEvent, None]:
     """Yield SSE events for the zero-result recovery phase.
 
@@ -446,21 +649,23 @@ async def _stream_zero_result_phase(
     False, and provider is not None — the caller should skip this generator
     when those conditions are not all met.
 
+    The refined query is executed through _stream_statement (row filter, its own mask
+    plan); the prompt and the ``sql`` event carry the clean query.
+
     Mutates *out* in-place:
-    - ``out["current_query"]``         — updated to the refined query if one was
-                                         produced by the LLM
-    - ``out["explanation"]``           — updated to the refined explanation when
-                                         available
+    - ``out["clean_query"]``           — the refined query, only once it has run
+    - ``out["explanation"]``           — the refined explanation, only once the refined
+                                         query has run (or when no query was refined)
     - ``out["zero_result_reexecuted"]``— True if re-execution succeeded, False
                                          if it raised an exception
-    *acc* is also updated in-place via _stream_cursor_batches when re-execution
-    succeeds; callers should rebuild their QueryResultsResponse from *acc* when
-    out["zero_result_reexecuted"] is True.
+    *acc* is also updated in-place when re-execution succeeds; callers should rebuild
+    their payload from *acc* (``_stream_payload``) when out["zero_result_reexecuted"]
+    is True.
     """
     yield StatusEvent(type="status", message="Query returned no rows — refining…")
     zero_query, zero_expl = await _attempt_zero_result_correction(
         original_question=message,
-        query=out["current_query"],
+        query=out["clean_query"],
         system_prompt=system_prompt,
         history=history,
         provider=provider,
@@ -470,23 +675,34 @@ async def _stream_zero_result_phase(
         adapter=adapter,
     )
     if zero_query:
-        out["current_query"] = zero_query
-        out["explanation"] = zero_expl or out["explanation"]
-        out["zero_result_reexecuted"] = True
-        yield SqlEvent(type="sql", query=out["current_query"], dialect=adapter.query_dialect)
+        yield SqlEvent(type="sql", query=zero_query, dialect=adapter.query_dialect)
         acc.reset_rows()
         try:
-            async for event in _stream_cursor_batches(
+            async for event in _stream_statement(
                 adapter,
-                out["current_query"],
+                zero_query,
+                privacy=privacy,
+                dq_literal=dq_literal,
                 timeout=settings.default_query_timeout,
                 max_rows=max_rows,
                 acc=acc,
             ):
                 yield event
         except Exception as exc:
-            logger.debug("Zero-result re-execution failed, keeping original: %s", exc)
+            # Keep the original 0-row result, query and explanation, as _execute_auto_query
+            # does: the refined query is adopted only once it has run. The log holds the
+            # redacted text, as the user-facing path does.
+            category = _classify(adapter, exc)
+            logger.debug(
+                "Zero-result re-execution failed, keeping original (%s): %s",
+                category,
+                redact_error_for_user(category, _exec_error_text(exc)),
+            )
             out["zero_result_reexecuted"] = False
+        else:
+            out["clean_query"] = zero_query
+            out["explanation"] = zero_expl or out["explanation"]
+            out["zero_result_reexecuted"] = True
     elif zero_expl:
         out["explanation"] = zero_expl
 
@@ -514,9 +730,13 @@ async def _stream_execute_with_correction(
 ) -> AsyncGenerator[SseEvent, None]:
     """Streaming counterpart of _execute_auto_query.
 
-    Yields RowBatchEvent/StatusEvent/SqlEvent objects as execution progresses,
-    applying self-correction and zero-result recovery using the same helpers as
-    _execute_auto_query.  Stores the final _ExecutionResult in result_out.result.
+    Yields RowBatchEvent/StatusEvent/SqlEvent objects as execution progresses, applying
+    self-correction and zero-result recovery using the same helpers as _execute_auto_query.
+    Every executed statement is rewritten by the row filter; every ``row_batch`` event and
+    the final payload are masked by the plan of the statement that produced them, so a
+    client watching the stream and one reading the stored message see the same values.
+    Prompts, ``sql`` events and the stored result carry the clean SQL. Stores the final
+    _ExecutionResult in result_out.result.
     """
     if not connected:
         conn_result = await adapter.connect(config_dict)
@@ -535,26 +755,36 @@ async def _stream_execute_with_correction(
         connected = True
 
     max_rows = min(options.get("max_rows", settings.default_row_limit), settings.default_row_limit)
+    dq_literal = _double_quote_is_literal(adapter)
     acc = _BatchAccumulator()
     out: dict = {
-        "current_query": generated_query,
+        "clean_query": generated_query,  # the model's SQL: prompts, events, storage
         "explanation": explanation,
-        "exec_error": None,
+        "exec_error": None,  # the engine's text; see _user_facing_error for what is shown
+        "error_note": None,
+        "exec_category": ErrorCategory.OTHER,
+        "exec_hint": None,
+        "exec_verbatim": False,
         "zero_result_reexecuted": False,
     }
 
     # Initial streaming execution
     try:
-        async for event in _stream_cursor_batches(
+        async for event in _stream_statement(
             adapter,
-            out["current_query"],
+            out["clean_query"],
+            privacy=privacy,
+            dq_literal=dq_literal,
             timeout=settings.default_query_timeout,
             max_rows=max_rows,
             acc=acc,
         ):
             yield event
     except Exception as exc:
-        out["exec_error"] = str(exc)
+        out["exec_error"] = _exec_error_text(exc)
+        out["exec_category"] = _classify(adapter, exc)
+        out["exec_hint"] = _llm_hint(exc)
+        out["exec_verbatim"] = _is_rejection(exc)
 
     # Self-correction retry loop
     if out["exec_error"] and not cache_hit and provider is not None:
@@ -571,6 +801,8 @@ async def _stream_execute_with_correction(
             history=history,
             message=message,
             schema=schema,
+            privacy=privacy,
+            dq_literal=dq_literal,
         ):
             yield event
 
@@ -580,21 +812,19 @@ async def _stream_execute_with_correction(
             execution_time_ms=acc.execution_time_ms,
             bytes_scanned=None,
             status="error",
-            error=out["exec_error"],
-            generated_query=out["current_query"],
+            error=_user_facing_error(
+                out["exec_error"],
+                out["exec_category"],
+                out["error_note"],
+                verbatim=out["exec_verbatim"],
+            ),
+            generated_query=out["clean_query"],
             explanation=out["explanation"],
             connected=connected,
         )
         return
 
-    results_response = QueryResultsResponse(
-        columns=acc.columns,
-        column_types=acc.column_types,
-        rows=acc.rows,
-        row_count=len(acc.rows),
-        truncated=acc.truncated,
-        execution_time_ms=acc.execution_time_ms or 0.0,
-    )
+    results_response = _stream_payload(acc)
 
     # Zero-result detection — same logic as _execute_auto_query
     if (
@@ -617,18 +847,13 @@ async def _stream_execute_with_correction(
             message=message,
             schema=schema,
             intent=intent,
+            privacy=privacy,
+            dq_literal=dq_literal,
         ):
             yield event
 
         if out["zero_result_reexecuted"]:
-            results_response = QueryResultsResponse(
-                columns=acc.columns,
-                column_types=acc.column_types,
-                rows=acc.rows,
-                row_count=len(acc.rows),
-                truncated=acc.truncated,
-                execution_time_ms=acc.execution_time_ms or 0.0,
-            )
+            results_response = _stream_payload(acc)
 
     result_out.result = _ExecutionResult(
         results_response=results_response,
@@ -636,7 +861,7 @@ async def _stream_execute_with_correction(
         bytes_scanned=None,
         status="cached" if cache_hit else "executed",
         error=None,
-        generated_query=out["current_query"],
+        generated_query=out["clean_query"],
         explanation=out["explanation"],
         connected=connected,
     )

@@ -5,9 +5,7 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from datetime import UTC, datetime
 import hashlib
 import json
 import logging
@@ -29,7 +27,6 @@ from .drift import (
     strip_ident_quotes,
 )
 from .models import (
-    GENERATION_BATCH_SIZE,
     AggregationType,
     BusinessMetric,
     CardinalityClass,
@@ -52,22 +49,21 @@ from .models import (
 )
 
 if TYPE_CHECKING:
-    from ..datasources.base import BaseDataSource
     from ..providers.base import BaseLLMProvider
 
 logger = logging.getLogger(__name__)
 
 # The per-column instructions of both annotation prompts (items 1-8; the table-level
 # items 9-11 stay in ``_BATCH_TABLES_PROMPT``). One constant: a new column is
-# annotated to the same standard as one from the full generation.
+# annotated to the same standard as one from ``generate_tables``.
 _COLUMN_FIELD_ITEMS = """\
 1. A human-friendly display name
 2. A business description explaining what this data represents
 3. semantic_type: One of: identifier, status_flag, monetary, percentage, \
 timestamp, date, free_text, categorical, boolean_flag, foreign_key, \
 url, email, phone, measurement, count, unknown
-4. For columns with coded/enum values (based on sample values), explain the likely \
-meaning of each value
+4. For columns with coded/enum values (from the column's ENUM/SET type or its comment), \
+explain the likely meaning of each value
 5. Identify columns that likely contain sensitive personal data (PII)
 6. currency: ISO code if monetary (EUR, USD, GBP...), null otherwise
 7. unit: Physical unit if measurement (kg, km, seconds, items...), null otherwise
@@ -83,7 +79,7 @@ generate semantic annotations.
 DATABASE SCHEMA:
 {schema_ddl}
 
-{column_stats_summary}
+
 For each table and column, provide:
 """
     + _COLUMN_FIELD_ITEMS
@@ -314,8 +310,8 @@ _AUDIT_TIMESTAMP_NAMES: frozenset[str] = frozenset(
 )
 
 # Suffix/prefix patterns that identify integer fiscal/period dimension columns.
-# Used by _infer_semantic_type (→ CATEGORICAL) and _infer_temporal_columns
-# (→ suppress audit timestamps as primary_timestamp_column).
+# Used by the fiscal-period helpers and by _infer_temporal_columns (→ suppress audit
+# timestamps as primary_timestamp_column).
 _FISCAL_DIMENSION_SUFFIXES: tuple[str, ...] = ("_year", "_quarter", "_period")
 _FISCAL_DIMENSION_PREFIXES: tuple[str, ...] = ("fiscal_", "budget_", "calendar_", "tax_")
 
@@ -741,311 +737,6 @@ def rename_columns(
 class SemanticModelGenerator:
     """Generates an initial SemanticModel by asking an LLM to analyse the schema."""
 
-    async def generate(
-        self,
-        schema: DataSourceSchema,
-        provider: BaseLLMProvider,
-        model: str | None = None,
-        schema_dialect: str = "sql",
-        datasource: BaseDataSource | None = None,
-    ) -> SemanticModel:
-        """
-        Auto-generate a semantic model from *schema* using *provider*.
-
-        Steps:
-        1. Build a compact DDL representation of the schema.
-        2. Build relationship summary from formal FK constraints.
-        3. Fingerprint columns via catalog statistics (best-effort, requires datasource).
-        4. Ask the LLM to return a JSON semantic model.
-        5. Parse and validate the JSON response.
-        6. Enrich with relationship edges, temporal columns, and time expressions.
-        7. Return a populated :class:`SemanticModel`.
-
-        :param schema_dialect: datasource ``source_type`` (e.g. ``'postgresql'``, ``'mysql'``)
-            or the legacy ``'sql'`` sentinel.
-        :param datasource: Connected datasource for catalog fingerprinting.
-            Optional — fingerprinting is skipped when ``None``.
-        """
-        schema_ddl = self._schema_to_ddl(schema)
-
-        if not schema_ddl.strip():
-            logger.warning("SemanticModelGenerator: schema is empty, returning empty model")
-            return SemanticModel()
-
-        # Build relationship edges from FK catalog (zero DB overhead)
-        relationship_edges = self._build_relationship_graph(schema)
-        relationships_summary = self._format_relationships_for_prompt(relationship_edges)
-
-        # Column fingerprinting (catalog-read; best-effort — failures are silently skipped).
-        # Each call is capped at 10 s so a single slow column cannot stall the whole generation.
-        column_stats: dict[str, dict] = {}
-        if datasource is not None:
-            for tbl in schema.tables:
-                for col in tbl.columns:
-                    key = f"{tbl.name}.{col.name}"
-                    try:
-                        stats = await asyncio.wait_for(
-                            self._fingerprint_column(datasource, tbl.schema_name, tbl.name, col),
-                            timeout=10.0,
-                        )
-                        if stats:
-                            column_stats[key] = stats
-                    except Exception:  # noqa: S110
-                        pass
-
-        # Always batch — the single-shot path was deleted in favour of a single
-        # uniform code path. Even small schemas now batch (one batch when ≤ GENERATION_BATCH_SIZE).
-        parsed = await self._generate_batched(
-            schema=schema,
-            provider=provider,
-            model=model,
-            column_stats=column_stats,
-            relationships_summary=relationships_summary,
-            relationship_edges=relationship_edges,
-        )
-
-        # Enrich with catalog-derived data (zero overhead — already in schema)
-        parsed.relationships = relationship_edges
-
-        # Append auto-detected ratio pairs not already covered by LLM-generated derived columns
-        auto_pairs = self._detect_ratio_pairs(schema)
-        existing_covered: set[tuple[str, str]] = set()
-        for existing in parsed.derived_columns:
-            expr = existing.sql_expression.lower()
-            for num_kw in _RATIO_NUMERATOR_KEYWORDS:
-                for den_kw in _RATIO_DENOMINATOR_KEYWORDS:
-                    if num_kw in expr and den_kw in expr:
-                        existing_covered.add((num_kw, den_kw))
-        parsed.derived_columns.extend(
-            dc for dc in auto_pairs if not self._is_already_covered(dc, existing_covered)
-        )
-
-        parsed.time_expressions = self.build_time_expressions(schema_dialect)
-        parsed.schema_hash = self.compute_schema_hash(schema)
-        parsed.source_dialect = schema_dialect
-
-        # Auto-detect temporal columns per table (name/type matching — no DB calls)
-        for table in schema.tables:
-            tbl_key = table_key(table)
-            if tbl_key in parsed.tables:
-                temporal = self._infer_temporal_columns(tbl_key, table.columns)
-                if temporal["primary_timestamp_column"]:
-                    parsed.tables[tbl_key].primary_timestamp_column = temporal[
-                        "primary_timestamp_column"
-                    ]
-                if temporal["primary_date_column"]:
-                    parsed.tables[tbl_key].primary_date_column = temporal["primary_date_column"]
-
-        # Backfill fingerprint-derived cardinality onto ColumnSemantic objects.
-        # column_stats keys are "table_name.col_name" (no schema prefix).
-        if column_stats:
-            for table in schema.tables:
-                tbl_key = table_key(table)
-                if tbl_key not in parsed.tables:
-                    continue
-                for col in table.columns:
-                    stat_key = f"{table.name}.{col.name}"
-                    if stat_key not in column_stats:
-                        continue
-                    if col.name in parsed.tables[tbl_key].columns:
-                        parsed.tables[tbl_key].columns[col.name].cardinality = column_stats[
-                            stat_key
-                        ]["cardinality"]
-
-        # Populate partition_columns, cluster_columns, and base_sql from introspection metadata.
-        # Also suggest COUNT_DISTINCT_APPROX for high-cardinality ID/FK columns.
-        self._populate_schema_metadata(parsed.tables, schema)
-
-        # Post-process: stamp audit timestamp descriptions, validate metric time columns,
-        # and auto-generate cross-table domain notes for fiscal-period tables.
-        self._enrich_fiscal_table_annotations(parsed.tables, schema)
-        parsed.generation_warnings.extend(
-            self._validate_metrics_time_columns(parsed.business_metrics, schema)
-        )
-        parsed.notes = self._auto_generate_notes(schema)
-
-        return parsed
-
-    # ── Batched generation (for low-output-token providers) ────────────────────
-
-    async def _generate_batched(
-        self,
-        schema: DataSourceSchema,
-        provider: BaseLLMProvider,
-        model: str | None,
-        column_stats: dict[str, dict],
-        relationships_summary: str,
-        relationship_edges: list[RelationshipEdge],
-    ) -> SemanticModel:
-        """
-        Generate semantic model in multiple LLM calls when the provider cannot produce
-        the full JSON in one shot (max_output_tokens < _BATCH_TOKEN_THRESHOLD).
-
-        Strategy:
-        1. Split schema.tables into batches of GENERATION_BATCH_SIZE.
-        2. Call the LLM once per batch, returning only {"tables": {...}}.
-        3. Merge all table results.
-        4. Call the LLM once more for {"business_metrics", "derived_columns", "common_joins"}.
-        5. Assemble a SemanticModel from the merged tables + global sections.
-        """
-        sys_prompt = (
-            "You are a data modelling expert. You ALWAYS respond with valid JSON and nothing else."
-        )
-        gen_model = model or provider.provider_name
-
-        # ── Step 1-3: one call per batch of tables ────────────────────────────
-        all_tables: dict[str, TableSemantic] = {}
-        tables = schema.tables
-        batches = [
-            tables[i : i + GENERATION_BATCH_SIZE]
-            for i in range(0, len(tables), GENERATION_BATCH_SIZE)
-        ]
-        logger.debug(
-            "SemanticModelGenerator batched: %d tables → %d batches",
-            len(tables),
-            len(batches),
-        )
-
-        for batch_idx, batch in enumerate(batches):
-            # Build DDL for this batch only
-            batch_schema_obj = DataSourceSchema(
-                source_type=schema.source_type,
-                schemas=schema.schemas,
-                tables=list(batch),
-                relationships=schema.relationships,
-                metadata=schema.metadata,
-            )
-            batch_ddl = self._schema_to_ddl(batch_schema_obj)
-
-            # Build column stats subset for this batch
-            batch_table_names = {t.name for t in batch}
-            stat_lines: list[str] = []
-            for col_key, st in column_stats.items():
-                # col_key = "table_name.col_name"
-                tbl_name = col_key.split(".")[0] if "." in col_key else ""
-                if tbl_name not in batch_table_names:
-                    continue
-                parts = [f"  {col_key}: cardinality={st.get('cardinality', '?')}"]
-                if st.get("n_distinct") is not None:
-                    parts.append(f"n_distinct={st['n_distinct']}")
-                if st.get("common_vals"):
-                    vals = ", ".join(str(v) for v in st["common_vals"][:5])
-                    parts.append(f"sample_values=[{vals}]")
-                stat_lines.append(", ".join(parts))
-            batch_stats_summary = (
-                "COLUMN STATISTICS (from catalog — no user data rows):\n" + "\n".join(stat_lines)
-                if stat_lines
-                else ""
-            )
-
-            prompt = _BATCH_TABLES_PROMPT.format(
-                schema_ddl=batch_ddl,
-                column_stats_summary=batch_stats_summary,
-            )
-
-            logger.debug(
-                "SemanticModelGenerator batched: calling LLM for batch %d/%d (%d tables)",
-                batch_idx + 1,
-                len(batches),
-                len(batch),
-            )
-            try:
-                result = await provider.generate_structured(
-                    system_prompt=sys_prompt,
-                    user_message=prompt,
-                    schema_type=TablesBatchResponse,
-                    model=model,
-                    temperature=0.0,
-                    max_tokens=min(65536, provider.max_output_tokens),
-                )
-                all_tables.update(result.tables)
-            except Exception as exc:
-                logger.warning(
-                    "SemanticModelGenerator batched: batch %d failed: %s — skipping",
-                    batch_idx + 1,
-                    exc,
-                )
-
-        # ── Step 4: one call for global sections ─────────────────────────────
-        tables_summary = self._build_tables_summary(schema)
-
-        global_prompt = _GLOBAL_SECTIONS_PROMPT.format(
-            tables_summary=tables_summary,
-            relationships_summary=relationships_summary or "(none detected)",
-        )
-        business_metrics: list[BusinessMetric] = []
-        common_joins: list[CommonJoin] = []
-        derived_columns: list[DerivedColumn] = []
-        segments: list[Segment] = []
-        try:
-            global_result = await provider.generate_structured(
-                system_prompt=sys_prompt,
-                user_message=global_prompt,
-                schema_type=GlobalSectionsResponse,
-                model=model,
-                temperature=0.0,
-                max_tokens=min(65536, provider.max_output_tokens),
-            )
-            business_metrics = global_result.business_metrics
-            common_joins = global_result.common_joins
-            derived_columns = global_result.derived_columns
-            segments = global_result.segments
-        except Exception as exc:
-            logger.warning(
-                "SemanticModelGenerator batched: global sections call failed: %s — "
-                "skipping metrics/joins",
-                exc,
-            )
-
-        logger.info(
-            "SemanticModelGenerator batched: completed — %d/%d tables, %d metrics, %d joins",
-            len(all_tables),
-            len(tables),
-            len(business_metrics),
-            len(common_joins),
-        )
-
-        # Prune to only include edges and derived columns that reference tables
-        # actually present in the model — the FK catalog covers all DB schemas
-        # but only a subset may have been generated.
-        generated_tables = set(all_tables.keys())
-        pruned_relationships = [
-            e
-            for e in relationship_edges
-            if e.from_table in generated_tables and e.to_table in generated_tables
-        ]
-        pruned_derived = [
-            d for d in derived_columns if all(t in generated_tables for t in d.base_tables)
-        ]
-        if len(pruned_relationships) < len(relationship_edges):
-            logger.info(
-                "SemanticModelGenerator: pruned %d dangling relationships (tables not in model)",
-                len(relationship_edges) - len(pruned_relationships),
-            )
-        if len(pruned_derived) < len(derived_columns):
-            logger.info(
-                "SemanticModelGenerator: pruned %d derived columns with missing base_tables",
-                len(derived_columns) - len(pruned_derived),
-            )
-
-        result = SemanticModel(
-            tables=all_tables,
-            business_metrics=business_metrics,
-            common_joins=common_joins,
-            derived_columns=pruned_derived,
-            relationships=pruned_relationships,
-            segments=segments,
-            generated_at=datetime.now(UTC).isoformat(),
-            is_user_reviewed=False,
-            generation_model=gen_model,
-        )
-        self._enrich_fiscal_table_annotations(result.tables, schema)
-        result.generation_warnings.extend(
-            self._validate_metrics_time_columns(result.business_metrics, schema)
-        )
-        result.notes = self._auto_generate_notes(schema)
-        return result
-
     # ── Phase methods (called independently by phased generation endpoints) ────
 
     async def generate_tables(
@@ -1091,10 +782,7 @@ class SemanticModelGenerator:
         sys_prompt = (
             "You are a data modelling expert. You ALWAYS respond with valid JSON and nothing else."
         )
-        prompt = _BATCH_TABLES_PROMPT.format(
-            schema_ddl=batch_ddl,
-            column_stats_summary="",
-        )
+        prompt = _BATCH_TABLES_PROMPT.format(schema_ddl=batch_ddl)
         if relationships_summary:
             prompt = (
                 f"DETECTED RELATIONSHIPS (formal foreign keys):\n{relationships_summary}\n\n"
@@ -1442,172 +1130,6 @@ class SemanticModelGenerator:
             )
         return "\n".join(lines)
 
-    # ── Column fingerprinting ──────────────────────────────────────────────────
-
-    # OVERHEAD: catalog-read — uses pg_stats populated by autovacuum
-    async def _fingerprint_column(
-        self,
-        datasource: BaseDataSource,
-        schema: str,
-        table: str,
-        column: ColumnInfo,
-    ) -> dict:
-        """
-        Derive semantic type and cardinality from pg_stats and column metadata.
-        Never scans user data tables.
-        """
-        stats: dict = {}
-        if hasattr(datasource, "get_column_statistics"):
-            stats = await datasource.get_column_statistics(schema, table, column.name)
-
-        n_distinct = stats.get("n_distinct", 0)
-        null_frac = stats.get("null_frac", 0.0)
-        common_vals = stats.get("most_common_vals", [])
-
-        cardinality = self._classify_cardinality(n_distinct)
-        semantic_type = self._infer_semantic_type(
-            column.name,
-            column.data_type,
-            n_distinct,
-            common_vals,
-            column.is_primary_key,
-            null_frac,
-        )
-
-        return {
-            "semantic_type": semantic_type,
-            "cardinality": cardinality,
-            "n_distinct": n_distinct,
-            "common_vals": common_vals,
-        }
-
-    def _classify_cardinality(self, n_distinct: float) -> CardinalityClass:
-        if n_distinct == -1:
-            return CardinalityClass.UNIQUE
-        if n_distinct < 0:
-            fraction = abs(n_distinct)
-            if fraction > 0.9:
-                return CardinalityClass.UNIQUE
-            if fraction > 0.3:
-                return CardinalityClass.HIGH
-            if fraction > 0.05:
-                return CardinalityClass.MEDIUM
-            return CardinalityClass.LOW
-        if n_distinct > 1000:
-            return CardinalityClass.HIGH
-        if n_distinct > 50:
-            return CardinalityClass.MEDIUM
-        return CardinalityClass.LOW
-
-    def _infer_semantic_type(
-        self,
-        name: str,
-        data_type: str,
-        n_distinct: float,
-        common_vals: list,
-        is_pk: bool,
-        null_frac: float,
-    ) -> SemanticType:
-        """
-        Pure local inference — no database calls.
-        Priority: PK check → name patterns → type patterns → cardinality.
-        """
-        name_lower = name.lower()
-
-        if is_pk:
-            return SemanticType.IDENTIFIER
-
-        if any(p in name_lower for p in ("email", "e_mail")):
-            return SemanticType.EMAIL
-        if any(p in name_lower for p in ("phone", "mobile", "tel")):
-            return SemanticType.PHONE
-        if any(p in name_lower for p in ("url", "link", "href", "website")):
-            return SemanticType.URL
-        if any(p in name_lower for p in ("password", "passwd", "secret", "token")):
-            return SemanticType.IDENTIFIER
-        if name_lower.endswith("_id") or name_lower.endswith("_fk"):
-            return SemanticType.FOREIGN_KEY
-        if any(p in name_lower for p in ("rate", "ratio", "pct", "percent", "fraction")):
-            return SemanticType.PERCENTAGE
-        if any(
-            p in name_lower
-            for p in (
-                "amount",
-                "price",
-                "revenue",
-                "cost",
-                "salary",
-                "_total",
-                "subtotal",
-                "tax",
-                "discount",
-                "wage",
-                "fee",
-            )
-        ):
-            return SemanticType.MONETARY
-        if any(
-            p in name_lower
-            for p in (
-                "status",
-                "state",
-                "type",
-                "kind",
-                "category",
-                "level",
-                "tier",
-                "stage",
-                "phase",
-                "mode",
-            )
-        ):
-            return SemanticType.STATUS_FLAG
-        if any(
-            p in name_lower for p in ("count", "qty", "quantity", "num_", "number_of", "total_")
-        ):
-            return SemanticType.COUNT
-        if any(
-            p in name_lower
-            for p in (
-                "weight",
-                "height",
-                "width",
-                "length",
-                "size",
-                "distance",
-                "speed",
-                "duration",
-                "age",
-            )
-        ):
-            return SemanticType.MEASUREMENT
-
-        # Fiscal/period integer dimensions — always categorical regardless of cardinality
-        if name_lower.endswith(_FISCAL_DIMENSION_SUFFIXES) or name_lower.startswith(
-            _FISCAL_DIMENSION_PREFIXES
-        ):
-            return SemanticType.CATEGORICAL
-
-        if data_type in (
-            "timestamp",
-            "timestamptz",
-            "datetime",
-            "timestamp with time zone",
-            "timestamp without time zone",
-        ):
-            return SemanticType.TIMESTAMP
-        if data_type == "date":
-            return SemanticType.DATE
-        if data_type in ("boolean", "bool"):
-            return SemanticType.BOOLEAN_FLAG
-        if data_type in ("text", "varchar") and n_distinct == -1:
-            return SemanticType.FREE_TEXT
-
-        if 0 < n_distinct < 20:
-            return SemanticType.CATEGORICAL
-
-        return SemanticType.UNKNOWN
-
     # ── Temporal column detection ──────────────────────────────────────────────
 
     # OVERHEAD: app-only — pure name/type pattern matching
@@ -1619,6 +1141,10 @@ class SemanticModelGenerator:
         """
         Identify primary timestamp and date columns from column names and types.
         No database queries.
+
+        Not called on the generation path yet; see
+        docs/architecture/semantic-model-generation.md, "Enrichment not yet on the
+        generation path".
         """
         timestamp_priority = [
             "created_at",
@@ -1868,7 +1394,13 @@ class SemanticModelGenerator:
 
         - partition_columns: columns where ColumnInfo.is_partition_key is True
         - base_sql: view definition when adapter stored it in TableInfo.metadata
+        - time_granularity = DAY: for columns the adapter typed as "date" that have none
         - COUNT_DISTINCT_APPROX: suggested for high-cardinality IDENTIFIER/FOREIGN_KEY columns
+          without an aggregation; needs ``cardinality``, which no generator sets
+
+        Not called on the generation path yet; see
+        docs/architecture/semantic-model-generation.md, "Enrichment not yet on the
+        generation path".
         """
         _high_card = (CardinalityClass.HIGH, CardinalityClass.UNIQUE)
         _id_types = (SemanticType.IDENTIFIER, SemanticType.FOREIGN_KEY)
@@ -2213,7 +1745,7 @@ class SemanticModelGenerator:
         return "\n".join(lines)
 
     # Maximum characters for the generated DDL string.  Large schemas (e.g. Airflow)
-    # can produce 100 k+ chars with sample values, which exceeds provider payload
+    # can produce 100 k+ chars of DDL and comments, which exceeds provider payload
     # limits (Groq 413, etc.).  We truncate gracefully when the limit is reached.
     _MAX_DDL_CHARS: int = 20_000
 

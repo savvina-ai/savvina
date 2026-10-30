@@ -97,6 +97,7 @@ Rotating the encryption key requires re-encrypting every stored secret in the da
 2. Stop the application
 3. Replace `ENCRYPTION_KEY` in `.env` with a new Fernet key
 4. Re-enter all connection credentials and API keys via the UI
+5. On connections with row filters, re-run the questions whose results you still need: every stored result records its row filters as a fingerprint keyed with `ENCRYPTION_KEY`, so after the rotation those results show *These results were computed under a different row filter. Re-run the question.* in the chat history, share links and exports
 
 This is intentionally manual — never expose decrypted credentials over the API.
 

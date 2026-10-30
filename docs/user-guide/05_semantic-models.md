@@ -152,7 +152,7 @@ Click any column row to expand it:
 |-------|-------------|
 | **Display name** | Human-readable column name. |
 | **Description** | What the column contains. |
-| **Value mappings** | Maps raw coded values to display labels (e.g. `confirmed → Confirmed`). Enumerates all valid values in the prompt — prevents the LLM from hallucinating values like `'completed'` that don't exist in the data. Add entries for every status/type column. |
+| **Value mappings** | Maps raw coded values to display labels (e.g. `confirmed → Confirmed`). Enumerates all valid values in the prompt — prevents the LLM from hallucinating values like `'completed'` that don't exist in the data. Add entries for every status/type column. The raw values are sent to the LLM on every question, whatever **Include sample values** says and whether or not the column matches a sensitive pattern; see [Privacy Controls](04_privacy-controls.md#semantic-value-mappings). |
 | **Sensitive** | Marks the column `[SENSITIVE]`. The column is omitted entirely from the LLM prompt (not just from SELECT clauses). |
 | **Default aggregation** | Prescribes the aggregation function to use for this column: `sum`, `count`, `count_distinct`, `count_distinct_approx`, `average`, `max`, `min`, `median`. Appended as `[aggregate: sum]` in the prompt. |
 | **Non-additive** | When `true`, the LLM is told never to SUM this column across dimensions (e.g. distinct-count metrics, percentages, balances). Use for any measure that is not safely addable across rows. |

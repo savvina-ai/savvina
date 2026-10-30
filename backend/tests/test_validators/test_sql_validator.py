@@ -221,6 +221,21 @@ class TestPostgreSQLValidatorBlockedFunctions:
         r = self.v.validate("SELECT pg_sleep(5)")
         assert "pg_sleep" in r.error_message
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # A value stored with set_config comes back under another column, unmasked.
+            "SELECT id, current_setting('my.l') AS v FROM customers "
+            "WHERE id = 2 AND set_config('my.l', email, true) IS NOT NULL",
+            "WITH s AS MATERIALIZED (SELECT SET_CONFIG('my.l', email, true) AS x FROM customers) "
+            "SELECT current_setting('my.l') FROM s",
+        ],
+    )
+    def test_set_config_blocked(self, query):
+        r = self.v.validate(query)
+        assert not r.is_valid
+        assert "set_config" in r.error_message
+
 
 class TestPostgreSQLValidatorBlockedPatterns:
     def setup_method(self):
@@ -276,3 +291,55 @@ class TestUnparseableQueryFailsClosed:
         ids = ",".join(str(i) for i in range(20000))
         result = self.v.validate(f"DELETE FROM users WHERE id IN ({ids})")  # noqa: S608
         assert not result.is_valid
+
+
+class TestBaseSQLValidatorSelectInto:
+    """INTO is rejected where it is SQL, and only there."""
+
+    def setup_method(self):
+        self.v = BaseSQLValidator()
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT * INTO new_table FROM orders",
+            "select * into new_table from orders",
+            "SELECT *\n\tINTO\nnew_table FROM orders",
+            "SELECT id INTO TEMP t FROM orders",
+            "SELECT id INTO UNLOGGED t FROM orders",
+            "WITH c AS (SELECT id FROM orders) SELECT * INTO copy_t FROM c",
+            "SELECT/**/*/**/INTO/**/t/**/FROM/**/orders",
+            "SELECT id FROM t INTO @x",
+        ],
+    )
+    def test_into_as_a_keyword_is_rejected(self, query):
+        r = self.v.validate(query)
+        assert not r.is_valid
+        assert r.error_message == "SELECT … INTO is not allowed: it writes to the database"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT 1 FROM notes WHERE body LIKE '%logged into%'",
+            "SELECT title FROM films WHERE title = 'Into the Wild'",
+            "SELECT title FROM films WHERE title = 'it''s into it'",
+            "-- split into monthly buckets\nSELECT date_trunc('month', d) FROM t",
+            "SELECT /* fold into one row */ count(*) FROM t",
+            'SELECT "into" FROM t',
+            "SELECT into_date, date_into FROM t",
+        ],
+    )
+    def test_into_in_a_literal_comment_or_name_is_allowed(self, query):
+        assert self.v.validate(query).is_valid
+
+    def test_mysql_validator_inherits_the_check(self):
+        from app.datasources.validators.mysql_validator import MySQLValidator
+
+        v = MySQLValidator()
+        assert not v.validate("SELECT id FROM t INTO @x").is_valid
+        assert v.validate("SELECT `into` FROM t").is_valid
+
+    def test_postgresql_validator_inherits_the_check(self):
+        v = PostgreSQLValidator()
+        assert not v.validate("SELECT * INTO new_table FROM orders").is_valid
+        assert v.validate("SELECT 1 FROM notes WHERE body LIKE '%logged into%'").is_valid

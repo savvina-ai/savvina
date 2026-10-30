@@ -9,10 +9,12 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from .errors import ErrorCategory
 from .models import (
     ConnectionResult,
     DataSourceSchema,
     PrivacySettings,
+    PrivilegeFacts,
     QueryResult,
     ValidationResult,
     table_key,
@@ -31,6 +33,16 @@ class BaseDataSource(ABC):
     source_type: str = ""
     display_name: str = ""
     query_dialect: str = ""
+    # Whether `"…"` in this dialect is a string literal (MySQL default) rather than a
+    # quoted identifier (SQL standard). Read by the result mask: on a literal dialect a
+    # double-quoted token is not a column reference and must not trigger redaction.
+    double_quote_is_string_literal: bool = False
+    # Whether a backslash in a string literal escapes the next character (MySQL's default;
+    # MySQL under NO_BACKSLASH_ESCAPES reads it as an ordinary character). The parsers behind
+    # the privacy checks read MySQL strings with backslash escapes, so on MySQL a False here
+    # makes ``row_filter._executable`` refuse any query that contains a backslash. Only MySQL
+    # reads it.
+    backslash_is_escape: bool = True
     icon: str = ""
 
     @abstractmethod
@@ -113,9 +125,71 @@ class BaseDataSource(ABC):
             )
 
     @abstractmethod
+    async def explain(self, sql: str, timeout: int) -> None:  # noqa: ASYNC109
+        """Plan *sql* (``EXPLAIN <sql>``) under the read-only guards ``execute_query`` uses.
+
+        Returns nothing. Raises ``ExplainError`` with the engine's text when the engine refuses
+        the statement: an unknown table or column, and on PostgreSQL a type error (MySQL only
+        warns). A connection failure raises the driver's exception, and ``RuntimeError`` when
+        not connected. The statement is not run, but planning can evaluate constant
+        expressions (PostgreSQL: immutable and stable ones, so ``1/0`` fails; MySQL: it may
+        read one row by unique key); volatile functions are not evaluated. Nothing is returned.
+        """
+        ...
+
+    @abstractmethod
+    async def audit_privileges(
+        self,
+        tables: list[tuple[str | None, str]],
+        timeout: int,  # noqa: ASYNC109
+    ) -> PrivilegeFacts:
+        """Read what the connection role can do, from the catalog only (no table row).
+
+        *tables* are ``(schema, table)`` pairs: the row-filtered tables (always qualified)
+        and the excluded tables. A pair with ``schema None`` is a bare ``excluded_tables``
+        entry, matched by name in every schema except the system ones; it yields one
+        ``TablePrivilegeFacts`` per schema where it exists, or one with ``exists False`` and
+        ``schema_name None``. A qualified pair that is not in the catalog yields ``exists
+        False``. Duplicates in *tables* are read once.
+
+        Fills ``PrivilegeFacts.writes`` (every write grant at every level and through every
+        grantee) with ``writes_truncated`` when the adapter's cap cut it, ``has_super``
+        (MySQL global ``SUPER`` when the role is not a superuser, ``is_superuser`` being
+        global ``ALL PRIVILEGES`` or ``SUPER`` plus every write privilege) with
+        ``super_grantees`` (the account or active roles that hold it), ``schemas`` (the non-system
+        schemas or databases), ``predefined_roles`` (PostgreSQL ``pg_read_all_data`` /
+        ``pg_write_all_data`` memberships) and, per table, ``TablePrivilegeFacts.select_grants``
+        (each SELECT path with its scope and grantee).
+
+        Runs under the same bounds as ``explain`` where the engine has them (PostgreSQL
+        ``statement_timeout`` inside a read-only transaction, MariaDB ``max_statement_time``);
+        the connections router bounds the call with ``asyncio.wait_for`` as well. A driver
+        exception passes through; ``RuntimeError`` when not connected. The adapter reports,
+        it does not judge: ``services/privilege_audit.evaluate`` turns the facts into findings.
+        """
+        ...
+
+    @abstractmethod
     def validate_query(self, query: str) -> ValidationResult:
         """Validate query is safe (read-only, no dangerous patterns)."""
         ...
+
+    def classify_error(self, exc: BaseException) -> ErrorCategory:
+        """Map a query failure onto an ``ErrorCategory`` from documented codes.
+
+        Must never raise. The engine's message text may inform the choice when a code is
+        too coarse, because only the category, never the text, reaches the LLM. Adapters
+        never return ``REJECTED``: it is reserved for this application's own refusals
+        (``QueryRejectedError``), and ``execution._classify`` reads it from an adapter as
+        ``OTHER``.
+        """
+        return ErrorCategory.OTHER
+
+    def describe_connection_error(self, text: str) -> str | None:
+        """A readable sentence for a connect or catalog failure the privilege audit stores as
+        its ``unavailable`` reason, or ``None`` to let the generic redaction apply. Must not
+        copy the engine's text: the audit's error is shown to the admin unredacted."""
+        return None
 
     def _quote_identifier(self, name: str) -> str:
         """Return a dialect-appropriate quoted identifier. Default: no quoting."""
@@ -135,7 +209,7 @@ class BaseDataSource(ABC):
         Respects privacy settings:
         - Excludes tables/columns marked as excluded
         - Omits sample values for sensitive columns (shows [SENSITIVE] instead)
-        - Omits comments if include_column_comments is False
+        - Omits comments if include_column_comments is False, and always for sensitive columns
         - Omits row counts if include_row_counts is False
 
         Dialect-specific identifier quoting is delegated to _quote_identifier();
@@ -187,10 +261,12 @@ class BaseDataSource(ABC):
                 if fk_target:
                     annotations.append(f"FK: {q(col.name)} -> {fk_target}")
 
-                if privacy.include_column_comments and col.description:
+                sensitive = privacy.is_column_sensitive(col.name)
+                # A sensitive column's comment can spell out its values: never sent.
+                if privacy.include_column_comments and col.description and not sensitive:
                     annotations.append(col.description)
 
-                if privacy.is_column_sensitive(col.name):
+                if sensitive:
                     annotations.append("[SENSITIVE]")
                 elif col.sample_values and privacy.include_sample_values:
                     sample_str = ", ".join(f"'{v}'" for v in col.sample_values[:3])

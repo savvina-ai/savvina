@@ -2,12 +2,11 @@
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 """
-Verify that introspect(), get_column_statistics(), and get_sample_values() never
-issue queries that perform full sequential scans on user data tables.
+Verify that introspect() and get_sample_values() never issue queries that perform full
+sequential scans on user data tables.
 
 OVERHEAD CONTRACT:
 - introspect() must only read catalog/pg_stats tables, never user tables
-- get_column_statistics() must only query pg_stats
 - get_sample_values() must use TABLESAMPLE when pg_stats has no data (never bare SELECT DISTINCT)
 """
 
@@ -143,6 +142,7 @@ class TestIntrospectOnlyReadsCatalog:
         orders = next(t for t in schema.tables if t.name == "orders")
         status_col = next(c for c in orders.columns if c.name == "status")
         assert status_col.sample_values == ["pending", "shipped", "delivered"]
+        assert status_col.sample_source == "stats"
 
     async def test_sample_values_disabled_means_no_pg_stats_query(self):
         """When include_sample_values=False, pg_stats must NOT be queried."""
@@ -178,7 +178,7 @@ class TestIntrospectOnlyReadsCatalog:
             [],  # pg_class relations
         ]
 
-        await adapter.introspect(
+        schema = await adapter.introspect(
             PrivacySettings(
                 include_sample_values=False,
                 include_column_comments=False,
@@ -186,70 +186,13 @@ class TestIntrospectOnlyReadsCatalog:
             )
         )
 
+        columns = [c for t in schema.tables for c in t.columns]
+        assert columns
+        assert all(c.sample_source is None for c in columns)
         sql_calls = [str(call.args[0]) for call in conn.fetch.call_args_list]
         assert not any("pg_stats" in s.lower() for s in sql_calls), (
             "pg_stats must not be queried when include_sample_values=False"
         )
-
-
-class TestGetColumnStatisticsReadsPgStatsOnly:
-    async def test_queries_pg_stats(self):
-        """get_column_statistics() must query only pg_stats."""
-        adapter, conn = make_adapter()
-        conn.fetchrow.return_value = FakeRecord(
-            {
-                "n_distinct": -0.05,
-                "null_frac": 0.0,
-                "avg_width": 8,
-                "most_common_vals": ["active", "inactive"],
-                "most_common_freqs": [0.8, 0.2],
-                "correlation": 0.1,
-            }
-        )
-
-        await adapter.get_column_statistics("public", "users", "status")
-
-        assert conn.fetchrow.call_count == 1
-        sql = str(conn.fetchrow.call_args.args[0])
-        assert "pg_stats" in sql.lower()
-        assert conn.fetch.call_count == 0
-
-    async def test_returns_empty_dict_when_no_stats(self):
-        """Returns {} when pg_stats has no row for this column."""
-        adapter, conn = make_adapter()
-        conn.fetchrow.return_value = None
-
-        result = await adapter.get_column_statistics("public", "users", "email")
-
-        assert result == {}
-
-    async def test_returns_all_stat_fields(self):
-        """All six statistic fields are returned."""
-        adapter, conn = make_adapter()
-        conn.fetchrow.return_value = FakeRecord(
-            {
-                "n_distinct": 3.0,
-                "null_frac": 0.01,
-                "avg_width": 6,
-                "most_common_vals": ["a", "b"],
-                "most_common_freqs": [0.6, 0.4],
-                "correlation": 0.5,
-            }
-        )
-
-        result = await adapter.get_column_statistics("public", "orders", "status")
-
-        assert result["n_distinct"] == 3.0
-        assert result["null_frac"] == 0.01
-        assert result["avg_width"] == 6
-        assert result["most_common_vals"] == ["a", "b"]
-        assert result["most_common_freqs"] == [0.6, 0.4]
-        assert result["correlation"] == 0.5
-
-    async def test_not_connected_raises(self):
-        adapter = PostgreSQLDataSource()  # no pool
-        with pytest.raises(RuntimeError, match="Not connected"):
-            await adapter.get_column_statistics("public", "users", "id")
 
 
 class TestGetSampleValuesUsesSafePaths:
@@ -331,3 +274,17 @@ class TestGetSampleValuesUsesSafePaths:
         adapter = PostgreSQLDataSource()  # no pool
         with pytest.raises(RuntimeError, match="Not connected"):
             await adapter.get_sample_values("public", "users", "id")
+
+
+class TestExplainOverhead:
+    async def test_explain_issues_exactly_one_statement_against_the_query(self):
+        """explain() plans through fetch (one statement, extended protocol); it never
+        issues a statement of its own that names a user table and never reads a row."""
+        adapter, conn = make_adapter()
+        await adapter.explain("SELECT * FROM public.orders WHERE (tenant_id = 7)", timeout=5)
+        executed = [c.args[0] for c in conn.execute.call_args_list]
+        assert not any("orders" in s for s in executed)
+        conn.fetch.assert_awaited_once_with(
+            "EXPLAIN SELECT * FROM public.orders WHERE (tenant_id = 7)"
+        )
+        conn.fetchrow.assert_not_called()

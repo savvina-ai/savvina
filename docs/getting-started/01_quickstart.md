@@ -245,7 +245,7 @@ To connect to the **bundled sample PostgreSQL database** that comes with the Doc
 | Port | `5432` |
 | Database | `savvina_test` |
 | Username | `savvina` |
-| Password | *(value of `SAMPLE_POSTGRES_PASSWORD` from your `.env`)* |
+| Password | *(value of `SAMPLE_POSTGRES_PASSWORD` from your `.env`; `savvina_demo` when it is empty)* |
 | SSL Mode | `disable` |
 
 5. Click **Test Connection** — you should see "Connected successfully"

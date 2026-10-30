@@ -6,8 +6,9 @@ import {
   connectionsApi,
   type CreateConnectionPayload,
 } from '../api/connections';
+import { datasourcesApi } from '../api/datasources';
 import { useAppStore } from '../store/appStore';
-import type { PrivacySettings, Connection } from '../types';
+import type { PrivacySettingsUpdate, Connection, SchemaResponse } from '../types';
 
 export function useConnections() {
   return useQuery({
@@ -57,9 +58,14 @@ export function useTestNewConnection() {
   });
 }
 
+/** `POST /connections/{id}/test`. A successful test rewrites the connection's stored
+ *  privilege audit, so the detail is refetched and the banner shows the new result. */
 export function useTestConnection() {
+  const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => connectionsApi.test(id),
+    // Returned, so the mutation stays pending until the detail refetch lands.
+    onSuccess: (_data, id) => queryClient.invalidateQueries({ queryKey: ['connections', id] }),
   });
 }
 
@@ -88,7 +94,7 @@ export function useConnectionSchema(id: string | null) {
 export function useUpdatePrivacySettings() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, settings }: { id: string; settings: Partial<PrivacySettings> }) =>
+    mutationFn: ({ id, settings }: { id: string; settings: PrivacySettingsUpdate }) =>
       connectionsApi.updatePrivacySettings(id, settings),
     onSuccess: (_data, { id }) => {
       queryClient.invalidateQueries({ queryKey: ['connections'] });
@@ -106,5 +112,38 @@ export function useUpdateExecutionMode() {
       queryClient.invalidateQueries({ queryKey: ['connections'] });
       queryClient.invalidateQueries({ queryKey: ['connections', id] });
     },
+  });
+}
+
+/** `schema.table` names from the connection's cached schema, for the row-filter datalist.
+ *  `null` before the first schema refresh (404). Separate from `useConnectionSchema`, which
+ *  also writes the schema into the app store as the chat page's current schema. */
+export function useConnectionTableNames(id: string | null) {
+  return useQuery({
+    queryKey: ['schema-tables', id],
+    queryFn: async () => {
+      try {
+        const schema = (await connectionsApi.getSchema(id!)) as SchemaResponse;
+        const names = schema.tables
+          .filter((t) => t.schema_name && t.name)
+          .map((t) => `${t.schema_name}.${t.name}`);
+        return Array.from(new Set(names));
+      } catch (e: unknown) {
+        const err = e as { response?: { status?: number } };
+        if (err?.response?.status === 404) return null;
+        throw e;
+      }
+    },
+    enabled: !!id,
+    staleTime: 5 * 60_000,
+  });
+}
+
+/** The registered datasource types (`DataSourceInfo[]`): static for the life of the app. */
+export function useDataSources() {
+  return useQuery({
+    queryKey: ['datasources'],
+    queryFn: datasourcesApi.getAvailable,
+    staleTime: Infinity,
   });
 }

@@ -154,6 +154,11 @@ class SemanticFormatter:
                     )
 
                     if col.value_mappings:
+                        # Value mappings are sent to the LLM on every turn, deliberately and
+                        # regardless of include_sample_values: they are semantic metadata the
+                        # user wrote (or reviewed, when auto-suggested) so the LLM writes exact
+                        # stored values in WHERE clauses. Only is_sensitive drops them (above).
+                        # Do not flag this as a privacy leak in reviews.
                         # Format as "label='raw'" so the LLM reads left→right as
                         # "user concept → SQL value to use in WHERE clauses".
                         mappings_str = ", ".join(

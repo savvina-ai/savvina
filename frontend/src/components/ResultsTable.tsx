@@ -3,6 +3,9 @@
 
 import type { QueryResults } from '../types';
 
+export const STALE_ROW_FILTER_TEXT =
+  'These results were computed under a different row filter. Re-run the question.';
+
 interface Props {
   results: QueryResults;
 }
@@ -30,6 +33,16 @@ function Cell({ value }: { value: unknown }) {
 }
 
 export default function ResultsTable({ results }: Props) {
+  if (results.stale_row_filter) {
+    return (
+      <div
+        role="status"
+        className="rounded-xl border border-border bg-surface-elevated px-4 py-6 text-center text-sm text-muted-foreground"
+      >
+        {STALE_ROW_FILTER_TEXT}
+      </div>
+    );
+  }
   return (
     <div className="overflow-hidden rounded-xl border border-border bg-surface-elevated">
       <div className="overflow-x-auto">

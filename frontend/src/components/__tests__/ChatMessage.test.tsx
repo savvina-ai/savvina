@@ -241,4 +241,14 @@ describe('ChatMessage — MetaLine', () => {
     expect(screen.queryByText(/rows/)).not.toBeInTheDocument();
     expect(screen.queryByText(/ms/)).not.toBeInTheDocument();
   });
+
+  it('hides the row count under a stale row filter', () => {
+    const msg = makeChatMessage({
+      status: 'executed',
+      results_json: makeQueryResults({ rows: [], row_count: 0, stale_row_filter: true }),
+      execution_time_ms: 45,
+    });
+    render(<ChatMessageBubble message={msg} />);
+    expect(screen.queryByText(/rows/)).not.toBeInTheDocument();
+  });
 });

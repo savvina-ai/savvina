@@ -13,9 +13,18 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.datasources.models import ConnectionResult, DataSourceSchema, QueryResult
+from app.config import get_settings
+from app.datasources.errors import ErrorCategory
+from app.datasources.models import (
+    ConnectionResult,
+    DataSourceSchema,
+    PrivacySettings,
+    QueryResult,
+    ValidationResult,
+)
 from app.providers.base import LLMResponse
 from app.services.execution import (
     _BatchAccumulator,
@@ -24,6 +33,9 @@ from app.services.execution import (
     _StreamResult,
 )
 from app.services.intent_classifier import QueryIntent
+from app.services.row_filter import row_filter_fingerprint
+from app.services.row_filter_errors import RowFilterRejectedError
+from app.services.row_filter_rewrite import apply_row_filters
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 
@@ -119,6 +131,7 @@ async def _run_stream(
     options: dict | None = None,
     settings=None,
     intent: QueryIntent = QueryIntent.UNKNOWN,
+    privacy: PrivacySettings | None = None,
 ) -> tuple[list, _StreamResult]:
     """Run _stream_execute_with_correction and return (events, result_out)."""
     result_out = _StreamResult()
@@ -140,6 +153,7 @@ async def _run_stream(
             options=options or {},
             settings=settings or _make_settings(),
             result_out=result_out,
+            privacy=privacy,
             intent=intent,
         )
     )
@@ -603,3 +617,739 @@ class TestConnectionGuard:
         assert result_out.result.connected is False
         # No row_batch events should have been emitted
         assert not any(e.get("type") == "row_batch" for e in events)
+
+
+class TestCorrectionPromptNeverCarriesTheDatabasesText:
+    """A real execution failure must never hand the database's own error text to the
+    correction LLM call, even though the retry succeeds and the turn completes."""
+
+    async def test_a_conversion_error_value_never_reaches_the_correction_prompt(self) -> None:
+        adapter = MagicMock()
+        calls = {"n": 0}
+
+        async def _stream(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError('invalid input syntax for type integer: "Jane Doe"')
+                yield  # pragma: no cover — makes this an async generator
+            yield _make_batch([[1]], columns=("id",), column_types=("int",))
+
+        adapter.execute_query_stream = _stream
+        adapter.query_dialect = "postgresql"
+        adapter.validate_query = MagicMock(
+            return_value=ValidationResult(is_valid=True, error_message=None)
+        )
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.DATA)
+        provider = _make_provider(query="SELECT id FROM customers", explanation="corrected")
+
+        events, result_out = await _run_stream(
+            generated_query="SELECT CAST(customer_name AS int) FROM customers",
+            adapter=adapter,
+            provider=provider,
+            schema=DataSourceSchema(source_type="postgresql"),
+        )
+
+        assert any(event["type"] == "sql" for event in events), "expected a correction"
+        for call in provider.generate_response.call_args_list:
+            for value in call.kwargs.values():
+                assert "Jane" not in str(value)
+        correction_msg = provider.generate_response.call_args.kwargs["user_message"]
+        assert "could not be converted, parsed or fitted" in correction_msg
+        assert result_out.result is not None
+        assert result_out.result.results_response is not None
+        assert result_out.result.results_response.rows[0] == [1]
+
+
+# ── Masking and row filter on the streaming path ──────────────────────────────
+
+_FILTER = "tenant_id = 7"
+# Every table the statements below reference, so each executed statement is rewritten.
+_FILTERS = {
+    f"public.{t}": _FILTER
+    for t in ("t", "orders", "ordes", "ordrs", "users", "customers", "customers2")
+}
+
+
+def _filtered(sql: str) -> str:
+    rewritten = apply_row_filters(sql, _FILTERS, "postgresql")
+    assert "WHERE (tenant_id = 7)" in rewritten
+    return rewritten
+
+
+def _capturing_adapter(*batch_sequences: list[QueryResult]) -> tuple[MagicMock, list[str]]:
+    """Like _make_adapter, but also records every SQL string handed to the database."""
+    executed: list[str] = []
+    call_count = 0
+
+    async def _stream_gen(query, **_kwargs):
+        nonlocal call_count
+        executed.append(query)
+        seq_index = min(call_count, len(batch_sequences) - 1)
+        call_count += 1
+        for batch in batch_sequences[seq_index]:
+            yield batch
+
+    adapter = MagicMock()
+    adapter.query_dialect = "postgresql"
+    adapter.execute_query_stream = _stream_gen
+    adapter.validate_query = MagicMock()
+    return adapter, executed
+
+
+def _failing_then(
+    failures: int, *success_batches: QueryResult, error: str = "boom"
+) -> tuple[MagicMock, list[str]]:
+    """An adapter whose first *failures* executions raise, then stream *success_batches*."""
+    executed: list[str] = []
+
+    async def _stream_gen(query, **_kwargs):
+        executed.append(query)
+        if len(executed) <= failures:
+            raise RuntimeError(error)
+            yield  # pragma: no cover — makes this an async generator
+        for batch in success_batches:
+            yield batch
+
+    adapter = MagicMock()
+    adapter.query_dialect = "postgresql"
+    adapter.execute_query_stream = _stream_gen
+    adapter.validate_query = MagicMock(
+        return_value=ValidationResult(is_valid=True, error_message=None)
+    )
+    adapter.classify_error = MagicMock(return_value=ErrorCategory.UNKNOWN_NAME)
+    return adapter, executed
+
+
+def _sequenced_provider(*queries: str) -> MagicMock:
+    """A provider whose successive generate_response calls return *queries* in order."""
+    provider = MagicMock()
+    provider.max_output_tokens = 4096
+    provider.generate_response = AsyncMock(
+        side_effect=[
+            LLMResponse(
+                query=q,
+                explanation=f"fix {i}",
+                raw_response=f"QUERY:\n```sql\n{q}\n```\nEXPLANATION: fix {i}",
+                model="test-model",
+            )
+            for i, q in enumerate(queries)
+        ]
+    )
+    return provider
+
+
+def _llm_text(provider: MagicMock) -> str:
+    """Everything every LLM call was handed, as one string."""
+    return "\n".join(
+        str(value)
+        for call in provider.generate_response.call_args_list
+        for value in (*call.args, *call.kwargs.values())
+    )
+
+
+class TestStreamMasking:
+    async def test_sensitive_column_masked_in_row_batches_and_final_result(self) -> None:
+        adapter = _make_adapter([_make_batch([[1, "a@x.com"]], columns=("id", "email"))])
+        events, result_out = await _run_stream(
+            generated_query="SELECT id, email FROM users",
+            adapter=adapter,
+            privacy=PrivacySettings(),
+        )
+        row_events = [e for e in events if e["type"] == "row_batch"]
+        assert row_events[0]["rows"] == [[1, "[REDACTED]"]]
+        assert result_out.result.results_response.rows == [[1, "[REDACTED]"]]
+
+    async def test_aliased_sensitive_column_is_masked(self) -> None:
+        adapter = _make_adapter([_make_batch([["a@x.com"]], columns=("contact",))])
+        events, result_out = await _run_stream(
+            generated_query="SELECT email AS contact FROM users",
+            adapter=adapter,
+            privacy=PrivacySettings(),
+        )
+        first_batch = next(e for e in events if e["type"] == "row_batch")
+        assert first_batch["rows"] == [["[REDACTED]"]]
+        assert result_out.result.results_response.rows == [["[REDACTED]"]]
+
+    async def test_aggregate_over_sensitive_column_is_not_masked(self) -> None:
+        adapter = _make_adapter([_make_batch([[5]], columns=("n",))])
+        events, result_out = await _run_stream(
+            generated_query="SELECT COUNT(email) AS n FROM users",
+            adapter=adapter,
+            privacy=PrivacySettings(),
+        )
+        first_batch = next(e for e in events if e["type"] == "row_batch")
+        assert first_batch["rows"] == [[5]]
+        assert result_out.result.results_response.rows == [[5]]
+
+    async def test_no_privacy_leaves_rows_untouched(self) -> None:
+        adapter = _make_adapter([_make_batch([["a@x.com"]], columns=("email",))])
+        events, _ = await _run_stream(generated_query="SELECT email FROM users", adapter=adapter)
+        first_batch = next(e for e in events if e["type"] == "row_batch")
+        assert first_batch["rows"] == [["a@x.com"]]
+
+    async def test_every_row_batch_is_masked(self) -> None:
+        cols = ("id", "contact")
+        adapter = _make_adapter(
+            [
+                _make_batch([[1, "a@x.com"]], columns=cols),
+                _make_batch([[2, "b@x.com"], [3, "c@x.com"]], columns=cols),
+            ]
+        )
+        events, result_out = await _run_stream(
+            generated_query="SELECT id, email AS contact FROM users",
+            adapter=adapter,
+            privacy=PrivacySettings(),
+        )
+        batches = [e["rows"] for e in events if e["type"] == "row_batch"]
+        assert batches == [
+            [[1, "[REDACTED]"]],
+            [[2, "[REDACTED]"], [3, "[REDACTED]"]],
+        ]
+        assert result_out.result.results_response.rows == [
+            [1, "[REDACTED]"],
+            [2, "[REDACTED]"],
+            [3, "[REDACTED]"],
+        ]
+
+    async def test_corrected_query_batches_are_masked(self) -> None:
+        adapter, _ = _failing_then(1, _make_batch([["a@x.com"]], columns=("contact",)))
+        provider = _sequenced_provider("SELECT email AS contact FROM users")
+
+        events, result_out = await _run_stream(
+            generated_query="SELECT id FROM ordrs",
+            adapter=adapter,
+            provider=provider,
+            privacy=PrivacySettings(),
+        )
+
+        batches = [e["rows"] for e in events if e["type"] == "row_batch"]
+        assert batches == [[["[REDACTED]"]]]
+        assert result_out.result.results_response.rows == [["[REDACTED]"]]
+
+    async def test_mask_is_reclassified_after_a_correction(self) -> None:
+        """The plan follows the SQL that ran: a stale one would still read ``contact`` as the
+        aliased email of the failed query and redact the corrected query's count."""
+        adapter, _ = _failing_then(1, _make_batch([[5]], columns=("contact",)))
+        provider = _sequenced_provider("SELECT COUNT(email) AS contact FROM users")
+
+        events, result_out = await _run_stream(
+            generated_query="SELECT email AS contact FROM users",
+            adapter=adapter,
+            provider=provider,
+            privacy=PrivacySettings(),
+        )
+
+        batches = [e["rows"] for e in events if e["type"] == "row_batch"]
+        assert batches == [[[5]]]
+        assert result_out.result.results_response.rows == [[5]]
+
+    async def test_zero_result_reexecution_batches_are_masked(self) -> None:
+        adapter, _ = _capturing_adapter(
+            [_make_batch([], columns=("id",))],
+            [_make_batch([["a@x.com"]], columns=("contact",))],
+        )
+        adapter.validate_query = MagicMock(
+            return_value=ValidationResult(is_valid=True, error_message=None)
+        )
+        provider = _sequenced_provider("SELECT email AS contact FROM users")
+
+        events, result_out = await _run_stream(
+            generated_query="SELECT id FROM users WHERE id < 0",
+            adapter=adapter,
+            provider=provider,
+            privacy=PrivacySettings(),
+        )
+
+        non_empty = [e["rows"] for e in events if e["type"] == "row_batch" and e["rows"]]
+        assert non_empty == [[["[REDACTED]"]]]
+        assert result_out.result.generated_query == "SELECT email AS contact FROM users"
+        assert result_out.result.results_response.rows == [["[REDACTED]"]]
+
+    async def test_masked_and_rewritten_together(self) -> None:
+        """The derived table's inner ``SELECT *`` neither hides the alias nor defeats the
+        aggregate exemption: classification reads the clean SQL."""
+        adapter, executed = _capturing_adapter(
+            [_make_batch([["a@x.com", 3]], columns=("contact", "n"))]
+        )
+        sql = "SELECT email AS contact, COUNT(email) AS n FROM users GROUP BY email"
+
+        events, result_out = await _run_stream(
+            generated_query=sql,
+            adapter=adapter,
+            privacy=PrivacySettings(row_filters=_FILTERS),
+        )
+
+        assert executed == [_filtered(sql)]
+        first_batch = next(e for e in events if e["type"] == "row_batch")
+        assert first_batch["rows"] == [["[REDACTED]", 3]]
+        assert result_out.result.results_response.rows == [["[REDACTED]", 3]]
+
+
+class TestStreamRowFilter:
+    async def test_executed_sql_is_rewritten_but_result_carries_clean_sql(self) -> None:
+        adapter, executed = _capturing_adapter([_make_batch([[1]])])
+        privacy = PrivacySettings(row_filters=_FILTERS)
+        _, result_out = await _run_stream(
+            generated_query="SELECT id FROM t", adapter=adapter, privacy=privacy
+        )
+        assert executed == [_filtered("SELECT id FROM t")]
+        assert result_out.result.generated_query == "SELECT id FROM t"
+
+    async def test_corrected_query_is_rewritten_again_and_prompt_sees_clean_sql(self) -> None:
+        call_count = 0
+        executed: list[str] = []
+
+        async def _stream_gen(query, **_kwargs):
+            nonlocal call_count
+            executed.append(query)
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("boom")
+                yield  # pragma: no cover
+            yield _make_batch([[1]])
+
+        adapter = MagicMock()
+        adapter.query_dialect = "postgresql"
+        adapter.execute_query_stream = _stream_gen
+        adapter.validate_query = MagicMock(
+            return_value=ValidationResult(is_valid=True, error_message=None)
+        )
+        provider = _make_provider(query="SELECT id FROM orders", explanation="fixed")
+        privacy = PrivacySettings(row_filters=_FILTERS)
+
+        events, result_out = await _run_stream(
+            generated_query="SELECT id FROM ordrs",
+            adapter=adapter,
+            provider=provider,
+            privacy=privacy,
+        )
+
+        assert executed[1] == _filtered("SELECT id FROM orders")
+        assert result_out.result.generated_query == "SELECT id FROM orders"
+        sql_events = [e for e in events if e["type"] == "sql"]
+        assert sql_events[0]["query"] == "SELECT id FROM orders"
+        prompt = provider.generate_response.call_args.kwargs["user_message"]
+        assert "tenant_id = 7" not in prompt
+        assert "SELECT id FROM ordrs" in prompt
+
+    async def test_every_correction_attempt_is_rewritten_and_prompts_stay_clean(self) -> None:
+        adapter, executed = _failing_then(2, _make_batch([[1]]))
+        provider = _sequenced_provider("SELECT id FROM ordes", "SELECT id FROM orders")
+
+        events, result_out = await _run_stream(
+            generated_query="SELECT id FROM ordrs",
+            adapter=adapter,
+            provider=provider,
+            privacy=PrivacySettings(row_filters=_FILTERS),
+        )
+
+        assert executed == [
+            _filtered("SELECT id FROM ordrs"),
+            _filtered("SELECT id FROM ordes"),
+            _filtered("SELECT id FROM orders"),
+        ]
+        prompts = [c.kwargs["user_message"] for c in provider.generate_response.call_args_list]
+        assert "SELECT id FROM ordrs" in prompts[0]
+        assert "SELECT id FROM ordes" in prompts[1]
+        assert "WHERE (tenant_id" not in _llm_text(provider)
+        # Holds only because the mock raises "boom". A real UNKNOWN_NAME error may name
+        # tenant_id as a schema name, which is acceptable: it is a name, not a value.
+        assert "tenant_id" not in _llm_text(provider)
+        assert [e["query"] for e in events if e["type"] == "sql"] == [
+            "SELECT id FROM ordes",
+            "SELECT id FROM orders",
+        ]
+        assert result_out.result.generated_query == "SELECT id FROM orders"
+        assert result_out.result.status == "executed"
+
+    async def test_failed_turn_carries_clean_sql(self) -> None:
+        adapter, executed = _failing_then(99)
+        provider = _sequenced_provider("SELECT id FROM ordes", "SELECT id FROM orders")
+
+        _, result_out = await _run_stream(
+            generated_query="SELECT id FROM ordrs",
+            adapter=adapter,
+            provider=provider,
+            privacy=PrivacySettings(row_filters=_FILTERS),
+        )
+
+        assert all("WHERE (tenant_id = 7)" in sql for sql in executed)
+        assert len(executed) == 3
+        assert result_out.result.status == "error"
+        assert result_out.result.generated_query == "SELECT id FROM orders"
+
+    async def test_zero_result_reexecution_is_rewritten_and_prompt_stays_clean(self) -> None:
+        adapter, executed = _capturing_adapter(
+            [_make_batch([], columns=("id",))], [_make_batch([[1]], columns=("id",))]
+        )
+        adapter.validate_query = MagicMock(
+            return_value=ValidationResult(is_valid=True, error_message=None)
+        )
+        provider = _sequenced_provider("SELECT id FROM t WHERE id > 0")
+
+        events, result_out = await _run_stream(
+            generated_query="SELECT id FROM t WHERE id < 0",
+            adapter=adapter,
+            provider=provider,
+            privacy=PrivacySettings(row_filters=_FILTERS),
+        )
+
+        assert executed == [
+            _filtered("SELECT id FROM t WHERE id < 0"),
+            _filtered("SELECT id FROM t WHERE id > 0"),
+        ]
+        prompt = provider.generate_response.call_args.kwargs["user_message"]
+        assert "SELECT id FROM t WHERE id < 0" in prompt
+        assert "WHERE (tenant_id" not in _llm_text(provider)
+        # The zero-result prompt carries only the clean query. The schema shown to the LLM
+        # may still list tenant_id as a column name, which is acceptable: not a value.
+        assert "tenant_id" not in _llm_text(provider)
+        assert [e["query"] for e in events if e["type"] == "sql"] == [
+            "SELECT id FROM t WHERE id > 0"
+        ]
+        assert result_out.result.generated_query == "SELECT id FROM t WHERE id > 0"
+        assert result_out.result.results_response.rows == [[1]]
+
+    async def test_database_text_never_reaches_an_llm_call_with_a_filter_set(self) -> None:
+        adapter, _ = _failing_then(
+            1,
+            _make_batch([], columns=("id",)),
+            error='invalid input syntax for type integer: "Jane Doe"',
+        )
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.DATA)
+        provider = _sequenced_provider("SELECT id FROM customers", "SELECT id FROM customers2")
+
+        _, result_out = await _run_stream(
+            generated_query="SELECT CAST(name AS int) FROM customers",
+            adapter=adapter,
+            provider=provider,
+            privacy=PrivacySettings(row_filters=_FILTERS),
+        )
+
+        # Both the execution correction and the zero-result refinement ran.
+        assert provider.generate_response.await_count == 2
+        assert "Jane" not in _llm_text(provider)
+        assert "WHERE (tenant_id" not in _llm_text(provider)
+        assert result_out.result.status == "executed"
+
+    async def test_rejection_text_is_shown_verbatim_even_with_an_apostrophe(self) -> None:
+        adapter, _ = _capturing_adapter([_make_batch([[1]])])
+        privacy = PrivacySettings(row_filters=_FILTERS)
+        rejection = RowFilterRejectedError("The admin's filter rejected it.")
+
+        with patch("app.services.row_filter.apply_row_filters", side_effect=rejection):
+            _, result_out = await _run_stream(
+                generated_query="SELECT id FROM t", adapter=adapter, privacy=privacy
+            )
+
+        assert result_out.result.status == "error"
+        assert result_out.result.error == "The admin's filter rejected it."
+
+    async def test_rejection_hint_reaches_the_correction_prompt(self) -> None:
+        adapter, _ = _capturing_adapter([_make_batch([[1]])])
+        provider = _sequenced_provider("SELECT id FROM public.t")
+        rejection = RowFilterRejectedError(
+            "Table t is ambiguous.", llm_hint="Qualify it as schema.table."
+        )
+        calls = {"n": 0}
+        real = apply_row_filters
+
+        def _first_rejected(
+            sql: str, filters: dict[str, str], dialect: str, **kwargs: object
+        ) -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise rejection
+            return real(sql, filters, dialect, **kwargs)
+
+        with patch("app.services.row_filter.apply_row_filters", side_effect=_first_rejected):
+            _, result_out = await _run_stream(
+                generated_query="SELECT id FROM t",
+                adapter=adapter,
+                provider=provider,
+                privacy=PrivacySettings(row_filters=_FILTERS),
+            )
+
+        prompt = provider.generate_response.call_args_list[0].kwargs["user_message"]
+        assert "Qualify it as schema.table." in prompt
+        assert result_out.result.status == "executed"
+
+    async def test_engine_error_after_a_rejection_is_redacted_and_carries_no_old_hint(self) -> None:
+        adapter, _ = _failing_then(99, error="bad value 'secret' in row")
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.DATA)
+        provider = _sequenced_provider("SELECT id FROM public.t", "SELECT id FROM public.t LIMIT 5")
+        rejection = RowFilterRejectedError("first", llm_hint="HINT-A")
+        calls = {"n": 0}
+
+        def _first_rejected(
+            sql: str, filters: dict[str, str], dialect: str, **kwargs: object
+        ) -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise rejection
+            return apply_row_filters(sql, filters, dialect, **kwargs)
+
+        with patch("app.services.row_filter.apply_row_filters", side_effect=_first_rejected):
+            _, result_out = await _run_stream(
+                generated_query="SELECT id FROM t",
+                adapter=adapter,
+                provider=provider,
+                privacy=PrivacySettings(row_filters=_FILTERS),
+            )
+
+        prompts = [c.kwargs["user_message"] for c in provider.generate_response.call_args_list]
+        assert len(prompts) == 2
+        assert "HINT-A" in prompts[0]
+        assert "HINT-A" not in prompts[1]
+        assert result_out.result.status == "error"
+        assert "secret" not in result_out.result.error
+
+
+class TestZeroResultReexecutionFailure:
+    async def test_failed_refinement_keeps_the_original_query_and_explanation(self) -> None:
+        """A refined query that fails at the database is not adopted: the turn reports the
+        original 0-row result under the original query and explanation."""
+        executed: list[str] = []
+
+        async def _stream_gen(query, **_kwargs):
+            executed.append(query)
+            if len(executed) == 1:
+                yield _make_batch([], columns=("id",))
+                return
+            raise RuntimeError("boom")
+            yield  # pragma: no cover
+
+        adapter = MagicMock()
+        adapter.query_dialect = "postgresql"
+        adapter.execute_query_stream = _stream_gen
+        adapter.validate_query = MagicMock(
+            return_value=ValidationResult(is_valid=True, error_message=None)
+        )
+        provider = _sequenced_provider("SELECT id FROM t WHERE x = 2")
+
+        events, result_out = await _run_stream(
+            generated_query="SELECT id FROM t WHERE x = 1",
+            explanation="original",
+            adapter=adapter,
+            provider=provider,
+        )
+
+        assert len(executed) == 2
+        # The refined query is still announced before it runs.
+        assert [e["query"] for e in events if e["type"] == "sql"] == [
+            "SELECT id FROM t WHERE x = 2"
+        ]
+        assert result_out.result.status == "executed"
+        assert result_out.result.generated_query == "SELECT id FROM t WHERE x = 1"
+        assert result_out.result.explanation == "original"
+        assert result_out.result.results_response.rows == []
+
+    async def test_failed_refinement_is_logged_redacted(self, caplog) -> None:
+        executed: list[str] = []
+
+        async def _stream_gen(query, **_kwargs):
+            executed.append(query)
+            if len(executed) == 1:
+                yield _make_batch([], columns=("id",))
+                return
+            raise RuntimeError('value "secret-value" out of range')
+            yield  # pragma: no cover
+
+        adapter = MagicMock()
+        adapter.query_dialect = "postgresql"
+        adapter.execute_query_stream = _stream_gen
+        adapter.validate_query = MagicMock(
+            return_value=ValidationResult(is_valid=True, error_message=None)
+        )
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.DATA)
+        provider = _sequenced_provider("SELECT id FROM t WHERE x = 2")
+
+        with caplog.at_level(logging.DEBUG, logger="app.services.execution"):
+            await _run_stream(
+                generated_query="SELECT id FROM t WHERE x = 1",
+                adapter=adapter,
+                provider=provider,
+            )
+
+        assert len(executed) == 2
+        assert "secret-value" not in caplog.text
+        assert "Zero-result re-execution failed, keeping original (data): " in caplog.text
+
+
+class TestStreamUserFacingErrorText:
+    async def test_data_error_value_is_redacted_without_correction(self) -> None:
+        adapter, _ = _failing_then(99, error='invalid input syntax for type integer: "Jane Doe"')
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.DATA)
+
+        _, result_out = await _run_stream(
+            generated_query="SELECT CAST(name AS int) FROM customers", adapter=adapter
+        )
+
+        assert result_out.result.status == "error"
+        assert "Jane" not in result_out.result.error
+        assert "invalid input syntax for type integer" in result_out.result.error
+
+    async def test_data_error_value_is_redacted_after_corrections_fail(self) -> None:
+        adapter, _ = _failing_then(99, error='invalid input syntax for type integer: "Jane Doe"')
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.DATA)
+        provider = _sequenced_provider("SELECT CAST(name AS int) FROM c2", "SELECT 1 FROM c3")
+
+        _, result_out = await _run_stream(
+            generated_query="SELECT CAST(name AS int) FROM customers",
+            adapter=adapter,
+            provider=provider,
+        )
+
+        assert result_out.result.status == "error"
+        assert "Jane" not in result_out.result.error
+        assert "Jane" not in _llm_text(provider)
+
+    async def test_note_is_appended_to_the_redacted_text(self) -> None:
+        adapter, _ = _failing_then(99, error='invalid input syntax for type integer: "Jane Doe"')
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.DATA)
+
+        with patch(
+            "app.services.execution._attempt_sql_execution_correction",
+            new=AsyncMock(return_value=(None, "gave up")),
+        ):
+            _, result_out = await _run_stream(
+                generated_query="SELECT CAST(name AS int) FROM customers",
+                adapter=adapter,
+                provider=_make_provider(),
+            )
+
+        assert "Jane" not in result_out.result.error
+        assert result_out.result.error.endswith("\n\nNote: gave up")
+
+
+class TestFingerprintOnTheStreamingPath:
+    async def test_payload_carries_the_fingerprint(self) -> None:
+        adapter = _make_adapter([_make_batch(rows=[[1]], columns=("id",))])
+        filters = {"public.t": "tenant_id = 7"}
+        _events, result_out = await _run_stream(
+            adapter=adapter,
+            generated_query="SELECT id FROM t",
+            privacy=PrivacySettings(row_filters=filters),
+        )
+        expected = row_filter_fingerprint(filters, get_settings().encryption_key)
+        assert result_out.result.results_response.row_filter_fingerprint == expected
+
+    async def test_no_filters_gives_the_empty_fingerprint(self) -> None:
+        adapter = _make_adapter([_make_batch(rows=[[1]], columns=("id",))])
+        _events, result_out = await _run_stream(adapter=adapter, generated_query="SELECT id FROM t")
+        assert result_out.result.results_response.row_filter_fingerprint == ""
+
+
+class TestNoBackslashEscapesOnTheStreamingPath:
+    async def test_a_backslash_is_refused_and_corrected(self) -> None:
+        from app.services import execution
+        from app.services.row_filter import _executable
+
+        bypass = "SELECT 'a\\' AS k, email AS x FROM users -- '"
+        fixed = "SELECT 'a' AS k FROM users"
+        adapter, executed = _capturing_adapter(
+            [_make_batch([["a"]], columns=("k",), column_types=("text",))]
+        )
+        adapter.query_dialect = "MySQL"
+        adapter.double_quote_is_string_literal = True
+        adapter.backslash_is_escape = False
+        provider = _sequenced_provider(fixed)
+        with patch.object(execution, "_executable", wraps=_executable) as executable:
+            _, result_out = await _run_stream(
+                generated_query=bypass,
+                adapter=adapter,
+                provider=provider,
+                privacy=PrivacySettings(),
+            )
+        first = executable.call_args_list[0]
+        assert first.args[0] == bypass
+        assert first.kwargs["backslash_is_escape"] is False
+        assert executed == [fixed]
+        assert "NO_BACKSLASH_ESCAPES" in _llm_text(provider)
+        assert result_out.result.status == "executed"
+
+    async def test_the_adapters_backslash_flag_is_passed(self) -> None:
+        from app.services import execution
+        from app.services.row_filter import _executable
+
+        adapter, _ = _capturing_adapter([_make_batch([[1]])])
+        adapter.backslash_is_escape = True
+        with patch.object(execution, "_executable", wraps=_executable) as executable:
+            await _run_stream(
+                generated_query="SELECT id FROM t", adapter=adapter, privacy=PrivacySettings()
+            )
+        assert executable.call_args.kwargs["backslash_is_escape"] is True
+
+
+class TestHintlessRejectionEndsTheCorrection:
+    """A rejection without an llm_hint (a filter that needs migration, a malformed key, a
+    missing fence) is nothing the model can change: no correction call is made and the user
+    sees the rejection text as it is."""
+
+    _TEXT = "The row filter on public.t needs migration, so the query was not run."
+
+    async def test_a_hintless_rejection_makes_no_llm_call(self) -> None:
+        adapter, executed = _capturing_adapter([_make_batch([[1]])])
+        provider = _sequenced_provider("SELECT id FROM public.t")
+
+        with patch(
+            "app.services.row_filter.apply_row_filters",
+            side_effect=RowFilterRejectedError(self._TEXT),
+        ):
+            events, result_out = await _run_stream(
+                generated_query="SELECT id FROM t",
+                adapter=adapter,
+                provider=provider,
+                privacy=PrivacySettings(row_filters=_FILTERS),
+            )
+
+        provider.generate_response.assert_not_awaited()
+        assert executed == []
+        assert result_out.result.status == "error"
+        assert result_out.result.error == self._TEXT
+        assert not any(e.get("message") == "Correcting query…" for e in events)
+
+    async def test_a_hintless_rejection_of_a_corrected_query_ends_the_loop(self) -> None:
+        adapter, _ = _capturing_adapter([_make_batch([[1]])])
+        provider = _sequenced_provider("SELECT id FROM public.t", "SELECT id FROM public.t")
+        rejections = [
+            RowFilterRejectedError("Table t is ambiguous.", llm_hint="Qualify the table t."),
+            RowFilterRejectedError(self._TEXT),
+        ]
+
+        with patch("app.services.row_filter.apply_row_filters", side_effect=rejections):
+            _, result_out = await _run_stream(
+                generated_query="SELECT id FROM t",
+                adapter=adapter,
+                provider=provider,
+                privacy=PrivacySettings(row_filters=_FILTERS),
+            )
+
+        assert provider.generate_response.await_count == 1
+        assert result_out.result.status == "error"
+        assert result_out.result.error == self._TEXT
+
+    async def test_a_rejection_with_a_hint_still_goes_through_correction(self) -> None:
+        adapter, _ = _capturing_adapter([_make_batch([[1]])])
+        provider = _sequenced_provider("SELECT id FROM public.t")
+        rejection = RowFilterRejectedError("Table t is ambiguous.", llm_hint="Qualify it.")
+        calls = {"n": 0}
+
+        def _first_rejected(
+            sql: str, filters: dict[str, str], dialect: str, **kwargs: object
+        ) -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise rejection
+            return apply_row_filters(sql, filters, dialect, **kwargs)
+
+        with patch("app.services.row_filter.apply_row_filters", side_effect=_first_rejected):
+            _, result_out = await _run_stream(
+                generated_query="SELECT id FROM t",
+                adapter=adapter,
+                provider=provider,
+                privacy=PrivacySettings(row_filters=_FILTERS),
+            )
+
+        assert provider.generate_response.await_count == 1
+        assert result_out.result.status == "executed"

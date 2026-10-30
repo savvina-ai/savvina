@@ -22,6 +22,9 @@ import type { ChatMessage, QueryResults } from '../types';
 import type { UserChart } from '../types/charts';
 import { CHART_TYPES, CHART_TYPE_ICONS, CHART_TYPE_LABELS } from '../types/charts';
 
+/** Shown for a message whose stored result was computed under a different row filter. */
+const STALE_SECTION_TEXT = 'Results outdated (row filter changed); re-run the question';
+
 // ── Error boundary so a broken chart doesn't kill the card ────────────────────
 class ChartErrorBoundary extends Component<
   { children: ReactNode },
@@ -387,7 +390,7 @@ export default function ReportBuilderPage() {
       if (wasDark) document.documentElement.classList.replace('dark', 'light');
       try {
         for (const sec of sections) {
-          if (sec.chart?.xKey && sec.chart.yKeys.length > 0) {
+          if (sec.chart?.xKey && sec.chart.yKeys.length > 0 && !sec.results?.stale_row_filter) {
             const el = chartCaptureRefs.current[sec.messageId];
             if (el) {
               try {
@@ -551,11 +554,16 @@ export default function ReportBuilderPage() {
                             <span className="flex-1 truncate">
                               {msg.content.slice(0, 80) || 'Query result'}
                             </span>
-                            {msg.results_json && (
-                              <span className="shrink-0 font-mono text-muted-foreground">
-                                {msg.results_json.row_count} rows
-                              </span>
-                            )}
+                            {msg.results_json &&
+                              (msg.results_json.stale_row_filter ? (
+                                <span className="shrink-0 text-amber-700 dark:text-amber-400">
+                                  {STALE_SECTION_TEXT}
+                                </span>
+                              ) : (
+                                <span className="shrink-0 font-mono text-muted-foreground">
+                                  {msg.results_json.row_count} rows
+                                </span>
+                              ))}
                           </button>
                         );
                       })}
@@ -595,6 +603,7 @@ export default function ReportBuilderPage() {
 
             {sections.map((sec, idx) => {
               const columns = sec.results?.columns ?? [];
+              const stale = sec.results?.stale_row_filter === true;
               const hasChart = sec.chart !== null;
               const chartReady =
                 hasChart && !!sec.chart?.xKey && (sec.chart?.yKeys.length ?? 0) > 0;
@@ -640,11 +649,16 @@ export default function ReportBuilderPage() {
                             {sec.preview}
                           </p>
                         )}
+                        {stale && (
+                          <p className="text-xs text-amber-700 dark:text-amber-400">
+                            {STALE_SECTION_TEXT}
+                          </p>
+                        )}
                       </div>
 
                       {/* Actions */}
                       <div className="flex shrink-0 items-center gap-1.5">
-                        {columns.length > 0 && (
+                        {columns.length > 0 && !stale && (
                           <button
                             type="button"
                             onClick={() =>

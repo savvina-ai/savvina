@@ -16,7 +16,7 @@ routers/chat.py: process_message()
        │    ├─ UserSchemaCache (DB read)
        │    ├─ adapter.introspect()                  # if cache miss
        │    ├─ _schema_from_dict()                   # deserialise stored JSON
-       │    ├─ _apply_privacy_to_schema()            # strip excluded schemas/tables/columns (+ their FKs)
+       │    ├─ _apply_privacy_to_schema()            # strip excluded schemas/tables/columns (+ their FKs); row-filtered tables lose stats samples and row count (_withhold_row_filtered_hints)
        │    └─ cache.compute_embedding_async()        # build per-table embeddings
        ├─ schema_pruning._select_relevant_tables()   # schema pruning (cosine similarity + domain boost)
        │    ├─ QueryCache.compute_embedding_async()
@@ -46,11 +46,11 @@ routers/chat.py: process_message()
        │    ├─ schema_utils._check_query_complexity() # CROSS JOIN / large-table guard
        │    ├─ correction._attempt_complexity_correction() # self-correction for complexity
        │    └─ QueryCache.store()                    # persist to query_cache
-       ├─ execution._execute_auto_query()            # run query on user's DB (auto_execute mode)
+       ├─ execution._stream_execute_with_correction() # run query on user's DB (auto_execute mode)
+       │    ├─ row_filter._executable()              # strict sensitive-column check (when on), then rewrite every executed statement with the per-table row filters
+       │    ├─ result_masking._plan_result_mask()    # redact excluded/sensitive columns in every row batch
        │    ├─ correction._attempt_sql_execution_correction() # runtime error self-correction
        │    └─ correction._attempt_zero_result_correction()   # 0-row result re-examination
-       ├─ execution._mask_sensitive_result_columns() # redact excluded/sensitive columns
-       ├─ execution._inject_row_filter()             # enforce row-level security filter
        ├─ chat_service._get_or_create_session()      # create/load ChatSession
        ├─ chat_service._save_user_message()          # persist user ChatMessage
        └─ chat_service._save_assistant_message()     # persist assistant ChatMessage
@@ -293,7 +293,7 @@ Schema introspection is expensive (multiple SQL queries against the user's datab
 
 - Cache hit → `_schema_from_dict()` deserialises the stored JSON back to `DataSourceSchema`
 - Cache miss → `adapter.connect()` + `adapter.introspect(privacy)` + `_schema_to_dict()` stores the result
-- `_apply_privacy_to_schema()` strips excluded schemas/tables, `excluded_columns` (exact `schema.table.column`) and the foreign keys on those columns before any further use
+- `_apply_privacy_to_schema()` strips excluded schemas/tables, `excluded_columns` (exact `schema.table.column`) and the foreign keys on those columns before any further use; a table under a row filter also loses its statistics sample values and row count (`_withhold_row_filtered_hints`; MySQL ENUM/SET members are kept)
 - If `table_embeddings` are absent, builds them: `_build_table_text(table)` per table → `cache.compute_embedding_async()` → stored on `UserSchemaCache.table_embeddings`
 
 ### Step 5: Intent Classification
@@ -442,10 +442,10 @@ For `auto_execute`:
 - `adapter.connect(config_dict)` — creates connection pool
 - `adapter.execute_query(query, timeout_ms, max_rows)` — runs query, returns `QueryResult`
 - `adapter.disconnect()` — always via `finally`
-- On runtime error: `_attempt_sql_execution_correction()` sends error + hint back to LLM (single attempt); hints for known patterns live in `_EXEC_ERROR_HINTS` dict
+- On runtime error: `_attempt_sql_execution_correction()` sends the failed SQL, Savvina's own description of the error (`error_feedback.describe_error_for_llm`: a category from `adapter.classify_error()` plus, for name-quoting categories, names the LLM already has) and a hint back to the LLM (single attempt). The database's message is never sent. Hints live in `_EXEC_ERROR_HINTS` (text match, used only when it agrees with the category) and `_CATEGORY_FALLBACK_HINTS`
 - **Zero-result detection** — if the query succeeds but returns 0 rows, `_attempt_zero_result_correction()` is called (skipped for `QueryIntent.EXISTENCE` queries and cache hits). It prompts the LLM to identify the most likely cause (wrong filter value, case mismatch, overly restrictive date range, faulty JOIN) and optionally return a corrected query. If a corrected query is returned and passes read-only validation, it is re-executed and replaces the original result. If the LLM confirms 0 rows is correct, its explanation is surfaced to the user.
-- `_mask_sensitive_result_columns(response, privacy)` — redacts `[REDACTED]` over sensitive/excluded columns in the result
-- `_inject_row_filter(sql, row_filter_sql, dialect)` — wraps query in subquery to enforce row-level security (if configured)
+- `result_masking._mask_sensitive_result_columns(response, privacy)` — redacts `[REDACTED]` over sensitive/excluded columns in the result; the streaming path applies the same plan (`result_masking._plan_result_mask`) to every `row_batch` event
+- `row_filter._executable(sql, privacy, dialect)` — when `strict_sensitive_columns` is on, first runs `sensitive_guard.check_strict_sensitive` on the clean query (after the migration check; a rejection is a `SensitiveColumnRejectedError`, shown verbatim and sent back to the model as a hint); then rewrites every executed statement (first run, corrections, zero-result re-run) with the connection's per-table row filters (`row_filter_rewrite.apply_row_filters`: each filtered table reference becomes a filtered derived table); prompts, events and the stored message carry the model's SQL; a connection in the row-filter migration state is refused before generation; each filtered derived table is fenced (`OFFSET 0` / MySQL `LIMIT 18446744073709551615`) so the condition runs before the model's predicates; the result carries `row_filter_fingerprint` and stored results are served only under the same map
 
 ### Step 16: Persistence
 
@@ -520,7 +520,7 @@ ConnectionsRouter.refresh_schema()
      • columns (with types)
      • primary keys
      • foreign keys
-     • column comments (if privacy.include_column_comments)
+     • column comments (if privacy.include_column_comments; a sensitive column's is withheld on every read)
      • row counts (if privacy.include_row_counts)
      • sample values (if privacy.include_sample_values, non-sensitive only)
   6. adapter.disconnect()
@@ -532,3 +532,5 @@ ConnectionsRouter.refresh_schema()
      in this order, the one every cache purge shares)
   9. Return schema as JSON
 ```
+
+Saving row filters (`PUT /api/v1/connections/{id}/privacy`, `POST /api/v1/connections`) plans every new or changed row-filter pair with a live `EXPLAIN` before storing it (`routers/connections._verify_row_filters` → `_check_statement`, which runs `SELECT * FROM "s"."t"` through `apply_row_filters`, → `BaseDataSource.explain`, under `asyncio.wait_for` at the query timeout plus five seconds); a pair the rewriter refuses, an engine error, an unreachable database or a plan that does not return in time is a 422 and nothing is stored.

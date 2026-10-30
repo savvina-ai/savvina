@@ -117,7 +117,7 @@ On first boot, create your admin account by entering your name, email, and passw
 | **Two-level cache** | Exact + semantic similarity caching reduces redundant LLM calls |
 | **Privacy controls** | Per-connection controls over what metadata (sample values, comments, row counts) reaches the LLM |
 | **Three execution modes** | Auto-execute, Review-first, or Generate-only — choose your trust level per connection |
-| **Read-only safety** | All generated SQL is validated before execution; only SELECT statements are permitted |
+| **Read-only safety** | Generated SQL is validated as a single SELECT and executed inside a database-enforced read-only transaction |
 | **Fernet encryption** | Database credentials and API keys are always encrypted at rest |
 | **Extensible adapters** | Adding a new data source or LLM provider requires only one new file |
 | **Report Builder** | Assemble query results from chat history into a PDF report; export individual results as CSV, XLSX, or PNG |
@@ -197,13 +197,13 @@ Commonly adjusted beyond the Quick Start:
 
 ## Privacy
 
-Savvina AI is designed to give you precise control over what metadata reaches the LLM. **No query results are ever sent to the LLM** — only the schema description and your natural language question.
+Savvina AI is designed to give you precise control over what metadata reaches the LLM. **No query results or database error messages are ever sent to the LLM** — only the schema description, your semantic model, and your natural language question and conversation. Apart from value mappings you keep in the semantic model, a value read from your tables reaches the LLM only when you turn on *Include sample values* for the connection.
 
 Per-connection privacy controls:
-- **Include sample values** — improves accuracy but sends 5 distinct values per column to the LLM
-- **Include column comments** — sends database column description text to the LLM
+- **Include sample values** — off by default; when on, improves accuracy by sending up to 3 example values per column (on MySQL, an ENUM/SET column's members) to the LLM
+- **Include column comments** — off by default; sends database column description text to the LLM
 - **Include row counts** — sends approximate row counts
-- **Sensitive column patterns** — columns matching patterns like `email`, `ssn`, `password` are auto-excluded from sample values
+- **Sensitive column patterns** — columns matching patterns like `email`, `ssn`, `password` are auto-excluded from sample values, and their values are replaced with `[REDACTED]` in query results
 - **Excluded schemas / tables / columns** — fine-grained exclusion list; these are never mentioned to the LLM
 
 See [docs/user-guide/04_privacy-controls.md](docs/user-guide/04_privacy-controls.md) for full details.

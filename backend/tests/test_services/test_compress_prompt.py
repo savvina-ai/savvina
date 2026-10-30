@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from app.datasources.models import DataSourceSchema, TableInfo
+from app.datasources.models import DataSourceSchema, PrivacySettings, TableInfo
 from app.semantic.models import (
     AggregationType,
     SemanticModel,
@@ -235,6 +235,40 @@ class TestCompressPrompt:
 
         # Two calls: one for protected tables (original privacy), one for remainder (_min_pvt)
         assert datasource.format_schema_for_llm.call_count == 2
+
+    def test_level_5_keeps_the_sensitive_settings(self) -> None:
+        """The minimal settings drop the annotations only: the sensitive lists, the strict
+        flag and the exclusions survive, so the compact prompt marks the same columns."""
+        builder = _make_builder(300, 300, 300, 300, 50)
+        datasource = MagicMock()
+        datasource.format_schema_for_llm.return_value = ""
+        privacy = PrivacySettings(
+            include_sample_values=True,
+            sensitive_column_patterns=["email"],
+            sensitive_columns=["name"],
+            strict_sensitive_columns=True,
+            excluded_columns=["public.t.ssn"],
+        )
+
+        _compress_prompt(
+            builder=builder,
+            datasource=datasource,
+            schema=DataSourceSchema(source_type="postgresql"),
+            privacy=privacy,
+            semantic_model=None,
+            few_shot_examples=None,
+            user_question="q",
+            user_message="q",
+            budget_chars=100,
+        )
+
+        min_pvt = datasource.format_schema_for_llm.call_args_list[1].args[1]
+        assert min_pvt.include_sample_values is False
+        assert min_pvt.sensitive_column_patterns == ["email"]
+        assert min_pvt.sensitive_columns == ["name"]
+        assert min_pvt.strict_sensitive_columns is True
+        assert min_pvt.excluded_columns == ["public.t.ssn"]
+        assert builder.build_system_prompt.call_args_list[4].kwargs["privacy"] is min_pvt
 
     def test_no_semantic_model_skips_compact_level(self) -> None:
         """When semantic_model is None, compact_semantic is also None — no crash."""

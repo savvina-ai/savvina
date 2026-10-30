@@ -78,6 +78,56 @@ class TestIsColumnSensitive:
         assert self.p.is_column_sensitive("USER_EMAIL")
 
 
+class TestSensitiveColumns:
+    def test_exact_names_are_folded_once_per_list(self):
+        from app.datasources import models
+
+        models._exact_sensitive_names.cache_clear()
+        privacy = PrivacySettings(sensitive_columns=["Name", "t.notes"])
+        for column in ("name", "NAME", "notes", "other"):
+            privacy.is_column_sensitive(column)
+        info = models._exact_sensitive_names.cache_info()
+        assert (info.misses, info.hits) == (1, 3)
+        assert models._exact_sensitive_names(("Name", "t.notes")) == frozenset({"name"})
+
+    def test_a_list_changed_in_place_is_read_again(self):
+        privacy = PrivacySettings(sensitive_columns=["name"])
+        assert privacy.is_column_sensitive("notes") is False
+        privacy.sensitive_columns.append("notes")
+        assert privacy.is_column_sensitive("notes") is True
+
+    def test_an_exact_name_matches_case_insensitively(self):
+        privacy = PrivacySettings(sensitive_column_patterns=[], sensitive_columns=["Name"])
+        assert privacy.is_column_sensitive("name") is True
+        assert privacy.is_column_sensitive("NAME") is True
+
+    def test_no_substring_match(self):
+        privacy = PrivacySettings(sensitive_column_patterns=[], sensitive_columns=["name"])
+        assert privacy.is_column_sensitive("username") is False
+        assert privacy.is_column_sensitive("name_first") is False
+
+    def test_patterns_and_names_are_both_honoured(self):
+        privacy = PrivacySettings(sensitive_column_patterns=["email"], sensitive_columns=["notes"])
+        assert privacy.is_column_sensitive("customer_email") is True
+        assert privacy.is_column_sensitive("notes") is True
+        assert privacy.is_column_sensitive("noted") is False
+
+    def test_a_dotted_entry_never_matches(self):
+        privacy = PrivacySettings(sensitive_column_patterns=[], sensitive_columns=["t.name"])
+        assert privacy.is_column_sensitive("name") is False
+        assert privacy.is_column_sensitive("t.name") is False
+
+    def test_from_dict_without_the_key_reads_empty(self):
+        assert PrivacySettings.from_dict({}).sensitive_columns == []
+
+    def test_values_and_exclusion_follow(self):
+        privacy = PrivacySettings(
+            include_sample_values=True, sensitive_column_patterns=[], sensitive_columns=["name"]
+        )
+        assert privacy.column_values_allowed("name") is False
+        assert privacy.is_column_excluded("public", "t", "name") is True
+
+
 class TestIsTableExcluded:
     def test_excluded_by_schema_name(self):
         p = PrivacySettings(excluded_schemas=["audit"])
@@ -141,3 +191,28 @@ class TestIsColumnExcluded:
         assert "email" in p.sensitive_column_patterns
         assert "password" in p.sensitive_column_patterns
         assert "ssn" in p.sensitive_column_patterns
+
+
+class TestDefaults:
+    def test_sample_values_are_off_by_default(self):
+        assert PrivacySettings().include_sample_values is False
+
+    def test_a_stored_dict_without_the_key_reads_as_off(self):
+        assert (
+            PrivacySettings.from_dict({"include_row_counts": True}).include_sample_values is False
+        )
+
+    def test_column_comments_are_off_by_default(self):
+        assert PrivacySettings().include_column_comments is False
+
+
+class TestColumnValuesAllowed:
+    def test_off_by_default(self):
+        assert PrivacySettings().column_values_allowed("status") is False
+
+    def test_on_for_an_ordinary_column_when_enabled(self):
+        assert PrivacySettings(include_sample_values=True).column_values_allowed("status") is True
+
+    def test_never_for_a_sensitive_column(self):
+        p = PrivacySettings(include_sample_values=True)
+        assert p.column_values_allowed("customer_email") is False

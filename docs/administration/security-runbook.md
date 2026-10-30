@@ -34,7 +34,7 @@ add_header Content-Security-Policy "... style-src 'self' 'unsafe-inline'; ..." a
 ```
 
 ```python
-# backend/app/main.py:170
+# backend/app/main.py:188
 "style-src 'self' 'unsafe-inline'; "
 ```
 

@@ -165,7 +165,7 @@ The application entry point:
 
 ### ChatService
 
-`ChatService` lives in `services/chat_service.py` (slim orchestrator) and delegates to six focused sub-modules. See [Data Flow](data-flow.md) for the step-by-step breakdown including precise function and class references.
+`ChatService` lives in `services/chat_service.py` (slim orchestrator) and delegates to seven focused sub-modules. See [Data Flow](data-flow.md) for the step-by-step breakdown including precise function and class references.
 
 ```
 services/
@@ -173,7 +173,13 @@ services/
 ├── correction.py      — self-correction loops (schema, complexity, execution, zero-result)
 ├── schema_pruning.py  — schema pruning, relevance filtering, schema resolution
 ├── validation.py      — query validation pipeline (_validate_and_correct_query)
-├── execution.py       — query execution, result masking, row-filter injection
+├── execution.py       — query execution, ORDER BY injection, streaming
+├── row_filter.py         — _executable, unwrap of the old wrap, filter validation
+├── row_filter_rewrite.py — per-table rewrite of a statement with sqlglot
+├── row_filter_errors.py  — QueryRejectedError (base, with llm_hint), RowFilterRejectedError, SensitiveColumnRejectedError, RowFilterInvalidError
+├── sensitive_guard.py    — strict sensitive-column check on the clean query (check_strict_sensitive)
+├── privilege_audit.py    — findings and rls_effective from the connection role's catalog facts
+├── result_masking.py  — SELECT-list classifier and [REDACTED] mask for query results
 ├── pipeline.py        — LLM provider setup, prompt compression, query generation
 └── chat_service.py    — ChatService class, session helpers, message persistence
 ```
@@ -199,8 +205,10 @@ services/
 | `_validate_columns_against_schema()` | `schema_utils` | Cross-references query table/column references against schema |
 | `_check_query_complexity()` | `schema_utils` | Rejects CROSS JOIN and large-table full scans |
 | `_execute_auto_query()` | `execution` | Runs the generated query and handles results |
-| `_mask_sensitive_result_columns()` | `execution` | Redacts sensitive/excluded columns in results |
-| `_inject_row_filter()` | `execution` | Enforces mandatory row-level security filter via subquery wrap |
+| `_plan_result_mask()` / `_mask_sensitive_result_columns()` | `result_masking` | Classifies the SELECT list and redacts sensitive/excluded columns in results, through aliases, expressions, CTEs and subqueries |
+| `apply_row_filters()` | `row_filter_rewrite` | Replaces every filtered table reference with a filtered derived table; rejects what it cannot rewrite safely |
+| `_executable()` / `validate_row_filters()` | `row_filter` | The statement the database receives; validates the per-table map an admin saves |
+| `evaluate()` / `from_dict()` | `privilege_audit` | Turns `BaseDataSource.audit_privileges` facts into findings with remediation SQL and `rls_effective` per filtered table; reads the stored `connections.privilege_audit` back, dropping unknown codes |
 | `_get_or_create_session()` | `chat_service` | Loads or creates `ChatSession` |
 | `_save_user_message()` / `_save_assistant_message()` | `chat_service` | Persists `ChatMessage` rows |
 
@@ -214,6 +222,8 @@ Every adapter must implement:
 - `introspect(privacy)` — schema discovery
 - `get_sample_values(schema, table, column, limit)`
 - `execute_query(query, timeout, max_rows)`
+- `explain(sql, timeout)` — plans a statement without returning rows (row-filter verification at save)
+- `audit_privileges(tables, timeout)` — reads what the connection role can do from the catalog (the privilege check)
 - `validate_query(query)` — delegates to a Validator class
 - `format_schema_for_llm(schema, privacy)`
 - `get_system_prompt_additions()` — dialect-specific LLM instructions
@@ -263,7 +273,7 @@ The application's own state is stored in the `db` PostgreSQL service (port 5434 
 |---|---|
 | `users` | User accounts (bcrypt passwords, roles, email verification) |
 | `refresh_tokens` | Stored refresh tokens (sha256 hash only — never raw) |
-| `connections` | Saved database connections (Fernet-encrypted host/port/db config) |
+| `connections` | Saved database connections (Fernet-encrypted host/port/db config), privacy settings, and the last privilege audit of the connection role (`privilege_audit`, JSONB, NULL until the first check) |
 | `chat_sessions` | Conversation sessions, one per connection+topic |
 | `chat_messages` | Individual messages (user and assistant) with query, results, status |
 | `provider_configs` | Saved LLM provider configurations (Fernet-encrypted API keys) |
