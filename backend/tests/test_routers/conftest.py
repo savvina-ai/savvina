@@ -110,6 +110,7 @@ def _make_conn(**kwargs) -> MagicMock:
     m.created_at = kwargs.get("created_at", now)
     m.updated_at = kwargs.get("updated_at", now)
     m.privacy_settings = kwargs.get("privacy_settings")
+    m.privilege_audit = kwargs.get("privilege_audit")
     m.semantic_model = kwargs.get("semantic_model")
     m.config_encrypted = kwargs.get("config_encrypted", b"fake-encrypted-config")
     return m

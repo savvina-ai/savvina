@@ -121,6 +121,16 @@ _QUOTE_BY_DIALECT = {"postgresql": '"', "mysql": "`"}
 _SHAPE = "row_filters must be an object mapping schema.table to a condition"
 
 
+def quote_identifier(part: str, dialect: str) -> str:
+    """*part* as a quoted identifier of *dialect* (``"`` on PostgreSQL, `` ` `` on MySQL; the
+    SQL-standard double quote for a dialect not in ``_QUOTE_BY_DIALECT``), the quote character
+    doubled inside. For SQL shown to the admin (the privilege audit's remediation): a stored
+    key part is the engine-normalised name without quotes, so quoting it always keeps its
+    case."""
+    quote = _QUOTE_BY_DIALECT.get((dialect or "").lower(), '"')
+    return quote + part.replace(quote, quote * 2) + quote
+
+
 # The longest identifier each engine keeps: PostgreSQL truncates at 63 bytes (NAMEDATALEN
 # - 1), MySQL refuses more than 64 characters.
 _MAX_NAME = {"postgresql": ("bytes", 63), "mysql": ("characters", 64)}

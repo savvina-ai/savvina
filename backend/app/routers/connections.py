@@ -26,6 +26,7 @@ from ..config import get_settings
 from ..database import get_db
 from ..datasources.adapters.postgresql import evict_pool as _evict_pg_pool
 from ..datasources.errors import ErrorCategory, ExplainError
+from ..datasources.models import PrivacySettings
 from ..datasources.registry import create_datasource, get_datasource_class
 from ..models.chat import ChatMessage, ChatSession
 from ..models.connection import Connection
@@ -46,6 +47,9 @@ from ..schemas.connection import (
 from ..schemas.pagination import PaginatedResponse
 from ..semantic import store as semantic_store
 from ..services.error_feedback import redact_error_for_user
+from ..services.privilege_audit import evaluate as evaluate_privileges
+from ..services.privilege_audit import to_dict as audit_to_dict
+from ..services.privilege_audit import unavailable as audit_unavailable
 from ..services.row_filter import (
     RowFilterInvalidError,
     RowFilterRejectedError,
@@ -230,6 +234,108 @@ async def _verify_row_filters(source_type: str, config: dict, pairs: dict[str, s
             )
 
 
+def _audit_tables(privacy: dict | None) -> list[tuple[str | None, str]]:
+    """The tables the privilege audit asks about, each once: every ``row_filters`` key
+    (``schema.table``, stored engine-normalised without quotes, split at the first dot as
+    ``_check_statement`` splits it) and every ``excluded_tables`` entry as
+    ``PrivacySettings.is_table_excluded`` reads it (an entry with a dot is split at the first
+    dot, a bare entry is ``(None, table)``: the table in every schema). No ``_key_part``, no
+    folding: the string as stored. Tables under ``excluded_schemas`` are not enumerated."""
+    privacy = privacy or {}
+    tables: list[tuple[str | None, str]] = []
+    for key in privacy.get("row_filters") or {}:
+        if isinstance(key, str) and "." in key:
+            schema, _, table = key.partition(".")
+            tables.append((schema, table))
+    for entry in privacy.get("excluded_tables") or []:
+        if not isinstance(entry, str) or not entry:
+            continue
+        if "." in entry:
+            schema, _, table = entry.partition(".")
+            tables.append((schema, table))
+        else:
+            tables.append((None, entry))
+    return list(dict.fromkeys(tables))
+
+
+async def _audit_privileges(source_type: str, config: dict, privacy: dict | None) -> dict:
+    """The stored privilege audit (``privilege_audit.to_dict``) of the connection role.
+
+    Opens the adapter as ``_verify_row_filters`` does, from the decrypted *config*, reads the
+    facts within ``_explain_budget()`` seconds and evaluates them under *privacy*. It never
+    raises: the save is already validated by the caller, and a catalog failure is reported,
+    not enforced. A refused connection (``connect`` returning ``success False``), a budget
+    timeout, an unknown source type or any driver exception stores ``status "unavailable"``
+    with the adapter's own sentence (``describe_connection_error``, only when it returns a
+    non-empty string) or else the text redacted by category (``redact_error_for_user``, as
+    every execution error is); 3b-2 reads ``unavailable`` as "fence stays". The facts are
+    evaluated with the connection's database, named by the dedicated-role script. A
+    ``disconnect`` that fails afterwards is logged and does not change the verdict.
+    """
+    settings = get_settings()
+    budget = _explain_budget()
+    adapter = None
+
+    def unavailable_text(category: ErrorCategory, text: str) -> str:
+        """The adapter's sentence for the failure when it has one, else the redacted text."""
+        described = adapter.describe_connection_error(text) if adapter is not None else None
+        if isinstance(described, str) and described:
+            return described
+        return redact_error_for_user(category, text)
+
+    try:
+        adapter = create_datasource(source_type)
+        result = await adapter.connect(config)
+        if result is not None and result.success is False:
+            text = unavailable_text(ErrorCategory.OTHER, result.message)
+            return audit_to_dict(audit_unavailable("", text))
+        facts = await asyncio.wait_for(
+            adapter.audit_privileges(
+                _audit_tables(privacy), timeout=settings.default_query_timeout
+            ),
+            timeout=budget,
+        )
+        audit = evaluate_privileges(
+            facts,
+            PrivacySettings.from_dict(privacy or {}),
+            source_type,
+            database=config.get("database"),
+        )
+        return audit_to_dict(audit)
+    except TimeoutError:
+        return audit_to_dict(
+            audit_unavailable("", f"the privilege check did not finish within {budget:g} seconds")
+        )
+    except Exception as exc:
+        category = adapter.classify_error(exc) if adapter is not None else ErrorCategory.OTHER
+        text = unavailable_text(category, str(exc) or type(exc).__name__)
+        logger.warning("Privilege audit failed: source_type=%s, error=%s", source_type, exc)
+        return audit_to_dict(audit_unavailable("", text))
+    finally:
+        if adapter is not None:
+            try:
+                await adapter.disconnect()
+            except Exception:
+                logger.warning(
+                    "Could not close the connection opened for the privilege audit", exc_info=True
+                )
+
+
+def _readable_config(config_encrypted: bytes) -> dict | None:
+    """The decrypted config, or ``None`` when it cannot be decrypted (an ``InvalidToken``
+    after an ``ENCRYPTION_KEY`` change) or parsed. For the callers that must not fail on it:
+    the warning names only the exception type, since a parse error can quote the content."""
+    try:
+        config = json.loads(decrypt_value(config_encrypted, get_settings().encryption_key))
+    except Exception as exc:
+        logger.warning("Could not read the connection config: error=%s", type(exc).__name__)
+        return None
+    if not isinstance(config, dict):
+        logger.warning("Could not read the connection config: error=not an object")
+        return None
+    return config
+
+
 def _mask_config(config: dict) -> dict:
     """Return a copy of the config dict with sensitive field values replaced by a sentinel."""
     return {
@@ -316,6 +422,10 @@ async def create_connection(
             # Verified before the row exists: a connection is not created with a filter
             # the database refuses. body.config is the plain dict the row is encrypted from.
             await _verify_row_filters(body.source_type, body.config, privacy["row_filters"])
+    # The audit is the handler's first connection (the wizard tests the config through
+    # POST /connections/test separately): a config that does not connect stores
+    # "unavailable" with the connect error. Never refuses the create.
+    privilege_audit = await _audit_privileges(body.source_type, body.config, privacy)
     settings = get_settings()
     config_encrypted = encrypt_value(json.dumps(body.config), settings.encryption_key)
     conn = Connection(
@@ -324,6 +434,7 @@ async def create_connection(
         source_type=body.source_type,
         config_encrypted=config_encrypted,
         privacy_settings=privacy,
+        privilege_audit=privilege_audit,
         execution_mode=body.execution_mode,
         is_active=True,
         created_at=datetime.now(UTC),
@@ -386,6 +497,18 @@ async def test_existing_connection(
             conn.source_type,
             result.server_version,
         )
+        # The one write of this endpoint: the audit column alone, with a single-column
+        # UPDATE (no row lock is held here, and writing the whole row could overwrite a
+        # concurrent privacy save). A failed test writes nothing.
+        privilege_audit = await _audit_privileges(
+            conn.source_type, config_dict, conn.privacy_settings
+        )
+        await db.execute(
+            update(Connection)
+            .where(Connection.id == connection_id)
+            .values(privilege_audit=privilege_audit)
+        )
+        await db.commit()
         response: dict = {"success": True, "message": result.message}
         if result.server_version:
             response["server_version"] = result.server_version
@@ -488,6 +611,9 @@ async def update_privacy(
     changes = body.model_dump(exclude_none=True, exclude={"clear_legacy_row_filter"})
     existing.update(changes)
     legacy = bool(existing.get("row_filter_sql"))
+    # Decrypted at most once: by the verification (which needs it and fails the save when
+    # it cannot be read) or else by the audit (which must not fail it).
+    config: dict | None = None
     if body.row_filters is not None:
         new_map = _validated_row_filters(body.row_filters, conn.source_type)
         pairs = _changed_pairs(new_map, prior.get("row_filters"))
@@ -506,9 +632,20 @@ async def update_privacy(
     if body.clear_legacy_row_filter:
         existing.pop("row_filter_sql", None)
         existing.setdefault("row_filters", {})
-    await db.execute(
-        update(Connection).where(Connection.id == connection_id).values(privacy_settings=existing)
-    )
+    values: dict = {"privacy_settings": existing}
+    # The audit reads facts about the row-filtered and the excluded tables: rerun it when
+    # that set changed (excluded_schemas is not enumerated, so a change there cannot change
+    # the facts). A 422 above has already left the stored audit as it was.
+    if any(prior.get(k) != existing.get(k) for k in ("row_filters", "excluded_tables")):
+        if config is None:
+            config = _readable_config(conn.config_encrypted)
+        if config is None:
+            values["privilege_audit"] = audit_to_dict(
+                audit_unavailable("", "the connection settings could not be read")
+            )
+        else:
+            values["privilege_audit"] = await _audit_privileges(conn.source_type, config, existing)
+    await db.execute(update(Connection).where(Connection.id == connection_id).values(**values))
     # A row-filter change does not alter introspection: keep the schema cache so the page's
     # schema read does not 404 after the save. Cached answers hold only generated SQL, which
     # runs through the row-filter rewrite again on every hit, so flushing them (and the
@@ -595,6 +732,12 @@ async def update_connection_config(
         else:
             merged = body.config
         values["config_encrypted"] = encrypt_value(json.dumps(merged), settings.encryption_key)
+        # On the merged config: the handler runs no connection test, so a config that does
+        # not connect stores "unavailable" with the connect error, which is what the banner
+        # should say.
+        values["privilege_audit"] = await _audit_privileges(
+            conn.source_type, merged, conn.privacy_settings
+        )
     if values:
         values["updated_at"] = datetime.now(UTC)
         await db.execute(update(Connection).where(Connection.id == connection_id).values(**values))

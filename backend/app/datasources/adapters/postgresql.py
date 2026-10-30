@@ -25,10 +25,14 @@ from ..models import (
     ConnectionResult,
     DataSourceSchema,
     PrivacySettings,
+    PrivilegeFacts,
+    PrivilegeGrant,
     QueryResult,
     RelationshipInfo,
+    RoleMembership,
     SchemaInfo,
     TableInfo,
+    TablePrivilegeFacts,
     ValidationResult,
 )
 from ..registry import register_datasource
@@ -93,6 +97,190 @@ def _column_types(record: Any) -> list[str]:
 def _quote_pg_ident(name: str) -> str:
     """Return a double-quoted PostgreSQL identifier with any embedded quotes escaped."""
     return '"' + name.replace('"', '""') + '"'
+
+
+# The functions that run SQL from a string or read a table named by a string, the names
+# ``services/row_filter_rewrite._UNFILTERABLE_FUNCTION`` denies, as a regular expression
+# for ``proname ~*``. pg_catalog's own members (query_to_xml, ts_stat ...) are not reported:
+# every role can execute them through PUBLIC, revoking them is a cluster-wide change, and the
+# rewriter denies them by name. What is reported is the extension functions (dblink,
+# tablefunc) and any user function of those names.
+_SQL_FROM_STRING_FUNCTIONS = (
+    r"^((query|table|cursor|schema|database)_to_xml\w*"
+    r"|ts_stat|ts_rewrite|crosstab\d*|connectby|dblink\w*)$"
+)
+
+_ROLE_FACTS_SQL = (
+    "SELECT rolname, rolsuper, rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = current_user"
+)
+
+# $1/$2: the qualified pairs as two parallel arrays; $3: the bare names, matched in every
+# schema but the system ones. One policy applies to the role when its role list names
+# PUBLIC or a role whose privileges current_user inherits (pg_has_role ... 'USAGE', not
+# 'MEMBER': a NOINHERIT membership does not make a policy apply). A CASE, not an OR: the
+# planner does not promise the operands' order and pg_has_role raises for 'public', which
+# is not a role. is_owner is the engine's own rule (check_enable_rls: has_privs_of_role),
+# so a role that inherits the owner bypasses RLS like the owner and reads True. For a
+# superuser that rule is true of every role (its bypass is the SUPERUSER finding), so only
+# the tables it owns by oid read True; the CASE keeps that order. can_select
+# needs USAGE on the schema as well: the table privilege alone is true for a table the
+# role cannot reach; can_write stays the table privilege, a write grant is worth revoking
+# either way. select_grantees: the grantees of the SELECT entries of the table's ACL that
+# the role is or inherits (PUBLIC for grantee 0), the owner's own entry left out (a non-null
+# ACL lists the owner; ownership is is_owner); NULL for a NULL ACL (default privileges: only
+# the owner reads).
+_TABLE_FACTS_SQL = """
+SELECT n.nspname AS schema_name,
+       c.relname AS table_name,
+       CASE WHEN c.relowner = me.oid THEN true
+            WHEN me.rolsuper THEN false
+            ELSE pg_has_role(current_user, c.relowner, 'USAGE') END AS is_owner,
+       c.relrowsecurity AS rls_enabled,
+       c.relforcerowsecurity AS rls_forced,
+       has_schema_privilege(current_user, c.relnamespace, 'USAGE')
+           AND has_table_privilege(current_user, c.oid, 'SELECT') AS can_select,
+       has_table_privilege(current_user, c.oid, 'INSERT, UPDATE, DELETE') AS can_write,
+       EXISTS (
+           SELECT 1
+           FROM pg_catalog.pg_policies p
+           WHERE p.schemaname = n.nspname
+             AND p.tablename = c.relname
+             AND p.cmd IN ('SELECT', 'ALL')
+             AND EXISTS (
+                 SELECT 1 FROM unnest(p.roles) AS r(name)
+                 WHERE CASE WHEN r.name = 'public' THEN true
+                            ELSE pg_has_role(current_user, r.name, 'USAGE') END
+             )
+       ) AS select_policy_applies,
+       (SELECT array_agg(v.name ORDER BY v.name)
+        FROM (SELECT CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE g.rolname END AS name
+              FROM aclexplode(c.relacl) a
+              LEFT JOIN pg_catalog.pg_roles g ON g.oid = a.grantee
+              WHERE a.privilege_type = 'SELECT'
+                AND a.grantee <> c.relowner
+                AND (a.grantee = 0 OR pg_has_role(current_user, a.grantee, 'USAGE'))) v
+       ) AS select_grantees
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_roles me ON me.rolname = current_user
+WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+  AND (
+      (n.nspname, c.relname) IN (SELECT * FROM unnest($1::text[], $2::text[]))
+      OR (c.relname = ANY($3::text[])
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND n.nspname NOT LIKE 'pg\\_toast%'
+          AND n.nspname NOT LIKE 'pg\\_temp%')
+  )
+ORDER BY 1, 2
+"""
+
+# The most write grants the audit keeps; the query reads one more to tell truncation.
+_WRITES_CAP = 500
+
+# Every write grant the role holds on a non-system relation (materialized views left out:
+# no INSERT/UPDATE/DELETE runs against one): the table-level entries of the
+# relation ACL, the column-level entries of the attribute ACLs (INSERT/UPDATE only: DELETE
+# has no column form), and one ownership row per table the role owns or inherits (the
+# owner's own ACL entry is left out of the ACL branches: it is that ownership row). Not run
+# for a superuser (pg_has_role answers true for every role when asked about one, so every
+# grant in the database would match; its bypass is the SUPERUSER finding and evaluate skips
+# tier 2 for it). Grouped per (table, grantee, column privilege); privileges aggregated,
+# columns in table order. One more row than the cap so the adapter can tell truncation.
+_WRITE_GRANTS_SQL = f"""
+WITH rels AS (
+    SELECT c.oid, c.relowner, c.relacl, n.nspname AS schema_name, c.relname AS table_name
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r', 'p', 'v', 'f')
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+      AND n.nspname NOT LIKE 'pg\\_toast%'
+      AND n.nspname NOT LIKE 'pg\\_temp%'
+),
+grants AS (
+    SELECT r.schema_name, r.table_name,
+           CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE g.rolname END AS grantee,
+           a.privilege_type, NULL::name AS column_name, NULL::smallint AS column_order
+    FROM rels r
+    CROSS JOIN LATERAL aclexplode(r.relacl) a
+    LEFT JOIN pg_catalog.pg_roles g ON g.oid = a.grantee
+    WHERE a.privilege_type IN ('INSERT', 'UPDATE', 'DELETE')
+      AND a.grantee <> r.relowner
+      AND (a.grantee = 0 OR pg_has_role(current_user, a.grantee, 'USAGE'))
+    UNION ALL
+    SELECT r.schema_name, r.table_name,
+           CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE g.rolname END,
+           a.privilege_type, att.attname, att.attnum
+    FROM rels r
+    JOIN pg_catalog.pg_attribute att
+      ON att.attrelid = r.oid AND att.attnum > 0 AND NOT att.attisdropped
+     AND att.attacl IS NOT NULL
+    CROSS JOIN LATERAL aclexplode(att.attacl) a
+    LEFT JOIN pg_catalog.pg_roles g ON g.oid = a.grantee
+    WHERE a.privilege_type IN ('INSERT', 'UPDATE')
+      AND a.grantee <> r.relowner
+      AND (a.grantee = 0 OR pg_has_role(current_user, a.grantee, 'USAGE'))
+    UNION ALL
+    SELECT r.schema_name, r.table_name, NULL, p.privilege, NULL, NULL
+    FROM rels r
+    CROSS JOIN (VALUES ('INSERT'), ('UPDATE'), ('DELETE')) AS p(privilege)
+    WHERE pg_has_role(current_user, r.relowner, 'USAGE')
+)
+SELECT schema_name, table_name, grantee,
+       CASE WHEN column_name IS NULL THEN NULL ELSE privilege_type END AS column_privilege,
+       array_agg(DISTINCT privilege_type) AS privileges,
+       array_agg(column_name ORDER BY column_order) FILTER (WHERE column_name IS NOT NULL)
+           AS columns
+FROM grants
+GROUP BY 1, 2, 3, 4
+ORDER BY 1, 2, 3 NULLS FIRST, 4 NULLS FIRST
+LIMIT {_WRITES_CAP + 1}
+"""  # noqa: S608 -- the LIMIT is an int constant, not input
+
+# The predefined roles that read or write every table with no ACL entry (PostgreSQL 14+):
+# a membership in pg_read_all_data or pg_write_all_data held by the role or a role it
+# inherits, so neither the table ACLs above nor the write query see it. Joined by name, so
+# a pre-14 server returns no row. The membership edge itself must be inherited: PostgreSQL 16
+# stores that per edge (inherit_option), read through to_jsonb so PostgreSQL 14/15, which
+# lack the column, fall back to the member's rolinherit. grantor is the role a
+# REVOKE ... GRANTED BY must name, NULL for the bootstrap superuser (oid 10, the grantor a
+# plain REVOKE run by a superuser matches); a LEFT JOIN so a dangling pre-16 grantor keeps
+# the row. DISTINCT: one row per (role, member, grantor), several grantors each need their
+# REVOKE. Not run for a superuser (pg_has_role is true for every role; its bypass is the
+# SUPERUSER finding).
+_PREDEFINED_ROLES_SQL = """
+SELECT DISTINCT p.rolname AS role, m.rolname AS member,
+       CASE WHEN am.grantor = 10 THEN NULL ELSE g.rolname END AS grantor
+FROM pg_catalog.pg_roles p
+JOIN pg_catalog.pg_auth_members am ON am.roleid = p.oid
+JOIN pg_catalog.pg_roles m ON m.oid = am.member
+LEFT JOIN pg_catalog.pg_roles g ON g.oid = am.grantor
+WHERE p.rolname IN ('pg_read_all_data', 'pg_write_all_data')
+  AND pg_has_role(current_user, m.oid, 'USAGE')
+  AND COALESCE((to_jsonb(am) ->> 'inherit_option')::boolean, m.rolinherit)
+ORDER BY 1, 2, 3 NULLS FIRST
+"""
+
+_SCHEMAS_SQL = """
+SELECT nspname
+FROM pg_catalog.pg_namespace
+WHERE nspname NOT IN ('pg_catalog', 'information_schema')
+  AND nspname NOT LIKE 'pg\\_toast%'
+  AND nspname NOT LIKE 'pg\\_temp%'
+ORDER BY 1
+"""
+
+# %I quotes a part only when it needs it, so the signature is REVOKE-ready and resolves
+# regardless of search_path: public.dblink(text).
+_FUNCTION_FACTS_SQL = """
+SELECT format('%I.%I(%s)', n.nspname, p.proname, pg_get_function_identity_arguments(p.oid))
+           AS signature
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname <> 'pg_catalog'
+  AND p.proname ~* $1
+  AND has_function_privilege(current_user, p.oid, 'EXECUTE')
+ORDER BY 1
+"""
 
 
 @register_datasource("postgresql")
@@ -653,6 +841,105 @@ class PostgreSQLDataSource(BaseDataSource):
                 await conn.fetch(f"EXPLAIN {sql}")
             except Exception as exc:
                 raise ExplainError(str(exc) or type(exc).__name__) from exc
+
+    async def audit_privileges(
+        self,
+        tables: list[tuple[str | None, str]],
+        timeout: int,  # noqa: ASYNC109
+    ) -> PrivilegeFacts:
+        """The role facts, the table facts, the write grants, the predefined-role memberships,
+        the schemas and the executable SQL-from-string functions, in six catalog queries (role,
+        tables, writes, predefined roles, schemas, functions; writes and predefined roles
+        skipped for a superuser) on one connection inside a read-only transaction under
+        ``statement_timeout`` (so a cancellation by the router's budget rolls back before the
+        connection returns to the shared pool). See ``BaseDataSource.audit_privileges``."""
+        if self._pool is None:
+            raise RuntimeError("Not connected.")
+        wanted = list(dict.fromkeys(tables))
+        qualified = [(s, t) for s, t in wanted if s is not None]
+        bare = [t for s, t in wanted if s is None]
+        async with self._pool.acquire() as conn, conn.transaction(readonly=True):
+            await conn.execute(f"SET LOCAL statement_timeout = {timeout * 1000}")
+            role_row = await conn.fetchrow(_ROLE_FACTS_SQL)
+            rows = (
+                await conn.fetch(
+                    _TABLE_FACTS_SQL,
+                    [s for s, _ in qualified],
+                    [t for _, t in qualified],
+                    bare,
+                )
+                if wanted
+                else []
+            )
+            # A superuser matches every grant and membership (pg_has_role) and skips tier 2
+            # in evaluate: the scans would be wasted.
+            superuser = bool(role_row and role_row["rolsuper"])
+            write_rows = [] if superuser else await conn.fetch(_WRITE_GRANTS_SQL)
+            predefined_rows = [] if superuser else await conn.fetch(_PREDEFINED_ROLES_SQL)
+            schema_rows = await conn.fetch(_SCHEMAS_SQL)
+            function_rows = await conn.fetch(_FUNCTION_FACTS_SQL, _SQL_FROM_STRING_FUNCTIONS)
+        facts = PrivilegeFacts(
+            role=str(role_row["rolname"]) if role_row else "",
+            is_superuser=superuser,
+            bypasses_rls=bool(role_row and role_row["rolbypassrls"]),
+            schemas=[str(r["nspname"]) for r in schema_rows],
+            predefined_roles=[
+                RoleMembership(
+                    str(r["role"]),
+                    str(r["member"]),
+                    None if r["grantor"] is None else str(r["grantor"]),
+                )
+                for r in predefined_rows
+            ],
+            sql_from_string_functions=[str(r["signature"]) for r in function_rows],
+        )
+        for r in write_rows[:_WRITES_CAP]:
+            facts.writes.append(
+                PrivilegeGrant(
+                    schema_name=str(r["schema_name"]),
+                    table_name=str(r["table_name"]),
+                    privileges=sorted(str(p) for p in r["privileges"]),
+                    grantee=None if r["grantee"] is None else str(r["grantee"]),
+                    columns=[str(c) for c in (r["columns"] or [])],
+                )
+            )
+        facts.writes_truncated = len(write_rows) > _WRITES_CAP
+        written = {g.key for g in facts.writes}
+        found: set[tuple[str, str]] = set()
+        for r in rows:
+            found.add((r["schema_name"], r["table_name"]))
+            is_owner = bool(r["is_owner"])
+            can_select = bool(r["can_select"])
+            grantees = [str(g) for g in (r["select_grantees"] or [])]
+            # Ownership is a SELECT path to revoke only for a non-superuser: a superuser's
+            # bypass is its own finding (spec 2.1).
+            via: list[str | None] = ([None] if is_owner and not superuser else []) + grantees
+            key = f"{r['schema_name']}.{r['table_name']}"
+            facts.tables.append(
+                TablePrivilegeFacts(
+                    schema_name=r["schema_name"],
+                    table_name=r["table_name"],
+                    exists=True,
+                    can_select=can_select,
+                    can_write=bool(r["can_write"]) or key in written,
+                    is_owner=is_owner,
+                    rls_enabled=bool(r["rls_enabled"]),
+                    rls_forced=bool(r["rls_forced"]),
+                    select_policy_applies=bool(r["select_policy_applies"]),
+                    select_grants=[
+                        PrivilegeGrant(r["schema_name"], r["table_name"], ["SELECT"], g)
+                        for g in via
+                    ]
+                    if can_select
+                    else [],
+                )
+            )
+        found_names = {t for _, t in found}
+        for schema, table in wanted:
+            missing = table not in found_names if schema is None else (schema, table) not in found
+            if missing:
+                facts.tables.append(TablePrivilegeFacts(schema, table, False))
+        return facts
 
     async def execute_query_stream(
         self,

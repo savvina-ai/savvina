@@ -60,6 +60,7 @@ class TestDefaultExecuteQueryStream:
                 return result  # type: ignore[override]
 
             async def explain(self, sql, timeout): ...  # type: ignore[override]  # noqa: ASYNC109
+            async def audit_privileges(self, tables, timeout): ...  # type: ignore[override]  # noqa: ASYNC109
 
             def validate_query(self, query): ...  # type: ignore[override]
             def format_schema_for_llm(self, schema, privacy=None): ...  # type: ignore[override]
@@ -105,6 +106,7 @@ class TestDefaultExecuteQueryStream:
                 return result  # type: ignore[override]
 
             async def explain(self, sql, timeout): ...  # type: ignore[override]  # noqa: ASYNC109
+            async def audit_privileges(self, tables, timeout): ...  # type: ignore[override]  # noqa: ASYNC109
 
             def validate_query(self, query): ...  # type: ignore[override]
             def format_schema_for_llm(self, schema, privacy=None): ...  # type: ignore[override]
@@ -150,6 +152,7 @@ class TestDefaultExecuteQueryStream:
                 return result  # type: ignore[override]
 
             async def explain(self, sql, timeout): ...  # type: ignore[override]  # noqa: ASYNC109
+            async def audit_privileges(self, tables, timeout): ...  # type: ignore[override]  # noqa: ASYNC109
 
             def validate_query(self, query): ...  # type: ignore[override]
             def format_schema_for_llm(self, schema, privacy=None): ...  # type: ignore[override]

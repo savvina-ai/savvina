@@ -8,9 +8,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 from ..datasources.models import PrivacySettings
+from ..services.privilege_audit import from_dict as audit_from_dict
+from ..services.privilege_audit import to_dict as audit_to_dict
 
 # ── Privacy Settings ───────────────────────────────────────────────────────────
 
@@ -65,6 +67,31 @@ class ConnectionTest(BaseModel):
     config: dict[str, Any]
 
 
+# ── Privilege audit ────────────────────────────────────────────────────────────
+
+
+class AuditFindingResponse(BaseModel):
+    """One finding of the privilege audit (``services/privilege_audit.AuditFinding``)."""
+
+    code: str
+    tables: list[str] = []
+    functions: list[str] = []
+    remediation: str
+    more_tables: int = 0  # tables beyond the cut of ``tables``
+
+
+class PrivilegeAuditResponse(BaseModel):
+    """The stored privilege audit (``services/privilege_audit.PrivilegeAudit``)."""
+
+    checked_at: datetime
+    role: str
+    status: Literal["ok", "unavailable"]
+    error: str | None
+    findings: list[AuditFindingResponse]
+    rls_in_use: bool
+    rls_effective: dict[str, bool]
+
+
 # ── Connection responses ───────────────────────────────────────────────────────
 
 
@@ -85,6 +112,18 @@ class ConnectionDetail(ConnectionResponse):
     """Full detail response — includes cached metadata."""
 
     privacy_settings: dict | None
+    # The last privilege audit; None when the audit never ran. The stored JSON passes
+    # through privilege_audit.from_dict, so a tampered or outdated column serves None, not
+    # a 500, and a finding code this version does not know is dropped.
+    privilege_audit: PrivilegeAuditResponse | None = None
+
+    @field_validator("privilege_audit", mode="before")
+    @classmethod
+    def _well_formed_audit(cls, value: object) -> object:
+        if value is None:
+            return None
+        audit = audit_from_dict(value)
+        return None if audit is None else audit_to_dict(audit)
 
     @computed_field  # type: ignore[prop-decorator]
     @property

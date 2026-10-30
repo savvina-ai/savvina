@@ -14,6 +14,7 @@ from .models import (
     ConnectionResult,
     DataSourceSchema,
     PrivacySettings,
+    PrivilegeFacts,
     QueryResult,
     ValidationResult,
     table_key,
@@ -131,6 +132,38 @@ class BaseDataSource(ABC):
         ...
 
     @abstractmethod
+    async def audit_privileges(
+        self,
+        tables: list[tuple[str | None, str]],
+        timeout: int,  # noqa: ASYNC109
+    ) -> PrivilegeFacts:
+        """Read what the connection role can do, from the catalog only (no table row).
+
+        *tables* are ``(schema, table)`` pairs: the row-filtered tables (always qualified)
+        and the excluded tables. A pair with ``schema None`` is a bare ``excluded_tables``
+        entry, matched by name in every schema except the system ones; it yields one
+        ``TablePrivilegeFacts`` per schema where it exists, or one with ``exists False`` and
+        ``schema_name None``. A qualified pair that is not in the catalog yields ``exists
+        False``. Duplicates in *tables* are read once.
+
+        Fills ``PrivilegeFacts.writes`` (every write grant at every level and through every
+        grantee) with ``writes_truncated`` when the adapter's cap cut it, ``has_super``
+        (MySQL global ``SUPER`` when the role is not a superuser, ``is_superuser`` being
+        global ``ALL PRIVILEGES`` or ``SUPER`` plus every write privilege) with
+        ``super_grantees`` (the account or active roles that hold it), ``schemas`` (the non-system
+        schemas or databases), ``predefined_roles`` (PostgreSQL ``pg_read_all_data`` /
+        ``pg_write_all_data`` memberships) and, per table, ``TablePrivilegeFacts.select_grants``
+        (each SELECT path with its scope and grantee).
+
+        Runs under the same bounds as ``explain`` where the engine has them (PostgreSQL
+        ``statement_timeout`` inside a read-only transaction, MariaDB ``max_statement_time``);
+        the connections router bounds the call with ``asyncio.wait_for`` as well. A driver
+        exception passes through; ``RuntimeError`` when not connected. The adapter reports,
+        it does not judge: ``services/privilege_audit.evaluate`` turns the facts into findings.
+        """
+        ...
+
+    @abstractmethod
     def validate_query(self, query: str) -> ValidationResult:
         """Validate query is safe (read-only, no dangerous patterns)."""
         ...
@@ -142,6 +175,12 @@ class BaseDataSource(ABC):
         too coarse, because only the category, never the text, reaches the LLM.
         """
         return ErrorCategory.OTHER
+
+    def describe_connection_error(self, text: str) -> str | None:
+        """A readable sentence for a connect or catalog failure the privilege audit stores as
+        its ``unavailable`` reason, or ``None`` to let the generic redaction apply. Must not
+        copy the engine's text: the audit's error is shown to the admin unredacted."""
+        return None
 
     def _quote_identifier(self, name: str) -> str:
         """Return a dialect-appropriate quoted identifier. Default: no quoting."""

@@ -14,8 +14,9 @@ import pytest
 from app.config import get_settings
 from app.database import get_db
 from app.datasources.errors import ErrorCategory, ExplainError
-from app.datasources.models import ConnectionResult
+from app.datasources.models import ConnectionResult, PrivilegeFacts, TablePrivilegeFacts
 from app.main import app
+from app.routers.connections import _audit_privileges, _audit_tables
 from app.services.row_filter import RowFilterRejectedError
 
 from .conftest import MockResult, _make_conn, _mock_db
@@ -31,6 +32,17 @@ def no_verification():
         patch("app.routers.connections.decrypt_value", return_value="{}"),
     ):
         yield verify
+
+
+@pytest.fixture
+def no_audit():
+    """Every create, test, privacy save and config save audits the connection role's
+    privileges on the live database; these tests are about the rest of the handler."""
+    with patch(
+        "app.routers.connections._audit_privileges",
+        new=AsyncMock(return_value={"status": "ok", "stub": True}),
+    ) as audit:
+        yield audit
 
 
 # ── POST /api/v1/connections/test ────────────────────────────────────────────────
@@ -79,6 +91,7 @@ class TestTestNewConnection:
 # ── POST /api/v1/connections ──────────────────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("no_audit")
 class TestCreateConnection:
     async def test_returns_201(self, http_client):
         db = _mock_db()
@@ -271,14 +284,134 @@ class TestGetConnection:
         resp = await http_client.get("/api/v1/connections/missing")
         assert resp.status_code == 404
 
+    async def test_serves_the_stored_privilege_audit(self, http_client):
+        stored = {
+            "checked_at": "2026-10-29T10:00:00+00:00",
+            "role": "savvina",
+            "status": "ok",
+            "error": None,
+            "findings": [
+                {
+                    "code": "superuser",
+                    "tables": [],
+                    "functions": [],
+                    "remediation": 'ALTER ROLE "savvina" NOSUPERUSER;',
+                },
+                {"code": "from_the_future", "remediation": "x"},
+            ],
+            "rls_in_use": False,
+            "rls_effective": {"public.orders": False},
+        }
+        conn = _make_conn(privilege_audit=stored)
+        db = _mock_db(MockResult(single=conn))
+        app.dependency_overrides[get_db] = lambda: db
+        body = (await http_client.get("/api/v1/connections/conn-123")).json()
+        audit = body["privilege_audit"]
+        assert audit["status"] == "ok"
+        assert audit["role"] == "savvina"
+        assert [f["code"] for f in audit["findings"]] == ["superuser"]
+        assert audit["findings"][0]["remediation"] == 'ALTER ROLE "savvina" NOSUPERUSER;'
+        assert audit["rls_in_use"] is False
+        assert audit["rls_effective"] == {"public.orders": False}
+        assert audit["checked_at"].startswith("2026-10-29T10:00:00")
+
+    async def test_serves_more_tables_and_reads_an_old_audit_without_it_as_zero(self, http_client):
+        stored = {
+            "checked_at": "2026-10-29T10:00:00+00:00",
+            "role": "savvina",
+            "status": "ok",
+            "error": None,
+            "findings": [
+                {"code": "write_privileges", "tables": ["public.t"], "more_tables": 3},
+                {"code": "reads_excluded_tables", "tables": ["hr.salaries"]},
+            ],
+            "rls_in_use": False,
+            "rls_effective": {},
+        }
+        conn = _make_conn(privilege_audit=stored)
+        db = _mock_db(MockResult(single=conn))
+        app.dependency_overrides[get_db] = lambda: db
+        body = (await http_client.get("/api/v1/connections/conn-123")).json()
+        findings = body["privilege_audit"]["findings"]
+        assert [f["more_tables"] for f in findings] == [3, 0]
+
+    async def test_a_never_audited_connection_serves_null(self, http_client):
+        conn = _make_conn()
+        db = _mock_db(MockResult(single=conn))
+        app.dependency_overrides[get_db] = lambda: db
+        body = (await http_client.get("/api/v1/connections/conn-123")).json()
+        assert body["privilege_audit"] is None
+
+    @pytest.mark.parametrize(
+        "stored", ["garbage", {"status": "ok"}, {"checked_at": "x", "status": "ok"}, []]
+    )
+    async def test_a_malformed_stored_audit_serves_null_not_500(self, http_client, stored):
+        conn = _make_conn(privilege_audit=stored)
+        db = _mock_db(MockResult(single=conn))
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/connections/conn-123")
+        assert resp.status_code == 200
+        assert resp.json()["privilege_audit"] is None
+
+    async def test_an_unavailable_audit_is_served(self, http_client):
+        stored = {
+            "checked_at": "2026-10-29T10:00:00+00:00",
+            "role": "",
+            "status": "unavailable",
+            "error": "connection refused",
+            "findings": [],
+            "rls_in_use": False,
+            "rls_effective": {},
+        }
+        conn = _make_conn(privilege_audit=stored)
+        db = _mock_db(MockResult(single=conn))
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/connections/conn-123")
+        assert resp.status_code == 200
+        audit = resp.json()["privilege_audit"]
+        assert audit["status"] == "unavailable"
+        assert audit["error"] == "connection refused"
+        assert audit["findings"] == []
+
+    @pytest.mark.parametrize("findings", [5, True, "x"])
+    async def test_a_non_list_findings_serves_an_audit_with_no_findings(
+        self, http_client, findings
+    ):
+        stored = {
+            "checked_at": "2026-10-29T10:00:00+00:00",
+            "role": "savvina",
+            "status": "ok",
+            "error": None,
+            "findings": findings,
+            "rls_in_use": False,
+            "rls_effective": {},
+        }
+        conn = _make_conn(privilege_audit=stored)
+        db = _mock_db(MockResult(single=conn))
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/connections/conn-123")
+        assert resp.status_code == 200
+        assert resp.json()["privilege_audit"]["findings"] == []
+
+    async def test_the_list_shape_does_not_carry_it(self, http_client):
+        conn = _make_conn(
+            privilege_audit={"checked_at": "2026-10-29T10:00:00+00:00", "status": "ok"}
+        )
+        db = _mock_db(MockResult(rows=[conn]))  # the count goes through db.scalar
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/connections")
+        assert resp.status_code == 200
+        assert "privilege_audit" not in resp.json()["items"][0]
+
 
 # ── POST /api/v1/connections/{id}/test ───────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("no_audit")
 class TestTestExistingConnection:
     async def test_success_returns_200(self, http_client):
         conn = _make_conn()
-        db = _mock_db(MockResult(single=conn))
+        db = _mock_db(MockResult(single=conn), MockResult())
         app.dependency_overrides[get_db] = lambda: db
         adapter = MagicMock()
         adapter.test_connection = AsyncMock(
@@ -515,6 +648,7 @@ class TestRefreshSchema:
 # ── PUT /api/v1/connections/{id}/privacy ─────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("no_audit")
 class TestUpdatePrivacy:
     async def test_success_returns_200(self, http_client):
         conn = _make_conn(privacy_settings={"include_sample_values": False})
@@ -679,7 +813,9 @@ class TestUpdatePrivacy:
         sql = str(lookup.compile(dialect=postgresql.dialect()))
         assert "FOR NO KEY UPDATE" in sql
 
-    async def test_empty_map_clears_when_there_is_no_legacy_filter(self, http_client):
+    async def test_empty_map_clears_when_there_is_no_legacy_filter(
+        self, http_client, no_verification
+    ):
         conn = _make_conn(privacy_settings={"row_filters": {"public.t": "tenant_id = 42"}})
         db = self._db_for_update(conn)
         self._use_db(db)
@@ -724,7 +860,7 @@ class TestUpdatePrivacy:
             {"clear_legacy_row_filter": True},
         ],
     )
-    async def test_clear_flag_removes_the_legacy_filter(self, http_client, body):
+    async def test_clear_flag_removes_the_legacy_filter(self, http_client, body, no_verification):
         conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 42"})
         db = self._db_for_update(conn)
         self._use_db(db)
@@ -893,6 +1029,7 @@ class TestUpdateExecutionMode:
 # ── PUT /api/v1/connections/{id}/config ──────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("no_audit")
 class TestUpdateConfig:
     @pytest.fixture(autouse=True)
     def patch_evict(self):
@@ -964,6 +1101,7 @@ class TestUpdateConfig:
 # ── GET /api/v1/connections/{id}/config — SEC-2 credential masking ────────────
 
 
+@pytest.mark.usefixtures("no_audit")
 class TestGetConnectionConfig:
     async def test_returns_masked_password(self, http_client) -> None:
         """GET /connections/{id}/config must mask the password field (SEC-2)."""
@@ -1089,6 +1227,7 @@ def _verifying_adapter(explain=None) -> MagicMock:
     return adapter
 
 
+@pytest.mark.usefixtures("no_audit")
 class TestRowFilterVerification:
     @pytest.fixture(autouse=True)
     def _config(self):
@@ -1469,3 +1608,529 @@ class TestRowFilterVerification:
             )
         assert resp.status_code == 200
         adapter.disconnect.assert_awaited_once()
+
+
+def _auditing_adapter(facts: PrivilegeFacts | None = None, *, connect=None) -> MagicMock:
+    adapter = MagicMock()
+    adapter.connect = connect or AsyncMock(
+        return_value=ConnectionResult(success=True, message="ok")
+    )
+    adapter.disconnect = AsyncMock()
+    adapter.audit_privileges = AsyncMock(return_value=facts or PrivilegeFacts(role="savvina"))
+    adapter.classify_error = MagicMock(return_value=ErrorCategory.OTHER)
+    adapter.describe_connection_error = MagicMock(return_value=None)
+    return adapter
+
+
+class TestAuditTables:
+    def test_row_filter_keys_split_at_the_first_dot(self):
+        assert _audit_tables({"row_filters": {"public.orders": "x", "s.a.b": "y"}}) == [
+            ("public", "orders"),
+            ("s", "a.b"),
+        ]
+
+    def test_excluded_entries_as_is_table_excluded_reads_them(self):
+        privacy = {"excluded_tables": ["public.Audit_Log", "sessions", "", 7, "a.b.c"]}
+        assert _audit_tables(privacy) == [
+            ("public", "Audit_Log"),
+            (None, "sessions"),
+            ("a", "b.c"),
+        ]
+
+    def test_duplicates_read_once_and_excluded_schemas_ignored(self):
+        privacy = {
+            "row_filters": {"public.orders": "x"},
+            "excluded_tables": ["public.orders"],
+            "excluded_schemas": ["hr"],
+        }
+        assert _audit_tables(privacy) == [("public", "orders")]
+
+    def test_empty(self):
+        assert _audit_tables({}) == []
+        assert _audit_tables(None) == []
+
+    def test_a_row_filter_key_without_a_dot_is_skipped(self):
+        assert _audit_tables({"row_filters": {"orders": "x"}}) == []
+
+
+class TestAuditPrivilegesHelper:
+    async def test_audits_the_tables_under_the_budget_and_disconnects(self):
+        facts = PrivilegeFacts(
+            role="savvina",
+            is_superuser=True,
+            tables=[TablePrivilegeFacts("public", "orders", True, can_select=True)],
+        )
+        adapter = _auditing_adapter(facts)
+        privacy = {"row_filters": {"public.orders": "tenant_id = 1"}, "excluded_tables": ["log"]}
+        with patch("app.routers.connections.create_datasource", return_value=adapter) as create:
+            stored = await _audit_privileges(
+                "postgresql", {"host": "db", "database": "app"}, privacy
+            )
+        create.assert_called_once_with("postgresql")
+        adapter.connect.assert_awaited_once_with({"host": "db", "database": "app"})
+        adapter.audit_privileges.assert_awaited_once_with(
+            [("public", "orders"), (None, "log")], timeout=get_settings().default_query_timeout
+        )
+        adapter.disconnect.assert_awaited_once()
+        assert stored["status"] == "ok"
+        assert stored["role"] == "savvina"
+        assert [f["code"] for f in stored["findings"]] == ["superuser"]
+        assert stored["rls_effective"] == {"public.orders": False}
+
+    async def test_a_refused_connection_is_described_by_the_adapter_before_redaction(self):
+        message = "(1045, \"Access denied for user 'u'@'h'\")"
+        adapter = MagicMock()
+        adapter.connect = AsyncMock(return_value=ConnectionResult(success=False, message=message))
+        adapter.describe_connection_error = MagicMock(
+            return_value="the server refused the user name or password"
+        )
+        adapter.disconnect = AsyncMock()
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            stored = await _audit_privileges("mysql", {"database": "shop"}, None)
+        assert stored["status"] == "unavailable"
+        assert stored["error"] == "the server refused the user name or password"
+        adapter.describe_connection_error.assert_called_once_with(message)
+
+    async def test_a_driver_exception_is_redacted_when_the_adapter_has_no_sentence(self):
+        adapter = MagicMock()
+        adapter.connect = AsyncMock(return_value=None)
+        adapter.audit_privileges = AsyncMock(
+            side_effect=RuntimeError("(1142, \"SELECT command denied to user 'u'@'h'\")")
+        )
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.OTHER)
+        adapter.describe_connection_error = MagicMock(return_value=None)
+        adapter.disconnect = AsyncMock()
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            stored = await _audit_privileges("mysql", {}, None)
+        assert stored["error"] == "(1142, [REDACTED])"
+
+    async def test_the_database_is_passed_to_evaluate_for_every_engine(self):
+        adapter = MagicMock()
+        adapter.connect = AsyncMock(return_value=None)
+        adapter.audit_privileges = AsyncMock(
+            return_value=PrivilegeFacts(role="r", is_superuser=True, schemas=["public"])
+        )
+        adapter.disconnect = AsyncMock()
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            stored = await _audit_privileges("postgresql", {"database": "app"}, None)
+        remediation = stored["findings"][0]["remediation"]
+        assert 'GRANT CONNECT ON DATABASE "app" TO savvina_reader;' in remediation
+
+    async def test_mysql_passes_the_database_to_the_superuser_remediation(self):
+        adapter = _auditing_adapter(PrivilegeFacts(role="root@localhost", is_superuser=True))
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            stored = await _audit_privileges("mysql", {"database": "shop"}, None)
+        assert stored["findings"][0]["remediation"].splitlines() == [
+            "-- Create a read-only account for Savvina and point the connection at it.",
+            "CREATE USER `savvina_reader`@`%` IDENTIFIED BY '<choose a password>';",
+            "GRANT SELECT ON `shop`.* TO `savvina_reader`@`%`;",
+        ]
+
+    async def test_a_refused_connection_is_unavailable(self):
+        adapter = _auditing_adapter(
+            connect=AsyncMock(
+                return_value=ConnectionResult(
+                    success=False, message="password authentication failed for user 'x'"
+                )
+            )
+        )
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            stored = await _audit_privileges("postgresql", {}, None)
+        assert stored["status"] == "unavailable"
+        assert stored["role"] == ""
+        assert stored["findings"] == [] and stored["rls_effective"] == {}
+        assert "[REDACTED]" in stored["error"] and "'x'" not in stored["error"]
+        adapter.audit_privileges.assert_not_awaited()
+        adapter.disconnect.assert_awaited_once()
+
+    async def test_a_catalog_exception_is_unavailable_with_the_text_redacted(self):
+        adapter = _auditing_adapter()
+        adapter.audit_privileges = AsyncMock(
+            side_effect=RuntimeError("relation 'secret_table' does not exist")
+        )
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            stored = await _audit_privileges("postgresql", {}, None)
+        assert stored["status"] == "unavailable"
+        assert stored["error"] == "relation [REDACTED] does not exist"
+        adapter.classify_error.assert_called_once()
+        adapter.disconnect.assert_awaited_once()
+
+    async def test_the_budget_timeout_is_unavailable(self):
+        adapter = _auditing_adapter()
+
+        async def slow(*_a, **_k):
+            await asyncio.sleep(60)
+
+        adapter.audit_privileges = AsyncMock(side_effect=slow)
+        with (
+            patch("app.routers.connections.create_datasource", return_value=adapter),
+            patch("app.routers.connections._explain_budget", return_value=0.01),
+        ):
+            stored = await _audit_privileges("postgresql", {}, None)
+        assert stored["status"] == "unavailable"
+        assert stored["error"] == "the privilege check did not finish within 0.01 seconds"
+        adapter.disconnect.assert_awaited_once()
+
+    async def test_an_unknown_source_type_is_unavailable(self):
+        with patch(
+            "app.routers.connections.create_datasource",
+            side_effect=ValueError("Unknown source_type 'x'"),
+        ):
+            stored = await _audit_privileges("x", {}, None)
+        assert stored["status"] == "unavailable"
+        assert stored["error"] == "Unknown source_type [REDACTED]"
+
+    async def test_a_failing_disconnect_does_not_change_the_verdict(self):
+        adapter = _auditing_adapter()
+        adapter.disconnect = AsyncMock(side_effect=RuntimeError("pool closed"))
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            stored = await _audit_privileges("postgresql", {}, None)
+        assert stored["status"] == "ok"
+
+    async def test_a_cancelled_audit_propagates_and_disconnects(self):
+        adapter = _auditing_adapter()
+        adapter.audit_privileges = AsyncMock(side_effect=asyncio.CancelledError())
+        with (
+            patch("app.routers.connections.create_datasource", return_value=adapter),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await _audit_privileges("postgresql", {}, None)
+        adapter.disconnect.assert_awaited_once()
+
+    async def test_an_evaluate_failure_after_the_facts_is_unavailable(self):
+        adapter = _auditing_adapter()
+        with (
+            patch("app.routers.connections.create_datasource", return_value=adapter),
+            patch(
+                "app.routers.connections.evaluate_privileges",
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
+            stored = await _audit_privileges("postgresql", {}, None)
+        assert stored["status"] == "unavailable"
+        assert stored["error"] == "boom"
+        adapter.disconnect.assert_awaited_once()
+
+
+# ── The four call sites of the privilege audit ───────────────────────────────────
+
+
+@pytest.mark.usefixtures("no_audit")
+class TestAuditCallSites:
+    """The tests assert on ``str(stmt)`` of the UPDATE the handler issued: SQLAlchemy renders
+    it as ``UPDATE connections SET privilege_audit=:privilege_audit ...``."""
+
+    async def test_create_stores_the_audit_on_the_new_row(self, http_client, no_audit):
+        db = _mock_db()
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.post(
+            "/api/v1/connections",
+            json={
+                "name": "My DB",
+                "source_type": "postgresql",
+                "config": {"host": "localhost", "database": "app"},
+                "privacy_settings": {"excluded_tables": ["log"]},
+            },
+        )
+        assert resp.status_code == 201
+        no_audit.assert_awaited_once_with(
+            "postgresql", {"host": "localhost", "database": "app"}, {"excluded_tables": ["log"]}
+        )
+        row = db.add.call_args.args[0]
+        assert row.privilege_audit == {"status": "ok", "stub": True}
+
+    async def test_create_runs_the_audit_after_the_row_filter_verification(
+        self, http_client, no_audit, no_verification
+    ):
+        order: list[str] = []
+        no_verification.side_effect = lambda *a, **k: order.append("verify")
+        no_audit.side_effect = lambda *a, **k: order.append("audit") or {"status": "ok"}
+        db = _mock_db()
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.post(
+            "/api/v1/connections",
+            json={
+                "name": "My DB",
+                "source_type": "postgresql",
+                "config": {"host": "localhost"},
+                "privacy_settings": {"row_filters": {"public.orders": "tenant_id = 1"}},
+            },
+        )
+        assert resp.status_code == 201
+        assert order == ["verify", "audit"]
+
+    async def test_a_successful_test_writes_only_the_audit_column(self, http_client, no_audit):
+        conn = _make_conn(privacy_settings={"excluded_tables": ["log"]})
+        db = _mock_db(MockResult(single=conn), MockResult())
+        app.dependency_overrides[get_db] = lambda: db
+        adapter = MagicMock()
+        adapter.test_connection = AsyncMock(
+            return_value=ConnectionResult(success=True, message="Connected")
+        )
+        with (
+            patch("app.routers.connections.decrypt_value", return_value='{"host":"localhost"}'),
+            patch("app.routers.connections.create_datasource", return_value=adapter),
+        ):
+            resp = await http_client.post("/api/v1/connections/conn-123/test")
+        assert resp.status_code == 200
+        no_audit.assert_awaited_once_with(
+            "postgresql", {"host": "localhost"}, {"excluded_tables": ["log"]}
+        )
+        assert db.execute.call_count == 2
+        stmt = db.execute.call_args_list[1].args[0]
+        assert str(stmt).startswith("UPDATE connections SET privilege_audit=")
+        assert "privacy_settings" not in str(stmt)
+        assert "WHERE connections.id" in str(stmt)
+        assert stmt.compile().params["privilege_audit"] == {"status": "ok", "stub": True}
+        db.commit.assert_awaited_once()
+        db.add.assert_not_called()
+
+    async def test_a_failed_test_writes_nothing(self, http_client, no_audit):
+        conn = _make_conn()
+        db = _mock_db(MockResult(single=conn))
+        app.dependency_overrides[get_db] = lambda: db
+        adapter = MagicMock()
+        adapter.test_connection = AsyncMock(
+            return_value=ConnectionResult(success=False, message="timeout")
+        )
+        with (
+            patch("app.routers.connections.decrypt_value", return_value='{"host":"x"}'),
+            patch("app.routers.connections.create_datasource", return_value=adapter),
+        ):
+            resp = await http_client.post("/api/v1/connections/conn-123/test")
+        assert resp.status_code == 400
+        no_audit.assert_not_awaited()
+        assert db.execute.call_count == 1
+        db.commit.assert_not_awaited()
+
+    async def test_privacy_save_that_changes_excluded_tables_stores_the_audit(
+        self, http_client, no_audit, no_verification
+    ):
+        conn = _make_conn(privacy_settings={"excluded_tables": ["a"]})
+        db = TestUpdatePrivacy._db_for_update(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={"excluded_tables": ["a", "b"]}
+        )
+        assert resp.status_code == 200
+        no_audit.assert_awaited_once()
+        assert no_audit.await_args.args[0] == "postgresql"
+        assert no_audit.await_args.args[2]["excluded_tables"] == ["a", "b"]
+        stmt = db.execute.call_args_list[1].args[0]
+        assert "privilege_audit" in str(stmt) and "privacy_settings" in str(stmt)
+        assert stmt.compile().params["privilege_audit"] == {"status": "ok", "stub": True}
+
+    async def test_privacy_save_that_changes_row_filters_stores_the_audit(
+        self, http_client, no_audit, no_verification
+    ):
+        conn = _make_conn(privacy_settings={})
+        db = TestUpdatePrivacy._db_for_update(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={"row_filters": {"public.orders": "tenant_id = 1"}},
+        )
+        assert resp.status_code == 200
+        no_audit.assert_awaited_once()
+        assert no_audit.await_args.args[2]["row_filters"] == {"public.orders": "tenant_id = 1"}
+
+    @pytest.mark.parametrize(
+        "body",
+        [{"include_sample_values": True}, {"excluded_schemas": ["hr"]}, {"excluded_tables": ["a"]}],
+    )
+    async def test_privacy_save_without_a_table_change_does_not_audit(
+        self, http_client, no_audit, no_verification, body
+    ):
+        conn = _make_conn(privacy_settings={"excluded_tables": ["a"], "row_filters": {}})
+        db = TestUpdatePrivacy._db_for_update(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put("/api/v1/connections/conn-123/privacy", json=body)
+        assert resp.status_code == 200
+        no_audit.assert_not_awaited()
+        assert "privilege_audit" not in str(db.execute.call_args_list[1].args[0])
+
+    async def test_a_422_on_the_row_filter_leaves_the_stored_audit(
+        self, http_client, no_audit, no_verification
+    ):
+        from fastapi import HTTPException
+
+        no_verification.side_effect = HTTPException(status_code=422, detail="nope")
+        conn = _make_conn(privacy_settings={})
+        db = TestUpdatePrivacy._db_for_update(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={"row_filters": {"public.orders": "tenant_id = 1"}},
+        )
+        assert resp.status_code == 422
+        no_audit.assert_not_awaited()
+        assert db.execute.call_count == 1
+
+    async def test_config_save_audits_the_merged_config(self, http_client, no_audit):
+        conn = _make_conn(privacy_settings={"excluded_tables": ["a"]})
+        db = _mock_db(
+            MockResult(single=conn), MockResult(), MockResult(), MockResult(), MockResult()
+        )
+        app.dependency_overrides[get_db] = lambda: db
+        with (
+            patch(
+                "app.routers.connections.decrypt_value",
+                return_value='{"host":"h","password":"old"}',
+            ),
+            patch("app.routers.connections.encrypt_value", return_value=b"enc"),
+            patch("app.routers.connections._evict_pg_pool", new=AsyncMock()),
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/config",
+                json={"config": {"host": "new", "password": "**redacted**"}},
+            )
+        assert resp.status_code == 200
+        no_audit.assert_awaited_once_with(
+            "postgresql", {"host": "new", "password": "old"}, {"excluded_tables": ["a"]}
+        )
+        stmt = db.execute.call_args_list[1].args[0]
+        assert "privilege_audit" in str(stmt) and "config_encrypted" in str(stmt)
+        assert stmt.compile().params["privilege_audit"] == {"status": "ok", "stub": True}
+
+    async def test_privacy_audit_gets_the_decrypted_config(
+        self, http_client, no_audit, no_verification
+    ):
+        # no_verification stubs decrypt_value to "{}".
+        conn = _make_conn(privacy_settings={"excluded_tables": ["a"]})
+        db = TestUpdatePrivacy._db_for_update(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={"excluded_tables": ["a", "b"]}
+        )
+        assert resp.status_code == 200
+        no_audit.assert_awaited_once()
+        assert no_audit.await_args.args[1] == {}
+
+    async def test_clearing_the_legacy_filter_on_a_row_without_row_filters_audits(
+        self, http_client, no_audit, no_verification
+    ):
+        # A missing row_filters key that becomes {} counts as changed.
+        conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 1"})
+        db = TestUpdatePrivacy._db_for_update(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={"clear_legacy_row_filter": True}
+        )
+        assert resp.status_code == 200
+        no_audit.assert_awaited_once()
+
+    async def test_an_undecryptable_config_on_an_excluded_tables_save_stores_unavailable(
+        self, http_client, no_audit
+    ):
+        from cryptography.fernet import InvalidToken
+
+        conn = _make_conn(privacy_settings={"excluded_tables": ["a"]})
+        db = TestUpdatePrivacy._db_for_update(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        with patch("app.routers.connections.decrypt_value", side_effect=InvalidToken()):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy", json={"excluded_tables": ["a", "b"]}
+            )
+        assert resp.status_code == 200
+        no_audit.assert_not_awaited()
+        stored = db.execute.call_args_list[1].args[0].compile().params["privilege_audit"]
+        assert stored["status"] == "unavailable"
+        assert stored["error"] == "the connection settings could not be read"
+
+    async def test_a_config_that_is_not_json_on_an_excluded_tables_save_stores_unavailable(
+        self, http_client, no_audit, caplog
+    ):
+        conn = _make_conn(privacy_settings={"excluded_tables": ["a"]})
+        db = TestUpdatePrivacy._db_for_update(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        with patch("app.routers.connections.decrypt_value", return_value="secret-pw-not-json"):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy", json={"excluded_tables": ["a", "b"]}
+            )
+        assert resp.status_code == 200
+        no_audit.assert_not_awaited()
+        stored = db.execute.call_args_list[1].args[0].compile().params["privilege_audit"]
+        assert stored["status"] == "unavailable"
+        assert "JSONDecodeError" in caplog.text
+        assert "secret-pw-not-json" not in caplog.text
+
+    async def test_a_row_filter_save_decrypts_the_config_once(
+        self, http_client, no_audit, no_verification
+    ):
+        conn = _make_conn(privacy_settings={})
+        db = TestUpdatePrivacy._db_for_update(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        with patch("app.routers.connections.decrypt_value", return_value='{"host":"h"}') as dec:
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "tenant_id = 1"}},
+            )
+        assert resp.status_code == 200
+        assert dec.call_count == 1
+        no_verification.assert_awaited_once()
+        no_audit.assert_awaited_once()
+        assert no_audit.await_args.args[1] == {"host": "h"}
+
+    async def test_a_name_only_config_save_does_not_audit(self, http_client, no_audit):
+        conn = _make_conn()
+        db = _mock_db(MockResult(single=conn), MockResult())
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/config", json={"name": "Renamed"}
+        )
+        assert resp.status_code == 200
+        no_audit.assert_not_awaited()
+
+
+class TestAuditEndToEnd:
+    """No ``no_audit``: the real ``_audit_privileges`` runs against a mocked adapter."""
+
+    async def test_create_with_a_config_that_does_not_connect_stores_unavailable_and_creates_row(
+        self, http_client
+    ):
+        adapter = _auditing_adapter(
+            connect=AsyncMock(
+                return_value=ConnectionResult(success=False, message="could not connect to server")
+            )
+        )
+        db = _mock_db()
+        app.dependency_overrides[get_db] = lambda: db
+        with (
+            patch("app.routers.connections.create_datasource", return_value=adapter),
+            patch("app.routers.connections.encrypt_value", return_value=b"enc"),
+        ):
+            resp = await http_client.post(
+                "/api/v1/connections",
+                json={
+                    "name": "My DB",
+                    "source_type": "postgresql",
+                    "config": {"host": "nowhere", "database": "app"},
+                },
+            )
+        assert resp.status_code == 201
+        row = db.add.call_args.args[0]
+        assert row.privilege_audit["status"] == "unavailable"
+        adapter.audit_privileges.assert_not_awaited()
+
+    async def test_a_catalog_exception_on_test_stores_unavailable_and_returns_200(
+        self, http_client
+    ):
+        conn = _make_conn()
+        db = _mock_db(MockResult(single=conn), MockResult())
+        app.dependency_overrides[get_db] = lambda: db
+        adapter = _auditing_adapter()
+        adapter.test_connection = AsyncMock(
+            return_value=ConnectionResult(success=True, message="Connected")
+        )
+        adapter.audit_privileges = AsyncMock(
+            side_effect=RuntimeError("permission denied for table pg_roles")
+        )
+        with (
+            patch("app.routers.connections.decrypt_value", return_value='{"host":"localhost"}'),
+            patch("app.routers.connections.create_datasource", return_value=adapter),
+        ):
+            resp = await http_client.post("/api/v1/connections/conn-123/test")
+        assert resp.status_code == 200
+        stmt = db.execute.call_args_list[1].args[0]
+        assert stmt.compile().params["privilege_audit"]["status"] == "unavailable"
+        db.commit.assert_awaited_once()
