@@ -15,6 +15,7 @@ from app.providers.base import LLMResponse
 from app.services.execution import _execute_auto_query
 from app.services.intent_classifier import QueryIntent
 from app.services.row_filter import row_filter_fingerprint
+from app.services.row_filter_errors import RowFilterRejectedError
 from app.services.row_filter_rewrite import apply_row_filters
 
 _FILTER = "tenant_id = 7"
@@ -400,3 +401,143 @@ class TestZeroResultLog:
         assert exe.generated_query == "SELECT id FROM t WHERE id < 0"
         assert "secret-value" not in caplog.text
         assert "Zero-result corrected query failed at execution (data): " in caplog.text
+
+
+class TestAdapterQuotingReachesTheExecutable:
+    async def test_the_adapters_flag_is_passed(self) -> None:
+        from app.services import execution
+        from app.services.row_filter import _executable
+
+        adapter = _adapter(_result(["id"], [[1]]))
+        # A MagicMock's auto-attribute already reads False (_double_quote_is_literal), so
+        # only True proves the adapter's own value reaches _executable.
+        adapter.double_quote_is_string_literal = True
+        with patch.object(execution, "_executable", wraps=_executable) as executable:
+            await _execute_auto_query(
+                generated_query="SELECT id FROM t",
+                explanation="",
+                adapter=adapter,
+                config_dict={},
+                connected=True,
+                cache_hit=False,
+                provider=None,
+                configured_model="m",
+                configured_max_tokens=100,
+                system_prompt="",
+                history=[],
+                message="q",
+                schema=DataSourceSchema(source_type="postgresql"),
+                options={},
+                settings=_settings(),
+                privacy=PrivacySettings(),
+            )
+        assert executable.call_args.kwargs["double_quote_is_string_literal"] is True
+
+    async def test_the_adapters_backslash_flag_is_passed(self) -> None:
+        from app.services import execution
+        from app.services.row_filter import _executable
+
+        adapter = _adapter(_result(["id"], [[1]]))
+        # As above: a MagicMock reads False (_backslash_is_escape), so only True proves it.
+        adapter.backslash_is_escape = True
+        with patch.object(execution, "_executable", wraps=_executable) as executable:
+            await _run(adapter, generated_query="SELECT id FROM t", privacy=PrivacySettings())
+        assert executable.call_args.kwargs["backslash_is_escape"] is True
+
+    async def test_a_backslash_under_no_backslash_escapes_is_refused_and_corrected(self) -> None:
+        from app.services import execution
+        from app.services.row_filter import _executable
+
+        bypass = "SELECT 'a\\' AS k, email AS x FROM users -- '"
+        fixed = "SELECT 'a' AS k FROM users"
+        adapter = _adapter(_result(["k"], [["a"]]))
+        adapter.query_dialect = "MySQL"
+        adapter.double_quote_is_string_literal = True
+        adapter.backslash_is_escape = False
+        provider = _provider(fixed)
+        with patch.object(execution, "_executable", wraps=_executable) as executable:
+            exe = await _run(
+                adapter, generated_query=bypass, privacy=PrivacySettings(), provider=provider
+            )
+        first = executable.call_args_list[0]
+        assert first.args[0] == bypass
+        assert first.kwargs["backslash_is_escape"] is False
+        # The refused query never reached the database; the model was told why.
+        assert _executed(adapter) == [fixed]
+        assert "NO_BACKSLASH_ESCAPES" in _llm_text(provider)
+        assert "Do not use a backslash anywhere in the query." in _llm_text(provider)
+        assert exe.status == "executed"
+        assert exe.generated_query == fixed
+
+
+class TestHintlessRejectionEndsTheCorrection:
+    """A rejection without an llm_hint (a filter that needs migration, a malformed key, a
+    missing fence) is nothing the model can change: no correction call is made and the user
+    sees the rejection text as it is."""
+
+    _TEXT = "The row filter on public.t needs migration, so the query was not run."
+
+    async def test_a_hintless_rejection_makes_no_llm_call(self) -> None:
+        adapter = _adapter(_result(["id"], [[1]]))
+        provider = _provider("SELECT id FROM public.t")
+
+        with patch(
+            "app.services.row_filter.apply_row_filters",
+            side_effect=RowFilterRejectedError(self._TEXT),
+        ):
+            exe = await _run(
+                adapter,
+                generated_query="SELECT id FROM t",
+                privacy=PrivacySettings(row_filters=_FILTERS),
+                provider=provider,
+            )
+
+        provider.generate_response.assert_not_awaited()
+        adapter.execute_query.assert_not_awaited()
+        assert exe.status == "error"
+        assert exe.error == self._TEXT
+
+    async def test_a_hintless_rejection_of_a_corrected_query_ends_the_loop(self) -> None:
+        adapter = _adapter(_result(["id"], [[1]]))
+        provider = _provider("SELECT id FROM public.t", "SELECT id FROM public.t")
+        rejections = [
+            RowFilterRejectedError("Table t is ambiguous.", llm_hint="Qualify the table t."),
+            RowFilterRejectedError(self._TEXT),
+        ]
+
+        with patch("app.services.row_filter.apply_row_filters", side_effect=rejections):
+            exe = await _run(
+                adapter,
+                generated_query="SELECT id FROM t",
+                privacy=PrivacySettings(row_filters=_FILTERS),
+                provider=provider,
+            )
+
+        assert provider.generate_response.await_count == 1
+        assert exe.status == "error"
+        assert exe.error == self._TEXT
+
+    async def test_a_rejection_with_a_hint_still_goes_through_correction(self) -> None:
+        adapter = _adapter(_result(["id"], [[1]]))
+        provider = _provider("SELECT id FROM public.t")
+        calls = {"n": 0}
+
+        def _first_rejected(
+            sql: str, filters: dict[str, str], dialect: str, **kwargs: object
+        ) -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RowFilterRejectedError("Table t is ambiguous.", llm_hint="Qualify it.")
+            return apply_row_filters(sql, filters, dialect, **kwargs)
+
+        with patch("app.services.row_filter.apply_row_filters", side_effect=_first_rejected):
+            exe = await _run(
+                adapter,
+                generated_query="SELECT id FROM t",
+                privacy=PrivacySettings(row_filters=_FILTERS),
+                provider=provider,
+            )
+
+        assert provider.generate_response.await_count == 1
+        assert "Qualify it." in _llm_text(provider)
+        assert exe.status == "executed"

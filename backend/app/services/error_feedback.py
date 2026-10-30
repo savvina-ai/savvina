@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 
 import sqlparse
@@ -72,6 +73,9 @@ _CATEGORY_SENTENCE: dict[ErrorCategory, str] = {
     ),
     ErrorCategory.TIMEOUT: "The query exceeded the time limit.",
     ErrorCategory.OTHER: "The database rejected the query.",
+    ErrorCategory.REJECTED: (
+        "The query was refused by this application's own checks before it reached the database."
+    ),
 }
 
 _WITHHELD = (
@@ -92,6 +96,33 @@ _UNQUOTED_OPERATOR_RE = re.compile(
     r"^(operator does not exist: |more than one operator named ).+", re.IGNORECASE
 )
 
+# pymysql formats every error as ``str((errno, message))``: the message is a Python repr
+# (``(1292, "Truncated incorrect DOUBLE value: 'abc'")``). Redacting the quoted spans of
+# that text would wipe the whole message, so it is unwrapped first.
+# After the unwrap only quoted spans, ``=(…)`` details and the operator tail are redacted, so
+# a value MySQL echoes without quotes would be shown (MySQL normally quotes values).
+_DRIVER_TUPLE_RE = re.compile(r"^\((\d+), (.*)\)$", re.DOTALL)
+
+
+def _driver_message(line: str) -> str:
+    """The first line of the message inside a pymysql ``(errno, 'message')`` line.
+
+    *line* itself when it is not such a tuple. The repr escapes newlines, so a ``DETAIL:``
+    line inside the message only shows once unwrapped; it is dropped like any other second
+    line. An empty first line gives ``""`` (the caller falls back to the category sentence).
+    """
+    match = _DRIVER_TUPLE_RE.match(line)
+    if match is None:
+        return line
+    try:
+        message = ast.literal_eval(match.group(2))
+    except Exception:  # any text literal_eval cannot build (TypeError too) stays as written
+        return line
+    if not isinstance(message, str):
+        return line
+    lines = message.splitlines()
+    return lines[0].strip() if lines else ""
+
 
 def redact_error_for_user(category: ErrorCategory, error: str) -> str:
     """The execution error as the user may see it.
@@ -99,14 +130,16 @@ def redact_error_for_user(category: ErrorCategory, error: str) -> str:
     Name-quoting categories (``_NAME_ECHOING_CATEGORIES``) keep the engine's text: it quotes
     names from the user's own SQL. Every other category can quote a stored value and the
     engine does not say which column it came from, so only the first line is kept
-    (``DETAIL:``/``HINT:`` lines can carry unquoted values), every quoted span becomes
-    ``[REDACTED]`` and a key detail ``=(…)`` becomes ``=([REDACTED])``. Never empty: the
-    category's own sentence stands in. The raw text is not logged: callers log this result.
+    (``DETAIL:``/``HINT:`` lines can carry unquoted values), a pymysql ``(errno, 'message')``
+    line is reduced to its message, every quoted span becomes ``[REDACTED]`` and a key
+    detail ``=(…)`` becomes ``=([REDACTED])``. Never empty: the category's own sentence
+    stands in. The raw text is not logged: callers log this result.
     """
     if category in _NAME_ECHOING_CATEGORIES:
         return error
     lines = error.splitlines()
     first = lines[0].strip() if lines else ""
+    first = _driver_message(first)
     first = _KEY_VALUE_RE.sub(f"=({_REDACTED})", first)
     first = _UNQUOTED_OPERATOR_RE.sub(rf"\g<1>{_REDACTED}", first)
     first = _QUOTED_RE.sub(_REDACTED, first)
@@ -206,13 +239,20 @@ def describe_error_for_llm(
 ) -> str:
     """The execution-error text for a correction prompt, composed only from known parts.
 
-    *error* — the engine's text — is read for names and never copied. *hint* is our own
-    sentence for a rejection the model can act on (``QueryRejectedError.llm_hint``).
+    *error* — the engine's text — is read for names and never copied, except for
+    ``REJECTED``, where it is this application's own sentence and is passed on as it is.
+    *hint* is our own sentence for a rejection the model can act on
+    (``QueryRejectedError.llm_hint``).
     """
-    parts = [_CATEGORY_SENTENCE[category], _WITHHELD]
-    names = mentioned_names(error, sql=sql, schema=schema, category=category)
-    if names:
-        parts.append("Names the error refers to: " + ", ".join(names) + ".")
+    if category is ErrorCategory.REJECTED:
+        # Our own refusal (QueryRejectedError): the text names columns from the query or
+        # the settings and never a value, so the model reads it as written.
+        parts = [error.strip() or _CATEGORY_SENTENCE[category]]
+    else:
+        parts = [_CATEGORY_SENTENCE[category], _WITHHELD]
+        names = mentioned_names(error, sql=sql, schema=schema, category=category)
+        if names:
+            parts.append("Names the error refers to: " + ", ".join(names) + ".")
     if hint:
         parts.append(hint)
     return " ".join(parts)

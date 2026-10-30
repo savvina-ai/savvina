@@ -10,6 +10,7 @@ import { useAuthStore } from '../store/authStore';
 import DataSourceSelector from '../components/DataSourceSelector';
 import DynamicConnectionForm from '../components/DynamicConnectionForm';
 import PrivacySettingsForm from '../components/PrivacySettings';
+import { PRIVACY_DEFAULTS } from '../lib/privacyDefaults';
 import PrivilegeAuditBanner from '../components/PrivilegeAuditBanner';
 import { displayRowFilterMap } from '../lib/rowFilterKeys';
 import ExecutionModeSelector from '../components/ExecutionModeSelector';
@@ -47,25 +48,6 @@ import { getDatasourceIcon } from '@/lib/datasourceIcons';
 import { apiErrorMessage } from '@/lib/apiError';
 import type { DataSourceInfo, PrivacySettings, Connection } from '../types';
 
-const DEFAULT_PRIVACY: PrivacySettings = {
-  include_sample_values: false,
-  include_column_comments: false,
-  include_row_counts: false,
-  sensitive_column_patterns: [
-    'password', 'passwd', 'secret', 'token', 'api_key',
-    'email', 'ssn', 'social_security', 'credit_card', 'card_number', 'cvv',
-    'phone', 'mobile', 'address', 'salary', 'wage', 'income',
-    'bank_account', 'routing_number', 'dob', 'date_of_birth',
-    'national_id', 'passport', 'license_number', 'tax_id',
-  ],
-  sensitive_columns: [],
-  strict_sensitive_columns: false,
-  excluded_schemas: [],
-  excluded_tables: [],
-  excluded_columns: [],
-  row_filters: {},
-};
-
 function EditPanel({ connId, onClose }: { connId: string; onClose: () => void }) {
   const { data: detail, isLoading } = useConnection(connId);
   const updatePrivacy = useUpdatePrivacySettings();
@@ -80,7 +62,7 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
   const dialect =
     dataSources?.find((s) => s.source_type === detail?.source_type)?.query_dialect ??
     detail?.source_type;
-  const [privacy, setPrivacy] = useState<PrivacySettings>(DEFAULT_PRIVACY);
+  const [privacy, setPrivacy] = useState<PrivacySettings>(PRIVACY_DEFAULTS);
   const [execMode, setExecMode] = useState<Connection['execution_mode']>('auto_execute');
   const [privacyOpen, setPrivacyOpen] = useState(false);
   const [initialized, setInitialized] = useState(false);
@@ -100,7 +82,7 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
         // form shows them (quoted where the dialect needs it), so a save that touches only
         // another setting sends each key back unchanged instead of letting the server fold it.
         setPrivacy({
-          ...DEFAULT_PRIVACY,
+          ...PRIVACY_DEFAULTS,
           ...detail.privacy_settings,
           row_filters: displayRowFilterMap(detail.privacy_settings.row_filters ?? {}, dialect),
           row_filter_sql: undefined,
@@ -269,6 +251,9 @@ function EditConnectionPanel({ conn, onClose }: { conn: Connection; onClose: () 
   const [schema, setSchema] = useState<DataSourceInfo | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  // Set when the stored config cannot be read (a 422 from GET /config): the form opens
+  // empty so the admin can enter every field again.
+  const [unreadableNotice, setUnreadableNotice] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{
@@ -294,11 +279,20 @@ function EditConnectionPanel({ conn, onClose }: { conn: Connection; onClose: () 
 
     Promise.all([
       dsPromise,
-      apiClient.get<{ name: string; source_type: string; config: Record<string, unknown> }>(
-        `/api/v1/connections/${conn.id}/config`,
-      ),
+      apiClient
+        .get<{ name: string; source_type: string; config: Record<string, unknown> }>(
+          `/api/v1/connections/${conn.id}/config`,
+        )
+        .catch((e: unknown) => {
+          if ((e as { response?: { status?: number } })?.response?.status === 422) {
+            setUnreadableNotice(apiErrorMessage(e));
+            return null;
+          }
+          throw e;
+        }),
     ])
       .then(([, cfgRes]) => {
+        if (!cfgRes) return;
         setConfigValues(cfgRes.data.config);
         setName(cfgRes.data.name);
       })
@@ -369,6 +363,12 @@ function EditConnectionPanel({ conn, onClose }: { conn: Connection; onClose: () 
           <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Server Settings
           </h3>
+          {unreadableNotice && (
+            <div className="flex items-start gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3">
+              <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+              <p className="text-sm text-destructive">{unreadableNotice}</p>
+            </div>
+          )}
           <div>
             <label htmlFor="conn-name-edit" className="mb-1.5 block text-sm font-medium text-foreground">
               Connection name
@@ -555,7 +555,7 @@ export default function ConnectionPage() {
 
   const [name, setName] = useState('');
   const [config, setConfig] = useState<Record<string, unknown>>({});
-  const [privacy, setPrivacy] = useState<PrivacySettings>(DEFAULT_PRIVACY);
+  const [privacy, setPrivacy] = useState<PrivacySettings>(PRIVACY_DEFAULTS);
   const [execMode, setExecMode] = useState<Connection['execution_mode']>('auto_execute');
   const [testResult, setTestResult] = useState<{
     success: boolean;

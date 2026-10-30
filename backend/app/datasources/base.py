@@ -37,6 +37,12 @@ class BaseDataSource(ABC):
     # quoted identifier (SQL standard). Read by the result mask: on a literal dialect a
     # double-quoted token is not a column reference and must not trigger redaction.
     double_quote_is_string_literal: bool = False
+    # Whether a backslash in a string literal escapes the next character (MySQL's default;
+    # MySQL under NO_BACKSLASH_ESCAPES reads it as an ordinary character). The parsers behind
+    # the privacy checks read MySQL strings with backslash escapes, so on MySQL a False here
+    # makes ``row_filter._executable`` refuse any query that contains a backslash. Only MySQL
+    # reads it.
+    backslash_is_escape: bool = True
     icon: str = ""
 
     @abstractmethod
@@ -172,7 +178,10 @@ class BaseDataSource(ABC):
         """Map a query failure onto an ``ErrorCategory`` from documented codes.
 
         Must never raise. The engine's message text may inform the choice when a code is
-        too coarse, because only the category, never the text, reaches the LLM.
+        too coarse, because only the category, never the text, reaches the LLM. Adapters
+        never return ``REJECTED``: it is reserved for this application's own refusals
+        (``QueryRejectedError``), and ``execution._classify`` reads it from an adapter as
+        ``OTHER``.
         """
         return ErrorCategory.OTHER
 

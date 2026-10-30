@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -16,7 +16,7 @@ from app.database import get_db
 from app.datasources.errors import ErrorCategory, ExplainError
 from app.datasources.models import ConnectionResult, PrivilegeFacts, TablePrivilegeFacts
 from app.main import app
-from app.routers.connections import _audit_privileges, _audit_tables
+from app.routers.connections import _audit_privileges, _audit_tables, _verify_row_filters
 from app.services.row_filter import RowFilterRejectedError
 
 from .conftest import MockResult, _make_conn, _mock_db
@@ -223,6 +223,55 @@ class TestCreateConnection:
         assert resp.status_code == 422
         # The rewriter knows no dialect for an unregistered source type (Task 5b).
         assert resp.json()["detail"] == "row_filters are not supported for this database"
+        db.add.assert_not_called()
+
+    async def test_sensitive_columns_are_stored_clean_and_deduplicated(self, http_client):
+        db = _mock_db()
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.post(
+            "/api/v1/connections",
+            json={
+                "name": "My DB",
+                "source_type": "postgresql",
+                "config": {"host": "localhost"},
+                "privacy_settings": {"sensitive_columns": ["Name", " name ", "", "  ", "notes"]},
+            },
+        )
+        assert resp.status_code == 201
+        assert db.add.call_args.args[0].privacy_settings == {"sensitive_columns": ["Name", "notes"]}
+
+    async def test_sensitive_columns_differing_only_in_case_keep_the_first(self, http_client):
+        db = _mock_db()
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.post(
+            "/api/v1/connections",
+            json={
+                "name": "My DB",
+                "source_type": "postgresql",
+                "config": {"host": "localhost"},
+                "privacy_settings": {"sensitive_columns": ["notes", "Notes"]},
+            },
+        )
+        assert resp.status_code == 201
+        assert db.add.call_args.args[0].privacy_settings == {"sensitive_columns": ["notes"]}
+
+    @pytest.mark.parametrize("value", ["name", None, {"a": 1}, ["a", 7], [["a"]], 5])
+    async def test_malformed_sensitive_columns_returns_422_and_creates_nothing(
+        self, http_client, value
+    ):
+        db = _mock_db()
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.post(
+            "/api/v1/connections",
+            json={
+                "name": "My DB",
+                "source_type": "postgresql",
+                "config": {"host": "localhost"},
+                "privacy_settings": {"sensitive_columns": value},
+            },
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "sensitive_columns must be a list of strings"
         db.add.assert_not_called()
 
 
@@ -446,6 +495,26 @@ class TestTestExistingConnection:
             resp = await http_client.post("/api/v1/connections/conn-123/test")
         assert resp.status_code == 400
 
+    async def test_unreadable_stored_config_returns_the_normal_failure(self, http_client, no_audit):
+        from cryptography.fernet import InvalidToken
+
+        conn = _make_conn()
+        db = _mock_db(MockResult(single=conn))
+        app.dependency_overrides[get_db] = lambda: db
+        with (
+            patch("app.routers.connections.decrypt_value", side_effect=InvalidToken()),
+            patch("app.routers.connections.create_datasource") as create,
+        ):
+            resp = await http_client.post("/api/v1/connections/conn-123/test")
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == (
+            "The stored connection settings could not be read; edit the connection and enter"
+            " them again."
+        )
+        create.assert_not_called()
+        no_audit.assert_not_awaited()
+        db.commit.assert_not_called()
+
 
 # ── DELETE /api/v1/connections/{id} ──────────────────────────────────────────────
 
@@ -514,6 +583,48 @@ class TestDeleteConnection:
         resp = await http_client.delete("/api/v1/connections/conn-123")
         assert resp.status_code == 204
         assert db.execute.call_count == 9
+
+    async def test_readable_postgresql_config_evicts_the_pool(self, http_client):
+        conn = _make_conn(source_type="postgresql")
+        db = _mock_db(
+            MockResult(single=conn),
+            MockResult(rows=[]),
+            MockResult(),
+            MockResult(),
+            MockResult(),
+            MockResult(),
+            MockResult(),
+        )
+        app.dependency_overrides[get_db] = lambda: db
+        with patch("app.routers.connections._evict_pg_pool", new=AsyncMock()) as evict:
+            resp = await http_client.delete("/api/v1/connections/conn-123")
+        assert resp.status_code == 204
+        evict.assert_awaited_once_with({"host": "h"})
+
+    async def test_unreadable_config_skips_pool_eviction_and_deletes(self, http_client, caplog):
+        from cryptography.fernet import InvalidToken
+
+        conn = _make_conn(source_type="postgresql")
+        db = _mock_db(
+            MockResult(single=conn),
+            MockResult(rows=[]),
+            MockResult(),
+            MockResult(),
+            MockResult(),
+            MockResult(),
+            MockResult(),
+        )
+        app.dependency_overrides[get_db] = lambda: db
+        with (
+            patch("app.routers.connections.decrypt_value", side_effect=InvalidToken()),
+            patch("app.routers.connections._evict_pg_pool", new=AsyncMock()) as evict,
+        ):
+            resp = await http_client.delete("/api/v1/connections/conn-123")
+        assert resp.status_code == 204
+        evict.assert_not_awaited()
+        db.commit.assert_awaited_once()
+        assert conn.is_active is False
+        assert "InvalidToken" in caplog.text
 
 
 # ── GET /api/v1/connections/{id}/schema ─────────────────────────────────────────
@@ -714,6 +825,19 @@ class TestUpdatePrivacy:
     def _touches_schema_cache(db) -> bool:
         return any("user_schema_caches" in str(c.args[0]) for c in db.execute.call_args_list)
 
+    async def test_privacy_save_dedupes_sensitive_columns_case_insensitively(self, http_client):
+        # They match case-insensitively (PrivacySettings.is_column_sensitive), so two
+        # spellings are one entry; the first spelling is kept.
+        conn = _make_conn(privacy_settings={})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={"sensitive_columns": ["Name", "name", " NAME ", "notes"]},
+        )
+        assert resp.status_code == 200
+        assert self._stored_privacy(db)["sensitive_columns"] == ["Name", "notes"]
+
     async def test_privacy_save_stores_sensitive_columns_trimmed(self, http_client):
         conn = _make_conn(privacy_settings={"include_sample_values": False})
         db = self._db_for_update(conn)
@@ -789,6 +913,45 @@ class TestUpdatePrivacy:
         assert self._stored_privacy(db)["row_filters"] == {"public.t": "tenant_id = 43"}
         assert self._executes(db) == 4
         assert not self._touches_schema_cache(db)
+
+    async def test_keys_missing_from_storage_sent_at_their_defaults_keep_the_schema_cache(
+        self, http_client, no_audit, no_verification
+    ):
+        # The map changes, so the audit runs: stubbed, or the real helper would try to
+        # connect with the stubbed "{}" config.
+        # A connection stored before sensitive_columns / strict_sensitive_columns existed:
+        # the whole form sends them at their defaults, which changes nothing.
+        stored = {"include_sample_values": False, "row_filters": {"public.t": "tenant_id = 42"}}
+        conn = _make_conn(privacy_settings=dict(stored))
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={
+                **stored,
+                "sensitive_columns": [],
+                "strict_sensitive_columns": False,
+                "excluded_tables": [],
+                "row_filters": {"public.t": "tenant_id = 43"},
+            },
+        )
+        assert resp.status_code == 200
+        assert self._executes(db) == 4
+        assert not self._touches_schema_cache(db)
+
+    async def test_a_key_missing_from_storage_set_off_its_default_flushes_the_schema_cache(
+        self, http_client, no_verification
+    ):
+        conn = _make_conn(privacy_settings={"row_filters": {"public.t": "tenant_id = 42"}})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={"row_filters": {"public.t": "tenant_id = 42"}, "sensitive_columns": ["name"]},
+        )
+        assert resp.status_code == 200
+        assert self._executes(db) == 5
+        assert self._touches_schema_cache(db)
 
     async def test_padded_key_is_stored_clean_and_keeps_the_schema_cache(self, http_client):
         stored = {
@@ -1228,6 +1391,133 @@ class TestGetConnectionConfig:
         assert resp.status_code == 200
         assert captured_config["password"] == "new-pass"
 
+    async def test_get_config_unreadable_returns_422(self, http_client) -> None:
+        from cryptography.fernet import InvalidToken
+
+        conn = _make_conn()
+        db = _mock_db(MockResult(single=conn))
+        app.dependency_overrides[get_db] = lambda: db
+        with patch("app.routers.connections.decrypt_value", side_effect=InvalidToken()):
+            resp = await http_client.get("/api/v1/connections/conn-123/config")
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            "The stored connection settings could not be read; enter every field again."
+        )
+
+    async def test_put_full_config_saves_without_reading_the_old_one(self, http_client) -> None:
+        from cryptography.fernet import InvalidToken
+
+        conn = _make_conn(source_type="mysql")
+        db = _mock_db(
+            MockResult(single=conn),
+            MockResult(),  # update Connection
+            MockResult(),  # delete UserSchemaCache
+            MockResult(),  # delete QueryCacheEntry
+            MockResult(),  # delete TableEmbeddingCache
+        )
+        db.refresh = AsyncMock()
+        app.dependency_overrides[get_db] = lambda: db
+        captured: dict = {}
+
+        def fake_encrypt(data: str, key: bytes) -> bytes:
+            captured.update(json.loads(data))
+            return b"encrypted"
+
+        with (
+            patch("app.routers.connections.decrypt_value", side_effect=InvalidToken()) as dec,
+            patch("app.routers.connections.encrypt_value", side_effect=fake_encrypt),
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/config",
+                json={"config": {"host": "new-host", "password": "new-pass"}},
+            )
+        assert resp.status_code == 200
+        dec.assert_not_called()
+        assert captured == {"host": "new-host", "password": "new-pass"}
+
+    async def test_put_sentinel_on_postgresql_evicts_the_old_unmasked_config(
+        self, http_client
+    ) -> None:
+        conn = _make_conn(source_type="postgresql")
+        db = _mock_db(
+            MockResult(single=conn), MockResult(), MockResult(), MockResult(), MockResult()
+        )
+        db.refresh = AsyncMock()
+        app.dependency_overrides[get_db] = lambda: db
+        old = {"host": "old-host", "password": "old-pass"}
+        with (
+            patch("app.routers.connections.decrypt_value", return_value=json.dumps(old)),
+            patch("app.routers.connections.encrypt_value", return_value=b"enc"),
+            patch("app.routers.connections._evict_pg_pool", new=AsyncMock()) as evict,
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/config",
+                json={"config": {"host": "new-host", "password": "**redacted**"}},
+            )
+        assert resp.status_code == 200
+        evict.assert_awaited_once_with(old)
+
+    async def test_put_full_config_on_postgresql_evicts_the_old_pool(self, http_client) -> None:
+        conn = _make_conn(source_type="postgresql")
+        db = _mock_db(
+            MockResult(single=conn), MockResult(), MockResult(), MockResult(), MockResult()
+        )
+        db.refresh = AsyncMock()
+        app.dependency_overrides[get_db] = lambda: db
+        old = {"host": "old-host", "password": "old-pass"}
+        with (
+            patch("app.routers.connections.decrypt_value", return_value=json.dumps(old)),
+            patch("app.routers.connections.encrypt_value", return_value=b"enc"),
+            patch("app.routers.connections._evict_pg_pool", new=AsyncMock()) as evict,
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/config",
+                json={"config": {"host": "new-host", "password": "new-pass"}},
+            )
+        assert resp.status_code == 200
+        evict.assert_awaited_once_with(old)
+
+    async def test_put_full_config_on_unreadable_postgresql_skips_pool_eviction(
+        self, http_client
+    ) -> None:
+        from cryptography.fernet import InvalidToken
+
+        conn = _make_conn(source_type="postgresql")
+        db = _mock_db(
+            MockResult(single=conn), MockResult(), MockResult(), MockResult(), MockResult()
+        )
+        db.refresh = AsyncMock()
+        app.dependency_overrides[get_db] = lambda: db
+        with (
+            patch("app.routers.connections.decrypt_value", side_effect=InvalidToken()),
+            patch("app.routers.connections.encrypt_value", return_value=b"enc"),
+            patch("app.routers.connections._evict_pg_pool", new=AsyncMock()) as evict,
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/config",
+                json={"config": {"host": "new-host", "password": "new-pass"}},
+            )
+        assert resp.status_code == 200
+        evict.assert_not_awaited()
+
+    async def test_put_sentinel_with_unreadable_old_config_returns_422(self, http_client) -> None:
+        from cryptography.fernet import InvalidToken
+
+        conn = _make_conn()
+        db = _mock_db(MockResult(single=conn))
+        app.dependency_overrides[get_db] = lambda: db
+        with patch("app.routers.connections.decrypt_value", side_effect=InvalidToken()):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/config",
+                json={"config": {"host": "new-host", "password": "**redacted**"}},
+            )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            "The stored connection settings could not be read; enter every field again."
+        )
+        db.commit.assert_not_called()
+        assert db.execute.call_count == 1
+
 
 # ── Response shape ──────────────────────────────────────────────────────────────
 
@@ -1311,6 +1601,30 @@ class TestRowFilterVerification:
         assert resp.status_code == 200
         planned = adapter.explain.await_args.args[0]
         assert '"public"."Orders" WHERE (tenant_id = 42) OFFSET 0) AS "Orders"' in planned
+
+    async def test_an_unreadable_config_is_422_and_opens_nothing(self, http_client):
+        from cryptography.fernet import InvalidToken
+
+        conn = _make_conn(privacy_settings={})
+        db = self._db(conn)
+        TestUpdatePrivacy._use_db(db)
+        with (
+            patch("app.routers.connections.decrypt_value", side_effect=InvalidToken),
+            patch("app.routers.connections.create_datasource") as create,
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "tenant_id = 1"}},
+            )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            "row filters could not be verified against the database: the connection settings"
+            " could not be read"
+        )
+        create.assert_not_called()
+        # Only the locked lookup ran: no UPDATE, no cache flush, no commit.
+        assert TestUpdatePrivacy._executes(db) == 1
+        db.commit.assert_not_called()
 
     async def test_a_pair_the_rewriter_refuses_is_422_and_nothing_is_planned(self, http_client):
         conn = _make_conn(privacy_settings={})
@@ -1729,7 +2043,7 @@ class TestAuditPrivilegesHelper:
         adapter.disconnect = AsyncMock()
         with patch("app.routers.connections.create_datasource", return_value=adapter):
             stored = await _audit_privileges("mysql", {}, None)
-        assert stored["error"] == "(1142, [REDACTED])"
+        assert stored["error"] == "SELECT command denied to user [REDACTED]@[REDACTED]"
 
     async def test_the_database_is_passed_to_evaluate_for_every_engine(self):
         adapter = MagicMock()
@@ -1861,10 +2175,26 @@ class TestAuditCallSites:
         )
         assert resp.status_code == 201
         no_audit.assert_awaited_once_with(
-            "postgresql", {"host": "localhost", "database": "app"}, {"excluded_tables": ["log"]}
+            "postgresql",
+            {"host": "localhost", "database": "app"},
+            {"excluded_tables": ["log"]},
+            session=ANY,
         )
         row = db.add.call_args.args[0]
         assert row.privilege_audit == {"status": "ok", "stub": True}
+
+    async def test_an_empty_map_sent_to_a_connection_without_one_does_not_audit(
+        self, http_client, no_audit, no_verification
+    ):
+        conn = _make_conn(privacy_settings={"include_sample_values": False})
+        db = TestUpdatePrivacy._db_for_update(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={"include_sample_values": False, "row_filters": {}, "excluded_tables": []},
+        )
+        assert resp.status_code == 200
+        no_audit.assert_not_awaited()
 
     async def test_create_runs_the_audit_after_the_row_filter_verification(
         self, http_client, no_audit, no_verification
@@ -1963,7 +2293,7 @@ class TestAuditCallSites:
 
     @pytest.mark.parametrize(
         "body",
-        [{"include_sample_values": True}, {"excluded_schemas": ["hr"]}, {"excluded_tables": ["a"]}],
+        [{"include_sample_values": True}, {"excluded_tables": ["a"]}],
     )
     async def test_privacy_save_without_a_table_change_does_not_audit(
         self, http_client, no_audit, no_verification, body
@@ -1975,6 +2305,21 @@ class TestAuditCallSites:
         assert resp.status_code == 200
         no_audit.assert_not_awaited()
         assert "privilege_audit" not in str(db.execute.call_args_list[1].args[0])
+
+    async def test_privacy_save_that_changes_excluded_schemas_stores_the_audit(
+        self, http_client, no_audit, no_verification
+    ):
+        conn = _make_conn(privacy_settings={"excluded_schemas": ["a"]})
+        db = TestUpdatePrivacy._db_for_update(conn)
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={"excluded_schemas": ["a", "hr"]}
+        )
+        assert resp.status_code == 200
+        no_audit.assert_awaited_once()
+        assert no_audit.await_args.args[2]["excluded_schemas"] == ["a", "hr"]
+        stmt = db.execute.call_args_list[1].args[0]
+        assert stmt.compile().params["privilege_audit"] == {"status": "ok", "stub": True}
 
     async def test_a_422_on_the_row_filter_leaves_the_stored_audit(
         self, http_client, no_audit, no_verification
@@ -2033,10 +2378,10 @@ class TestAuditCallSites:
         no_audit.assert_awaited_once()
         assert no_audit.await_args.args[1] == {}
 
-    async def test_clearing_the_legacy_filter_on_a_row_without_row_filters_audits(
+    async def test_clearing_the_legacy_filter_on_a_row_without_row_filters_does_not_audit(
         self, http_client, no_audit, no_verification
     ):
-        # A missing row_filters key that becomes {} counts as changed.
+        # A missing row_filters key that becomes {} is no change: it reads as {} either way.
         conn = _make_conn(privacy_settings={"row_filter_sql": "tenant_id = 1"})
         db = TestUpdatePrivacy._db_for_update(conn)
         app.dependency_overrides[get_db] = lambda: db
@@ -2044,7 +2389,7 @@ class TestAuditCallSites:
             "/api/v1/connections/conn-123/privacy", json={"clear_legacy_row_filter": True}
         )
         assert resp.status_code == 200
-        no_audit.assert_awaited_once()
+        no_audit.assert_not_awaited()
 
     async def test_an_undecryptable_config_on_an_excluded_tables_save_stores_unavailable(
         self, http_client, no_audit
@@ -2161,3 +2506,104 @@ class TestAuditEndToEnd:
         stmt = db.execute.call_args_list[1].args[0]
         assert stmt.compile().params["privilege_audit"]["status"] == "unavailable"
         db.commit.assert_awaited_once()
+
+
+class TestOneConnectionPerSave:
+    @staticmethod
+    def _adapter() -> MagicMock:
+        adapter = _verifying_adapter()
+        adapter.audit_privileges = AsyncMock(return_value=PrivilegeFacts(role="savvina"))
+        adapter.describe_connection_error = MagicMock(return_value=None)
+        return adapter
+
+    async def test_create_with_filters_connects_once_for_the_check_and_the_audit(self, http_client):
+        db = _mock_db()
+        db.refresh = AsyncMock()
+        app.dependency_overrides[get_db] = lambda: db
+        adapter = self._adapter()
+        with (
+            patch("app.routers.connections.create_datasource", return_value=adapter) as create,
+            patch("app.routers.connections.encrypt_value", return_value=b"enc"),
+        ):
+            resp = await http_client.post(
+                "/api/v1/connections",
+                json={
+                    "name": "My DB",
+                    "source_type": "postgresql",
+                    "config": {"host": "localhost"},
+                    "privacy_settings": {"row_filters": {"public.orders": "tenant_id = 1"}},
+                },
+            )
+        assert resp.status_code == 201
+        create.assert_called_once_with("postgresql")
+        adapter.connect.assert_awaited_once()
+        adapter.explain.assert_awaited_once()
+        adapter.audit_privileges.assert_awaited_once()
+        adapter.disconnect.assert_awaited_once()
+        assert db.add.call_args.args[0].privilege_audit["status"] == "ok"
+
+    async def test_privacy_save_with_a_new_filter_connects_once(self, http_client):
+        conn = _make_conn(privacy_settings={})
+        app.dependency_overrides[get_db] = lambda: TestUpdatePrivacy._db_for_update(conn)
+        adapter = self._adapter()
+        with (
+            patch("app.routers.connections.decrypt_value", return_value='{"host": "db"}'),
+            patch("app.routers.connections.create_datasource", return_value=adapter) as create,
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "tenant_id = 42"}},
+            )
+        assert resp.status_code == 200
+        create.assert_called_once_with("postgresql")
+        adapter.connect.assert_awaited_once()
+        adapter.explain.assert_awaited_once()
+        adapter.audit_privileges.assert_awaited_once()
+        adapter.disconnect.assert_awaited_once()
+
+    async def test_a_refused_connection_is_422_and_the_audit_never_runs(self, http_client):
+        db = _mock_db()
+        app.dependency_overrides[get_db] = lambda: db
+        adapter = self._adapter()
+        adapter.connect = AsyncMock(return_value=ConnectionResult(success=False, message="no"))
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.post(
+                "/api/v1/connections",
+                json={
+                    "name": "My DB",
+                    "source_type": "postgresql",
+                    "config": {"host": "localhost"},
+                    "privacy_settings": {"row_filters": {"public.orders": "tenant_id = 1"}},
+                },
+            )
+        assert resp.status_code == 422
+        adapter.connect.assert_awaited_once()
+        adapter.audit_privileges.assert_not_awaited()
+        adapter.disconnect.assert_awaited_once()
+        db.add.assert_not_called()
+
+    async def test_a_rejected_filter_on_a_privacy_save_never_audits(self, http_client):
+        conn = _make_conn(privacy_settings={})
+        app.dependency_overrides[get_db] = lambda: TestUpdatePrivacy._db_for_update(conn)
+        adapter = self._adapter()
+        adapter.explain = AsyncMock(side_effect=ExplainError("x"))
+        with (
+            patch("app.routers.connections.decrypt_value", return_value='{"host": "db"}'),
+            patch("app.routers.connections.create_datasource", return_value=adapter),
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "tenant_id = 42"}},
+            )
+        assert resp.status_code == 422
+        adapter.audit_privileges.assert_not_awaited()
+        adapter.disconnect.assert_awaited_once()
+
+    async def test_the_helpers_still_open_their_own_connection_when_called_alone(self):
+        adapter = self._adapter()
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            await _verify_row_filters("postgresql", {"host": "db"}, {"public.t": "x = 1"})
+            stored = await _audit_privileges("postgresql", {"host": "db"}, None)
+        assert stored["status"] == "ok"
+        assert adapter.connect.await_count == 2
+        assert adapter.disconnect.await_count == 2

@@ -20,13 +20,15 @@ from sqlglot import exp
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from ..datasources.base import BaseDataSource
+
 from ..auth.dependencies import get_current_active_user
 from ..auth.limiter import limiter
 from ..config import get_settings
 from ..database import get_db
 from ..datasources.adapters.postgresql import evict_pool as _evict_pg_pool
 from ..datasources.errors import ErrorCategory, ExplainError
-from ..datasources.models import PrivacySettings
+from ..datasources.models import ConnectionResult, PrivacySettings
 from ..datasources.registry import create_datasource, get_datasource_class
 from ..models.chat import ChatMessage, ChatSession
 from ..models.connection import Connection
@@ -162,7 +164,50 @@ def _changed_pairs(new: dict[str, str], stored: dict[str, str] | None) -> dict[s
     return {key: cond for key, cond in new.items() if stored.get(key) != cond}
 
 
-async def _verify_row_filters(source_type: str, config: dict, pairs: dict[str, str]) -> None:
+class _OpenedDatasource:
+    """One adapter per handler, shared by the row-filter check and the privilege audit so a
+    create or a privacy save connects once. ``open`` creates and connects on the first call
+    and returns the same adapter and ``connect`` result afterwards; a ``connect`` that
+    raised raises the same exception again (defensive: today a failed open in the
+    verification always ends the handler with 422, so the audit never reuses it). ``close``
+    disconnects whatever was opened and logs a failure instead of raising, since the verdict
+    is decided by then."""
+
+    def __init__(self, source_type: str, config: dict) -> None:
+        self._source_type = source_type
+        self._config = config
+        self.adapter: BaseDataSource | None = None
+        self.result: ConnectionResult | None = None
+        self._failure: Exception | None = None
+
+    async def open(self) -> tuple[BaseDataSource, ConnectionResult | None]:
+        if self._failure is not None:
+            raise self._failure
+        if self.adapter is None:
+            self.adapter = create_datasource(self._source_type)
+            try:
+                self.result = await self.adapter.connect(self._config)
+            except Exception as exc:
+                self._failure = exc
+                raise
+        return self.adapter, self.result
+
+    async def close(self, purpose: str) -> None:
+        if self.adapter is None:
+            return
+        try:
+            await self.adapter.disconnect()
+        except Exception:
+            logger.warning("Could not close the connection opened %s", purpose, exc_info=True)
+
+
+async def _verify_row_filters(
+    source_type: str,
+    config: dict,
+    pairs: dict[str, str],
+    *,
+    session: _OpenedDatasource | None = None,
+) -> None:
     """Plan every pair of *pairs* on the live database, or raise HTTP 422.
 
     The statement is the one the runtime would send for ``SELECT * FROM <schema>.<table>``
@@ -175,16 +220,18 @@ async def _verify_row_filters(source_type: str, config: dict, pairs: dict[str, s
     category as every execution error is. A timeout, a plan that does not return within
     ``_explain_budget()`` seconds, a refused connection or a driver error is 422 "could not
     be verified" and nothing is stored. Opens the connection as the schema refresh does,
-    from the decrypted *config*; the callers pass only new or changed pairs and call only
-    when there is one, so an unchanged map opens nothing.
+    from the decrypted *config*, or uses *session*, the handler's adapter shared with the
+    privilege audit and closed by the handler; the callers pass only new or changed pairs
+    and call only when there is one, so an unchanged map opens nothing.
     """
     # Built before the connection is opened: a pair the rewriter refuses opens nothing.
     statements = {key: _check_statement(key, cond, source_type) for key, cond in pairs.items()}
     settings = get_settings()
     budget = _explain_budget()
-    adapter = create_datasource(source_type)
+    own = session is None
+    session = session or _OpenedDatasource(source_type, config)
     try:
-        result = await adapter.connect(config)
+        adapter, result = await session.open()
         if result is not None and result.success is False:
             raise HTTPException(
                 status_code=422, detail=_UNVERIFIED_DETAIL.format(reason=result.message)
@@ -196,9 +243,10 @@ async def _verify_row_filters(source_type: str, config: dict, pairs: dict[str, s
                 )
             except TimeoutError as exc:
                 # asyncio.wait_for cancelled the plan. On MySQL the adapter closes the
-                # cancelled connection and the disconnect below closes the pool. On
-                # PostgreSQL asyncpg cancels the statement on the server and rolls back
-                # before the connection returns to the shared pool.
+                # cancelled connection, and closing the session (below, or in the handler
+                # when it is shared) closes the pool. On PostgreSQL asyncpg cancels the
+                # statement on the server and rolls back before the connection returns to
+                # the shared pool.
                 raise HTTPException(
                     status_code=422,
                     detail=_UNVERIFIED_DETAIL.format(
@@ -224,14 +272,10 @@ async def _verify_row_filters(source_type: str, config: dict, pairs: dict[str, s
             status_code=422, detail=_UNVERIFIED_DETAIL.format(reason=reason)
         ) from exc
     finally:
-        try:
-            await adapter.disconnect()
-        except Exception:
+        if own:
             # The verdict is already decided; a close that fails must not turn a 422 (or
             # a success) into a 500.
-            logger.warning(
-                "Could not close the connection opened to verify row filters", exc_info=True
-            )
+            await session.close("to verify row filters")
 
 
 def _audit_tables(privacy: dict | None) -> list[tuple[str | None, str]]:
@@ -258,34 +302,43 @@ def _audit_tables(privacy: dict | None) -> list[tuple[str | None, str]]:
     return list(dict.fromkeys(tables))
 
 
-async def _audit_privileges(source_type: str, config: dict, privacy: dict | None) -> dict:
+async def _audit_privileges(
+    source_type: str,
+    config: dict,
+    privacy: dict | None,
+    *,
+    session: _OpenedDatasource | None = None,
+) -> dict:
     """The stored privilege audit (``privilege_audit.to_dict``) of the connection role.
 
-    Opens the adapter as ``_verify_row_filters`` does, from the decrypted *config*, reads the
-    facts within ``_explain_budget()`` seconds and evaluates them under *privacy*. It never
-    raises: the save is already validated by the caller, and a catalog failure is reported,
-    not enforced. A refused connection (``connect`` returning ``success False``), a budget
-    timeout, an unknown source type or any driver exception stores ``status "unavailable"``
-    with the adapter's own sentence (``describe_connection_error``, only when it returns a
-    non-empty string) or else the text redacted by category (``redact_error_for_user``, as
-    every execution error is); 3b-2 reads ``unavailable`` as "fence stays". The facts are
-    evaluated with the connection's database, named by the dedicated-role script. A
-    ``disconnect`` that fails afterwards is logged and does not change the verdict.
+    Opens the adapter as ``_verify_row_filters`` does, from the decrypted *config*, or uses
+    *session*, the handler's adapter shared with the row-filter check and closed by the
+    handler, reads the facts within ``_explain_budget()`` seconds and evaluates them under
+    *privacy*. It never raises: the save is already validated by the caller, and a catalog
+    failure is reported, not enforced. A refused connection (``connect`` returning ``success
+    False``), a budget timeout, an unknown source type or any driver exception stores
+    ``status "unavailable"`` with the adapter's own sentence (``describe_connection_error``,
+    only when it returns a non-empty string) or else the text redacted by category
+    (``redact_error_for_user``, as every execution error is); 3b-2 reads ``unavailable`` as
+    "fence stays". The facts are evaluated with the connection's database, named by the
+    dedicated-role script. A ``disconnect`` that fails afterwards is logged and does not
+    change the verdict.
     """
     settings = get_settings()
     budget = _explain_budget()
-    adapter = None
+    own = session is None
+    session = session or _OpenedDatasource(source_type, config)
 
     def unavailable_text(category: ErrorCategory, text: str) -> str:
         """The adapter's sentence for the failure when it has one, else the redacted text."""
+        adapter = session.adapter
         described = adapter.describe_connection_error(text) if adapter is not None else None
         if isinstance(described, str) and described:
             return described
         return redact_error_for_user(category, text)
 
     try:
-        adapter = create_datasource(source_type)
-        result = await adapter.connect(config)
+        adapter, result = await session.open()
         if result is not None and result.success is False:
             text = unavailable_text(ErrorCategory.OTHER, result.message)
             return audit_to_dict(audit_unavailable("", text))
@@ -307,18 +360,14 @@ async def _audit_privileges(source_type: str, config: dict, privacy: dict | None
             audit_unavailable("", f"the privilege check did not finish within {budget:g} seconds")
         )
     except Exception as exc:
+        adapter = session.adapter
         category = adapter.classify_error(exc) if adapter is not None else ErrorCategory.OTHER
         text = unavailable_text(category, str(exc) or type(exc).__name__)
         logger.warning("Privilege audit failed: source_type=%s, error=%s", source_type, exc)
         return audit_to_dict(audit_unavailable("", text))
     finally:
-        if adapter is not None:
-            try:
-                await adapter.disconnect()
-            except Exception:
-                logger.warning(
-                    "Could not close the connection opened for the privilege audit", exc_info=True
-                )
+        if own:
+            await session.close("for the privilege audit")
 
 
 def _readable_config(config_encrypted: bytes) -> dict | None:
@@ -334,6 +383,24 @@ def _readable_config(config_encrypted: bytes) -> dict | None:
         logger.warning("Could not read the connection config: error=not an object")
         return None
     return config
+
+
+_UNREADABLE_ENTER_ALL = "The stored connection settings could not be read; enter every field again."
+_UNREADABLE_TEST = (
+    "The stored connection settings could not be read; edit the connection and enter them again."
+)
+
+
+def _clean_sensitive_columns(names: list[str]) -> list[str]:
+    """*names* trimmed, without empty entries, de-duplicated on the lower-cased name (the
+    column match is whole-name and case-insensitive, ``PrivacySettings.is_column_sensitive``)
+    keeping the first spelling."""
+    unique: dict[str, str] = {}
+    for entry in names:
+        name = (entry or "").strip()
+        if name:
+            unique.setdefault(name.lower(), name)
+    return list(unique.values())
 
 
 def _mask_config(config: dict) -> dict:
@@ -418,14 +485,29 @@ async def create_connection(
             privacy["row_filters"] = _validated_row_filters(
                 privacy["row_filters"], body.source_type
             )
-        if privacy.get("row_filters"):
-            # Verified before the row exists: a connection is not created with a filter
-            # the database refuses. body.config is the plain dict the row is encrypted from.
-            await _verify_row_filters(body.source_type, body.config, privacy["row_filters"])
-    # The audit is the handler's first connection (the wizard tests the config through
+        if "sensitive_columns" in privacy:
+            columns = privacy["sensitive_columns"]
+            if not isinstance(columns, list) or not all(isinstance(c, str) for c in columns):
+                raise HTTPException(
+                    status_code=422, detail="sensitive_columns must be a list of strings"
+                )
+            privacy["sensitive_columns"] = _clean_sensitive_columns(columns)
+    # One connection for the row-filter check and the audit. When no row filter is checked,
+    # the audit is the handler's first query (the wizard tests the config through
     # POST /connections/test separately): a config that does not connect stores
-    # "unavailable" with the connect error. Never refuses the create.
-    privilege_audit = await _audit_privileges(body.source_type, body.config, privacy)
+    # "unavailable" with the connect error. Never refuses the create; the row-filter check
+    # does (422), before the row exists.
+    session = _OpenedDatasource(body.source_type, body.config)
+    try:
+        if privacy is not None and privacy.get("row_filters"):
+            await _verify_row_filters(
+                body.source_type, body.config, privacy["row_filters"], session=session
+            )
+        privilege_audit = await _audit_privileges(
+            body.source_type, body.config, privacy, session=session
+        )
+    finally:
+        await session.close("to verify row filters and audit privileges")
     settings = get_settings()
     config_encrypted = encrypt_value(json.dumps(body.config), settings.encryption_key)
     conn = Connection(
@@ -483,9 +565,12 @@ async def test_existing_connection(
 ) -> dict:
     """Test an existing saved connection."""
     logger.info("Testing existing connection: id=%s", connection_id)
-    settings = get_settings()
     conn = await get_connection_or_404(connection_id, db)
-    config_dict = json.loads(decrypt_value(conn.config_encrypted, settings.encryption_key))
+    config_dict = _readable_config(conn.config_encrypted)
+    if config_dict is None:
+        # Nothing to connect with, and nothing to write: the same failure a refused
+        # connection gives.
+        raise HTTPException(status_code=400, detail=_UNREADABLE_TEST)
 
     adapter = create_datasource(conn.source_type)
     result = await adapter.test_connection(config_dict)
@@ -530,7 +615,6 @@ async def delete_connection(
     _user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    settings = get_settings()
     conn = await get_connection_or_404(connection_id, db)
     conn.is_active = False  # type: ignore[assignment]
     session_result = await db.execute(
@@ -549,8 +633,11 @@ async def delete_connection(
     # blob, which the store clears with them) go explicitly.
     await semantic_store.delete_model(db, connection_id, changed_by=_user.id)
     if conn.source_type == "postgresql":
-        config_dict = json.loads(decrypt_value(conn.config_encrypted, settings.encryption_key))
-        await _evict_pg_pool(config_dict)
+        # An unreadable config (after an ENCRYPTION_KEY change) must not block the delete: no
+        # pool can be matched to it, so none is evicted.
+        config_dict = _readable_config(conn.config_encrypted)
+        if config_dict is not None:
+            await _evict_pg_pool(config_dict)
     await db.commit()
 
 
@@ -610,55 +697,76 @@ async def update_privacy(
     existing: dict = dict(prior)
     changes = body.model_dump(exclude_none=True, exclude={"clear_legacy_row_filter"})
     if body.sensitive_columns is not None:
-        changes["sensitive_columns"] = list(
-            dict.fromkeys(c.strip() for c in body.sensitive_columns if c and c.strip())
-        )
+        changes["sensitive_columns"] = _clean_sensitive_columns(body.sensitive_columns)
     existing.update(changes)
     legacy = bool(existing.get("row_filter_sql"))
-    # Decrypted at most once: by the verification (which needs it and fails the save when
-    # it cannot be read) or else by the audit (which must not fail it).
+    # Decrypted at most once, through the fail-safe reader: the verification needs the config
+    # and fails the save as unverified when it cannot be read; the audit, which must not fail
+    # it, reads it the same way. Both share one opened adapter.
     config: dict | None = None
-    if body.row_filters is not None:
-        new_map = _validated_row_filters(body.row_filters, conn.source_type)
-        pairs = _changed_pairs(new_map, prior.get("row_filters"))
-        if pairs:
-            key = get_settings().encryption_key
-            config = json.loads(decrypt_value(conn.config_encrypted, key))
-            await _verify_row_filters(conn.source_type, config, pairs)
-        existing["row_filters"] = new_map
-        if existing["row_filters"]:
-            # Defining real filters ends the migration state.
+    session: _OpenedDatasource | None = None
+    try:
+        if body.row_filters is not None:
+            new_map = _validated_row_filters(body.row_filters, conn.source_type)
+            pairs = _changed_pairs(new_map, prior.get("row_filters"))
+            if pairs:
+                config = _readable_config(conn.config_encrypted)
+                if config is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=_UNVERIFIED_DETAIL.format(
+                            reason="the connection settings could not be read"
+                        ),
+                    )
+                session = _OpenedDatasource(conn.source_type, config)
+                await _verify_row_filters(conn.source_type, config, pairs, session=session)
+            existing["row_filters"] = new_map
+            if existing["row_filters"]:
+                # Defining real filters ends the migration state.
+                existing.pop("row_filter_sql", None)
+            elif legacy and not body.clear_legacy_row_filter:
+                # An empty map must not drop the old filter silently (an unrelated save sends
+                # the whole form): the admin removes it explicitly or defines filters.
+                raise HTTPException(status_code=422, detail=_LEGACY_FILTER_DETAIL)
+        if body.clear_legacy_row_filter:
             existing.pop("row_filter_sql", None)
-        elif legacy and not body.clear_legacy_row_filter:
-            # An empty map must not drop the old filter silently (an unrelated save sends
-            # the whole form): the admin removes it explicitly or defines filters.
-            raise HTTPException(status_code=422, detail=_LEGACY_FILTER_DETAIL)
-    if body.clear_legacy_row_filter:
-        existing.pop("row_filter_sql", None)
-        existing.setdefault("row_filters", {})
-    values: dict = {"privacy_settings": existing}
-    # The audit reads facts about the row-filtered and the excluded tables: rerun it when
-    # that set changed (excluded_schemas is not enumerated, so a change there cannot change
-    # the facts). A 422 above has already left the stored audit as it was.
-    if any(prior.get(k) != existing.get(k) for k in ("row_filters", "excluded_tables")):
-        if config is None:
-            config = _readable_config(conn.config_encrypted)
-        if config is None:
-            values["privilege_audit"] = audit_to_dict(
-                audit_unavailable("", "the connection settings could not be read")
-            )
-        else:
-            values["privilege_audit"] = await _audit_privileges(conn.source_type, config, existing)
+            existing.setdefault("row_filters", {})
+        # Compared as PrivacySettings reads them, not as the JSON was stored: a key the
+        # stored settings never had (added after the connection was saved) is at its
+        # default, and the whole form sending that default changes nothing.
+        before = asdict(PrivacySettings.from_dict(prior))
+        after = asdict(PrivacySettings.from_dict(existing))
+        changed = {key for key, value in after.items() if before[key] != value}
+        values: dict = {"privacy_settings": existing}
+        # The audit reads facts about the row-filtered and the excluded tables, and the
+        # stored remediation script lists the schemas minus excluded_schemas: rerun it when
+        # any of the three changed. A 422 above has already left the stored audit as it was.
+        if changed & {"row_filters", "excluded_tables", "excluded_schemas"}:
+            if config is None:
+                config = _readable_config(conn.config_encrypted)
+            if config is None:
+                values["privilege_audit"] = audit_to_dict(
+                    audit_unavailable("", "the connection settings could not be read")
+                )
+            else:
+                session = session or _OpenedDatasource(conn.source_type, config)
+                values["privilege_audit"] = await _audit_privileges(
+                    conn.source_type, config, existing, session=session
+                )
+    finally:
+        if session is not None:
+            await session.close("to verify row filters and audit privileges")
     await db.execute(update(Connection).where(Connection.id == connection_id).values(**values))
     # A row-filter change does not alter introspection: keep the schema cache so the page's
     # schema read does not 404 after the save. Cached answers hold only generated SQL, which
     # runs through the row-filter rewrite again on every hit, so flushing them (and the
     # embeddings, which the helper flushes together with them) is a safe extra, not a
     # correctness need.
-    # The UI sends the whole form, so look at stored values, not at the keys sent. A key
-    # missing from storage counts as changed.
-    changed = {k for k, v in changes.items() if k not in prior or prior[k] != v}
-    await _invalidate_connection_caches(connection_id, db, keep_schema=changed <= {"row_filters"})
+    # The UI sends the whole form, so what counts is what changed, not what was sent. Neither
+    # the row-filter map nor the legacy filter alters introspection.
+    await _invalidate_connection_caches(
+        connection_id, db, keep_schema=changed <= {"row_filters", "row_filter_sql"}
+    )
     await db.commit()
     await db.refresh(conn)
     return conn
@@ -692,9 +800,10 @@ async def get_connection_config(
     db: AsyncSession = Depends(get_db),
 ) -> ConnectionConfigResponse:
     """Return decrypted connection config so the UI can pre-fill the edit form."""
-    settings = get_settings()
     conn = await get_connection_or_404(connection_id, db)
-    config_dict = json.loads(decrypt_value(conn.config_encrypted, settings.encryption_key))
+    config_dict = _readable_config(conn.config_encrypted)
+    if config_dict is None:
+        raise HTTPException(status_code=422, detail=_UNREADABLE_ENTER_ALL)
     return ConnectionConfigResponse(
         name=conn.name,
         source_type=conn.source_type,
@@ -729,9 +838,17 @@ async def update_connection_config(
                 detail=f"A connection named '{body.name}' already exists.",
             )
         values["name"] = body.name
+    existing: dict | None = None
     if body.config is not None:
-        existing = json.loads(decrypt_value(conn.config_encrypted, settings.encryption_key))
-        if _MASK_SENTINEL in body.config.values():
+        # The old config is read only for what needs it: the sentinel merge (an unreadable
+        # old config then cannot be merged, so 422) and, on PostgreSQL, the pool eviction
+        # (skipped when it cannot be read). A full new config saves without it.
+        has_sentinel = _MASK_SENTINEL in body.config.values()
+        if has_sentinel or conn.source_type == "postgresql":
+            existing = _readable_config(conn.config_encrypted)
+        if has_sentinel:
+            if existing is None:
+                raise HTTPException(status_code=422, detail=_UNREADABLE_ENTER_ALL)
             merged = _unmask_config(body.config, existing)
         else:
             merged = body.config
@@ -747,7 +864,7 @@ async def update_connection_config(
         await db.execute(update(Connection).where(Connection.id == connection_id).values(**values))
         if body.config is not None:
             await _invalidate_connection_caches(connection_id, db)
-            if conn.source_type == "postgresql":
+            if conn.source_type == "postgresql" and existing is not None:
                 await _evict_pg_pool(existing)
         await db.commit()
         await db.refresh(conn)

@@ -3,7 +3,7 @@
 
 import { useState } from 'react';
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import PrivacySettingsForm from '../PrivacySettings';
 import type { PrivacySettings } from '../../types';
@@ -404,6 +404,47 @@ describe('PrivacySettingsForm sensitive columns', () => {
     await userEvent.click(checkbox);
     expect(lastEmitted(onChange).strict_sensitive_columns).toBe(true);
   });
+
+  it('refuses a name already listed in another case', async () => {
+    const onChange = vi.fn();
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({ sensitive_columns: ['Name'] })}
+        onChange={onChange}
+      />,
+    );
+    const input = screen.getByLabelText('Sensitive columns (exact names)');
+    await userEvent.type(input, 'name{enter}');
+    expect(onChange).not.toHaveBeenCalled();
+    expect(input).toHaveValue('name');
+  });
+
+  it('adds a name not listed in any case', async () => {
+    const onChange = vi.fn();
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({ sensitive_columns: ['Name'] })}
+        onChange={onChange}
+      />,
+    );
+    await userEvent.type(screen.getByLabelText('Sensitive columns (exact names)'), 'notes{enter}');
+    expect(lastEmitted(onChange).sensitive_columns).toEqual(['Name', 'notes']);
+  });
+
+  it('keeps the patterns list case-sensitive', async () => {
+    const onChange = vi.fn();
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({ sensitive_column_patterns: ['email'] })}
+        onChange={onChange}
+      />,
+    );
+    await userEvent.type(
+      screen.getByLabelText('Sensitive column patterns (values masked)'),
+      'EMAIL{enter}',
+    );
+    expect(lastEmitted(onChange).sensitive_column_patterns).toEqual(['email', 'EMAIL']);
+  });
 });
 
 describe('PrivacySettingsForm removed default patterns', () => {
@@ -446,5 +487,93 @@ describe('PrivacySettingsForm removed default patterns', () => {
     );
 
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+});
+
+describe('PrivacySettingsForm duplicate entry hint', () => {
+  it('names the existing entry when a name listed in another case is refused', async () => {
+    const onChange = vi.fn();
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({ sensitive_columns: ['Name'] })}
+        onChange={onChange}
+      />,
+    );
+    await userEvent.type(screen.getByLabelText('Sensitive columns (exact names)'), 'name{enter}');
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByText('Already listed as Name.')).toBeInTheDocument();
+  });
+
+  it('shows the hint for an exact duplicate in a case-sensitive list', async () => {
+    const onChange = vi.fn();
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({ sensitive_column_patterns: ['email'] })}
+        onChange={onChange}
+      />,
+    );
+    await userEvent.type(
+      screen.getByLabelText('Sensitive column patterns (values masked)'),
+      'email{enter}',
+    );
+    expect(screen.getByText('Already listed as email.')).toBeInTheDocument();
+  });
+
+  it('clears the hint when the draft changes', async () => {
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({ sensitive_columns: ['Name'] })}
+        onChange={vi.fn()}
+      />,
+    );
+    const input = screen.getByLabelText('Sensitive columns (exact names)');
+    await userEvent.type(input, 'name{enter}');
+    expect(screen.getByText('Already listed as Name.')).toBeInTheDocument();
+    await userEvent.type(input, 's');
+    expect(screen.queryByText(/Already listed/)).not.toBeInTheDocument();
+  });
+
+  it('shows no hint for a name that is added', async () => {
+    const onChange = vi.fn();
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({ sensitive_columns: ['Name'] })}
+        onChange={onChange}
+      />,
+    );
+    await userEvent.type(screen.getByLabelText('Sensitive columns (exact names)'), 'notes{enter}');
+    expect(onChange).toHaveBeenCalled();
+    expect(screen.queryByText(/Already listed/)).not.toBeInTheDocument();
+  });
+
+  it('keeps the hint under the list that refused the entry', async () => {
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({ sensitive_columns: ['Name'] })}
+        onChange={vi.fn()}
+      />,
+    );
+    await userEvent.type(screen.getByLabelText('Sensitive columns (exact names)'), 'name{enter}');
+    expect(screen.getAllByText(/Already listed/)).toHaveLength(1);
+    expect(screen.getByLabelText('Sensitive columns (exact names)')).toHaveAccessibleDescription(
+      'Already listed as Name.',
+    );
+    expect(
+      screen.getByLabelText('Sensitive column patterns (values masked)'),
+    ).not.toHaveAccessibleDescription(/Already listed/);
+  });
+
+  it('clears the hint when an entry is removed', async () => {
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({ sensitive_columns: ['Name'] })}
+        onChange={vi.fn()}
+      />,
+    );
+    await userEvent.type(screen.getByLabelText('Sensitive columns (exact names)'), 'name{enter}');
+    await userEvent.click(
+      within(screen.getByText('Name', { selector: 'span' })).getByRole('button', { name: '×' }),
+    );
+    expect(screen.queryByText(/Already listed/)).not.toBeInTheDocument();
   });
 });

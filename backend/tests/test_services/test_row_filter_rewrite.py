@@ -9,13 +9,16 @@ or the statement is rejected before it runs."""
 from __future__ import annotations
 
 import contextlib
+from unittest.mock import patch
 
 import pytest
 import sqlglot
 from sqlglot import exp
-from sqlglot.errors import UnsupportedError
+from sqlglot.errors import ErrorLevel, UnsupportedError
 
+from app.datasources.errors import ErrorCategory
 from app.services import row_filter_rewrite
+from app.services.error_feedback import describe_error_for_llm
 from app.services.row_filter_errors import RowFilterRejectedError
 from app.services.row_filter_rewrite import apply_row_filters, parse_condition
 
@@ -56,6 +59,16 @@ def _expected(cond: str, dialect: str) -> str:
 
 def _assert_plain(exc: RowFilterRejectedError) -> None:
     assert "'" not in str(exc) and '"' not in str(exc)
+
+
+def _assert_advice(exc: RowFilterRejectedError, advice: str) -> None:
+    """A refusal the model can fix carries an advice-only, quote-free hint, so the
+    correction loop still runs (a hint-less refusal ends it)."""
+    hint = exc.llm_hint
+    assert hint is not None
+    assert advice in hint
+    assert str(exc) not in hint
+    assert "'" not in hint and '"' not in hint
 
 
 def _assert_every_reference_filtered(out: str, dialect: str, names: set[str]) -> None:
@@ -268,7 +281,7 @@ class TestRejections:
         with pytest.raises(RowFilterRejectedError) as excinfo:
             apply_row_filters("SELECT 1; SELECT 2", {"public.orders": _COND}, "PostgreSQL")
         _assert_plain(excinfo.value)
-        assert excinfo.value.llm_hint is None
+        _assert_advice(excinfo.value, "exactly one SELECT statement")
 
     def test_unknown_dialect_with_a_non_empty_map(self) -> None:
         with pytest.raises(RowFilterRejectedError) as excinfo:
@@ -284,7 +297,7 @@ class TestRejections:
         with pytest.raises(RowFilterRejectedError) as excinfo:
             apply_row_filters("SELECT id FROM orders", {"public.orders": _COND}, "PostgreSQL")
         _assert_plain(excinfo.value)
-        assert excinfo.value.llm_hint is None
+        _assert_advice(excinfo.value, "standard SELECT constructs")
 
     def test_unterminated_string_is_a_rejection_with_a_hint(self) -> None:
         # sqlglot raises TokenError here, which is not a ParseError: both are caught.
@@ -300,6 +313,7 @@ class TestRejections:
             apply_row_filters(sql, {"public.customers": _COND}, "PostgreSQL")
         _assert_plain(excinfo.value)
         assert "nests a join" in str(excinfo.value)
+        _assert_advice(excinfo.value, "filtered table public.customers directly")
 
     def test_nested_join_on_an_unfiltered_table_is_left_alone(self) -> None:
         # Only the node that matched a filter is checked; the tables inside the nested join
@@ -385,7 +399,7 @@ class TestUnfilterableShapes:
         with pytest.raises(RowFilterRejectedError) as excinfo:
             apply_row_filters("SELECT * FROM describe d", {"public.describe": _COND}, "PostgreSQL")
         _assert_plain(excinfo.value)
-        assert excinfo.value.llm_hint is None
+        _assert_advice(excinfo.value, "one plain SELECT statement")
 
     def test_ordinary_functions_are_not_affected(self) -> None:
         sql = "SELECT xmlelement(name x, id), to_tsvector(note) FROM orders"
@@ -607,3 +621,104 @@ class TestFenceMap:
         table = sqlglot.parse_one("SELECT * FROM t", read=read).find(exp.Table)
         out = row_filter_rewrite._filtered(table, parse_condition("x = 1", read), read)
         assert fence in out.sql(dialect=read)
+
+
+class TestAParsedTree:
+    def test_a_given_tree_is_rewritten_without_parsing(self) -> None:
+        sql = "SELECT id FROM users"
+        tree = sqlglot.parse_one(sql, read="postgres", error_level=ErrorLevel.IMMEDIATE)
+        with patch("app.services.row_filter_rewrite._parse_statement") as parse:
+            out = apply_row_filters(sql, {"public.users": "tenant_id = 7"}, "postgresql", tree=tree)
+        parse.assert_not_called()
+        assert out == apply_row_filters(sql, {"public.users": "tenant_id = 7"}, "postgresql")
+
+    def test_a_recursion_error_on_a_given_tree_is_still_a_rejection(self) -> None:
+        sql = "SELECT id FROM users"
+        tree = sqlglot.parse_one(sql, read="postgres", error_level=ErrorLevel.IMMEDIATE)
+        with (
+            patch(
+                "app.services.row_filter_rewrite._reject_unfilterable", side_effect=RecursionError
+            ),
+            pytest.raises(RowFilterRejectedError, match="nested too deeply"),
+        ):
+            apply_row_filters(sql, {"public.users": "tenant_id = 7"}, "postgresql", tree=tree)
+
+
+class TestHintsCarryOnlyTheAdvice:
+    """The REJECTED correction prompt already carries the rejection text; a hint that
+    repeated it would show the model the same sentence twice. Each hint still reads on its
+    own: it names what to change."""
+
+    @pytest.mark.parametrize(
+        ("dialect", "sql", "filters", "advice"),
+        [
+            pytest.param(
+                "PostgreSQL",
+                "SELECT query_to_xml('SELECT 1', true, false, '')",
+                {"public.orders": _COND},
+                "without the function query_to_xml",
+                id="function",
+            ),
+            pytest.param(
+                "PostgreSQL",
+                "SELECT * FROM pg_catalog.pg_stats",
+                {"public.orders": _COND},
+                "without the catalog view pg_stats",
+                id="catalog-view",
+            ),
+            pytest.param(
+                "PostgreSQL",
+                "WITH orders AS (SELECT 1 AS id) SELECT id FROM orders",
+                {"public.orders": _COND},
+                "Rename the CTE",
+                id="cte",
+            ),
+            pytest.param(
+                "PostgreSQL",
+                "SELECT id FROM orders",
+                {"a.orders": _COND, "b.orders": _COND},
+                "Qualify the table orders as schema.table",
+                id="ambiguous",
+            ),
+            pytest.param(
+                "PostgreSQL",
+                "SELECT id FROM Orders",
+                {"public.Orders": _COND},
+                "public.Orders",
+                id="case-variant",
+            ),
+        ],
+    )
+    def test_the_hint_does_not_repeat_the_message(
+        self, dialect: str, sql: str, filters: dict[str, str], advice: str
+    ) -> None:
+        with pytest.raises(RowFilterRejectedError) as excinfo:
+            apply_row_filters(sql, filters, dialect)
+        hint = excinfo.value.llm_hint
+        assert hint is not None
+        assert str(excinfo.value) not in hint
+        assert advice in hint
+
+    def test_the_nesting_hint_does_not_repeat_the_message(self) -> None:
+        with (
+            patch(
+                "app.services.row_filter_rewrite._reject_unfilterable", side_effect=RecursionError
+            ),
+            pytest.raises(RowFilterRejectedError) as excinfo,
+        ):
+            apply_row_filters("SELECT id FROM orders", {"public.orders": _COND}, "PostgreSQL")
+        hint = excinfo.value.llm_hint
+        assert hint is not None
+        assert str(excinfo.value) not in hint
+        assert "Simplify the query" in hint
+
+    def test_the_correction_description_carries_the_message_once(self) -> None:
+        sql = "WITH orders AS (SELECT 1 AS id) SELECT id FROM orders"
+        with pytest.raises(RowFilterRejectedError) as excinfo:
+            apply_row_filters(sql, {"public.orders": _COND}, "PostgreSQL")
+        exc = excinfo.value
+        described = describe_error_for_llm(
+            ErrorCategory.REJECTED, str(exc), sql=sql, schema=None, hint=exc.llm_hint
+        )
+        assert described.count(str(exc)) == 1
+        assert exc.llm_hint is not None and exc.llm_hint in described

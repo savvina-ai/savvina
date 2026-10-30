@@ -23,7 +23,7 @@ import sqlparse
 import sqlparse.tokens as sql_tokens
 
 from ..datasources.models import PrivacySettings
-from .row_filter_errors import RowFilterInvalidError, RowFilterRejectedError
+from .row_filter_errors import QueryRejectedError, RowFilterInvalidError, RowFilterRejectedError
 from .row_filter_rewrite import apply_row_filters, parse_condition, sqlglot_dialect
 from .sensitive_guard import check_strict_sensitive
 
@@ -44,6 +44,36 @@ _MIGRATION_MESSAGE = (
     "Open the privacy settings of the connection and define per-table filters, or remove "
     "the old filter there."
 )
+
+# Shown verbatim. The strict check and the rewriter parse with sqlglot's MySQL dialect, which
+# reads "…" as a string; under ANSI_QUOTES the server reads it as a name, so a query with a
+# double quote would be checked on one reading and run on another.
+_ANSI_QUOTES_MESSAGE = (
+    "The database reads double quotes as names (ANSI_QUOTES), which the strict sensitive-column"
+    " check and the row-filter rewriter cannot follow, so the query was not run."
+)
+_ANSI_QUOTES_HINT = (
+    "Write names with backticks and strings with single quotes; do not use a double quote"
+    " anywhere in the query."
+)
+
+# Shown verbatim. Result masking, the strict check and the rewriter read a MySQL string with
+# backslash escapes ('a\' continues past the quote); under NO_BACKSLASH_ESCAPES the server
+# ends it there, so the rest of the statement is read as text by one and run by the other.
+# Masking parses every executed statement, so this refusal does not wait for strict mode or
+# a row filter.
+_NO_BACKSLASH_ESCAPES_MESSAGE = (
+    "The database reads a backslash in a string as an ordinary character"
+    " (NO_BACKSLASH_ESCAPES), which the privacy checks cannot follow, so the query was not run."
+)
+_NO_BACKSLASH_ESCAPES_HINT = "Do not use a backslash anywhere in the query."
+
+
+def _reads_double_quotes_as_names(dialect: str, double_quote_is_string_literal: bool) -> bool:
+    """The engine reads ``"…"`` as a name while its sqlglot dialect reads it as a string:
+    MySQL under ANSI_QUOTES, which the adapter detects at connect by clearing
+    ``double_quote_is_string_literal``."""
+    return (dialect or "").lower() == "mysql" and not double_quote_is_string_literal
 
 
 def _parenthesis_depth(text: str, dialect: str) -> int:
@@ -302,7 +332,14 @@ def unwrap_row_filter(sql: str) -> str:
     return sql
 
 
-def _executable(sql: str, privacy: PrivacySettings | None, dialect: str) -> str:
+def _executable(
+    sql: str,
+    privacy: PrivacySettings | None,
+    dialect: str,
+    *,
+    double_quote_is_string_literal: bool,
+    backslash_is_escape: bool,
+) -> str:
     """The SQL actually sent to the database: *sql* with every filtered table reference
     rewritten (``apply_row_filters``) when the connection has row filters.
 
@@ -317,16 +354,40 @@ def _executable(sql: str, privacy: PrivacySettings | None, dialect: str) -> str:
 
     With strict sensitive-column mode on, ``check_strict_sensitive`` parses and checks the
     clean query first (``SensitiveColumnRejectedError``), so the rewritten form, which names
-    the admin's filter columns, is never inspected; the sort path's injected ``ORDER BY`` on a
+    the admin's filter columns, is never inspected, and the tree it parsed is handed to the
+    rewriter, which otherwise parses the query itself; the sort path's injected ``ORDER BY`` on a
     masked column is rejected here too.
+
+    *double_quote_is_string_literal* is the adapter's reading of ``"…"``
+    (``result_masking._double_quote_is_literal``). On MySQL under ANSI_QUOTES it is False and
+    a query that contains a double quote is refused when strict mode or a row filter would
+    parse it (``_ANSI_QUOTES_MESSAGE``); without either, nothing here parses it and masking
+    reads the flag itself.
+
+    *backslash_is_escape* is the adapter's reading of a backslash in a string
+    (``result_masking._backslash_is_escape``). On MySQL under NO_BACKSLASH_ESCAPES it is False
+    and a query that contains a backslash is refused whatever the settings
+    (``_NO_BACKSLASH_ESCAPES_MESSAGE``): result masking parses every executed statement. The
+    check comes first, before the ``privacy is None`` return, so it does not depend on the
+    caller loading the settings.
+
+    Both mode keywords are required: each caller reads them off the connected adapter.
     """
+    if (dialect or "").lower() == "mysql" and not backslash_is_escape and "\\" in sql:
+        raise QueryRejectedError(_NO_BACKSLASH_ESCAPES_MESSAGE, llm_hint=_NO_BACKSLASH_ESCAPES_HINT)
     if privacy is None:
         return sql
     if privacy.row_filter_needs_migration:
         raise RowFilterRejectedError(_MIGRATION_MESSAGE)
-    check_strict_sensitive(sql, privacy, dialect)
+    if (
+        (privacy.strict_sensitive_columns or privacy.row_filters)
+        and _reads_double_quotes_as_names(dialect, double_quote_is_string_literal)
+        and '"' in sql
+    ):
+        raise QueryRejectedError(_ANSI_QUOTES_MESSAGE, llm_hint=_ANSI_QUOTES_HINT)
+    tree = check_strict_sensitive(sql, privacy, dialect)
     if privacy.row_filters:
-        return apply_row_filters(sql, privacy.row_filters, dialect)
+        return apply_row_filters(sql, privacy.row_filters, dialect, tree=tree)
     return sql
 
 

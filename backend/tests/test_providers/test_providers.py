@@ -325,6 +325,68 @@ class TestParseLLMResponseRefusalWithReasoning:
         assert r.explanation == "I cannot answer that from this schema."
 
 
+class TestRefusalExplanationOffset:
+    def test_the_explanation_is_cut_on_the_original_text(self):
+        # "ΐ".upper() is three characters: an offset found on an upper-cased copy lands two
+        # characters too far on the original per "ΐ" before the marker and loses the start of
+        # the explanation.
+        raw = "REASONING:\nΗ ερώτηση αφορά ναΐς ΐΐ\n\nEXPLANATION:\nΔεν μπορώ να απαντήσω."  # noqa: RUF001
+        r = parse_llm_response(raw, "test-model")
+        assert r.query == ""
+        assert r.explanation == "Δεν μπορώ να απαντήσω."  # noqa: RUF001
+
+    def test_a_lower_case_marker_is_honoured(self):
+        r = parse_llm_response("reasoning: thinking\n\nexplanation:\nNo such table.", "m")
+        assert r.explanation == "No such table."
+
+    def test_the_last_marker_wins(self):
+        raw = "REASONING: the EXPLANATION: label above is quoted\n\nEXPLANATION:\nFinal."
+        assert parse_llm_response(raw, "m").explanation == "Final."
+
+
+class TestStructuredResponseOffsets:
+    """Markers are found on the original text: upper-casing "ΐ" or "ß" changes its length."""
+
+    @pytest.mark.parametrize("odd", ["ΐΐ", "ßß", "ναΐς ßß ΐ"])
+    def test_query_then_explanation_after_odd_characters(self, odd):
+        raw = (
+            f"REASONING:\nΗ ερώτηση {odd} αφορά πελάτες\n\n"  # noqa: RUF001
+            "QUERY:\n```sql\nSELECT id FROM customers\n```\n\n"
+            "EXPLANATION:\nΛίστα πελατών."  # noqa: RUF001
+        )
+        r = parse_llm_response(raw, "test-model")
+        assert r.query == "SELECT id FROM customers"
+        assert r.explanation == "Λίστα πελατών."
+
+    @pytest.mark.parametrize("odd", ["ΐΐ", "ßß"])
+    def test_explanation_before_query_after_odd_characters(self, odd):
+        raw = (
+            f"EXPLANATION:\nΛίστα {odd} πελατών.\n\n"  # noqa: RUF001
+            "QUERY:\n```sql\nSELECT id FROM customers\n```"
+        )
+        r = parse_llm_response(raw, "test-model")
+        assert r.query == "SELECT id FROM customers"
+        assert r.explanation == f"Λίστα {odd} πελατών."
+
+    def test_a_leaked_reasoning_after_a_greek_string_is_stripped_in_place(self):
+        raw = (
+            "QUERY:\nSELECT id FROM customers WHERE city = 'ΐΐΐ' REASONING: leaked\n\n"
+            "EXPLANATION:\nΛίστα."  # noqa: RUF001
+        )
+        r = parse_llm_response(raw, "test-model")
+        assert r.query == "SELECT id FROM customers WHERE city = 'ΐΐΐ'"
+        assert r.explanation == "Λίστα."
+
+    def test_a_leaked_reasoning_after_an_odd_string_is_stripped_in_place(self):
+        raw = (
+            "QUERY:\nSELECT id FROM customers WHERE city = 'ßß' reasoning: leaked\n\n"
+            "EXPLANATION:\nDone."
+        )
+        r = parse_llm_response(raw, "test-model")
+        assert r.query == "SELECT id FROM customers WHERE city = 'ßß'"
+        assert r.explanation == "Done."
+
+
 # ── Provider registry ─────────────────────────────────────────────────────────
 
 

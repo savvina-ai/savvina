@@ -3,26 +3,8 @@
 
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { displayRowFilterKey, displayRowFilterMap } from '../lib/rowFilterKeys';
+import { PRIVACY_DEFAULTS } from '../lib/privacyDefaults';
 import type { PrivacySettings, PrivilegeAudit } from '../types';
-
-const DEFAULTS: PrivacySettings = {
-  include_sample_values: false,
-  include_column_comments: false,
-  include_row_counts: false,
-  sensitive_column_patterns: [
-    'password', 'passwd', 'secret', 'token', 'api_key',
-    'email', 'ssn', 'social_security', 'credit_card', 'card_number', 'cvv',
-    'phone', 'mobile', 'address', 'salary', 'wage', 'income',
-    'bank_account', 'routing_number', 'dob', 'date_of_birth',
-    'national_id', 'passport', 'license_number', 'tax_id',
-  ],
-  sensitive_columns: [],
-  strict_sensitive_columns: false,
-  excluded_schemas: [],
-  excluded_tables: [],
-  excluded_columns: [],
-  row_filters: {},
-};
 
 interface Props {
   settings: PrivacySettings;
@@ -46,20 +28,36 @@ function TagList({
   items,
   onChange,
   description,
+  caseInsensitive = false,
 }: {
   label: string;
   items: string[];
   onChange: (items: string[]) => void;
   description?: string;
+  /** Two spellings of one name are one entry (the backend matches and de-duplicates the
+   *  sensitive column names that way). */
+  caseInsensitive?: boolean;
 }) {
   const [draft, setDraft] = useState('');
+  const hintId = useId();
+  // The existing entry a refused draft collides with; cleared as soon as the draft changes.
+  const [duplicateOf, setDuplicateOf] = useState<string | null>(null);
+  const listed = (value: string) =>
+    items.find((item) =>
+      caseInsensitive ? item.toLowerCase() === value.toLowerCase() : item === value,
+    );
 
   const add = () => {
     const trimmed = draft.trim();
-    if (trimmed && !items.includes(trimmed)) {
-      onChange([...items, trimmed]);
-      setDraft('');
+    if (!trimmed) return;
+    const existing = listed(trimmed);
+    if (existing !== undefined) {
+      setDuplicateOf(existing);
+      return;
     }
+    onChange([...items, trimmed]);
+    setDraft('');
+    setDuplicateOf(null);
   };
 
   return (
@@ -70,8 +68,12 @@ function TagList({
         <input
           type="text"
           aria-label={label}
+          aria-describedby={duplicateOf !== null ? hintId : undefined}
           value={draft}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            setDuplicateOf(null);
+          }}
           onKeyDown={(e) => e.key === 'Enter' && (e.preventDefault(), add())}
           placeholder="Add and press Enter"
           className="flex-1 bg-background text-foreground px-3 py-1.5 border border-border rounded text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
@@ -84,6 +86,13 @@ function TagList({
           Add
         </button>
       </div>
+      <p
+        id={hintId}
+        aria-live="polite"
+        className={duplicateOf !== null ? 'text-xs text-muted-foreground mb-2' : undefined}
+      >
+        {duplicateOf !== null && `Already listed as ${duplicateOf}.`}
+      </p>
       <div className="flex flex-wrap gap-2">
         {items.map((item) => (
           <span
@@ -93,7 +102,10 @@ function TagList({
             {item}
             <button
               type="button"
-              onClick={() => onChange(items.filter((i) => i !== item))}
+              onClick={() => {
+                onChange(items.filter((i) => i !== item));
+                setDuplicateOf(null);
+              }}
               className="hover:text-destructive ml-1"
             >
               ×
@@ -332,7 +344,7 @@ export default function PrivacySettingsForm({
   // Removing a default pattern is allowed (the admin may not want it), but it is said out
   // loud: the columns it matched lose the [SENSITIVE] tag, their sample values and masking.
   const kept = new Set(settings.sensitive_column_patterns.map((p) => p.toLowerCase()));
-  const removedDefaults = DEFAULTS.sensitive_column_patterns.filter((p) => !kept.has(p));
+  const removedDefaults = PRIVACY_DEFAULTS.sensitive_column_patterns.filter((p) => !kept.has(p));
 
   return (
     <div className="space-y-5">
@@ -379,6 +391,7 @@ export default function PrivacySettingsForm({
           ignored."
         items={settings.sensitive_columns ?? []}
         onChange={(v) => set('sensitive_columns', v)}
+        caseInsensitive
       />
       <Toggle
         label="Strict sensitive columns"
@@ -420,7 +433,7 @@ export default function PrivacySettingsForm({
         type="button"
         // Keep the row filters: resetting the other settings must not drop the per-table
         // filters the admin defined. Remove rows one by one to clear them.
-        onClick={() => onChange({ ...DEFAULTS, row_filters: settings.row_filters ?? {} })}
+        onClick={() => onChange({ ...PRIVACY_DEFAULTS, row_filters: settings.row_filters ?? {} })}
         className="text-sm text-muted-foreground hover:text-foreground underline"
       >
         Reset to defaults

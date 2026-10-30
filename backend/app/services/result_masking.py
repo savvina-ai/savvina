@@ -1860,6 +1860,13 @@ def _double_quote_is_literal(adapter: object) -> bool:
     return getattr(adapter, "double_quote_is_string_literal", False) is True
 
 
+def _backslash_is_escape(adapter: object) -> bool:
+    """Read ``backslash_is_escape`` off *adapter*, fail-safe: anything but a literal ``True``
+    reads ``False``, so on MySQL a query with a backslash is refused
+    (``row_filter._executable``). Other dialects ignore it."""
+    return getattr(adapter, "backslash_is_escape", False) is True
+
+
 _REDACTED = "[REDACTED]"
 
 

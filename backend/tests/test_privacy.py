@@ -79,6 +79,23 @@ class TestIsColumnSensitive:
 
 
 class TestSensitiveColumns:
+    def test_exact_names_are_folded_once_per_list(self):
+        from app.datasources import models
+
+        models._exact_sensitive_names.cache_clear()
+        privacy = PrivacySettings(sensitive_columns=["Name", "t.notes"])
+        for column in ("name", "NAME", "notes", "other"):
+            privacy.is_column_sensitive(column)
+        info = models._exact_sensitive_names.cache_info()
+        assert (info.misses, info.hits) == (1, 3)
+        assert models._exact_sensitive_names(("Name", "t.notes")) == frozenset({"name"})
+
+    def test_a_list_changed_in_place_is_read_again(self):
+        privacy = PrivacySettings(sensitive_columns=["name"])
+        assert privacy.is_column_sensitive("notes") is False
+        privacy.sensitive_columns.append("notes")
+        assert privacy.is_column_sensitive("notes") is True
+
     def test_an_exact_name_matches_case_insensitively(self):
         privacy = PrivacySettings(sensitive_column_patterns=[], sensitive_columns=["Name"])
         assert privacy.is_column_sensitive("name") is True

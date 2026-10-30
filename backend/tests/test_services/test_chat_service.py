@@ -1134,6 +1134,109 @@ class TestRowFilterRejectionOnReExecution:
         adapter.execute_query.assert_not_called()
 
 
+class TestModesAreReadFromTheConnectedAdapter:
+    """Approve, edit-and-execute and sort read the sql_mode flags off the adapter after
+    connect(): a fresh MySQL adapter holds the class defaults until connect reads @@sql_mode."""
+
+    _DQ = "SELECT id FROM users WHERE \"email\" = 'x'"
+    _BS = "SELECT 'a\\' AS k, email AS x FROM users -- '"
+
+    @staticmethod
+    def _mysql_adapter(**connected_modes: bool) -> MagicMock:
+        adapter = _make_adapter()
+        adapter.query_dialect = "MySQL"
+        # The class defaults a fresh MySQLDataSource holds before connect.
+        adapter.double_quote_is_string_literal = True
+        adapter.backslash_is_escape = True
+
+        async def _connect(_config: dict) -> None:
+            for name, value in connected_modes.items():
+                setattr(adapter, name, value)
+
+        adapter.connect = AsyncMock(side_effect=_connect)
+        return adapter
+
+    _CASES = (
+        pytest.param(
+            {"double_quote_is_string_literal": False},
+            {"strict_sensitive_columns": True, "sensitive_column_patterns": ["email"]},
+            _DQ,
+            "ANSI_QUOTES",
+            id="ansi_quotes",
+        ),
+        pytest.param(
+            {"backslash_is_escape": False},
+            {},
+            _BS,
+            "NO_BACKSLASH_ESCAPES",
+            id="no_backslash_escapes",
+        ),
+    )
+
+    @pytest.mark.parametrize(("modes", "privacy", "query", "word"), _CASES)
+    async def test_execute_pending(self, modes, privacy, query, word):
+        msg = _make_msg(status="pending_approval", query_generated=query, query_dialect="MySQL")
+        conn = _make_connection(privacy_settings=privacy or None)
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)), MockResult())
+        adapter = self._mysql_adapter(**modes)
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+        ):
+            resp = await service.execute_pending(message_id="msg-1", db=db)
+
+        assert resp.status == "error"
+        assert word in resp.error
+        adapter.execute_query.assert_not_awaited()
+        adapter.disconnect.assert_awaited_once()
+
+    @pytest.mark.parametrize(("modes", "privacy", "query", "word"), _CASES)
+    async def test_edit_and_execute(self, modes, privacy, query, word):
+        msg = _make_msg(status="pending_approval", query_dialect="MySQL")
+        conn = _make_connection(privacy_settings=privacy or None)
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)), MockResult())
+        adapter = self._mysql_adapter(**modes)
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+        ):
+            resp = await service.edit_and_execute(message_id="msg-1", edited_query=query, db=db)
+
+        assert resp.status == "error"
+        assert word in resp.error
+        adapter.execute_query.assert_not_awaited()
+        adapter.disconnect.assert_awaited_once()
+
+    @pytest.mark.parametrize(("modes", "privacy", "query", "word"), _CASES)
+    async def test_sort_and_execute(self, modes, privacy, query, word):
+        msg = _make_msg(status="executed", query_generated=query, query_dialect="MySQL")
+        msg.results_json = {"columns": ["id", "k"], "rows": []}
+        conn = _make_connection(privacy_settings=privacy or None)
+        db = _make_db(MockResult(row=(msg, _make_session(), conn)))
+        adapter = self._mysql_adapter(**modes)
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            pytest.raises(ValueError, match="Sort execution failed") as excinfo,
+        ):
+            await service.sort_and_execute(
+                message_id="msg-1", sort_column="id", sort_order="asc", db=db
+            )
+
+        assert word in str(excinfo.value)
+        adapter.execute_query.assert_not_awaited()
+        adapter.disconnect.assert_awaited_once()
+
+
 # ── Scenario 7: submit_feedback ───────────────────────────────────────────────
 
 

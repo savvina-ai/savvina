@@ -47,7 +47,6 @@ from ..semantic import store as semantic_store
 from ..semantic.models import SemanticModel
 from ..utils.encryption import decrypt_value
 from .execution import (
-    _executable,
     _execute_auto_query,
     _fingerprint,
     _inject_order_by,
@@ -55,14 +54,17 @@ from .execution import (
     _stream_execute_with_correction,
     _StreamResult,
     _user_error_text,
-    unwrap_row_filter,
 )
 from .intent_classifier import IntentClassifier
 from .pipeline import (
     _generate_query,
 )
-from .result_masking import _double_quote_is_literal, _mask_sensitive_result_columns
-from .row_filter import _MIGRATION_MESSAGE
+from .result_masking import (
+    _backslash_is_escape,
+    _double_quote_is_literal,
+    _mask_sensitive_result_columns,
+)
+from .row_filter import _MIGRATION_MESSAGE, _executable, unwrap_row_filter
 from .schema_pruning import (
     _filter_semantic_by_relevance,
     _filter_semantic_to_schema,
@@ -1043,10 +1045,20 @@ class ChatService:
         exec_error: str | None = None
         query_result: QueryResult | None = None
         try:
-            # The row-filter rewrite can reject the query (QueryRejectedError): handled like any
-            # execution failure below.
-            approved_query = _executable(approved_query, privacy, adapter.query_dialect)
+            # _executable can refuse the query (QueryRejectedError: the row-filter rewrite, the
+            # strict sensitive-column check, the ANSI_QUOTES double-quote check, the
+            # NO_BACKSLASH_ESCAPES backslash check): handled like any execution failure below.
+            # Connect first: the adapter reads @@sql_mode at connect, and both flags below
+            # come from it (a fresh adapter holds the class defaults). A refusal raised after
+            # connect still reaches the disconnect in finally.
             await adapter.connect(config_dict)
+            approved_query = _executable(
+                approved_query,
+                privacy,
+                adapter.query_dialect,
+                double_quote_is_string_literal=_double_quote_is_literal(adapter),
+                backslash_is_escape=_backslash_is_escape(adapter),
+            )
             query_result = await adapter.execute_query(
                 approved_query,
                 timeout=settings.default_query_timeout,
@@ -1201,8 +1213,17 @@ class ChatService:
         exec_error: str | None = None
         run_query = edited_query
         try:
-            run_query = _executable(run_query, privacy, adapter.query_dialect)
+            # Connect first: the adapter reads @@sql_mode at connect, and both flags below
+            # come from it (a fresh adapter holds the class defaults). A refusal raised after
+            # connect still reaches the disconnect in finally.
             await adapter.connect(config_dict)
+            run_query = _executable(
+                run_query,
+                privacy,
+                adapter.query_dialect,
+                double_quote_is_string_literal=_double_quote_is_literal(adapter),
+                backslash_is_escape=_backslash_is_escape(adapter),
+            )
             query_result = await adapter.execute_query(
                 run_query,
                 timeout=settings.default_query_timeout,
@@ -1350,8 +1371,17 @@ class ChatService:
         exec_error: str | None = None
         query_result: QueryResult | None = None
         try:
-            run_query = _executable(run_query, privacy, adapter.query_dialect)
+            # Connect first: the adapter reads @@sql_mode at connect, and both flags below
+            # come from it (a fresh adapter holds the class defaults). A refusal raised after
+            # connect still reaches the disconnect in finally.
             await adapter.connect(config_dict)
+            run_query = _executable(
+                run_query,
+                privacy,
+                adapter.query_dialect,
+                double_quote_is_string_literal=_double_quote_is_literal(adapter),
+                backslash_is_escape=_backslash_is_escape(adapter),
+            )
             query_result = await adapter.execute_query(
                 run_query,
                 timeout=settings.default_query_timeout,

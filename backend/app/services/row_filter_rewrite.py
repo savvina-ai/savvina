@@ -149,7 +149,8 @@ def _reject_unfilterable(tree: exp.Expression, read: str) -> None:
     """
     if tree.find(exp.Describe, exp.Command):
         raise RowFilterRejectedError(
-            "The query contains a construct the row filter cannot inspect, so it was not run."
+            "The query contains a construct the row filter cannot inspect, so it was not run.",
+            llm_hint="Write the query as one plain SELECT statement.",
         )
     for func in tree.find_all(exp.Func):
         name = func.name if isinstance(func, exp.Anonymous) else func.sql_name()
@@ -158,7 +159,9 @@ def _reject_unfilterable(tree: exp.Expression, read: str) -> None:
                 f"The function {name.lower()} reads rows the row filter cannot see,"
                 " so the query was not run."
             )
-            raise RowFilterRejectedError(text, llm_hint=f"{text} Write the query without it.")
+            raise RowFilterRejectedError(
+                text, llm_hint=f"Write the query without the function {name.lower()}."
+            )
     schemas, views = _VALUE_STATISTICS_VIEWS[read]
     for table in tree.find_all(exp.Table):
         schema = table.args.get("db")
@@ -167,11 +170,14 @@ def _reject_unfilterable(tree: exp.Expression, read: str) -> None:
             and table.name.casefold() in views
             and (schema.name.casefold() if isinstance(schema, exp.Identifier) else None) in schemas
         ):
+            view = table.name.casefold()
             text = (
-                f"The catalog view {table.name.casefold()} exposes values the row filter"
+                f"The catalog view {view} exposes values the row filter"
                 " cannot see, so the query was not run."
             )
-            raise RowFilterRejectedError(text, llm_hint=f"{text} Write the query without it.")
+            raise RowFilterRejectedError(
+                text, llm_hint=f"Write the query without the catalog view {view}."
+            )
 
 
 def _reject_cte_collisions(ctes: set[str], filters: list[_Filter], read: str) -> None:
@@ -186,7 +192,10 @@ def _reject_cte_collisions(ctes: set[str], filters: list[_Filter], read: str) ->
                 f"The query defines a CTE named like the filtered table {f.key}, which the"
                 " row filter cannot tell from the table, so it was not run."
             )
-            raise RowFilterRejectedError(text, llm_hint=f"{text} Rename the CTE.")
+            raise RowFilterRejectedError(
+                text,
+                llm_hint=f"Rename the CTE so that it differs from the filtered table {f.key}.",
+            )
 
 
 def _match(table: exp.Table, filters: list[_Filter], dialect: Dialect, read: str) -> _Filter | None:
@@ -214,7 +223,7 @@ def _match(table: exp.Table, filters: list[_Filter], dialect: Dialect, read: str
             f"Table {name} is referenced without a schema and a row filter exists for it"
             " in more than one schema."
         )
-        raise RowFilterRejectedError(text, llm_hint=f"{text} Qualify it as schema.table.")
+        raise RowFilterRejectedError(text, llm_hint=f"Qualify the table {name} as schema.table.")
     loose = [
         f
         for f in filters
@@ -223,7 +232,9 @@ def _match(table: exp.Table, filters: list[_Filter], dialect: Dialect, read: str
     ]
     if loose:
         text = f"Table {reference} does not match the filtered table {loose[0].key} exactly."
-        raise RowFilterRejectedError(text, llm_hint=f"{text} Write the name as {loose[0].key}.")
+        raise RowFilterRejectedError(
+            text, llm_hint=f"Write the table {reference} as {loose[0].key}."
+        )
     return None
 
 
@@ -268,8 +279,16 @@ def _generate(tree: exp.Expression, dialect: str) -> str:
     return tree.sql(dialect=dialect, unsupported_level=ErrorLevel.RAISE, comments=False)
 
 
-def apply_row_filters(sql: str, row_filters: dict[str, str], dialect: str) -> str:
+def apply_row_filters(
+    sql: str, row_filters: dict[str, str], dialect: str, *, tree: exp.Expression | None = None
+) -> str:
     """*sql* with every filtered base-table reference replaced by a filtered derived table.
+
+    *tree*, when given, is *sql* already parsed with this dialect (the strict check's tree):
+    it is rewritten in place and *sql* is not parsed again. The tree is trusted, not checked
+    against *sql*: a tree parsed from another statement would be rewritten and returned
+    instead of *sql*, so only ``row_filter._executable`` passes it, with the strict check's
+    tree of the same *sql*.
 
     Raises ``RowFilterRejectedError`` when the statement cannot be rewritten safely: an
     unknown dialect, a malformed key, a parse failure, more than one statement, a shape that
@@ -286,29 +305,19 @@ def apply_row_filters(sql: str, row_filters: dict[str, str], dialect: str) -> st
             "Row filters are not supported for this database dialect, so the query was not run."
         )
     try:
-        return _apply(sql, row_filters, read)
+        return _apply(sql, row_filters, read, tree)
     except RecursionError as exc:
         text = "The query is nested too deeply for the row filter, so it was not run."
-        raise RowFilterRejectedError(text, llm_hint=f"{text} Simplify the query.") from exc
-
-
-def _apply(sql: str, row_filters: dict[str, str], read: str) -> str:
-    try:
-        parsed = sqlglot.parse(
-            sql.rstrip().rstrip(";"), read=read, error_level=ErrorLevel.IMMEDIATE
-        )
-    except (ParseError, TokenError) as exc:
-        first = str(exc).splitlines()[0] if str(exc) else "parse error"
         raise RowFilterRejectedError(
-            "The query could not be parsed by the row-filter rewriter, so it was not run.",
-            llm_hint=f"The row-filter rewriter could not parse the query: {first}",
+            text, llm_hint="Simplify the query so that it is less deeply nested."
         ) from exc
-    statements = [s for s in parsed if s is not None]
-    if len(statements) != 1:
-        raise RowFilterRejectedError(
-            "The row filter needs exactly one statement, so the query was not run."
-        )
-    tree = statements[0]
+
+
+def _apply(
+    sql: str, row_filters: dict[str, str], read: str, tree: exp.Expression | None = None
+) -> str:
+    if tree is None:
+        tree = _parse_statement(sql, read)
     sg = Dialect.get_or_raise(read)
     filters = _filters(row_filters, read)
     _reject_unfilterable(tree, read)
@@ -325,7 +334,11 @@ def _apply(sql: str, row_filters: dict[str, str], read: str) -> str:
         if table.args.get("joins") or table.args.get("laterals"):
             raise RowFilterRejectedError(
                 "The query nests a join inside a filtered table reference, which the row"
-                " filter cannot rewrite, so it was not run."
+                " filter cannot rewrite, so it was not run.",
+                llm_hint=(
+                    f"Join the filtered table {matched.key} directly in FROM or JOIN,"
+                    " not inside a parenthesised join."
+                ),
             )
         table.replace(_filtered(table, matched.condition, read))
     try:
@@ -333,5 +346,27 @@ def _apply(sql: str, row_filters: dict[str, str], read: str) -> str:
     except UnsupportedError as exc:
         raise RowFilterRejectedError(
             "The query uses a construct the row-filter rewriter cannot write back for this"
-            " dialect, so it was not run."
+            " dialect, so it was not run.",
+            llm_hint="Write the query with standard SELECT constructs for this database.",
         ) from exc
+
+
+def _parse_statement(sql: str, read: str) -> exp.Expression:
+    """*sql* as one statement, or the rewriter's rejection."""
+    try:
+        parsed = sqlglot.parse(
+            sql.rstrip().rstrip(";"), read=read, error_level=ErrorLevel.IMMEDIATE
+        )
+    except (ParseError, TokenError) as exc:
+        first = str(exc).splitlines()[0] if str(exc) else "parse error"
+        raise RowFilterRejectedError(
+            "The query could not be parsed by the row-filter rewriter, so it was not run.",
+            llm_hint=f"The row-filter rewriter could not parse the query: {first}",
+        ) from exc
+    statements = [s for s in parsed if s is not None]
+    if len(statements) != 1:
+        raise RowFilterRejectedError(
+            "The row filter needs exactly one statement, so the query was not run.",
+            llm_hint="Write exactly one SELECT statement.",
+        )
+    return statements[0]

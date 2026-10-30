@@ -1,7 +1,7 @@
 // Copyright (c) 2025 Savvina AI Ltd
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -10,6 +10,7 @@ import { http, HttpResponse, delay } from 'msw';
 import { server } from '../../test/server';
 import { makeConnection } from '../../test/factories';
 import ConnectionPage from '../ConnectionPage';
+import { useAuthStore } from '../../store/authStore';
 
 const API = 'http://localhost:8000';
 const DETAIL = "Row filter must be a single condition without ';'";
@@ -499,5 +500,83 @@ describe('ConnectionPage privilege audit banner', () => {
     expect(await screen.findByText(/Privileges checked/)).not.toBeVisible();
     await userEvent.click(await screen.findByRole('button', { name: /Privacy Settings/ }));
     expect(await screen.findByText(/Privileges checked/)).toBeVisible();
+  });
+});
+
+describe('ConnectionPage edit connection panel', () => {
+  const UNREADABLE =
+    'The stored connection settings could not be read; enter every field again.';
+  const SOURCE = {
+    source_type: 'postgresql',
+    display_name: 'PostgreSQL',
+    icon: 'postgresql',
+    query_dialect: 'postgresql',
+    config_schema: {
+      fields: [
+        {
+          name: 'host',
+          type: 'string',
+          label: 'Host',
+          required: true,
+          placeholder: 'db.example.com',
+        },
+      ],
+    },
+  };
+
+  async function openEditConnection(configStatus: number) {
+    renderPage();
+    const conn = makeConnection();
+    const configPuts: unknown[] = [];
+    server.use(
+      http.put(`${API}/api/v1/connections/${conn.id}/config`, async ({ request }) => {
+        configPuts.push(await request.json());
+        return HttpResponse.json(conn);
+      }),
+      http.get(`${API}/api/v1/datasources`, () => HttpResponse.json([SOURCE])),
+      http.get(`${API}/api/v1/connections/${conn.id}/config`, () =>
+        configStatus === 422
+          ? HttpResponse.json({ detail: UNREADABLE }, { status: 422 })
+          : HttpResponse.json({ detail: 'boom' }, { status: configStatus }),
+      ),
+    );
+    await screen.findByText('Test Connection');
+    const trigger = screen
+      .getAllByRole('button')
+      .find((b) => !b.textContent?.trim() && b.getAttribute('aria-haspopup') === 'menu')!;
+    await userEvent.click(trigger);
+    await userEvent.click(await screen.findByRole('menuitem', { name: 'Edit connection' }));
+    return { configPuts };
+  }
+
+  beforeEach(() => {
+    useAuthStore.setState({ user: { id: 'u1', email: 'a@b.c', display_name: null } });
+  });
+  afterEach(() => {
+    useAuthStore.setState({ user: null });
+  });
+
+  it('a 422 on the stored config shows the sentence and an empty form to enter it again', async () => {
+    const { configPuts } = await openEditConnection(422);
+
+    expect(await screen.findByText(UNREADABLE)).toBeInTheDocument();
+    expect(screen.queryByText('Failed to load connection details.')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Connection name')).toHaveValue('Test Connection');
+    expect(screen.getByText('Host')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Test' })).toBeInTheDocument();
+
+    // Entering the fields again saves a full config: no sentinel is sent.
+    await userEvent.type(screen.getByPlaceholderText('db.example.com'), 'new-host');
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(configPuts).toHaveLength(1));
+    expect(configPuts[0]).toEqual({ name: 'Test Connection', config: { host: 'new-host' } });
+    expect(JSON.stringify(configPuts[0])).not.toContain('**redacted**');
+  });
+
+  it('any other error keeps the generic message and no form', async () => {
+    await openEditConnection(500);
+
+    expect(await screen.findByText('Failed to load connection details.')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Connection name')).not.toBeInTheDocument();
   });
 });

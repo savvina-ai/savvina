@@ -2,6 +2,7 @@
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 from dataclasses import dataclass, field, fields
+import functools
 import re
 from typing import Any, Literal
 
@@ -241,6 +242,16 @@ class PrivilegeFacts:
     tables: list[TablePrivilegeFacts] = field(default_factory=list)
 
 
+@functools.lru_cache(maxsize=64)
+def _exact_sensitive_names(entries: tuple[str, ...]) -> frozenset[str]:
+    """Lower-cased ``sensitive_columns`` entries without a dot, folded once per distinct
+    list. Keyed by the list's contents because the dataclass is mutable: a list changed in
+    place is a new key. An entry with a dot is a qualified name (table.column), not a
+    column name: it never matches, so a qualified entry cannot be mistaken for a bare one.
+    """
+    return frozenset(name.lower() for name in entries if "." not in name)
+
+
 @dataclass
 class PrivacySettings:
     """Per-connection privacy controls for what metadata reaches the LLM."""
@@ -319,9 +330,7 @@ class PrivacySettings:
         ``sensitive_columns`` (whole, case-insensitive). The one rule every consumer reads:
         the [SENSITIVE] annotation, value withholding, result masking, entity hints."""
         col_lower = column_name.lower()
-        # An entry with a dot is a qualified name (table.column), not a column name: it
-        # never matches, so a qualified entry cannot be mistaken for a bare one.
-        if any(col_lower == name.lower() for name in self.sensitive_columns if "." not in name):
+        if col_lower in _exact_sensitive_names(tuple(self.sensitive_columns)):
             return True
         return any(pattern in col_lower for pattern in self.sensitive_column_patterns)
 

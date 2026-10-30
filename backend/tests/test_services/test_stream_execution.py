@@ -1054,11 +1054,13 @@ class TestStreamRowFilter:
         calls = {"n": 0}
         real = apply_row_filters
 
-        def _first_rejected(sql: str, filters: dict[str, str], dialect: str) -> str:
+        def _first_rejected(
+            sql: str, filters: dict[str, str], dialect: str, **kwargs: object
+        ) -> str:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise rejection
-            return real(sql, filters, dialect)
+            return real(sql, filters, dialect, **kwargs)
 
         with patch("app.services.row_filter.apply_row_filters", side_effect=_first_rejected):
             _, result_out = await _run_stream(
@@ -1079,11 +1081,13 @@ class TestStreamRowFilter:
         rejection = RowFilterRejectedError("first", llm_hint="HINT-A")
         calls = {"n": 0}
 
-        def _first_rejected(sql: str, filters: dict[str, str], dialect: str) -> str:
+        def _first_rejected(
+            sql: str, filters: dict[str, str], dialect: str, **kwargs: object
+        ) -> str:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise rejection
-            return apply_row_filters(sql, filters, dialect)
+            return apply_row_filters(sql, filters, dialect, **kwargs)
 
         with patch("app.services.row_filter.apply_row_filters", side_effect=_first_rejected):
             _, result_out = await _run_stream(
@@ -1234,3 +1238,118 @@ class TestFingerprintOnTheStreamingPath:
         adapter = _make_adapter([_make_batch(rows=[[1]], columns=("id",))])
         _events, result_out = await _run_stream(adapter=adapter, generated_query="SELECT id FROM t")
         assert result_out.result.results_response.row_filter_fingerprint == ""
+
+
+class TestNoBackslashEscapesOnTheStreamingPath:
+    async def test_a_backslash_is_refused_and_corrected(self) -> None:
+        from app.services import execution
+        from app.services.row_filter import _executable
+
+        bypass = "SELECT 'a\\' AS k, email AS x FROM users -- '"
+        fixed = "SELECT 'a' AS k FROM users"
+        adapter, executed = _capturing_adapter(
+            [_make_batch([["a"]], columns=("k",), column_types=("text",))]
+        )
+        adapter.query_dialect = "MySQL"
+        adapter.double_quote_is_string_literal = True
+        adapter.backslash_is_escape = False
+        provider = _sequenced_provider(fixed)
+        with patch.object(execution, "_executable", wraps=_executable) as executable:
+            _, result_out = await _run_stream(
+                generated_query=bypass,
+                adapter=adapter,
+                provider=provider,
+                privacy=PrivacySettings(),
+            )
+        first = executable.call_args_list[0]
+        assert first.args[0] == bypass
+        assert first.kwargs["backslash_is_escape"] is False
+        assert executed == [fixed]
+        assert "NO_BACKSLASH_ESCAPES" in _llm_text(provider)
+        assert result_out.result.status == "executed"
+
+    async def test_the_adapters_backslash_flag_is_passed(self) -> None:
+        from app.services import execution
+        from app.services.row_filter import _executable
+
+        adapter, _ = _capturing_adapter([_make_batch([[1]])])
+        adapter.backslash_is_escape = True
+        with patch.object(execution, "_executable", wraps=_executable) as executable:
+            await _run_stream(
+                generated_query="SELECT id FROM t", adapter=adapter, privacy=PrivacySettings()
+            )
+        assert executable.call_args.kwargs["backslash_is_escape"] is True
+
+
+class TestHintlessRejectionEndsTheCorrection:
+    """A rejection without an llm_hint (a filter that needs migration, a malformed key, a
+    missing fence) is nothing the model can change: no correction call is made and the user
+    sees the rejection text as it is."""
+
+    _TEXT = "The row filter on public.t needs migration, so the query was not run."
+
+    async def test_a_hintless_rejection_makes_no_llm_call(self) -> None:
+        adapter, executed = _capturing_adapter([_make_batch([[1]])])
+        provider = _sequenced_provider("SELECT id FROM public.t")
+
+        with patch(
+            "app.services.row_filter.apply_row_filters",
+            side_effect=RowFilterRejectedError(self._TEXT),
+        ):
+            events, result_out = await _run_stream(
+                generated_query="SELECT id FROM t",
+                adapter=adapter,
+                provider=provider,
+                privacy=PrivacySettings(row_filters=_FILTERS),
+            )
+
+        provider.generate_response.assert_not_awaited()
+        assert executed == []
+        assert result_out.result.status == "error"
+        assert result_out.result.error == self._TEXT
+        assert not any(e.get("message") == "Correcting query…" for e in events)
+
+    async def test_a_hintless_rejection_of_a_corrected_query_ends_the_loop(self) -> None:
+        adapter, _ = _capturing_adapter([_make_batch([[1]])])
+        provider = _sequenced_provider("SELECT id FROM public.t", "SELECT id FROM public.t")
+        rejections = [
+            RowFilterRejectedError("Table t is ambiguous.", llm_hint="Qualify the table t."),
+            RowFilterRejectedError(self._TEXT),
+        ]
+
+        with patch("app.services.row_filter.apply_row_filters", side_effect=rejections):
+            _, result_out = await _run_stream(
+                generated_query="SELECT id FROM t",
+                adapter=adapter,
+                provider=provider,
+                privacy=PrivacySettings(row_filters=_FILTERS),
+            )
+
+        assert provider.generate_response.await_count == 1
+        assert result_out.result.status == "error"
+        assert result_out.result.error == self._TEXT
+
+    async def test_a_rejection_with_a_hint_still_goes_through_correction(self) -> None:
+        adapter, _ = _capturing_adapter([_make_batch([[1]])])
+        provider = _sequenced_provider("SELECT id FROM public.t")
+        rejection = RowFilterRejectedError("Table t is ambiguous.", llm_hint="Qualify it.")
+        calls = {"n": 0}
+
+        def _first_rejected(
+            sql: str, filters: dict[str, str], dialect: str, **kwargs: object
+        ) -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise rejection
+            return apply_row_filters(sql, filters, dialect, **kwargs)
+
+        with patch("app.services.row_filter.apply_row_filters", side_effect=_first_rejected):
+            _, result_out = await _run_stream(
+                generated_query="SELECT id FROM t",
+                adapter=adapter,
+                provider=provider,
+                privacy=PrivacySettings(row_filters=_FILTERS),
+            )
+
+        assert provider.generate_response.await_count == 1
+        assert result_out.result.status == "executed"

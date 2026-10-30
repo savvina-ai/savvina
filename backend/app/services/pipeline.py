@@ -20,9 +20,9 @@ from ..models.chat import ChatMessage
 from ..providers._factory import resolve_provider_config
 from ..providers.base import BaseLLMProvider, is_degenerate_output
 from ..semantic.models import SemanticModel
-from .execution import unwrap_row_filter
 from .prompt_builder import PromptBuilder
 from .result_masking import sql_mentions_sensitive
+from .row_filter import unwrap_row_filter
 from .schema_utils import _is_fallback_query, _validate_columns_against_schema
 
 if TYPE_CHECKING:

@@ -41,7 +41,6 @@ from ..datasources.models import PrivacySettings
 from ..datasources.registry import get_datasource_class
 from ..models.chat import ChatSession
 from ..models.connection import Connection
-from .execution import unwrap_row_filter
 from .result_masking import (
     _REDACTED,
     MASK_ALL_COLUMNS,
@@ -49,7 +48,7 @@ from .result_masking import (
     _plan_result_mask,
     _ResultMaskPlan,
 )
-from .row_filter import row_filter_fingerprint
+from .row_filter import row_filter_fingerprint, unwrap_row_filter
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession

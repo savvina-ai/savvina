@@ -279,6 +279,92 @@ class TestMySQLValidator:
         result = self.adapter.validate_query("SET SESSION sql_mode = 'STRICT_ALL_TABLES'")
         assert not result.is_valid
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # MariaDB: a per-statement variable, here lifting the statement time limit.
+            "SET STATEMENT max_statement_time=0 FOR SELECT 1",
+            # MariaDB: a per-statement sql_mode the adapter never read at connect.
+            "SET STATEMENT sql_mode='ANSI_QUOTES' FOR SELECT 1",
+            "set   statement sql_mode='NO_BACKSLASH_ESCAPES' for select 1",
+            # MySQL 8: the optimizer hint that sets a variable for this statement.
+            "SELECT /*+ SET_VAR(sql_mode='') */ 1",
+            "SELECT /*+ SET_VAR (sql_mode='ANSI_QUOTES') */ 1",
+            # A comment between the words is whitespace to the server.
+            "SET/**/STATEMENT max_statement_time=0 FOR SELECT 1",
+            "SET/* a\nb */STATEMENT max_statement_time=0 FOR SELECT 1",
+            "SET -- x\nSTATEMENT max_statement_time=0 FOR SELECT 1",
+            "SET#x\nSTATEMENT max_statement_time=0 FOR SELECT 1",
+            "SET /**/ -- x\n #y\n STATEMENT max_statement_time=0 FOR SELECT 1",
+            "SET/**/STATEMENT sql_mode='NO_BACKSLASH_ESCAPES' FOR "
+            "SELECT 'a\\' AS k, email AS x FROM users -- '",
+            "/* lead */ SET STATEMENT max_statement_time=0 FOR SELECT 1",
+            # An executable comment: the server runs its content.
+            "/*!SET*/ STATEMENT max_statement_time=0 FOR SELECT 1",
+            "/*!100000 SET*/ STATEMENT max_statement_time=0 FOR SELECT 1",
+            "/*M!100000 SET STATEMENT max_statement_time=0 FOR*/ SELECT 1",
+            "SELECT /*+ SET_VAR/**/(sql_mode='') */ 1",
+            "SELECT /*+ SET_VAR -- x\n(sql_mode='') */ 1",
+            "SELECT /*+ SET_VAR#x\n(sql_mode='') */ 1",
+            "SELECT /*!SET_VAR*/(sql_mode='') 1",
+            # A plain SET whose value is a subquery mentions SELECT and so passed the type check.
+            "SET sql_mode=(SELECT 'ANSI_QUOTES')",
+            "/* c */ SET @a=(SELECT 1)",
+            "-- c\nSET max_statement_time=(SELECT 0)",
+            # A # comment with no space after it, which sqlparse does not read as a comment.
+            "#x\nSET sql_mode=(SELECT 1)",
+            # A SET inside an executable comment: the server runs it.
+            "/*!SET*/ sql_mode = (SELECT 'ANSI_QUOTES')",
+            "/*!40101 SET*/ sql_mode = (SELECT 'ANSI_QUOTES')",
+            "/*!SET sql_mode=(SELECT 1)*/",
+            "/*M!SET*/ max_statement_time=(SELECT 0)",
+            "set sql_mode=(select 1)",
+        ],
+    )
+    def test_blocks_per_statement_variables(self, query: str) -> None:
+        result = self.adapter.validate_query(query)
+        assert not result.is_valid
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT 1",
+            "SELECT asset statement FROM t",
+            "SELECT offset_var, reset_var FROM settings",
+            "SELECT asset FROM t WHERE label = 'set'",
+            "SELECT id FROM t WHERE note = 'set it' -- set\n",
+            "SELECT /* set */ id FROM t",
+            "WITH s AS (SELECT 1 AS a) SELECT a FROM s",
+            "(SELECT 1) UNION ALL (SELECT 2)",
+            "SELECT /*! STRAIGHT_JOIN */ a FROM t",
+            "SELECT /*+ MAX_EXECUTION_TIME(1000) */ a FROM t",
+            "SELECT settings FROM t",
+            "SELECT a FROM t WHERE FIND_IN_SET('a', b)",
+        ],
+    )
+    def test_plain_selects_stay_valid(self, query: str) -> None:
+        assert self.adapter.validate_query(query).is_valid
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "SELECT 1 FROM t WHERE a = 'SET {gaps}'",
+            "SELECT 1 FROM t WHERE a = 'SET_VAR {gaps}'",
+            "{gaps}SELECT 1",
+        ],
+        ids=["set", "set_var", "leading"],
+    )
+    @pytest.mark.parametrize("gap", ["/*/", "-- \n", "*/", "# \n", "/**/ "])
+    def test_a_long_run_of_comment_gaps_validates_quickly(self, template: str, gap: str) -> None:
+        # Each gap form is matched one way only (atomic group, possessive quantifier), so a
+        # run of ambiguous pieces cannot make the pattern scan backtrack exponentially.
+        import time
+
+        query = template.format(gaps=gap * 5000)
+        start = time.monotonic()
+        self.adapter.validate_query(query)
+        assert time.monotonic() - start < 1.0
+
     def test_multi_statement_blocked(self) -> None:
         """Stacked queries via semicolon are rejected even in MySQL context."""
         result = self.adapter.validate_query("SELECT id FROM users; DROP TABLE users")
@@ -294,6 +380,89 @@ class TestMySQLValidator:
 
 
 class TestConnect:
+    @staticmethod
+    def _pool_with(*rows: tuple):
+        """A pool whose one cursor answers the connect's queries with *rows* in order."""
+        mock_pool = MagicMock()
+        mock_pool.wait_closed = AsyncMock()
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.__aenter__ = AsyncMock(return_value=mock_cur)
+        mock_cur.__aexit__ = AsyncMock(return_value=None)
+        mock_cur.execute = AsyncMock()
+        mock_cur.fetchone = AsyncMock(side_effect=list(rows))
+        mock_conn.cursor = MagicMock(return_value=mock_cur)
+
+        @asynccontextmanager
+        async def _acquire():
+            yield mock_conn
+
+        mock_pool.acquire = _acquire
+        return mock_pool, mock_cur
+
+    @pytest.mark.parametrize(
+        ("sql_mode", "expected"),
+        [
+            ("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION", True),
+            ("ANSI_QUOTES,STRICT_TRANS_TABLES", False),
+            (
+                "REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI",
+                False,
+            ),
+            ("ansi_quotes", False),
+            ("", True),
+            (None, True),
+            # Some servers and drivers return the variable as bytes.
+            (b"ANSI_QUOTES,STRICT_TRANS_TABLES", False),
+            (b"STRICT_TRANS_TABLES", True),
+        ],
+    )
+    async def test_connect_reads_ansi_quotes_from_sql_mode(self, sql_mode, expected) -> None:
+        pool, cur = self._pool_with(("8.0.33",), (sql_mode,))
+        with patch("aiomysql.create_pool", AsyncMock(return_value=pool)):
+            adapter = MySQLDataSource()
+            result = await adapter.connect(
+                {"host": "localhost", "username": "u", "password": "p", "database": "db"}
+            )
+        assert result.success
+        assert adapter.double_quote_is_string_literal is expected
+        assert cur.execute.await_args_list[1].args == ("SELECT @@sql_mode",)
+        # The class default is untouched: a fresh adapter reads MySQL's default again.
+        assert MySQLDataSource.double_quote_is_string_literal is True
+        assert MySQLDataSource().double_quote_is_string_literal is True
+
+    @pytest.mark.parametrize(
+        ("sql_mode", "expected"),
+        [
+            ("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION", True),
+            ("NO_BACKSLASH_ESCAPES", False),
+            ("STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES,ONLY_FULL_GROUP_BY", False),
+            (
+                "REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI,"
+                "NO_BACKSLASH_ESCAPES",
+                False,
+            ),
+            ("no_backslash_escapes", False),
+            (b"STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES", False),
+            (b"STRICT_TRANS_TABLES", True),
+            ("", True),
+            (None, True),
+        ],
+    )
+    async def test_connect_reads_no_backslash_escapes_from_sql_mode(
+        self, sql_mode, expected
+    ) -> None:
+        pool, _ = self._pool_with(("8.0.33",), (sql_mode,))
+        with patch("aiomysql.create_pool", AsyncMock(return_value=pool)):
+            adapter = MySQLDataSource()
+            result = await adapter.connect(
+                {"host": "localhost", "username": "u", "password": "p", "database": "db"}
+            )
+        assert result.success
+        assert adapter.backslash_is_escape is expected
+        assert MySQLDataSource.backslash_is_escape is True
+        assert MySQLDataSource().backslash_is_escape is True
+
     async def test_connect_success(self) -> None:
         mock_pool = MagicMock()
         mock_pool.wait_closed = AsyncMock()
@@ -320,6 +489,27 @@ class TestConnect:
         assert result.success
         assert result.server_version == "8.0.33"
         assert not adapter._is_mariadb
+
+    async def test_the_detected_mode_survives_disconnect(self) -> None:
+        # Masking after disconnect still reads the flag the server reported.
+        pool, _ = self._pool_with(("8.0.33",), ("ANSI_QUOTES",))
+        with patch("aiomysql.create_pool", AsyncMock(return_value=pool)):
+            adapter = MySQLDataSource()
+            await adapter.connect(
+                {"host": "localhost", "username": "u", "password": "p", "database": "db"}
+            )
+        await adapter.disconnect()
+        assert adapter.double_quote_is_string_literal is False
+
+    async def test_a_failed_connect_keeps_the_default(self) -> None:
+        with patch("aiomysql.create_pool", AsyncMock(side_effect=Exception("refused"))):
+            adapter = MySQLDataSource()
+            result = await adapter.connect(
+                {"host": "bad", "username": "u", "password": "p", "database": "db"}
+            )
+        assert not result.success
+        assert adapter.double_quote_is_string_literal is True
+        assert adapter.backslash_is_escape is True
 
     async def test_connect_failure_returns_false(self) -> None:
         with patch("aiomysql.create_pool", AsyncMock(side_effect=Exception("refused"))):

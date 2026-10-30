@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import json
 import logging
+import re
 from typing import TypeVar
 
 from json_repair import repair_json
@@ -22,6 +23,13 @@ _BM = TypeVar("_BM", bound=BaseModel)
 # Shared HTTP timeout constants used by provider fetch_available_models() implementations.
 _HTTP_TIMEOUT_S: float = 15.0
 _HEALTH_CHECK_TIMEOUT_S: float = 5.0
+
+# The reply's section labels, matched on the text itself (never on an upper-cased copy:
+# upper-casing can lengthen a string, "ß" -> "SS", "ΐ" -> three characters, which would
+# shift every offset after it).
+_QUERY_MARKER = re.compile(r"QUERY:", re.IGNORECASE)
+_EXPLANATION_MARKER = re.compile(r"EXPLANATION:", re.IGNORECASE)
+_REASONING_MARKER = re.compile(r"REASONING:", re.IGNORECASE)
 
 
 class ProviderConnectError(Exception):
@@ -225,31 +233,34 @@ def _parse_structured_response(raw: str) -> tuple[str, str]:
        query section and use the text between EXPLANATION: and QUERY: as the
        explanation.
     """
-    raw_upper = raw.upper()
-    q_pos = raw_upper.find("QUERY:") + len("QUERY:")
-    e_pos = raw_upper.find("EXPLANATION:")
+    q_match = _QUERY_MARKER.search(raw)
+    e_matches = list(_EXPLANATION_MARKER.finditer(raw))
+    if q_match is None or not e_matches:  # parse_llm_response only calls with both present
+        return "", ""
+    q_pos = q_match.end()
+    e_pos = e_matches[0].start()
     # Guard 1: if EXPLANATION: appears before QUERY: (e.g. mentioned in REASONING),
     # find the LAST EXPLANATION: instead so the slice is non-empty.
     if e_pos < q_pos:
-        e_pos = raw_upper.rfind("EXPLANATION:")
+        e_pos = e_matches[-1].start()
     # Guard 2: single EXPLANATION: precedes QUERY: — consume the rest as the
     # query section; treat the text before QUERY: as the explanation.
     if e_pos < q_pos:
         q_section = raw[q_pos:].strip()
-        explanation = raw[e_pos + len("EXPLANATION:") : q_pos - len("QUERY:")].strip()
+        explanation = raw[e_pos + len("EXPLANATION:") : q_match.start()].strip()
     else:
         q_section = raw[q_pos:e_pos].strip()
         explanation = raw[e_pos + len("EXPLANATION:") :].strip()
     extracted = _extract_sql(q_section)
-    if not extracted and q_section.upper().startswith("QUERY:"):
-        q_section = q_section[len("QUERY:") :].strip()
+    if not extracted and (label := _QUERY_MARKER.match(q_section)):
+        q_section = q_section[label.end() :].strip()
     query = extracted or q_section
     # Safety: strip any trailing EXPLANATION/REASONING text that leaked in when
     # the LLM omitted the closing code fence or wrote sections without separation.
-    for _marker in ("EXPLANATION:", "REASONING:"):
-        _marker_pos = query.upper().find(_marker)
-        if _marker_pos != -1:
-            query = query[:_marker_pos].strip()
+    for _marker in (_EXPLANATION_MARKER, _REASONING_MARKER):
+        _leaked = _marker.search(query)
+        if _leaked:
+            query = query[: _leaked.start()].strip()
     # LLM wrote a null signal as the query — surface the explanation instead.
     if query.strip().lower() in ("none", "null", "n/a"):
         query = ""
@@ -306,9 +317,9 @@ def _parse_unstructured_response(raw: str, model: str) -> tuple[str, str]:
             # A refusal in the prompt's format (REASONING:, then EXPLANATION: and no
             # QUERY:) keeps only its EXPLANATION section; the reasoning is the model's
             # working, not a message for the user.
-            e_pos = candidate.upper().rfind("EXPLANATION:")
-            if e_pos != -1:
-                candidate = candidate[e_pos + len("EXPLANATION:") :].strip()
+            markers = list(_EXPLANATION_MARKER.finditer(candidate))
+            if markers:
+                candidate = candidate[markers[-1].end() :].strip()  # the last one wins
             explanation = candidate
     return query, explanation
 
@@ -357,8 +368,7 @@ def parse_llm_response(
     2. Otherwise fall back to finding any SQL code block (````sql`` or `` ``` ``).
     3. Last resort: treat the entire response as the query.
     """
-    raw_upper = raw.upper()
-    if "QUERY:" in raw_upper and "EXPLANATION:" in raw_upper:
+    if _QUERY_MARKER.search(raw) and _EXPLANATION_MARKER.search(raw):
         query, explanation = _parse_structured_response(raw)
     else:
         query, explanation = _parse_unstructured_response(raw, model)

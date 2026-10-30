@@ -218,6 +218,24 @@ class TestDescribeErrorForLlm:
         )
         assert text.endswith("Names the error refers to: amont.")
 
+    def test_a_rejection_is_described_in_its_own_words(self) -> None:
+        text = (
+            "Strict sensitive columns: the query uses the column email outside its SELECT"
+            " list. This connection does not allow that."
+        )
+        out = describe_error_for_llm(
+            ErrorCategory.REJECTED,
+            text,
+            sql="SELECT id FROM users WHERE email = 'x'",
+            schema=None,
+            hint="Select it as a plain column or leave it out.",
+        )
+        assert out == f"{text} Select it as a plain column or leave it out."
+
+    def test_an_empty_rejection_falls_back_to_the_sentence(self) -> None:
+        out = describe_error_for_llm(ErrorCategory.REJECTED, "", sql="SELECT 1", schema=None)
+        assert out == _CATEGORY_SENTENCE[ErrorCategory.REJECTED]
+
     def test_every_category_has_a_sentence(self) -> None:
         for category in ErrorCategory:
             text = describe_error_for_llm(category, "", sql="SELECT 1", schema=None)
@@ -297,6 +315,7 @@ class TestRedactErrorForUser:
             ErrorCategory.TYPE_MISMATCH,
             ErrorCategory.PERMISSION,
             ErrorCategory.SYNTAX,
+            ErrorCategory.REJECTED,
         ],
     )
     def test_name_quoting_categories_are_unchanged(self, category: ErrorCategory) -> None:
@@ -326,3 +345,55 @@ class TestRedactErrorForUser:
             redact_error_for_user(ErrorCategory.OTHER, "\nDETAIL: x")
             == (_CATEGORY_SENTENCE[ErrorCategory.OTHER])
         )
+
+    @pytest.mark.parametrize(
+        ("error", "expected"),
+        [
+            pytest.param(
+                "(1292, \"Truncated incorrect DOUBLE value: 'abc'\")",
+                "Truncated incorrect DOUBLE value: [REDACTED]",
+                id="single-quoted value inside a double-quoted repr",
+            ),
+            pytest.param(
+                "(2013, 'Lost connection to MySQL server during query')",
+                "Lost connection to MySQL server during query",
+                id="no value",
+            ),
+            pytest.param(
+                "(1292, 'Truncated incorrect DOUBLE value: \\'it\"s\\'')",
+                "Truncated incorrect DOUBLE value: [REDACTED]",
+                id="escaped quotes in the repr",
+            ),
+        ],
+    )
+    def test_a_pymysql_tuple_is_unwrapped_before_redaction(self, error: str, expected: str) -> None:
+        # pymysql formats every error as str((errno, message)); redacting the quoted span of
+        # that text used to wipe the whole message.
+        assert redact_error_for_user(ErrorCategory.DATA, error) == expected
+
+    def test_a_tuple_that_is_not_a_repr_is_redacted_as_text(self) -> None:
+        assert redact_error_for_user(ErrorCategory.DATA, "(1, x 'y')") == "(1, x [REDACTED])"
+
+    def test_a_syntax_tuple_keeps_its_text(self) -> None:
+        error = "(1064, \"You have an error in your SQL syntax near 'FROM'\")"
+        assert redact_error_for_user(ErrorCategory.SYNTAX, error) == error
+
+    def test_a_tuple_whose_message_is_not_a_string_is_redacted_as_text(self) -> None:
+        assert redact_error_for_user(ErrorCategory.DATA, "(1, 5)") == "(1, 5)"
+
+    def test_a_tuple_message_keeps_only_its_first_line(self) -> None:
+        # The repr escapes a newline, so the whole tuple is one line until it is unwrapped;
+        # a DETAIL line inside the message can carry an unquoted value.
+        error = "(1644, 'bad value\\nDETAIL: secret123')"
+        assert redact_error_for_user(ErrorCategory.DATA, error) == "bad value"
+
+    def test_a_tuple_message_with_an_empty_first_line_falls_back_to_the_sentence(self) -> None:
+        error = "(1644, '\\nDETAIL: secret123')"
+        assert (
+            redact_error_for_user(ErrorCategory.DATA, error)
+            == _CATEGORY_SENTENCE[ErrorCategory.DATA]
+        )
+
+    def test_a_tuple_that_literal_eval_cannot_build_is_redacted_as_text(self) -> None:
+        # ``{[]: 1}`` parses but raises TypeError (unhashable key) when evaluated.
+        assert redact_error_for_user(ErrorCategory.DATA, "(1, {[]: 1})") == "(1, {[]: 1})"

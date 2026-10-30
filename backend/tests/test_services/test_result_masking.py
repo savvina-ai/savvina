@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import ClassVar
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -14,6 +16,7 @@ from app.schemas.chat import QueryResultsResponse
 from app.services import result_masking
 from app.services.result_masking import (
     MASK_ALL_COLUMNS,
+    _backslash_is_escape,
     _classify_select_columns,
     _mask_sensitive_result_columns,
     _plan_result_mask,
@@ -1364,3 +1367,25 @@ class TestTask4dReview:
     )
     def test_qualified_aggregate(self, sql: str, redacted: set[int]) -> None:
         assert _redacted(sql, ["x"]) == redacted
+
+
+class TestBackslashIsEscapeReader:
+    """Read fail-safe: anything but a literal True reads False (on MySQL, a refusal)."""
+
+    @pytest.mark.parametrize(
+        "adapter",
+        [
+            object(),
+            MagicMock(),
+            SimpleNamespace(backslash_is_escape=1),
+            SimpleNamespace(backslash_is_escape="true"),
+            SimpleNamespace(backslash_is_escape=None),
+            SimpleNamespace(backslash_is_escape=False),
+        ],
+        ids=["missing", "magicmock", "one", "string", "none", "false"],
+    )
+    def test_anything_but_true_reads_false(self, adapter: object) -> None:
+        assert _backslash_is_escape(adapter) is False
+
+    def test_a_literal_true_reads_true(self) -> None:
+        assert _backslash_is_escape(SimpleNamespace(backslash_is_escape=True)) is True

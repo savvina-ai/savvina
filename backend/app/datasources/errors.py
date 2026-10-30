@@ -17,7 +17,9 @@ import re
 
 
 class ErrorCategory(StrEnum):
-    """Why the database rejected a query. The LLM is told this, never the engine's text."""
+    """Why the database rejected a query (or, for REJECTED, why this application refused it
+    before sending it). The LLM is told the category, never the engine's text; a REJECTED
+    refusal's text is ours and is passed on."""
 
     UNKNOWN_NAME = "unknown_name"
     AMBIGUOUS_NAME = "ambiguous_name"
@@ -31,6 +33,10 @@ class ErrorCategory(StrEnum):
     UNSUPPORTED = "unsupported"
     TIMEOUT = "timeout"
     OTHER = "other"
+    # Not the database: this application refused the statement before sending it (a row
+    # filter that cannot be applied, the strict sensitive-column rule; QueryRejectedError).
+    # The text is ours and names only columns and tables, never a value.
+    REJECTED = "rejected"
 
 
 class ExplainError(Exception):
@@ -43,7 +49,8 @@ class ExplainError(Exception):
 # stored values. The user sees their text as is and the LLM is told the names in it that it
 # already has (``services/error_feedback``); every other category can quote a value. An
 # adapter whose engine reports a value under one of these codes must classify it as DATA
-# (PostgreSQL: ``PostgreSQLDataSource._classify_one``).
+# (PostgreSQL: ``PostgreSQLDataSource._classify_one``). ``REJECTED`` is listed because its
+# text is this application's own, quote-free sentence.
 NAME_ECHOING_CATEGORIES = frozenset(
     {
         ErrorCategory.UNKNOWN_NAME,
@@ -52,6 +59,7 @@ NAME_ECHOING_CATEGORIES = frozenset(
         ErrorCategory.TYPE_MISMATCH,
         ErrorCategory.PERMISSION,
         ErrorCategory.SYNTAX,
+        ErrorCategory.REJECTED,
     }
 )
 

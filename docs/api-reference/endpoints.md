@@ -249,7 +249,7 @@ Get a single connection with full detail including schema cache and privacy sett
 
 ### `DELETE /api/v1/connections/{id}`
 
-Delete a connection and cascade-delete all associated sessions, messages, cache entries, examples, and semantic model (the semantic rows are deleted; their audit history is kept).
+Delete a connection and cascade-delete all associated sessions, messages, cache entries, examples, and semantic model (the semantic rows are deleted; their audit history is kept). A connection whose stored settings can no longer be decrypted (after an `ENCRYPTION_KEY` change) is deleted too; only the PostgreSQL pool eviction is skipped.
 
 **Response `204`:** No content
 **Response `404`:** Connection not found
@@ -288,6 +288,7 @@ Test a new connection **before saving it**. Does not create any database records
 Test an existing saved connection using its stored (encrypted) credentials.
 
 **Response `200`:** Same as `POST /api/v1/connections/test`
+**Response `400`:** Connection failed, or the stored settings could not be read (`detail`: "The stored connection settings could not be read; edit the connection and enter them again.")
 
 ---
 
@@ -328,7 +329,7 @@ Update privacy settings for a connection. Partial updates are supported — omit
 }
 ```
 
-`sensitive_columns` (default `[]`) lists exact column names, matched case-insensitively with the same effect as a pattern; on `PUT` it is trimmed, empty entries are dropped and duplicates removed (on `POST` it is stored as sent). `strict_sensitive_columns` (default `false`) refuses before execution a query that uses a sensitive column anywhere but as a plain item of its SELECT list; see [Strict Sensitive Columns](../user-guide/04_privacy-controls.md#strict-sensitive-columns).
+`sensitive_columns` (default `[]`) lists exact column names, matched case-insensitively with the same effect as a pattern; on `PUT` and `POST` it is trimmed, empty entries are dropped and duplicates removed (the first spelling is kept); on `POST` a value that is not a list of strings is refused (422). `strict_sensitive_columns` (default `false`) refuses before execution a query that uses a sensitive column anywhere but as a plain item of its SELECT list; see [Strict Sensitive Columns](../user-guide/04_privacy-controls.md#strict-sensitive-columns).
 
 `row_filters`: an object sets the map after validation, `{}` clears it, and an absent field leaves it unchanged. On a connection that still stores the legacy `row_filter_sql`, `{}` is refused (422) unless `clear_legacy_row_filter: true` is sent as well; that flag alone also removes the legacy filter. `row_filter_sql` in the body is ignored. Changing privacy settings invalidates the connection's caches; a change that only touches `row_filters` keeps the cached schema.
 
@@ -363,6 +364,7 @@ Return the stored connection config so the UI can pre-fill its edit form.
 
 **Response `200`:** `ConnectionConfigResponse` — `{"name": ..., "source_type": ..., "config": {...}}`
 **Response `404`:** Connection not found
+**Response `422`:** The stored settings could not be read (after an `ENCRYPTION_KEY` change): "The stored connection settings could not be read; enter every field again."
 
 ---
 
@@ -374,8 +376,11 @@ Send `**redacted**` back for any credential field you do not want to change and 
 
 Changing the config clears that connection's cached schema and its query cache, since both may no longer describe the database being pointed at.
 
+The stored config is read only when the body contains `**redacted**` (and, on PostgreSQL, to evict the old connection pool when it can be read), so a full new config saves even when the stored one can no longer be decrypted.
+
 **Response `200`:** `ConnectionResponse`
 **Response `404`:** Connection not found
+**Response `422`:** The body contains `**redacted**` but the stored settings could not be read: "The stored connection settings could not be read; enter every field again."
 
 ---
 

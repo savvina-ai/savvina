@@ -8,6 +8,8 @@ from __future__ import annotations
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from app.datasources.errors import ErrorCategory
 from app.datasources.models import DataSourceSchema, ValidationResult
 from app.providers.base import LLMResponse
@@ -283,8 +285,11 @@ class TestCorrectionPromptComposition:
         assert "more than one row" in prompt
         assert "EXISTS" in prompt
 
-    def test_every_category_except_other_has_a_fallback_hint(self) -> None:
-        missing = [c for c in ErrorCategory if c is not ErrorCategory.OTHER and c not in _FALLBACKS]
+    def test_every_engine_category_has_a_fallback_hint(self) -> None:
+        # OTHER has no signal; REJECTED is our own refusal, described in its own words
+        # (describe_error_for_llm) with its own llm_hint, so an engine hint would mislead.
+        exempt = {ErrorCategory.OTHER, ErrorCategory.REJECTED}
+        missing = [c for c in ErrorCategory if c not in exempt and c not in _FALLBACKS]
         assert missing == []
 
 
@@ -306,13 +311,41 @@ class TestRowFilterHint:
             schema=None,
             adapter=adapter,
             error_category=ErrorCategory.SYNTAX,
-            llm_hint="Table orders is referenced without a schema and a row filter exists"
-            " for it in more than one schema. Qualify it as schema.table.",
+            llm_hint="Qualify the table orders as schema.table.",
         )
 
         prompt = provider.generate_response.call_args.kwargs["user_message"]
-        assert "Qualify it as schema.table." in prompt
+        assert "Qualify the table orders as schema.table." in prompt
         assert "The query has a syntax error for this SQL dialect." in prompt
+
+    async def test_a_rejection_gets_its_text_and_hint_and_no_engine_advice(self) -> None:
+        provider = _make_provider(_make_llm_response("SELECT id FROM users", "Fixed"))
+        adapter = _make_adapter(valid=True)
+        text = (
+            "Strict sensitive columns: the query uses the column email outside its SELECT"
+            " list (in a condition, join, grouping, ordering, expression or under another"
+            " name). This connection does not allow that."
+        )
+        await _attempt_sql_execution_correction(
+            original_question="q",
+            failed_query="SELECT id FROM users WHERE email = 'x'",
+            exec_error=text,
+            system_prompt="",
+            history=[],
+            provider=provider,
+            configured_max_tokens=4096,
+            configured_model="test-model",
+            schema=None,
+            adapter=adapter,
+            error_category=ErrorCategory.REJECTED,
+            llm_hint="Select it as a plain column or leave it out.",
+        )
+        prompt = provider.generate_response.call_args.kwargs["user_message"]
+        assert text in prompt
+        assert "Select it as a plain column or leave it out." in prompt
+        assert "syntax error" not in prompt
+        assert _FALLBACKS[ErrorCategory.SYNTAX] not in prompt
+        assert "withheld" not in prompt
 
     async def test_no_hint_adds_nothing(self) -> None:
         provider = _make_provider()
@@ -335,3 +368,48 @@ class TestRowFilterHint:
         prompt = provider.generate_response.call_args.kwargs["user_message"]
         assert "Qualify" not in prompt
         assert "some db error" not in prompt
+
+
+class TestPromptWordingByCategory:
+    async def _prompt(self, category: ErrorCategory, **kwargs: object) -> str:
+        provider = _make_provider()
+        await _attempt_sql_execution_correction(
+            original_question="q",
+            failed_query="SELECT id FROM orders",
+            exec_error="The query was refused.",
+            system_prompt="",
+            history=[],
+            provider=provider,
+            configured_max_tokens=4096,
+            configured_model="test-model",
+            schema=None,
+            adapter=_make_adapter(valid=True),
+            attempt_num=2,
+            error_category=category,
+            **kwargs,
+        )
+        return provider.generate_response.call_args.kwargs["user_message"]
+
+    async def test_a_refusal_is_described_as_refused_before_it_ran(self) -> None:
+        prompt = await self._prompt(ErrorCategory.REJECTED, llm_hint="Rename the CTE.")
+        assert prompt.startswith(
+            "The query you generated was refused before it ran (correction attempt 2):"
+        )
+        assert "REFUSAL:\nThe query was refused. Rename the CTE." in prompt
+        assert "EXECUTION ERROR:" not in prompt
+        assert "failed when executed against the database" not in prompt
+
+    @pytest.mark.parametrize(
+        "category", [c for c in ErrorCategory if c is not ErrorCategory.REJECTED]
+    )
+    async def test_every_other_category_keeps_the_execution_wording(
+        self, category: ErrorCategory
+    ) -> None:
+        prompt = await self._prompt(category)
+        assert prompt.startswith(
+            "The query you generated failed when executed against the database"
+            " (correction attempt 2):"
+        )
+        assert "EXECUTION ERROR:\n" in prompt
+        assert "REFUSAL:" not in prompt
+        assert "refused before it ran" not in prompt

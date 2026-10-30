@@ -9,7 +9,7 @@ import re
 
 import pytest
 
-from app.services.execution import unwrap_row_filter
+from app.services.row_filter import unwrap_row_filter
 
 _F = "tenant_id = 7"
 

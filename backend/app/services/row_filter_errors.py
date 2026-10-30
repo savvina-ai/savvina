@@ -13,10 +13,12 @@ class QueryRejectedError(ValueError):
     sent.
 
     ``str(exc)`` is shown to the user verbatim (``execution._user_facing_error`` skips the
-    redaction for this class) and the failure is classified SYNTAX. The fixed parts of every
-    message are plain sentences with no apostrophe or quote character; names taken from the
-    query or from the settings are interpolated as written. ``llm_hint`` is set only when
-    the model can act on the rejection; the correction prompt appends it.
+    redaction for this class) and the failure is classified ``ErrorCategory.REJECTED``: the
+    correction prompt carries this text and ``llm_hint`` in place of an engine description.
+    The fixed parts of every message are plain sentences with no apostrophe or quote
+    character; names taken from the query or from the settings are interpolated as written.
+    ``llm_hint`` is set only when the model can act on the rejection; the correction prompt
+    appends it.
     """
 
     def __init__(self, message: str, *, llm_hint: str | None = None) -> None:

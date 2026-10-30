@@ -530,7 +530,12 @@ class MySQLDataSource(BaseDataSource):
     source_type = "mysql"
     display_name = "MySQL / MariaDB"
     query_dialect = "MySQL"
-    double_quote_is_string_literal = True  # unless sql_mode has ANSI_QUOTES, which is not detected
+    # MySQL's default. connect() reads @@sql_mode once per pool and clears this on the
+    # instance under ANSI_QUOTES, where the server reads "…" as a name, as PostgreSQL does.
+    double_quote_is_string_literal = True
+    # MySQL's default as well; connect() clears it on the instance under NO_BACKSLASH_ESCAPES,
+    # where the server reads a backslash in a string as an ordinary character.
+    backslash_is_escape = True
     icon = "🐬"
 
     def __init__(self) -> None:
@@ -570,8 +575,23 @@ class MySQLDataSource(BaseDataSource):
                 await cur.execute("SELECT VERSION()")
                 row = await cur.fetchone()
                 version = row[0] if row else "unknown"
+                await cur.execute("SELECT @@sql_mode")
+                row = await cur.fetchone()
+                raw_mode = row[0] if row else None
+            # Some servers and drivers return the variable as bytes; str() would read b'...'.
+            if isinstance(raw_mode, bytes | bytearray):
+                sql_mode = bytes(raw_mode).decode("utf-8", errors="replace")
+            else:
+                sql_mode = "" if raw_mode is None else str(raw_mode)
             self._version = version
             self._is_mariadb = "MariaDB" in version
+            # @@sql_mode lists the mode expanded (ANSI appears as its members plus ANSI). The
+            # validator refuses the known ways a query can change it for its own run (a SET
+            # statement, MariaDB's SET STATEMENT ... FOR, MySQL's SET_VAR optimizer hint), so
+            # the session mode read here is the one queries on this pool run under.
+            modes = {part.strip().upper() for part in sql_mode.split(",")}
+            self.double_quote_is_string_literal = "ANSI_QUOTES" not in modes
+            self.backslash_is_escape = "NO_BACKSLASH_ESCAPES" not in modes
             logger.info(
                 "Connection pool established: host=%s, database=%s, version=%s",
                 host,

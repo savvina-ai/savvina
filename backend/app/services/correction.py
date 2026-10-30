@@ -282,7 +282,7 @@ _EXEC_ERROR_HINTS: dict[str, tuple[ErrorCategory, str]] = {
 
 # Used when no text hint both matched and agreed with the category (a non-English server,
 # or the only textual match was refused). Dialect-neutral by construction: these fire for
-# PostgreSQL and MySQL alike.
+# PostgreSQL and MySQL alike. REJECTED has none: the rejection's own ``llm_hint`` is the advice.
 _CATEGORY_FALLBACK_HINTS: dict[ErrorCategory, str] = {
     ErrorCategory.UNKNOWN_NAME: _UNKNOWN_NAME_ADVICE,
     ErrorCategory.AMBIGUOUS_NAME: _AMBIGUOUS_ADVICE,
@@ -346,7 +346,9 @@ async def _attempt_sql_execution_correction(
 
     Sends the failed query and *our own* description of the runtime error (plus a targeted
     hint) back to the LLM. The database's error text is read here to pick a hint and is
-    never copied into the prompt: it can quote a value stored in the tables. Re-validates
+    never copied into the prompt: it can quote a value stored in the tables. A REJECTED
+    refusal's own text is passed on (``describe_error_for_llm``), and the prompt says the
+    query was refused before it ran and labels the description ``REFUSAL:``. Re-validates
     the corrected query before returning it. Returns (corrected_query, explanation) on
     success, or (None, "") if still invalid. *llm_hint* is a ``QueryRejectedError.llm_hint``,
     appended to the description as it is.
@@ -373,11 +375,16 @@ async def _attempt_sql_execution_correction(
     error_description = describe_error_for_llm(
         error_category, exec_error, sql=failed_query, schema=schema, hint=llm_hint
     )
+    if error_category is ErrorCategory.REJECTED:
+        # Our own refusal: the query never reached the database.
+        outcome, label = "was refused before it ran", "REFUSAL"
+    else:
+        outcome, label = "failed when executed against the database", "EXECUTION ERROR"
     correction_message = (
-        f"The query you generated failed when executed against the database"
+        f"The query you generated {outcome}"
         f" (correction attempt {attempt_num}):\n\n"
         f"FAILED QUERY:\n```sql\n{failed_query}\n```\n\n"
-        f"EXECUTION ERROR:\n{error_description}{hint}\n\n"
+        f"{label}:\n{error_description}{hint}\n\n"
         f"Please correct the query to fix the above error. "
         f"The original question was: {original_question}"
     )

@@ -17,6 +17,7 @@ import pytest
 from app.datasources.errors import ErrorCategory
 from app.services.execution import (
     _classify,
+    _correctable,
     _exec_error_text,
     _is_rejection,
     _llm_hint,
@@ -61,6 +62,19 @@ class TestClassify:
         adapter = MagicMock()
         adapter.classify_error.return_value = MagicMock()
         assert _classify(adapter, ValueError("x")) is ErrorCategory.OTHER
+
+    def test_an_adapter_answering_rejected_reads_other(self) -> None:
+        # REJECTED is reserved for QueryRejectedError, whose text is ours and reaches the
+        # LLM and the user unredacted; an engine error must never be read that way.
+        adapter = MagicMock()
+        adapter.classify_error.return_value = ErrorCategory.REJECTED
+        assert _classify(adapter, ValueError("x")) is ErrorCategory.OTHER
+
+    def test_an_adapter_answering_rejected_still_gets_the_builtin_timeout_fallback(
+        self,
+    ) -> None:
+        adapter = _Hook(ErrorCategory.REJECTED)
+        assert _classify(adapter, TimeoutError()) is ErrorCategory.TIMEOUT
 
     def test_adapter_without_the_hook_reads_other(self) -> None:
         assert _classify(object(), ValueError("x")) is ErrorCategory.OTHER
@@ -114,12 +128,30 @@ class TestRejectionBase:
             ),
         ],
     )
-    def test_every_rejection_is_verbatim_syntax_with_its_hint(self, exc, expected_hint) -> None:
+    def test_every_rejection_is_verbatim_and_rejected_with_its_hint(
+        self, exc, expected_hint
+    ) -> None:
         assert isinstance(exc, QueryRejectedError)
         assert _is_rejection(exc) is True
         assert _llm_hint(exc) == expected_hint
-        assert _classify(object(), exc) is ErrorCategory.SYNTAX
+        assert _classify(object(), exc) is ErrorCategory.REJECTED
 
     def test_a_plain_error_is_not_a_rejection(self) -> None:
         assert _is_rejection(ValueError("x")) is False
         assert _llm_hint(ValueError("x")) is None
+
+
+class TestCorrectable:
+    @pytest.mark.parametrize(
+        ("rejected", "hint", "expected"),
+        [
+            pytest.param(False, None, True, id="engine-error"),
+            pytest.param(True, "Qualify it.", True, id="rejection-with-hint"),
+            pytest.param(True, None, False, id="rejection-without-hint"),
+            pytest.param(True, "", False, id="rejection-with-empty-hint"),
+        ],
+    )
+    def test_only_a_rejection_without_a_hint_ends_the_loop(
+        self, rejected: bool, hint: str | None, expected: bool
+    ) -> None:
+        assert _correctable(rejected, hint) is expected
