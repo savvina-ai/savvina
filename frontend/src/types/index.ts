@@ -40,6 +40,11 @@ export interface PrivacySettings {
   include_column_comments: boolean;
   include_row_counts: boolean;
   sensitive_column_patterns: string[];
+  /** Column names matched exactly (case-insensitive) in every table; same effect as a
+   *  pattern match. */
+  sensitive_columns: string[];
+  /** Reject a query that uses a sensitive column anywhere but as a plain SELECT item. */
+  strict_sensitive_columns: boolean;
   excluded_schemas: string[];
   excluded_tables: string[];
   excluded_columns: string[];

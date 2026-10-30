@@ -14,6 +14,8 @@ function makeSettings(overrides?: Partial<PrivacySettings>): PrivacySettings {
     include_column_comments: false,
     include_row_counts: false,
     sensitive_column_patterns: ['password'],
+    sensitive_columns: [],
+    strict_sensitive_columns: false,
     excluded_schemas: [],
     excluded_tables: ['audit_log'],
     excluded_columns: [],
@@ -130,7 +132,10 @@ describe('PrivacySettingsForm row filters', () => {
     const onChange = vi.fn();
     render(
       <PrivacySettingsForm
-        settings={makeSettings({ row_filters: { 'public.orders': 'tenant_id = 42' } })}
+        settings={makeSettings({
+          row_filters: { 'public.orders': 'tenant_id = 42' },
+          strict_sensitive_columns: true,
+        })}
         onChange={onChange}
       />,
     );
@@ -140,6 +145,7 @@ describe('PrivacySettingsForm row filters', () => {
     const next = lastEmitted(onChange);
     expect(next.row_filters).toEqual({ 'public.orders': 'tenant_id = 42' });
     expect(next.excluded_tables).toEqual([]);
+    expect(next.strict_sensitive_columns).toBe(false);
   });
 
   it('shows a PostgreSQL key part with quotes where an unquoted save would fold it', () => {
@@ -339,5 +345,63 @@ describe('PrivacySettingsForm privilege check line', () => {
     expect(screen.queryByText(/Privileges checked/)).not.toBeInTheDocument();
     rerender(<PrivacySettingsForm settings={makeSettings()} onChange={vi.fn()} audit={null} />);
     expect(screen.queryByText(/Privileges checked/)).not.toBeInTheDocument();
+  });
+});
+
+describe('PrivacySettingsForm sensitive columns', () => {
+  it('adding an exact column name emits sensitive_columns', async () => {
+    const onChange = vi.fn();
+    render(
+      <PrivacySettingsForm settings={makeSettings({ sensitive_columns: [] })} onChange={onChange} />,
+    );
+    const input = screen.getByLabelText('Sensitive columns (exact names)');
+    await userEvent.type(input, 'notes{enter}');
+    expect(lastEmitted(onChange).sensitive_columns).toEqual(['notes']);
+  });
+
+  it('adds to an empty list when the settings object has no sensitive_columns', async () => {
+    const settings = makeSettings();
+    delete (settings as Partial<PrivacySettings>).sensitive_columns;
+    const onChange = vi.fn();
+    render(<PrivacySettingsForm settings={settings} onChange={onChange} />);
+    await userEvent.type(screen.getByLabelText('Sensitive columns (exact names)'), 'notes{enter}');
+    expect(lastEmitted(onChange).sensitive_columns).toEqual(['notes']);
+  });
+
+  it('the strict toggle emits strict_sensitive_columns', async () => {
+    const onChange = vi.fn();
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({ strict_sensitive_columns: false })}
+        onChange={onChange}
+      />,
+    );
+    await userEvent.click(screen.getByRole('checkbox', { name: /^Strict sensitive columns/ }));
+    expect(lastEmitted(onChange).strict_sensitive_columns).toBe(true);
+  });
+
+  it('shows the strict toggle checked and clicking it emits false', async () => {
+    const onChange = vi.fn();
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({ strict_sensitive_columns: true })}
+        onChange={onChange}
+      />,
+    );
+    const checkbox = screen.getByRole('checkbox', { name: /^Strict sensitive columns/ });
+    expect(checkbox).toBeChecked();
+    await userEvent.click(checkbox);
+    expect(lastEmitted(onChange).strict_sensitive_columns).toBe(false);
+  });
+
+  it('shows the strict toggle unchecked when the settings object lacks the field', async () => {
+    const settings = makeSettings();
+    delete (settings as Partial<PrivacySettings>).strict_sensitive_columns;
+    const onChange = vi.fn();
+    render(<PrivacySettingsForm settings={settings} onChange={onChange} />);
+    const checkbox = screen.getByRole('checkbox', { name: /^Strict sensitive columns/ });
+    expect(checkbox).not.toBeChecked();
+    await userEvent.click(checkbox);
+    expect(lastEmitted(onChange).strict_sensitive_columns).toBe(true);
   });
 });

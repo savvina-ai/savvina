@@ -58,6 +58,8 @@ const DEFAULT_PRIVACY: PrivacySettings = {
     'bank_account', 'routing_number', 'dob', 'date_of_birth',
     'national_id', 'passport', 'license_number', 'tax_id',
   ],
+  sensitive_columns: [],
+  strict_sensitive_columns: false,
   excluded_schemas: [],
   excluded_tables: [],
   excluded_columns: [],

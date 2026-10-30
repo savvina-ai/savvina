@@ -16,6 +16,8 @@ const DEFAULTS: PrivacySettings = {
     'bank_account', 'routing_number', 'dob', 'date_of_birth',
     'national_id', 'passport', 'license_number', 'tax_id',
   ],
+  sensitive_columns: [],
+  strict_sensitive_columns: false,
   excluded_schemas: [],
   excluded_tables: [],
   excluded_columns: [],
@@ -67,6 +69,7 @@ function TagList({
       <div className="flex gap-2 mb-2">
         <input
           type="text"
+          aria-label={label}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && (e.preventDefault(), add())}
@@ -356,6 +359,27 @@ export default function PrivacySettingsForm({
           columns below."
         items={settings.sensitive_column_patterns}
         onChange={(v) => set('sensitive_column_patterns', v)}
+      />
+      <TagList
+        label="Sensitive columns (exact names)"
+        description="Column names matched exactly (case-insensitive), in every table that has
+          them. Use this for names too common for a pattern, such as name, notes or comment.
+          Same effect as a pattern match. Column names only: an entry such as table.column is
+          ignored."
+        items={settings.sensitive_columns ?? []}
+        onChange={(v) => set('sensitive_columns', v)}
+      />
+      <Toggle
+        label="Strict sensitive columns"
+        description="Refuse any query that uses a sensitive column other than as a plain column
+          of its SELECT list: no WHERE, JOIN, GROUP BY, HAVING, ORDER BY or expression over it,
+          and no alias or position that reaches it. This makes narrowing a masked value down
+          much harder but is not a guarantee: for values that must never be learned, use
+          Excluded columns. Questions that filter on such a column stop working, sorting the
+          result grid by a masked column is refused, and a query that cannot be parsed is
+          refused too."
+        checked={settings.strict_sensitive_columns ?? false}
+        onChange={(v) => set('strict_sensitive_columns', v)}
       />
       <TagList
         label="Excluded schemas"
