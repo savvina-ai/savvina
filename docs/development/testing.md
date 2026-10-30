@@ -108,6 +108,7 @@ backend/tests/
 │   ├── test_stream_message.py / test_stream_execution.py / test_sse_utils.py
 │   ├── test_result_masking.py     ← SELECT-list classifier and the [REDACTED] mask (services/result_masking.py)
 │   ├── test_stored_results.py     ← Stored results re-masked on every read
+│   ├── test_sensitive_guard.py    ← Strict sensitive-column check (services/sensitive_guard.py)
 │   ├── test_entity_resolver.py / test_intent_classifier.py
 │   ├── test_inject_order_by.py / test_validate_columns.py / test_schema_utils_parse_limits.py
 │   ├── test_export_service.py     ← CSV / XLSX / PDF export

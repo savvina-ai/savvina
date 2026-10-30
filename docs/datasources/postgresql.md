@@ -37,7 +37,8 @@ schema. No user tables are scanned — only metadata catalog views are read.
 **Privacy controls flow through introspection:**
 
 - Schemas, tables, or columns in the `excluded_*` lists are never fetched or passed to the LLM.
-- Columns matching `sensitive_column_patterns` (e.g., `email`, `password`, `ssn`) have sample
+- Columns matching `sensitive_column_patterns` (e.g., `email`, `password`, `ssn`) or listed in
+  `sensitive_columns` have sample
   values suppressed — the column appears in the schema description but without examples.
 - `include_row_counts`, `include_column_comments`, and `include_sample_values` can each be
   independently toggled per connection. `include_sample_values` and `include_column_comments`

@@ -209,6 +209,8 @@ Create and save a new data source connection.
     "include_column_comments": true,
     "include_row_counts": true,
     "sensitive_column_patterns": ["email", "ssn", "password"],
+    "sensitive_columns": [],
+    "strict_sensitive_columns": false,
     "excluded_schemas": [],
     "excluded_tables": [],
     "excluded_columns": [],
@@ -317,12 +319,16 @@ Update privacy settings for a connection. Partial updates are supported — omit
   "include_column_comments": true,
   "include_row_counts": true,
   "sensitive_column_patterns": ["email", "phone"],
+  "sensitive_columns": ["name"],
+  "strict_sensitive_columns": false,
   "excluded_schemas": ["audit"],
   "excluded_tables": ["sessions"],
   "excluded_columns": ["public.users.password_hash"],
   "row_filters": {"public.orders": "tenant_id = 42"}
 }
 ```
+
+`sensitive_columns` (default `[]`) lists exact column names, matched case-insensitively with the same effect as a pattern; on `PUT` it is trimmed, empty entries are dropped and duplicates removed (on `POST` it is stored as sent). `strict_sensitive_columns` (default `false`) refuses before execution a query that uses a sensitive column anywhere but as a plain item of its SELECT list; see [Strict Sensitive Columns](../user-guide/04_privacy-controls.md#strict-sensitive-columns).
 
 `row_filters`: an object sets the map after validation, `{}` clears it, and an absent field leaves it unchanged. On a connection that still stores the legacy `row_filter_sql`, `{}` is refused (422) unless `clear_legacy_row_filter: true` is sent as well; that flag alone also removes the legacy filter. `row_filter_sql` in the body is ignored. Changing privacy settings invalidates the connection's caches; a change that only touches `row_filters` keeps the cached schema.
 

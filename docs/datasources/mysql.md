@@ -36,7 +36,8 @@ tables are scanned.
 **Privacy controls flow through introspection:**
 
 - Schemas, tables, or columns in the `excluded_*` lists are never fetched or passed to the LLM.
-- Columns matching `sensitive_column_patterns` (e.g., `email`, `password`, `ssn`) have sample
+- Columns matching `sensitive_column_patterns` (e.g., `email`, `password`, `ssn`) or listed in
+  `sensitive_columns` have sample
   values suppressed.
 - An ENUM/SET column's member list is part of its type (`enum('placed','confirmed',…)`). Unless
   the column's values are allowed (sample values on and the column not sensitive), the list is

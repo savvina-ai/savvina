@@ -176,7 +176,8 @@ services/
 ├── execution.py       — query execution, ORDER BY injection, streaming
 ├── row_filter.py         — _executable, unwrap of the old wrap, filter validation
 ├── row_filter_rewrite.py — per-table rewrite of a statement with sqlglot
-├── row_filter_errors.py  — RowFilterRejectedError (with llm_hint), RowFilterInvalidError
+├── row_filter_errors.py  — QueryRejectedError (base, with llm_hint), RowFilterRejectedError, SensitiveColumnRejectedError, RowFilterInvalidError
+├── sensitive_guard.py    — strict sensitive-column check on the clean query (check_strict_sensitive)
 ├── privilege_audit.py    — findings and rls_effective from the connection role's catalog facts
 ├── result_masking.py  — SELECT-list classifier and [REDACTED] mask for query results
 ├── pipeline.py        — LLM provider setup, prompt compression, query generation

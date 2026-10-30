@@ -52,12 +52,13 @@ Each connection has independent privacy settings. Configure them at **Connection
 | **Include sample values** | Off | When off, no sample value reaches the LLM by any route: not in the schema, not as an ENUM member list, not as a filter hint. This reduces accuracy for enum-like columns. When on, the system also runs **Named Entity Resolution**: quoted strings and capitalised proper nouns in your question are matched against column sample values, and the stored spelling is added as a filter hint (e.g. resolving `"Acme Corp"` → `'acme corp'`). Sensitive columns, excluded columns and excluded tables are never matched. A table under a row filter sends no sample values (a MySQL ENUM/SET column keeps its declared members; see [Row Filters](#row-filters)). |
 | **Include column comments** | Off | When off, column and table comments are omitted from the LLM prompt |
 | **Include row counts** | On (a connection created in the UI starts with it off) | When off, approximate row counts are omitted from the LLM prompt. A table under a row filter sends no row count (see [Row Filters](#row-filters)). |
+| **Strict sensitive columns** | Off | When on, a query that uses a sensitive column anywhere but as a plain column of its SELECT list is refused before it runs (see [Strict Sensitive Columns](#strict-sensitive-columns)) |
 
 ### Sensitive Column Patterns
 
 A list of case-insensitive patterns. Any column whose name **contains** a matching pattern is annotated `[SENSITIVE]` in the LLM schema. Its sample values are withheld even when the toggle is on, and its values are masked in results.
 
-**The column itself is not hidden, and the query is not restricted.** The name and type stay visible so the LLM can use the column in `WHERE`, a join or an aggregate. For example, "all orders for the customer with email `someone@example.com`" filters on the column and returns rows normally.
+**The column itself is not hidden, and the query is not restricted** (unless **Strict sensitive columns** is on; see [below](#strict-sensitive-columns)). The name and type stay visible so the LLM can use the column in `WHERE`, a join or an aggregate. For example, "all orders for the customer with email `someone@example.com`" filters on the column and returns rows normally.
 
 **Result masking:** when a sensitive column's value appears in a query's output, it is replaced with `[REDACTED]` before the response reaches your browser. This covers the streamed rows and the saved message. Stored results are masked again with the connection's current settings every time they are read: in the chat history, through a share link, and in CSV, Excel and PDF exports. Tightening the settings therefore also applies to results saved earlier. Changing row filters goes further: earlier results are withheld entirely (see [Row Filters](#row-filters)).
 
@@ -97,6 +98,42 @@ national_id, passport, license_number, tax_id
 ```
 
 You can add custom patterns. For example, to treat any column containing `internal` as sensitive, add `internal` to the list.
+
+### Sensitive Columns
+
+A list of column names matched exactly, case-insensitively, in every table that has them. Use it for names too common for a pattern: `name` as a pattern would also match `username` and `first_name`; as a sensitive column it matches only a column called `name`. The effect is the same as a pattern match: `[SENSITIVE]` in the schema, no sample values, masked results, re-masked stored results. Entries are column names only; `table.column` is not recognised. An entry such as `customers.notes` is kept but never matches anything, so list the bare name.
+
+### Strict Sensitive Columns
+
+When this toggle is on, a sensitive column (one that matches a pattern, one listed under **Sensitive columns**, or the bare name of an excluded column) may appear in a query only as a plain column of a SELECT list, with or without an alias. `SELECT email FROM users`, `SELECT email AS contact FROM users`, `SELECT * FROM users`, `SELECT u.* FROM users u` and `SELECT count(*) FROM users` run as usual, and masking covers their output.
+
+The check runs on every query the model writes or you edit, before it is sent to the database: the first execution, self-corrected retries, the re-run after a query returns no rows, approved and edited queries, and re-sorts. A query it refuses is never sent. When the refusal ends the request, you see one of three messages; during an automatic correction the model gets the message and may fix the query, and a refused re-run after an empty result keeps the empty result.
+
+**The column is used outside the SELECT list.** The message names the column: *Strict sensitive columns: the query uses the column email outside its SELECT list (in a condition, join, grouping, ordering, expression or under another name). This connection does not allow that.* It is shown for:
+
+- an expression over the column, in the SELECT list too: `lower(email)`, `count(email)`, a `CASE` that reads it;
+- a `WHERE`, `JOIN`, `GROUP BY`, `HAVING` or `ORDER BY` on it;
+- an alias of it used in any of those places (`SELECT email AS e … WHERE e = …`), also when the alias is given inside a CTE or a subquery; the message then names the alias;
+- a position that points at it (`ORDER BY 2` when the second SELECT item is `email`);
+- `JOIN … USING (email)`.
+
+**A construct the check cannot follow.** The message names the construct, for example *Strict sensitive columns: the query uses a natural join, which the strict check cannot follow, so it was not run.* These are refused whether or not the query names a sensitive column, because the check cannot tell which columns they read:
+
+- a `NATURAL` join;
+- a whole-row reference: `u::text`, `to_jsonb(u)`, `SELECT u FROM users u`;
+- a star anywhere but as a SELECT item or in `count(*)`: `row_to_json(u.*)`;
+- a position that points at a star (`SELECT * FROM users ORDER BY 1`);
+- a column list on a table alias (`WITH c(e) AS (…)`).
+
+A column that has the same name as a table or alias in the query is read as a whole-row reference and refused (`SELECT status FROM status`); write it with its table or alias (`SELECT s.status FROM status s`).
+
+**A query that cannot be parsed.** The message is *Strict sensitive columns: the query could not be parsed, so it was not run.* In strict mode every query is parsed, whether or not it names a sensitive column, and one the parser cannot read as one plain statement is refused.
+
+Because patterns match by substring, strict mode also refuses a filter on a column such as `email_verified` when `email` is a pattern; use **Sensitive columns** for exact names if that gets in the way.
+
+The LLM is told the rule, and when a question needs a filter on a sensitive column it is asked to explain that instead of generating a query. If it writes such a query anyway, the rejection goes back to it with a hint, as for any failed query. In **Review First** mode the generated query is shown first and the rejection comes when you run it. Sorting the result grid by a sensitive column is refused too, because the sort adds an `ORDER BY` on that column.
+
+This makes narrowing a masked value down much harder but is not a guarantee: for values that must never be learned, use **Excluded columns**. The mode is off by default because questions that filter on a sensitive column stop working.
 
 ### Excluded Schemas
 
@@ -262,8 +299,8 @@ The fence does not hide *how long* a query takes: the time still depends on the 
 condition excludes.
 
 **Three controls, three jobs.** Row filters decide which rows the database reads. Excluded
-schemas, tables and columns decide what the model is told about. Sensitive patterns and
-excluded columns also decide what is shown: their values come back as `[REDACTED]`. Use
+schemas, tables and columns decide what the model is told about. Sensitive patterns,
+sensitive column names and excluded columns also decide what is shown: their values come back as `[REDACTED]`. Use
 them together; none of them replaces another.
 
 **Upgrading from 2.2.** The old single `row_filter_sql` is no longer applied. A connection
@@ -279,7 +316,7 @@ filters, results from before the migration keep showing it and must be re-run.
 
 ## Sensitive Column Auto-Detection
 
-Pattern matching is applied **automatically** at schema introspection time. If your table has a column `customer_email_address`, it matches `email`. The column appears in the schema as `[SENSITIVE]`, no sample values are sent for it, and its result values are masked, without you listing it anywhere.
+Pattern matching is applied **automatically** at schema introspection time. If your table has a column `customer_email_address`, it matches `email`. The column appears in the schema as `[SENSITIVE]`, no sample values are sent for it, and its result values are masked, without you listing it anywhere. For a name too common for a pattern, list it under **Sensitive columns** (see [Sensitive Columns](#sensitive-columns)).
 
 **What masking does, and does not, protect.** Masking changes what is displayed, not what
 the query reads. A `WHERE`, `JOIN`, `ORDER BY` or `GROUP BY` on a sensitive column still
@@ -288,9 +325,11 @@ value down (`WHERE salary > 99999 AND salary < 100001` returns the matching rows
 salary redacted), and an error raised by an expression over the value tells them something
 too. Masking prevents accidental exposure; it is not a defence against a user who is
 trying to extract the value. For that, restrict the rows with row filters, remove the
-column with **Excluded columns** so the model never sees it, or restrict the database
-account itself. Statistical aggregates (`COUNT`, `SUM`, `AVG`) over a sensitive column are
-returned unmasked on purpose; a group of one row reveals its value.
+column with **Excluded columns** so the model never sees it, restrict the database
+account itself, or turn on **Strict sensitive columns**, which refuses most such queries
+before they run. Statistical aggregates (`COUNT`, `SUM`, `AVG`) over a sensitive column are
+returned unmasked on purpose (with strict mode off; strict mode refuses them); a group of
+one row reveals its value.
 
 A query under row filters is regenerated before it runs, and a function column without an
 alias comes back under the engine function's name (`strpos(email, '@')` is shown as
@@ -380,7 +419,7 @@ The check does not enumerate the tables under an excluded schema when it looks f
 
 ## Error Messages You See
 
-When a query fails at the database, the error shown in the chat and stored with the message depends on the kind of error. For an unknown or ambiguous name, a grouping error, a type mismatch, a permission error or a syntax error, you see the database's message as is: these messages quote names from the query, not stored values. For any other error, such as a value that could not be converted, you see only the first line of the message, with every quoted part replaced by `[REDACTED]`. The full text is written to the server log only.
+When a query fails at the database, the error shown in the chat and stored with the message depends on the kind of error. For an unknown or ambiguous name, a grouping error, a type mismatch, a permission error or a syntax error, you see the database's message as is: these messages quote names from the query, not stored values. For any other error, such as a value that could not be converted, you see only the first line of the message, with every quoted part replaced by `[REDACTED]`. Savvina does not log the full text; the server log holds the same redacted line. Savvina's own rejections (a row filter that cannot be applied, the strict sensitive-column rule) are shown as written; they quote names from the query or the settings, never a value.
 
 PostgreSQL also reports a stored value that a query looked up or parsed under these name and syntax codes: `SELECT ssn::regclass …` fails with `relation "123456789" does not exist`. So on PostgreSQL such an error counts as a name or syntax error only when the database points to a place in the query text. An error without that position, or one raised while the database parsed a stored value (as for `::regtype`), is treated as a value error and redacted. Permission errors usually carry no position and always keep their text.
 
