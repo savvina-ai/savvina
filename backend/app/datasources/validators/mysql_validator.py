@@ -45,6 +45,15 @@ class MySQLValidator(BaseSQLValidator):
                     error_message=f"Query uses a blocked MySQL function: {func}",
                 )
 
+        # A value assigned to a user variable (@v := col) is read back as @v under another
+        # column in the same statement, past result masking. Checked on the raw text, so
+        # ':=' inside a string literal is refused too.
+        if ":=" in query:
+            return ValidationResult(
+                is_valid=False,
+                error_message="Query assigns a user variable (:=), which is not allowed",
+            )
+
         for pattern in self.MYSQL_DANGEROUS_PATTERNS:
             if re.search(pattern, query_upper):
                 return ValidationResult(

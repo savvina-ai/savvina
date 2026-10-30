@@ -303,6 +303,12 @@ def _parse_unstructured_response(raw: str, model: str) -> tuple[str, str]:
         if any(candidate.upper().lstrip().startswith(kw) for kw in sql_starters):
             query = candidate
         else:
+            # A refusal in the prompt's format (REASONING:, then EXPLANATION: and no
+            # QUERY:) keeps only its EXPLANATION section; the reasoning is the model's
+            # working, not a message for the user.
+            e_pos = candidate.upper().rfind("EXPLANATION:")
+            if e_pos != -1:
+                candidate = candidate[e_pos + len("EXPLANATION:") :].strip()
             explanation = candidate
     return query, explanation
 

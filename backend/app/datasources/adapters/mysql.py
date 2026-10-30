@@ -44,6 +44,34 @@ _POOL_MAX_SIZE: int = 5
 # TCP-level timeout (seconds) for both pool creation and test_connection().
 _CONNECT_TIMEOUT_S: int = 10
 
+
+class _NoWarnings:
+    """Skip aiomysql's SHOW WARNINGS after a statement that raised a warning.
+
+    aiomysql passes each warning to warnings.warn, which writes it to stderr and so to the
+    server log. MySQL warnings quote stored values (1292 ``Truncated incorrect DOUBLE value:
+    '<value>'`` for ``WHERE email = 1``, one per row), sensitive columns included. Turning
+    them off on the server (``max_error_count = 0``) needs SESSION_VARIABLES_ADMIN, which a
+    read-only role lacks. Nothing in this adapter reads warnings. Every cursor the adapter
+    opens is one of the classes below.
+    """
+
+    async def _show_warnings(self, conn: Any) -> None:
+        return None
+
+
+class _Cursor(_NoWarnings, aiomysql.Cursor):
+    pass
+
+
+class _DictCursor(_NoWarnings, aiomysql.DictCursor):
+    pass
+
+
+class _SSCursor(_NoWarnings, aiomysql.SSCursor):
+    pass
+
+
 _SYSTEM_SCHEMAS = frozenset({"information_schema", "mysql", "performance_schema", "sys"})
 
 # Generated from _SYSTEM_SCHEMAS so that adding a schema only requires editing the frozenset.
@@ -536,6 +564,7 @@ class MySQLDataSource(BaseDataSource):
                 maxsize=_POOL_MAX_SIZE,
                 autocommit=True,
                 connect_timeout=_CONNECT_TIMEOUT_S,
+                cursorclass=_Cursor,
             )
             async with self._pool.acquire() as conn, conn.cursor() as cur:
                 await cur.execute("SELECT VERSION()")
@@ -596,6 +625,7 @@ class MySQLDataSource(BaseDataSource):
                 db=config["database"],
                 ssl=config.get("ssl", False) or None,
                 connect_timeout=_CONNECT_TIMEOUT_S,
+                cursorclass=_Cursor,
             )
             async with conn.cursor() as cur:
                 await cur.execute("SELECT VERSION()")
@@ -678,7 +708,7 @@ class MySQLDataSource(BaseDataSource):
             "AND TABLE_SCHEMA NOT IN " + _SYSTEM_SCHEMAS_TUPLE
         )
 
-        async with self._pool.acquire() as conn, conn.cursor(aiomysql.DictCursor) as cur:
+        async with self._pool.acquire() as conn, conn.cursor(_DictCursor) as cur:
             # 1. Schemas (MySQL calls them "databases")
             await cur.execute(_q_schemas)
             schema_rows = await cur.fetchall()
@@ -805,7 +835,7 @@ class MySQLDataSource(BaseDataSource):
             raise RuntimeError("Not connected.")
 
         async with self._pool.acquire() as conn:
-            async with conn.cursor(aiomysql.DictCursor) as cur:
+            async with conn.cursor(_DictCursor) as cur:
                 await cur.execute(
                     """
                     SELECT COLUMN_TYPE
@@ -1132,7 +1162,7 @@ class MySQLDataSource(BaseDataSource):
                 await setup_cur.execute("SET SESSION TRANSACTION READ ONLY")
 
             try:
-                async with conn.cursor(aiomysql.SSCursor) as cur:
+                async with conn.cursor(_SSCursor) as cur:
                     await cur.execute(query)
                     description = cur.description or []
 

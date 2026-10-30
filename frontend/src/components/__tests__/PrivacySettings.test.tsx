@@ -405,3 +405,46 @@ describe('PrivacySettingsForm sensitive columns', () => {
     expect(lastEmitted(onChange).strict_sensitive_columns).toBe(true);
   });
 });
+
+describe('PrivacySettingsForm removed default patterns', () => {
+  it('names the default patterns missing from the list', () => {
+    render(<PrivacySettingsForm settings={makeSettings()} onChange={vi.fn()} />);
+    const note = screen.getByRole('status');
+    expect(note).toHaveTextContent('Default patterns removed:');
+    expect(note).toHaveTextContent('email');
+    expect(note).toHaveTextContent('phone');
+    expect(note).not.toHaveTextContent('password');
+  });
+
+  it('shows nothing once the defaults are restored', async () => {
+    const onChange = vi.fn();
+    const { rerender } = render(
+      <PrivacySettingsForm settings={makeSettings()} onChange={onChange} />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Reset to defaults' }));
+    rerender(<PrivacySettingsForm settings={lastEmitted(onChange)} onChange={onChange} />);
+
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('counts a default kept in another case as kept', async () => {
+    const onChange = vi.fn();
+    const { rerender } = render(
+      <PrivacySettingsForm settings={makeSettings()} onChange={onChange} />,
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Reset to defaults' }));
+    const defaults = lastEmitted(onChange).sensitive_column_patterns;
+
+    rerender(
+      <PrivacySettingsForm
+        settings={makeSettings({
+          sensitive_column_patterns: defaults.map((p) => (p === 'email' ? 'EMAIL' : p)),
+        })}
+        onChange={onChange}
+      />,
+    );
+
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+});

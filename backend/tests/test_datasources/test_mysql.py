@@ -14,10 +14,13 @@ import pytest
 from app.datasources.adapters.mysql import (
     _WRITE_PRIVILEGES,
     MySQLDataSource,
+    _Cursor,
+    _DictCursor,
     _is_enum_or_set,
     _parse_enum_values,
     _parse_grant_line,
     _serialize,
+    _SSCursor,
 )
 from app.datasources.adapters.postgresql import PostgreSQLDataSource
 from app.datasources.errors import ExplainError
@@ -218,6 +221,22 @@ class TestMySQLValidator:
         result = self.adapter.validate_query("SELECT 1; SET GLOBAL max_connections=10")
         assert not result.is_valid
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # A value assigned to a user variable comes back under another column, unmasked.
+            "SELECT id, @l AS v FROM customers WHERE id = 2 AND (@l := email) IS NOT NULL",
+            "SELECT @l AS v FROM (SELECT @l:=email AS x FROM customers) t",
+        ],
+    )
+    def test_blocks_variable_assignment(self, query: str) -> None:
+        result = self.adapter.validate_query(query)
+        assert not result.is_valid
+        assert ":=" in (result.error_message or "")
+
+    def test_allows_reading_a_variable(self) -> None:
+        assert self.adapter.validate_query("SELECT @@version").is_valid
+
     def test_blocks_into_outfile(self) -> None:
         result = self.adapter.validate_query("SELECT * FROM users INTO OUTFILE '/tmp/dump'")
         assert not result.is_valid
@@ -336,6 +355,83 @@ class TestConnect:
 
         assert result.success
         assert adapter._is_mariadb
+
+    async def test_pool_cursors_skip_warnings(self) -> None:
+        mock_pool = MagicMock()
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.__aenter__ = AsyncMock(return_value=mock_cur)
+        mock_cur.__aexit__ = AsyncMock(return_value=None)
+        mock_cur.execute = AsyncMock()
+        mock_cur.fetchone = AsyncMock(return_value=("8.0.33",))
+        mock_conn.cursor = MagicMock(return_value=mock_cur)
+
+        @asynccontextmanager
+        async def _acquire():
+            yield mock_conn
+
+        mock_pool.acquire = _acquire
+        create_pool = AsyncMock(return_value=mock_pool)
+
+        with patch("aiomysql.create_pool", create_pool):
+            await MySQLDataSource().connect(
+                {"host": "localhost", "username": "u", "password": "p", "database": "db"}
+            )
+
+        assert create_pool.call_args.kwargs["cursorclass"] is _Cursor
+
+    async def test_test_connection_cursor_skips_warnings(self) -> None:
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.__aenter__ = AsyncMock(return_value=mock_cur)
+        mock_cur.__aexit__ = AsyncMock(return_value=None)
+        mock_cur.execute = AsyncMock()
+        mock_cur.fetchone = AsyncMock(return_value=("8.0.33",))
+        mock_conn.cursor = MagicMock(return_value=mock_cur)
+        connect = AsyncMock(return_value=mock_conn)
+
+        with patch("aiomysql.connect", connect):
+            await MySQLDataSource().test_connection(
+                {"host": "localhost", "username": "u", "password": "p", "database": "db"}
+            )
+
+        assert connect.call_args.kwargs["cursorclass"] is _Cursor
+
+
+# ── MySQL warnings never reach warnings.warn ─────────────────────────────────
+
+
+class TestCursorsSkipWarnings:
+    """A MySQL warning quotes stored values (1292 ``Truncated incorrect DOUBLE value:
+    'a@b.c'``); aiomysql would pass it to warnings.warn and so to the server log."""
+
+    def test_aiomysql_still_has_the_hook(self) -> None:
+        # The override relies on this private method; an aiomysql upgrade that renames it
+        # would silently bring the warnings back.
+        assert callable(getattr(aiomysql.Cursor, "_show_warnings", None))
+
+    @pytest.mark.parametrize("cls", [_Cursor, _DictCursor, _SSCursor])
+    async def test_show_warnings_reads_and_emits_nothing(self, cls, recwarn) -> None:
+        conn = MagicMock()
+        conn.show_warnings = AsyncMock(
+            return_value=[("Warning", 1292, "Truncated incorrect DOUBLE value: 'a@b.c'")]
+        )
+        cur = cls.__new__(cls)
+
+        await cur._show_warnings(conn)
+
+        conn.show_warnings.assert_not_awaited()
+        assert not [w for w in recwarn if "a@b.c" in str(w.message)]
+
+    def test_adapter_opens_no_stock_cursor(self) -> None:
+        # Every cursor the adapter opens must skip warnings: a stock aiomysql cursor class
+        # passed to conn.cursor() would bring them back for that query.
+        import pathlib
+
+        import app.datasources.adapters.mysql as mod
+
+        source = pathlib.Path(mod.__file__).read_text()
+        assert not re.search(r"\.cursor\(\s*aiomysql\.", source)
 
 
 # ── introspect ────────────────────────────────────────────────────────────────
@@ -716,7 +812,7 @@ class MockMySQLConnWithSSCursor:
     def cursor(self, cursor_class: type | None = None) -> MockSSCursor | MockCursor:
         import aiomysql
 
-        if cursor_class is aiomysql.SSCursor:
+        if cursor_class is not None and issubclass(cursor_class, aiomysql.SSCursor):
             return self._ss_cursor
         return self._plain_cursor
 

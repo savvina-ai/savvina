@@ -221,6 +221,21 @@ class TestPostgreSQLValidatorBlockedFunctions:
         r = self.v.validate("SELECT pg_sleep(5)")
         assert "pg_sleep" in r.error_message
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # A value stored with set_config comes back under another column, unmasked.
+            "SELECT id, current_setting('my.l') AS v FROM customers "
+            "WHERE id = 2 AND set_config('my.l', email, true) IS NOT NULL",
+            "WITH s AS MATERIALIZED (SELECT SET_CONFIG('my.l', email, true) AS x FROM customers) "
+            "SELECT current_setting('my.l') FROM s",
+        ],
+    )
+    def test_set_config_blocked(self, query):
+        r = self.v.validate(query)
+        assert not r.is_valid
+        assert "set_config" in r.error_message
+
 
 class TestPostgreSQLValidatorBlockedPatterns:
     def setup_method(self):

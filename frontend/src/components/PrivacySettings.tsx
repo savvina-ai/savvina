@@ -329,6 +329,10 @@ export default function PrivacySettingsForm({
 }: Props) {
   const set = <K extends keyof PrivacySettings>(key: K, val: PrivacySettings[K]) =>
     onChange({ ...settings, [key]: val });
+  // Removing a default pattern is allowed (the admin may not want it), but it is said out
+  // loud: the columns it matched lose the [SENSITIVE] tag, their sample values and masking.
+  const kept = new Set(settings.sensitive_column_patterns.map((p) => p.toLowerCase()));
+  const removedDefaults = DEFAULTS.sensitive_column_patterns.filter((p) => !kept.has(p));
 
   return (
     <div className="space-y-5">
@@ -360,6 +364,13 @@ export default function PrivacySettingsForm({
         items={settings.sensitive_column_patterns}
         onChange={(v) => set('sensitive_column_patterns', v)}
       />
+      {removedDefaults.length > 0 && (
+        <p role="status" className="-mt-3 text-xs text-amber-700 dark:text-amber-400">
+          Default patterns removed: {removedDefaults.join(', ')}. Columns that only these
+          matched are no longer tagged [SENSITIVE]: their values are not masked in results, and
+          their sample values are sent to the LLM while sample values are on.
+        </p>
+      )}
       <TagList
         label="Sensitive columns (exact names)"
         description="Column names matched exactly (case-insensitive), in every table that has
