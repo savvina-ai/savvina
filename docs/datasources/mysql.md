@@ -12,7 +12,7 @@ It uses `aiomysql` — a native async MySQL driver — for all connection and qu
 | Connection name | Yes | `Analytics DB` | Display label in the UI |
 | Host | Yes | `mysql.example.com` | Hostname or IP. Use `host.docker.internal` for a DB on your host machine outside Docker |
 | Port | Yes | `3306` | Default MySQL port |
-| Database | Yes | `myapp` | Database (schema) name |
+| Database | Yes | `myapp` | Database (schema) the session starts in. It does not limit what the connection sees: see below |
 | Username | Yes | `readonly_user` | Use a dedicated read-only account (see below) |
 | Password | Yes | — | Fernet-encrypted before storage; never logged |
 
@@ -24,6 +24,13 @@ The password is stored Fernet-encrypted in PostgreSQL and decrypted only when op
 
 When a connection is saved (or refreshed), the adapter queries `INFORMATION_SCHEMA` — no user
 tables are scanned.
+
+On MySQL a schema is a database, and introspection reads **every database the account can see**
+(all but `information_schema`, `mysql`, `performance_schema` and `sys`), not only the one named
+in the **Database** field. Their tables reach the LLM, and queries can join across them. To keep
+the connection to one database, grant the account access to that database only (see
+[Read-Only Account](#read-only-account-recommended)), or list the other databases under
+**Excluded schemas** in the connection's privacy settings.
 
 | Metadata | Source |
 |---|---|
@@ -38,7 +45,7 @@ tables are scanned.
 - Schemas, tables, or columns in the `excluded_*` lists are never fetched or passed to the LLM.
 - Columns matching `sensitive_column_patterns` (e.g., `email`, `password`, `ssn`) or listed in
   `sensitive_columns` have sample
-  values suppressed.
+  values suppressed, and their comments are never sent.
 - An ENUM/SET column's member list is part of its type (`enum('placed','confirmed',…)`). Unless
   the column's values are allowed (sample values on and the column not sensitive), the list is
   withheld from the type as `enum(…)`, at introspection and again whenever a cached schema is read.
@@ -80,6 +87,8 @@ CREATE USER `savvina_reader`@`%` IDENTIFIED BY '<choose a password>';
 -- Grant read access to all tables in your database
 GRANT SELECT ON `myapp`.* TO `savvina_reader`@`%`;
 ```
+
+Grant no other database: the connection sees every database the account can read.
 
 Savvina validates every statement as a read-only SELECT and also runs it inside a database-enforced read-only transaction, so a write cannot succeed even if the text check is fooled. A read-only user is a third layer: it also limits what the connection can *read*.
 

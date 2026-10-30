@@ -200,6 +200,19 @@ class TestApplyPrivacyWithholdsValues:
         assert status.native_type == "enum('pending','shipped')"
         assert email.sample_values is None
 
+    def test_sensitive_column_comment_withheld_whatever_the_toggles(self) -> None:
+        # A comment can spell out the values the member list was withheld for.
+        schema = _valued_schema()
+        schema.tables[0].columns[0].description = "pending=new, shipped=sent"
+        schema.tables[0].columns[1].description = "a@example.com style address"
+        for privacy in (
+            PrivacySettings(include_column_comments=True),
+            PrivacySettings(include_column_comments=True, include_sample_values=True),
+        ):
+            status, email = _apply_privacy_to_schema(schema, privacy).tables[0].columns
+            assert status.description == "pending=new, shipped=sent"
+            assert email.description is None
+
     def test_valued_input_schema_is_not_mutated(self) -> None:
         schema = _valued_schema()
         _apply_privacy_to_schema(schema, PrivacySettings())

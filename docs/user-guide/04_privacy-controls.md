@@ -10,7 +10,7 @@ The system prompt always includes the schema DDL and, if one has been generated,
 
 1. **Schema DDL** — `CREATE TABLE` statements listing table names, column names, data types, primary keys and foreign-key relationships
 2. **Sample values** — up to 3 example values per column, only when **Include sample values** is on (**off by default**). On PostgreSQL they come from the catalog's most-common-values statistics (`pg_stats`); on MySQL/MariaDB only ENUM and SET columns have them, taken from the column's declared members. A table under a row filter sends no sample values (a MySQL ENUM/SET column keeps its declared members; see [Row Filters](#row-filters)).
-3. **Column comments** — PostgreSQL `COMMENT ON` text and MySQL column comments, only when **Include column comments** is on (**off by default**)
+3. **Column comments** — PostgreSQL `COMMENT ON` text and MySQL column comments, only when **Include column comments** is on (**off by default**). A sensitive column's comment is never sent, because a comment can spell out the column's values
 4. **Approximate row counts** — from the catalog, only when **Include row counts** is on. A table under a row filter sends no row count (see [Row Filters](#row-filters)).
 5. **Semantic model** — your business glossary, if one has been generated, including its value mappings
 6. **Few-shot examples** — question and SQL pairs from the Example Library (answers you marked 👍) that are similar to the current question
@@ -33,7 +33,7 @@ Value mappings are semantic metadata that you curate. Semantic model generation 
 |---|---|---|---|
 | **Query generation** | Every question not answered from the cache | Nothing more | Cannot be turned off; it is the product |
 | **Corrections** | The generated SQL fails validation, fails to execute, or returns no rows | The failed SQL. For a validation failure, the validator's message, which is built from your query and your schema. For a query that returned no rows, only that fact. For a database error, **the database's own message is never sent**, because it can quote a stored value (`invalid input syntax for type integer: "Jane Doe"`). Savvina sends its own description instead: the kind of error (unknown name, syntax error, a stored value that could not be converted, …) and a fixed hint. For an unknown or ambiguous name, a grouping error, a type mismatch, a permission error or a syntax error, it also lists the names the error refers to, but only names the LLM wrote in its query or, for an unknown or ambiguous name, was shown in the schema. Every other kind of error lists no names. Savvina's own refusals (a row filter that cannot be applied, the strict sensitive-column rule, a double quote on a MySQL server with `ANSI_QUOTES`, a backslash on a MySQL server with `NO_BACKSLASH_ESCAPES`) are the exception: they are passed to the model in their own words, with their hint, since they name only columns and tables from your query or settings. A refusal the model cannot fix by rewriting the query (a row filter that needs migration or is malformed) ends the correction at once: the model is not called and you see the refusal | Automatic. It runs at most a few times per question |
-| **Semantic model generation** | When an admin generates or regenerates a connection's semantic model, or applies schema drift | Schema DDL (names, types, keys, and column comments collected while **Include column comments** is on) and foreign-key relationships. Later passes also send the annotations already generated. No column values, except that a MySQL ENUM/SET column's declared members appear in its type when its values are allowed (sample values on and the column not sensitive). Otherwise the member list is withheld | Do not run generation, or edit the model by hand |
+| **Semantic model generation** | When an admin generates or regenerates a connection's semantic model, or applies schema drift | Schema DDL (names, types, keys, and column comments collected while **Include column comments** is on, except a sensitive column's) and foreign-key relationships. Later passes also send the annotations already generated. No column values, except that a MySQL ENUM/SET column's declared members appear in its type when its values are allowed (sample values on and the column not sensitive). Otherwise the member list is withheld | Do not run generation, or edit the model by hand |
 
 Entity resolution (matching a quoted name in your question against known values) and schema pruning run locally and make no LLM call of their own. Their output is part of the query-generation prompt and follows the same toggle.
 
@@ -50,13 +50,13 @@ Each connection has independent privacy settings. Configure them at **Connection
 | Setting | Default | Effect |
 |---|---|---|
 | **Include sample values** | Off | When off, no sample value reaches the LLM by any route: not in the schema, not as an ENUM member list, not as a filter hint. This reduces accuracy for enum-like columns. When on, the system also runs **Named Entity Resolution**: quoted strings and capitalised proper nouns in your question are matched against column sample values, and the stored spelling is added as a filter hint (e.g. resolving `"Acme Corp"` → `'acme corp'`). Sensitive columns, excluded columns and excluded tables are never matched. A table under a row filter sends no sample values (a MySQL ENUM/SET column keeps its declared members; see [Row Filters](#row-filters)). |
-| **Include column comments** | Off | When off, column and table comments are omitted from the LLM prompt |
+| **Include column comments** | Off | When off, column and table comments are omitted from the LLM prompt. When on, a sensitive column's comment is still omitted |
 | **Include row counts** | On (a connection created in the UI starts with it off) | When off, approximate row counts are omitted from the LLM prompt. A table under a row filter sends no row count (see [Row Filters](#row-filters)). |
 | **Strict sensitive columns** | Off | When on, a query that uses a sensitive column anywhere but as a plain column of its SELECT list is refused before it runs (see [Strict Sensitive Columns](#strict-sensitive-columns)) |
 
 ### Sensitive Column Patterns
 
-A list of case-insensitive patterns. Any column whose name **contains** a matching pattern is annotated `[SENSITIVE]` in the LLM schema. Its sample values are withheld even when the toggle is on, and its values are masked in results.
+A list of case-insensitive patterns. Any column whose name **contains** a matching pattern is annotated `[SENSITIVE]` in the LLM schema. Its sample values and its comment are withheld even when the toggles are on, and its values are masked in results.
 
 **The column itself is not hidden, and the query is not restricted** (unless **Strict sensitive columns** is on; see [below](#strict-sensitive-columns)). The name and type stay visible so the LLM can use the column in `WHERE`, a join or an aggregate. For example, "all orders for the customer with email `someone@example.com`" filters on the column and returns rows normally.
 
@@ -154,7 +154,7 @@ This makes narrowing a masked value down much harder but is not a guarantee: for
 
 ### Excluded Schemas
 
-Schema names to **completely hide** from the LLM. Tables, columns and row counts in these schemas are not included in any prompt. Useful for internal audit schemas (`pg_audit`, `logs`, …). One name per line:
+Schema names to **completely hide** from the LLM. Tables, columns and row counts in these schemas are not included in any prompt. Useful for internal audit schemas (`pg_audit`, `logs`, …). On MySQL/MariaDB a schema is a database, and a connection sees **every database its account can read**, not only the one in its settings: list the other databases here, or grant the account access to that one database only (see [MySQL](../datasources/mysql.md#connecting)). One name per line:
 ```
 pg_audit
 internal
@@ -372,10 +372,10 @@ When a schema is introspected (on first chat, after **Refresh Schema**, or on th
 4. For each column:
    - If `include_column_comments` is off, skips comments
    - If the column is in `excluded_columns`, removes it entirely
-   - If the column matches a sensitive pattern, keeps it but collects no values for it (on MySQL, its ENUM/SET member list is withheld from the type too)
+   - If the column matches a sensitive pattern, keeps it but collects no values for it (on MySQL, its ENUM/SET member list is withheld from the type too). Its comment is collected but withheld whenever the schema is read (below)
    - Otherwise, if `include_sample_values` is on, attaches example values. PostgreSQL reads the catalog's most-common values (`pg_stats`). MySQL reads an ENUM/SET column's declared members. No table is scanned
 
-Excluded schemas, tables and columns, and the withholding of sample values and ENUM/SET member lists, are applied again every time a cached schema is read. A schema cached under older settings therefore never shows the LLM more than the current settings allow.
+Excluded schemas, tables and columns, and the withholding of sample values, ENUM/SET member lists and sensitive columns' comments, are applied again every time a cached schema is read. A schema cached under older settings therefore never shows the LLM more than the current settings allow.
 
 ---
 

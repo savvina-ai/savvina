@@ -286,22 +286,25 @@ def _withhold_column_values(table: TableInfo, privacy: PrivacySettings) -> Table
     """Drop sample values and ENUM/SET member lists from columns whose values may not reach the LLM.
 
     The column itself stays — the sensitive patterns mark a column, they do not hide it.
+    A sensitive column also loses its comment, whatever the toggles: a comment often
+    spells out the values (``bike=pedal, scooter=motor``) the member list was withheld for.
     Runs on every cached read, so a schema cached under older settings, or before this
     rule existed, needs no migration. Returns a new TableInfo; the cached one is untouched.
     ``sample_source`` goes with the values: a column without values has no source.
     """
-    columns = [
-        col
-        if privacy.column_values_allowed(col.name)
-        else replace(
+
+    def withhold(col: ColumnInfo) -> ColumnInfo:
+        if privacy.column_values_allowed(col.name):
+            return col
+        col = replace(
             col,
             sample_values=None,
             sample_source=None,
             native_type=withhold_enum_labels(col.native_type),
         )
-        for col in table.columns
-    ]
-    return replace(table, columns=columns)
+        return replace(col, description=None) if privacy.is_column_sensitive(col.name) else col
+
+    return replace(table, columns=[withhold(col) for col in table.columns])
 
 
 def _row_filtered_keys(privacy: PrivacySettings) -> set[str] | None:

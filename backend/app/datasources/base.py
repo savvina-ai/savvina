@@ -209,7 +209,7 @@ class BaseDataSource(ABC):
         Respects privacy settings:
         - Excludes tables/columns marked as excluded
         - Omits sample values for sensitive columns (shows [SENSITIVE] instead)
-        - Omits comments if include_column_comments is False
+        - Omits comments if include_column_comments is False, and always for sensitive columns
         - Omits row counts if include_row_counts is False
 
         Dialect-specific identifier quoting is delegated to _quote_identifier();
@@ -261,10 +261,12 @@ class BaseDataSource(ABC):
                 if fk_target:
                     annotations.append(f"FK: {q(col.name)} -> {fk_target}")
 
-                if privacy.include_column_comments and col.description:
+                sensitive = privacy.is_column_sensitive(col.name)
+                # A sensitive column's comment can spell out its values: never sent.
+                if privacy.include_column_comments and col.description and not sensitive:
                     annotations.append(col.description)
 
-                if privacy.is_column_sensitive(col.name):
+                if sensitive:
                     annotations.append("[SENSITIVE]")
                 elif col.sample_values and privacy.include_sample_values:
                     sample_str = ", ".join(f"'{v}'" for v in col.sample_values[:3])

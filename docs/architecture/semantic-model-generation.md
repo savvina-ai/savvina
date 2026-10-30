@@ -179,7 +179,7 @@ The page retries a call that is throttled (`429`), finds the provider unavailabl
 
 For each batch of up to 4 tables, named by key:
 
-1. **`_schema_to_ddl(batch_schema_obj)`** — builds a compact `CREATE TABLE` DDL string for the batch tables. Column lines include native type, NOT NULL, PRIMARY KEY, and inline `--` comments from column descriptions. Sample values are omitted here (this is a semantic DDL, not the full schema). A MySQL ENUM/SET native type carries its member list only when the column's values are allowed (`PrivacySettings.column_values_allowed`); otherwise `_apply_privacy_to_schema` has already withheld it as `enum(…)`. Total DDL capped at `_MAX_DDL_CHARS = 20,000` characters.
+1. **`_schema_to_ddl(batch_schema_obj)`** — builds a compact `CREATE TABLE` DDL string for the batch tables. Column lines include native type, NOT NULL, PRIMARY KEY, and inline `--` comments from column descriptions (a sensitive column's comment is already withheld by `_apply_privacy_to_schema`). Sample values are omitted here (this is a semantic DDL, not the full schema). A MySQL ENUM/SET native type carries its member list only when the column's values are allowed (`PrivacySettings.column_values_allowed`); otherwise `_apply_privacy_to_schema` has already withheld it as `enum(…)`. Total DDL capped at `_MAX_DDL_CHARS = 20,000` characters.
 
 2. **`_format_relationships_for_prompt(batch_edges)`** — renders FK edges as `from.col → to.col (JOIN: ...)` lines for the prompt.
 

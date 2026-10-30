@@ -520,7 +520,7 @@ ConnectionsRouter.refresh_schema()
      • columns (with types)
      • primary keys
      • foreign keys
-     • column comments (if privacy.include_column_comments)
+     • column comments (if privacy.include_column_comments; a sensitive column's is withheld on every read)
      • row counts (if privacy.include_row_counts)
      • sample values (if privacy.include_sample_values, non-sensitive only)
   6. adapter.disconnect()

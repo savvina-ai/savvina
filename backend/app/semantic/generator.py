@@ -62,8 +62,8 @@ _COLUMN_FIELD_ITEMS = """\
 3. semantic_type: One of: identifier, status_flag, monetary, percentage, \
 timestamp, date, free_text, categorical, boolean_flag, foreign_key, \
 url, email, phone, measurement, count, unknown
-4. For columns with coded/enum values (based on sample values), explain the likely \
-meaning of each value
+4. For columns with coded/enum values (from the column's ENUM/SET type or its comment), \
+explain the likely meaning of each value
 5. Identify columns that likely contain sensitive personal data (PII)
 6. currency: ISO code if monetary (EUR, USD, GBP...), null otherwise
 7. unit: Physical unit if measurement (kg, km, seconds, items...), null otherwise
@@ -1745,7 +1745,7 @@ class SemanticModelGenerator:
         return "\n".join(lines)
 
     # Maximum characters for the generated DDL string.  Large schemas (e.g. Airflow)
-    # can produce 100 k+ chars with sample values, which exceeds provider payload
+    # can produce 100 k+ chars of DDL and comments, which exceeds provider payload
     # limits (Groq 413, etc.).  We truncate gracefully when the limit is reached.
     _MAX_DDL_CHARS: int = 20_000
 

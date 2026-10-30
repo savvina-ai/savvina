@@ -30,10 +30,10 @@ Expand **Privacy Settings** to control what metadata reaches the LLM:
 | Setting | Default | Description |
 |---|---|---|
 | Include sample values | Off | Sends up to 3 example values per column (on MySQL, an ENUM/SET column's members) to the LLM for better accuracy |
-| Include column comments | Off | Sends database column description text |
+| Include column comments | Off | Sends database column description text, except a sensitive column's |
 | Include row counts | Off | Sends approximate row counts |
 | Sensitive column patterns | (list) | Columns matching these patterns are never sampled and their values are masked in results (e.g., `email`, `ssn`, `password`) |
-| Excluded schemas | (empty) | Schemas to completely hide from the LLM |
+| Excluded schemas | (empty) | Schemas to completely hide from the LLM. On MySQL a schema is a database, and the connection sees every database its account can read |
 | Excluded tables | (empty) | Tables to completely hide |
 | Excluded columns | (empty) | Individual columns to hide, format: `schema.table.column` |
 

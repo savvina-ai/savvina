@@ -341,6 +341,16 @@ class TestFormatSchemaForLLM:
         p = PrivacySettings(include_column_comments=False)
         assert "User accounts" not in self.adapter.format_schema_for_llm(self.schema, p)
 
+    def test_sensitive_column_comment_never_shown(self):
+        # A comment can spell out a sensitive column's values; the render drops it too.
+        users = self.schema.tables[0]
+        for col in users.columns:
+            col.description = {"email": "work=a@x.com", "name": "Full name"}.get(col.name)
+        p = PrivacySettings(include_column_comments=True, include_sample_values=True)
+        out = self.adapter.format_schema_for_llm(self.schema, p)
+        assert "work=a@x.com" not in out
+        assert "Full name" in out
+
     def test_empty_schema_returns_string(self):
         out = self.adapter.format_schema_for_llm(DataSourceSchema(source_type="postgresql"))
         assert isinstance(out, str)

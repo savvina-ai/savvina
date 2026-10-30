@@ -124,7 +124,7 @@ Privacy settings are configured per connection and applied before schema data re
 ### Schema-level filtering (before LLM)
 - **Excluded schemas/tables**: stripped from the schema entirely — the LLM never sees them
 - **Excluded columns**: stripped from table definitions — the LLM cannot reference them
-- **Sensitive columns** (pattern-matched against names like `email`, `ssn`, `password`, `token`, `credit_card`, etc., or listed by exact name in `sensitive_columns`): kept in the schema but annotated as `[SENSITIVE]`; sample values are omitted
+- **Sensitive columns** (pattern-matched against names like `email`, `ssn`, `password`, `token`, `credit_card`, etc., or listed by exact name in `sensitive_columns`): kept in the schema but annotated as `[SENSITIVE]`; sample values are omitted, and so is the column's comment (it can spell out the values), in `_apply_privacy_to_schema` and again when `format_schema_for_llm` renders
 - **Column values** (sample values, MySQL ENUM/SET member lists, entity-resolution hints): sent only when `PrivacySettings.column_values_allowed()` is true, that is `include_sample_values` is on (default off; absent settings are not consent) and the column is not sensitive. ENUM/SET member lists are withheld at introspection and again on every read of a cached schema. Semantic `value_mappings` are not gated by this rule: they are curated semantic metadata, sent on every chat turn unless the semantic model marks the column `is_sensitive` or the privacy settings hide it
 - **Row counts and column comments**: individually toggled via `include_row_counts` / `include_column_comments` settings
 
