@@ -14,6 +14,7 @@ import TokenUsageBadge from './TokenUsageBadge';
 import { chatApi } from '../api/chat';
 import { useAppStore } from '../store/appStore';
 import { cn } from '@/lib/utils';
+import { copyToClipboard } from '@/lib/clipboard';
 import type { ChatMessage as ChatMessageType, SemanticCorrectionPayload } from '../types';
 
 interface Props {
@@ -55,23 +56,6 @@ function ActionButton({
       <Icon className="h-3.5 w-3.5" />
     </button>
   );
-}
-
-async function copyToClipboard(text: string): Promise<void> {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
-  } else {
-    // Fallback for non-secure contexts (HTTP non-localhost)
-    const el = document.createElement('textarea');
-    el.value = text;
-    el.style.position = 'fixed';
-    el.style.opacity = '0';
-    document.body.appendChild(el);
-    el.focus();
-    el.select();
-    document.execCommand('copy'); // legacy fallback — clipboard API unavailable in HTTP contexts
-    document.body.removeChild(el);
-  }
 }
 
 function ChatMessageBubble({ message, onRetry, onEdit, userQuestion: _userQuestion, onRefresh }: Props) {
@@ -134,22 +118,18 @@ function ChatMessageBubble({ message, onRetry, onEdit, userQuestion: _userQuesti
 
   const copyQuery = async () => {
     if (!message.query_generated) return;
-    try {
-      await copyToClipboard(message.query_generated);
-      setSqlCopied(true);
-      if (sqlTimerRef.current) clearTimeout(sqlTimerRef.current);
-      sqlTimerRef.current = setTimeout(() => setSqlCopied(false), 2000);
-    } catch { /* ignore */ }
+    if (!(await copyToClipboard(message.query_generated))) return;
+    setSqlCopied(true);
+    if (sqlTimerRef.current) clearTimeout(sqlTimerRef.current);
+    sqlTimerRef.current = setTimeout(() => setSqlCopied(false), 2000);
   };
 
   const copyContent = async () => {
     if (!message.content) return;
-    try {
-      await copyToClipboard(message.content);
-      setContentCopied(true);
-      if (contentTimerRef.current) clearTimeout(contentTimerRef.current);
-      contentTimerRef.current = setTimeout(() => setContentCopied(false), 2000);
-    } catch { /* ignore */ }
+    if (!(await copyToClipboard(message.content))) return;
+    setContentCopied(true);
+    if (contentTimerRef.current) clearTimeout(contentTimerRef.current);
+    contentTimerRef.current = setTimeout(() => setContentCopied(false), 2000);
   };
 
   const handleEditSubmit = () => {

@@ -10,6 +10,7 @@ import { useAuthStore } from '../store/authStore';
 import DataSourceSelector from '../components/DataSourceSelector';
 import DynamicConnectionForm from '../components/DynamicConnectionForm';
 import PrivacySettingsForm from '../components/PrivacySettings';
+import PrivilegeAuditBanner from '../components/PrivilegeAuditBanner';
 import { displayRowFilterMap } from '../lib/rowFilterKeys';
 import ExecutionModeSelector from '../components/ExecutionModeSelector';
 import {
@@ -34,6 +35,7 @@ import {
   useCreateConnection,
   useDeleteConnection,
   useTestNewConnection,
+  useTestConnection,
   useUpdatePrivacySettings,
   useUpdateExecutionMode,
   useConnectionTableNames,
@@ -66,6 +68,7 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
   const { data: detail, isLoading } = useConnection(connId);
   const updatePrivacy = useUpdatePrivacySettings();
   const updateMode = useUpdateExecutionMode();
+  const recheck = useTestConnection();
   const { data: knownTables } = useConnectionTableNames(connId);
   const { data: dataSources, isPending: sourcesPending } = useDataSources();
   // The listed dialect is preferred. When the datasource list failed to load, the connection's
@@ -142,6 +145,15 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
     }
   };
 
+  const handleRecheck = async () => {
+    setError(null);
+    try {
+      await recheck.mutateAsync(connId);
+    } catch (e: unknown) {
+      setError(apiErrorMessage(e, 'Could not check the privileges'));
+    }
+  };
+
   // The form is not shown before the state above is initialised from the detail, so a Save
   // can never send the defaults.
   if (isLoading || (detail && !initialized)) {
@@ -175,6 +187,12 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
           </button>
         </div>
       )}
+      <PrivilegeAuditBanner
+        audit={detail?.privilege_audit ?? null}
+        dialect={dialect}
+        onRecheck={handleRecheck}
+        rechecking={recheck.isPending}
+      />
       <div>
         <button
           onClick={() => setPrivacyOpen((o) => !o)}
@@ -192,6 +210,7 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
             knownTables={knownTables ?? undefined}
             dialect={dialect}
             onValidityChange={setFormValid}
+            audit={detail?.privilege_audit ?? null}
           />
         </div>
       </div>

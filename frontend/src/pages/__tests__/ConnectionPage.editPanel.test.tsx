@@ -39,6 +39,7 @@ function renderPage(options: RenderOptions = {}) {
       privacy_settings: null,
       schema_cache: null,
       row_filter_needs_migration: false,
+      privilege_audit: null,
       ...options.detail,
     } as Record<string, unknown>,
   };
@@ -402,5 +403,101 @@ describe('ConnectionPage edit settings panel', () => {
       include_row_counts: true,
       row_filters: { 'public."Orders"': 'tenant_id = 42' },
     });
+  });
+});
+
+const SUPERUSER_AUDIT = {
+  checked_at: '2026-10-29T10:00:00+00:00',
+  role: 'savvina',
+  status: 'ok',
+  error: null,
+  findings: [{ code: 'superuser', tables: [], functions: [], more_tables: 0, remediation: 'ALTER ROLE "savvina" NOSUPERUSER;' }],
+  rls_in_use: true,
+  rls_effective: { 'public.orders': false },
+};
+
+describe('ConnectionPage privilege audit banner', () => {
+  it('is rendered below the migration banner when both apply', async () => {
+    renderPage({ detail: { ...LEGACY, privilege_audit: SUPERUSER_AUDIT } });
+    await openEditPanel();
+    const migration = await screen.findByText(/Queries on this connection are rejected/);
+    const audit = await screen.findByText(
+      "Row-level security in the database does not apply to this connection's role.",
+    );
+    expect(migration.compareDocumentPosition(audit) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByText('ALTER ROLE "savvina" NOSUPERUSER;')).toBeInTheDocument();
+  });
+
+  it('Check again posts to /test and refetches the detail', async () => {
+    const tests: string[] = [];
+    const conn = makeConnection();
+    const state: { audit: Record<string, unknown> } = {
+      audit: { ...SUPERUSER_AUDIT, status: 'unavailable', findings: [], error: 'refused' },
+    };
+    renderPage({ detail: { privilege_audit: state.audit } });
+    server.use(
+      http.post(`${API}/api/v1/connections/${conn.id}/test`, () => {
+        tests.push('test');
+        state.audit = SUPERUSER_AUDIT;
+        return HttpResponse.json({ success: true, message: 'Connected' });
+      }),
+      http.get(`${API}/api/v1/connections/${conn.id}`, () =>
+        HttpResponse.json({
+          ...conn,
+          privacy_settings: null,
+          schema_cache: null,
+          row_filter_needs_migration: false,
+          privilege_audit: state.audit,
+        }),
+      ),
+    );
+    await openEditPanel();
+    expect(await screen.findByText('Privileges could not be checked: refused.')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Check again' }));
+    expect(
+      await screen.findByText(
+        "Row-level security in the database does not apply to this connection's role.",
+      ),
+    ).toBeInTheDocument();
+    expect(tests).toEqual(['test']);
+  });
+
+  it('a failed Check again shows the error in the panel', async () => {
+    const conn = makeConnection();
+    renderPage({ detail: { privilege_audit: { ...SUPERUSER_AUDIT, status: 'unavailable', findings: [], error: 'refused' } } });
+    server.use(
+      http.post(`${API}/api/v1/connections/${conn.id}/test`, () =>
+        HttpResponse.json({ detail: 'password authentication failed' }, { status: 400 }),
+      ),
+    );
+    await openEditPanel();
+    await userEvent.click(await screen.findByRole('button', { name: 'Check again' }));
+    expect(await screen.findByText('password authentication failed')).toBeInTheDocument();
+    expect(screen.getByText('Privileges could not be checked: refused.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Check again' })).toBeEnabled();
+  });
+
+  it('shows Checking… and disables the button while the test is pending', async () => {
+    const conn = makeConnection();
+    renderPage({ detail: { privilege_audit: { ...SUPERUSER_AUDIT, status: 'unavailable', findings: [], error: 'refused' } } });
+    server.use(
+      http.post(`${API}/api/v1/connections/${conn.id}/test`, async () => {
+        await delay(300);
+        return HttpResponse.json({ success: true, message: 'Connected' });
+      }),
+    );
+    await openEditPanel();
+    await userEvent.click(await screen.findByRole('button', { name: 'Check again' }));
+    expect(await screen.findByRole('button', { name: 'Checking…' })).toBeDisabled();
+    expect(await screen.findByRole('button', { name: 'Check again' })).toBeEnabled();
+  });
+
+  it('shows the checked line for a clean audit', async () => {
+    renderPage({ detail: { privilege_audit: { ...SUPERUSER_AUDIT, findings: [], rls_in_use: false } } });
+    await openEditPanel();
+    // The Privacy Settings section starts collapsed (`hidden`).
+    expect(await screen.findByText(/Privileges checked/)).not.toBeVisible();
+    await userEvent.click(await screen.findByRole('button', { name: /Privacy Settings/ }));
+    expect(await screen.findByText(/Privileges checked/)).toBeVisible();
   });
 });

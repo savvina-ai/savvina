@@ -3,7 +3,7 @@
 
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { displayRowFilterKey, displayRowFilterMap } from '../lib/rowFilterKeys';
-import type { PrivacySettings } from '../types';
+import type { PrivacySettings, PrivilegeAudit } from '../types';
 
 const DEFAULTS: PrivacySettings = {
   include_sample_values: false,
@@ -34,6 +34,9 @@ interface Props {
   /** Called with `false` while a row filter is incomplete or duplicated, so the parent can
    *  block saving; `true` otherwise. */
   onValidityChange?: (valid: boolean) => void;
+  /** The connection's last privilege audit; a clean one is acknowledged at the end of the
+   *  form (findings are shown by the banner above the form). */
+  audit?: PrivilegeAudit | null;
 }
 
 function TagList({
@@ -319,6 +322,7 @@ export default function PrivacySettingsForm({
   knownTables,
   dialect,
   onValidityChange,
+  audit,
 }: Props) {
   const set = <K extends keyof PrivacySettings>(key: K, val: PrivacySettings[K]) =>
     onChange({ ...settings, [key]: val });
@@ -386,6 +390,12 @@ export default function PrivacySettingsForm({
       >
         Reset to defaults
       </button>
+      {audit?.status === 'ok' && audit.findings.length === 0 && (
+        <p className="text-sm text-muted-foreground">
+          Privileges checked {new Date(audit.checked_at).toLocaleString()}: the role has only the
+          access Savvina needs.
+        </p>
+      )}
     </div>
   );
 }

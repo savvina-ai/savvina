@@ -69,9 +69,47 @@ export interface Connection {
   created_at: string;
 }
 
+// ── Privilege audit ──
+export type PrivilegeFindingCode =
+  | 'superuser'
+  | 'super_privilege'
+  | 'bypassrls'
+  | 'owner_without_force'
+  | 'write_privileges'
+  | 'reads_excluded_tables'
+  | 'sql_from_string';
+
+export interface AuditFinding {
+  code: PrivilegeFindingCode;
+  /** `schema.table` keys; empty for a role-level finding. */
+  tables: string[];
+  /** `sql_from_string` only: `schema.name(argtypes)`. */
+  functions: string[];
+  /** Tables beyond the 50 listed in `tables`. */
+  more_tables: number;
+  /** The SQL the admin runs; one statement per line. */
+  remediation: string;
+}
+
+/** The last privilege audit of the connection role (stored on the connection; written on
+ *  create, Test, a privacy save that changes the filtered or excluded tables, and a config
+ *  save). `unavailable`: the catalog could not be read, `error` says why. */
+export interface PrivilegeAudit {
+  checked_at: string;
+  role: string;
+  status: 'ok' | 'unavailable';
+  error: string | null;
+  findings: AuditFinding[];
+  /** Some row-filtered table has native row-level security enabled: the superuser,
+   *  bypassrls and owner findings are then about RLS, otherwise about least privilege. */
+  rls_in_use: boolean;
+  rls_effective: Record<string, boolean>;
+}
+
 export interface ConnectionDetail extends Connection {
   privacy_settings: PrivacySettings | null;
   row_filter_needs_migration: boolean;
+  privilege_audit: PrivilegeAudit | null;
   schema_cache: Record<string, unknown> | null;
 }
 

@@ -58,9 +58,14 @@ export function useTestNewConnection() {
   });
 }
 
+/** `POST /connections/{id}/test`. A successful test rewrites the connection's stored
+ *  privilege audit, so the detail is refetched and the banner shows the new result. */
 export function useTestConnection() {
+  const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => connectionsApi.test(id),
+    // Returned, so the mutation stays pending until the detail refetch lands.
+    onSuccess: (_data, id) => queryClient.invalidateQueries({ queryKey: ['connections', id] }),
   });
 }
 

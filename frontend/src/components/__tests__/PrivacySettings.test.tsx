@@ -301,3 +301,43 @@ describe('PrivacySettingsForm row filter validation', () => {
     expect(screen.getByLabelText('Table 2')).toHaveValue('public.items');
   });
 });
+
+describe('PrivacySettingsForm privilege check line', () => {
+  const checked = {
+    checked_at: '2026-10-29T10:00:00+00:00',
+    role: 'savvina',
+    status: 'ok' as const,
+    error: null,
+    findings: [],
+    rls_in_use: false,
+    rls_effective: {},
+  };
+
+  it('shows the checked line for ok without findings', () => {
+    render(<PrivacySettingsForm settings={makeSettings()} onChange={vi.fn()} audit={checked} />);
+    const line = screen.getByText(/^Privileges checked .*: the role has only the access Savvina needs\.$/);
+    expect(line).toHaveClass('text-muted-foreground');
+    expect(line.textContent).toContain(new Date(checked.checked_at).toLocaleString());
+  });
+
+  it('shows nothing with findings, when unavailable, or without an audit', () => {
+    const { rerender } = render(
+      <PrivacySettingsForm
+        settings={makeSettings()}
+        onChange={vi.fn()}
+        audit={{ ...checked, findings: [{ code: 'superuser', tables: [], functions: [], more_tables: 0, remediation: 'x' }] }}
+      />,
+    );
+    expect(screen.queryByText(/Privileges checked/)).not.toBeInTheDocument();
+    rerender(
+      <PrivacySettingsForm
+        settings={makeSettings()}
+        onChange={vi.fn()}
+        audit={{ ...checked, status: 'unavailable', error: 'x' }}
+      />,
+    );
+    expect(screen.queryByText(/Privileges checked/)).not.toBeInTheDocument();
+    rerender(<PrivacySettingsForm settings={makeSettings()} onChange={vi.fn()} audit={null} />);
+    expect(screen.queryByText(/Privileges checked/)).not.toBeInTheDocument();
+  });
+});
