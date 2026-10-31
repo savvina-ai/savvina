@@ -54,6 +54,18 @@ class PromptBuilder:
     def __init__(self) -> None:
         self._classifier = IntentClassifier()
 
+    @staticmethod
+    def has_business_context(semantic_model: SemanticModel | None) -> bool:
+        """Whether ``build_system_prompt`` writes a ``## Business Context`` section for
+        the model: it has tables, metrics, segments or time expressions. Relationships,
+        derived columns or notes alone render nothing."""
+        return semantic_model is not None and bool(
+            semantic_model.tables
+            or semantic_model.business_metrics
+            or semantic_model.segments
+            or semantic_model.time_expressions
+        )
+
     def build_system_prompt(
         self,
         datasource: BaseDataSource,
@@ -98,12 +110,7 @@ class PromptBuilder:
 
         # 5. Semantic model (if available)
         #    Time expressions are only injected for temporal questions to save tokens.
-        if semantic_model and (
-            semantic_model.tables
-            or semantic_model.business_metrics
-            or semantic_model.segments
-            or semantic_model.time_expressions
-        ):
+        if self.has_business_context(semantic_model):
             is_temporal = has_temporal_reference(user_question) if user_question else True
             parts.append("## Business Context")
             parts.append(

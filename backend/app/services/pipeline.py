@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from sqlalchemy import select
 
@@ -70,6 +70,15 @@ class _GenerationResult:
     # Embedding deferred so cache.store() can be called after successful execution.
     cache_embedding: list[float] | None = None
     tpm_warning: str | None = None
+    # Set when the context-window or TPM compression left the semantic model out of the
+    # prompt, or compacted it (``_semantic_context_warning``).
+    semantic_warning: str | None = None
+
+    @property
+    def user_warning(self) -> str | None:
+        """What the chat shows under the answer: the TPM note, the semantic note, or both."""
+        parts = [w for w in (self.tpm_warning, self.semantic_warning) if w]
+        return " ".join(parts) or None
 
 
 def _split_schema_by_priority(
@@ -119,6 +128,53 @@ def _compact_semantic_model(semantic: SemanticModel) -> SemanticModel:
     )
 
 
+# What the chat shows when the compression took the semantic model out of the prompt.
+# Worded for both paths (context window, TPM): on the TPM path it follows ``tpm_warning``.
+_SEMANTIC_DROPPED_WARNING = (
+    "The prompt was too long for the model, so the semantic model was left out of it: the "
+    "query was generated without your business context (metrics, default filters, value "
+    "mappings, relationships). Use a model with a larger context window or token limit, or "
+    "exclude unused schemas and tables in the connection's privacy settings."
+)
+_SEMANTIC_COMPACTED_WARNING = (
+    "The prompt was too long for the model, so the semantic model was compacted: the "
+    "business metrics, named filters, notes and time expressions were kept where they "
+    "apply, but the table and column descriptions, value mappings, default filters, "
+    "relationships and derived calculations were left out. Use a model with a larger "
+    "context window or token limit, or exclude unused schemas and tables in the "
+    "connection's privacy settings."
+)
+
+
+# What ``_compress_prompt`` kept of the semantic model: all of it (levels 1-2), the
+# compacted copy (level 3, when it still renders a Business Context section) or nothing
+# (levels 4-5, or level 3 when the compacted copy renders nothing).
+_SemanticFit = Literal["full", "compact", "dropped"]
+
+
+def _semantic_context_warning(
+    fit: _SemanticFit, semantic_model: SemanticModel | None
+) -> str | None:
+    """The warning for a prompt the compression stripped of semantic context, else None.
+
+    *fit* is what ``_compress_prompt`` kept of the model ("compact" only if the compacted
+    copy still renders a Business Context section). Dropping it loses something
+    only when the prompt would have rendered it at all
+    (``PromptBuilder.has_business_context``); compacting loses something only when
+    ``_compact_semantic_model`` had anything to strip: tables, relationships or derived
+    columns (common joins are never rendered).
+    """
+    if semantic_model is None or fit == "full":
+        return None
+    if not PromptBuilder.has_business_context(semantic_model):
+        return None
+    if fit == "dropped":
+        return _SEMANTIC_DROPPED_WARNING
+    if semantic_model.tables or semantic_model.relationships or semantic_model.derived_columns:
+        return _SEMANTIC_COMPACTED_WARNING
+    return None
+
+
 def _compress_prompt(
     *,
     builder: PromptBuilder,
@@ -130,7 +186,7 @@ def _compress_prompt(
     user_question: str,
     user_message: str,
     budget_chars: int,
-) -> str:
+) -> tuple[str, _SemanticFit]:
     """Progressively strip optional prompt sections to fit within budget_chars.
 
     Tries in order:
@@ -139,7 +195,9 @@ def _compress_prompt(
       3. No few-shot, compact semantic (business metrics / segments / time exprs only)
       4. No few-shot, no semantic model
       5. No few-shot, no semantic model, minimal schema (no sample values / comments / row counts)
-    Returns the shortest prompt that fits, or the smallest possible if none fit.
+    Returns the shortest prompt that fits, or the smallest possible if none fit, with what it
+    kept of the semantic model (``_SemanticFit``); a level-3 compact copy that renders no
+    Business Context section counts as dropped.
     """
     compact_semantic = (
         _compact_semantic_model(semantic_model) if semantic_model is not None else None
@@ -153,12 +211,19 @@ def _compress_prompt(
         include_column_comments=False,
         include_row_counts=False,
     )
-    for examples, semantic, pvt in [
-        (few_shot_examples, semantic_model, privacy),  # full
-        (None, semantic_model, privacy),  # no few-shot
-        (None, compact_semantic, privacy),  # no few-shot, compact semantic
-        (None, None, privacy),  # no few-shot, no semantic
-    ]:
+    levels: list[tuple[list | None, SemanticModel | None, PrivacySettings | None, _SemanticFit]]
+    levels = [
+        (few_shot_examples, semantic_model, privacy, "full"),  # full
+        (None, semantic_model, privacy, "full"),  # no few-shot
+        (
+            None,
+            compact_semantic,
+            privacy,
+            "compact" if PromptBuilder.has_business_context(compact_semantic) else "dropped",
+        ),  # no few-shot, compact semantic
+        (None, None, privacy, "dropped"),  # no few-shot, no semantic
+    ]
+    for examples, semantic, pvt, fit in levels:
         prompt = builder.build_system_prompt(
             datasource=datasource,
             schema=schema,
@@ -168,7 +233,7 @@ def _compress_prompt(
             user_question=user_question,
         )
         if len(prompt) + len(user_message) <= budget_chars:
-            return prompt
+            return prompt, fit
 
     # Level 5: tiered schema — protect top tables' annotations, strip the rest.
     # The pruned schema is relevance-ranked, so the first _PROTECTED_TABLE_COUNT
@@ -189,7 +254,7 @@ def _compress_prompt(
         user_question=user_question,
         schema_override=composite_schema,
     )
-    return prompt  # return smallest even if still over; API error handled by caller
+    return prompt, "dropped"  # smallest even if still over; API error handled by caller
 
 
 async def _build_provider(
@@ -389,6 +454,7 @@ async def _generate_query(
     # ── Session closed here — pool slot returned before LLM call ─────────────
 
     _tpm_hit = False
+    semantic_fit: _SemanticFit = "full"
     if not cache_hit:
         _tpm_retry_attempted = False
         _ctx_retry_attempted = False
@@ -407,7 +473,7 @@ async def _generate_query(
                     prompt_budget = max(0, budget_chars - history_chars)
                     original_len = len(system_prompt) + len(message)
                     if original_len > prompt_budget:
-                        system_prompt = _compress_prompt(
+                        system_prompt, semantic_fit = _compress_prompt(
                             builder=PromptBuilder(),
                             datasource=adapter,
                             schema=schema,
@@ -458,7 +524,7 @@ async def _generate_query(
                             budget_tokens * provider.chars_per_token * _CONTEXT_RETRY_BUDGET_FACTOR
                         ),
                     )
-                    system_prompt = _compress_prompt(
+                    system_prompt, semantic_fit = _compress_prompt(
                         builder=PromptBuilder(),
                         datasource=adapter,
                         schema=schema,
@@ -484,7 +550,7 @@ async def _generate_query(
                     current_len = len(system_prompt) + len(message)
                     if tpm_budget >= current_len:
                         tpm_budget = int(current_len * 0.75)
-                    system_prompt = _compress_prompt(
+                    system_prompt, semantic_fit = _compress_prompt(
                         builder=PromptBuilder(),
                         datasource=adapter,
                         schema=schema,
@@ -586,6 +652,10 @@ async def _generate_query(
             " for best results."
         )
 
+    semantic_warning: str | None = None
+    if not cache_hit and not error:
+        semantic_warning = _semantic_context_warning(semantic_fit, semantic_model)
+
     return _GenerationResult(
         generated_query=generated_query,
         explanation=explanation,
@@ -602,4 +672,5 @@ async def _generate_query(
         history=history,
         cache_embedding=embedding if _eligible_for_cache else None,
         tpm_warning=tpm_warning,
+        semantic_warning=semantic_warning,
     )

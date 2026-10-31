@@ -311,8 +311,9 @@ class RelationshipEdge(_Base):
     to_column: str  # 'id'
     join_sql: str  # 'ecommerce.orders.customer_id = ecommerce.customers.id'
     relationship_type: RelationshipType = RelationshipType.MANY_TO_ONE
-    # ``True`` ⇒ FK column is NOT NULL, so INNER JOIN is safe in either
-    # direction. ``False`` ⇒ FK is nullable, must LEFT JOIN to preserve rows.
+    # ``True`` ⇒ FK column is NOT NULL: every child row has a parent key, so INNER JOIN
+    # drops none of them unless the query also filters the parent. ``False`` ⇒ FK is
+    # nullable, must LEFT JOIN to preserve rows.
     is_required: bool = False
     description: str | None = None
     entity_type: EntityType | None = None  # PRIMARY = PK/dim side, FOREIGN = FK/fact side
@@ -524,7 +525,6 @@ class GlobalSectionsResponse(_Base):
     business_metrics: list[BusinessMetric] = Field(default_factory=list)
     segments: list[Segment] = Field(default_factory=list)
     derived_columns: list[DerivedColumn] = Field(default_factory=list)
-    common_joins: list[CommonJoin] = Field(default_factory=list)
 
     @field_validator("business_metrics", mode="before")
     @classmethod
@@ -576,12 +576,3 @@ class GlobalSectionsResponse(_Base):
         if not isinstance(raw, list):
             return []
         return [i for i in raw if isinstance(i, dict) and i.get("name") and i.get("sql_expression")]
-
-    @field_validator("common_joins", mode="before")
-    @classmethod
-    def _filter_joins(cls, raw: Any) -> list:
-        if not isinstance(raw, list):
-            return []
-        return [
-            i for i in raw if isinstance(i, dict) and i.get("description") and i.get("join_pattern")
-        ]

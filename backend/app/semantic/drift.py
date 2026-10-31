@@ -87,26 +87,38 @@ def strip_ident_quotes(name: str) -> str:
     return ".".join(part.strip().strip(_IDENT_QUOTES) for part in name.strip().split("."))
 
 
+def matching_real_keys(name: str, real_keys: list[str], *, bare_ok: bool) -> list[str]:
+    """The entries of ``real_keys`` that ``name`` matches under the first rule that
+    matches anything: quote-stripped exact match, case-insensitive match, and — when
+    ``bare_ok`` and the name has no dot — a case-insensitive match against the part
+    after the last dot of each real key (a bare table name).
+
+    Empty when nothing matches; several entries when the name is ambiguous.
+    ``resolve_real_key`` is the one-match case; the join prune at finalisation
+    (``routers.semantic._names_gone_table``) reads the list to tell ambiguous from gone.
+    """
+    stripped = strip_ident_quotes(name)
+    if stripped in real_keys:
+        return [stripped]
+    lowered = stripped.lower()
+    matches = [k for k in real_keys if k.lower() == lowered]
+    if not matches and bare_ok and "." not in stripped:
+        matches = [k for k in real_keys if k.rsplit(".", 1)[-1].lower() == lowered]
+    return matches
+
+
 def resolve_real_key(name: str, real_keys: list[str], *, bare_ok: bool) -> str | None:
     """Map a near-miss ``name`` onto exactly one entry of ``real_keys``, else ``None``.
 
-    Tried in order, the first rule that matches anything decides (ambiguity at that
-    rule means ``None``): quote-stripped exact match, case-insensitive match, and —
-    when ``bare_ok`` and the name has no dot — a case-insensitive match against the
-    part after the last dot of each real key (a bare table name).
+    The one match of ``matching_real_keys``; ambiguity at the rule that decides means
+    ``None``.
 
     The one resolver: ``SemanticModelGenerator._resolve_real_key`` delegates here, so
     the generator's near-miss remap, the prune's near-miss warning, ``names_any_table``
     and the drift check's renamed columns (``compute_drift``) match a name alike.
     Table names resolve with ``bare_ok``, column names without.
     """
-    stripped = strip_ident_quotes(name)
-    if stripped in real_keys:
-        return stripped
-    lowered = stripped.lower()
-    matches = [k for k in real_keys if k.lower() == lowered]
-    if not matches and bare_ok and "." not in stripped:
-        matches = [k for k in real_keys if k.rsplit(".", 1)[-1].lower() == lowered]
+    matches = matching_real_keys(name, real_keys, bare_ok=bare_ok)
     return matches[0] if len(matches) == 1 else None
 
 

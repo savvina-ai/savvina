@@ -71,7 +71,7 @@ class SemanticFormatter:
               Date columns:   created_at [primary timestamp]
               Identifiers:    id, customer_id
 
-            RELATIONSHIPS:
+            RELATIONSHIPS (INNER JOIN marks a NOT NULL foreign key, …):
               FROM orders LEFT JOIN customers ON orders.customer_id = customers.id
 
             Business Metrics:
@@ -188,11 +188,15 @@ class SemanticFormatter:
         # ── Relationship graph — compact single-line format ───────────────────
         # 2a: common_joins intentionally omitted (relationships covers this)
         if model.relationships:
-            parts.append("\nRELATIONSHIPS:")
+            parts.append(
+                "\nRELATIONSHIPS (INNER JOIN marks a NOT NULL foreign key, LEFT JOIN a nullable"
+                " one; use LEFT JOIN either way when every row of the left table must stay,"
+                " e.g. when the right table is filtered, and put that filter in the ON clause):"
+            )
             for rel in model.relationships:
-                # INNER JOIN when the FK column is non-nullable (every child row has
-                # a matching parent); LEFT JOIN otherwise — the safe default that
-                # preserves child rows whose FK is NULL.
+                # INNER JOIN when the FK column is non-nullable (every child row has a
+                # parent key); LEFT JOIN otherwise. The header above tells the LLM when to
+                # prefer LEFT JOIN regardless: NOT NULL does not survive a filter on the parent.
                 join_type = "INNER JOIN" if rel.is_required else "LEFT JOIN"
                 # Extract bare table names for the JOIN template
                 from_bare = rel.from_table.rpartition(".")[2]
