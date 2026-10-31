@@ -14,6 +14,7 @@ import pytest
 from app.datasources.models import QueryResult, ValidationResult
 from app.providers.base import LLMResponse
 from app.services.chat_service import ChatService
+from app.services.pipeline import _GenerationResult
 from app.services.row_filter_rewrite import apply_row_filters
 
 pytestmark = pytest.mark.usefixtures("stored_semantic_model")
@@ -242,6 +243,72 @@ class TestStreamMessageHappyPath:
         assert done["message_id"] == "msg-1"
         assert done["cache_hit"] is False
         assert done["status"] == "executed"
+
+    async def test_done_carries_the_combined_tpm_and_semantic_warning(self):
+        """``DoneEvent.warning`` is ``gen.user_warning``: the TPM note, the semantic-context
+        note or both, and None when the prompt was not compressed."""
+        for tpm, semantic, expected in (
+            (None, None, None),
+            ("tpm note.", None, "tpm note."),
+            (None, "semantic note.", "semantic note."),
+            ("tpm note.", "semantic note.", "tpm note. semantic note."),
+        ):
+            conn = _make_connection()
+            db = _make_db_with_conn(conn)
+            adapter = _make_adapter()
+            svc = ChatService(MagicMock(), MagicMock())
+
+            with (
+                patch(f"{_MODULE}.get_settings", return_value=_make_settings()),
+                patch(f"{_MODULE}.decrypt_value", return_value=json.dumps({"host": "db"})),
+                patch(f"{_MODULE}.create_datasource", return_value=adapter),
+                patch(f"{_MODULE}._create_session", _mock_session_factory(db)),
+                patch(f"{_MODULE}._resolve_schema") as mock_schema,
+                patch(f"{_MODULE}._generate_query") as mock_gen,
+                patch(f"{_MODULE}._validate_and_correct_query") as mock_val,
+                patch(f"{_MODULE}._get_or_create_session") as mock_session,
+                patch(f"{_MODULE}._save_user_message", new=AsyncMock()),
+                patch(f"{_MODULE}._save_assistant_message") as mock_save,
+            ):
+                mock_schema.return_value = MagicMock(
+                    schema=MagicMock(), connected=False, embeddings_available=False
+                )
+                gen_result = _GenerationResult(
+                    generated_query="SELECT count(*) FROM users",
+                    explanation="Count users",
+                    error=None,
+                    status="executed",
+                    cache_hit=False,
+                    provider=_make_provider(),
+                    configured_model="claude-3",
+                    configured_max_tokens=0,
+                    system_prompt="sys",
+                    history=[],
+                    tpm_warning=tpm,
+                    semantic_warning=semantic,
+                )
+                mock_gen.return_value = gen_result
+                val_result = MagicMock()
+                val_result.generated_query = gen_result.generated_query
+                val_result.explanation = "Count users"
+                val_result.error = None
+                val_result.status = "executed"
+                mock_val.return_value = val_result
+                mock_session.return_value = MagicMock(id="sess-1")
+                mock_save.return_value = MagicMock(id="msg-1")
+
+                events = await _collect(
+                    svc.stream_message(
+                        connection_id="conn-1",
+                        session_id=None,
+                        message="How many users?",
+                        provider_name="claude",
+                        options={"max_rows": 100},
+                    )
+                )
+
+            done = next(e for e in events if e["type"] == "done")
+            assert done["warning"] == expected, (tpm, semantic)
 
     async def test_row_batch_event_has_correct_fields(self):
         conn = _make_connection()

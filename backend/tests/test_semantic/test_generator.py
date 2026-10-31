@@ -13,6 +13,7 @@ from app.datasources.models import (
     ColumnInfo,
     DataSourceSchema,
     PrivacySettings,
+    RelationshipInfo,
     SchemaInfo,
     TableInfo,
 )
@@ -40,6 +41,7 @@ from app.semantic.models import (
     SimpleMetric,
     TablesBatchResponse,
     TableSemantic,
+    ValueMapping,
 )
 
 
@@ -142,6 +144,7 @@ async def _generate(
     provider: MagicMock,
     keys: list[str],
     edges: list[RelationshipEdge] | None = None,
+    privacy: PrivacySettings | None = None,
 ) -> dict[str, TableSemantic]:
     return await SemanticModelGenerator().generate_tables(
         schema=schema,
@@ -149,6 +152,7 @@ async def _generate(
         model=None,
         table_keys=keys,
         relationship_edges=edges or [],
+        privacy=privacy,
     )
 
 
@@ -174,6 +178,7 @@ async def _generate_new_columns(
     columns_by_table: dict[str, list[str]],
     context: dict[str, TableSemantic] | None = None,
     edges: list[RelationshipEdge] | None = None,
+    privacy: PrivacySettings | None = None,
 ) -> dict[str, dict[str, ColumnSemantic]]:
     return await SemanticModelGenerator().generate_new_columns(
         schema=schema,
@@ -182,6 +187,7 @@ async def _generate_new_columns(
         columns_by_table=columns_by_table,
         table_context=context or {},
         relationship_edges=edges or [],
+        privacy=privacy,
     )
 
 
@@ -290,6 +296,43 @@ class TestGenerateTablesByKey:
                 relationship_edges=[],
             )
         assert "[RATE_LIMIT]" in str(excinfo.value)
+
+    async def test_generate_globals_returns_metrics_derived_columns_and_segments(self) -> None:
+        """A 3-tuple: no joins (never generated) and no warnings (the routes run the
+        metric checks over the metrics they keep)."""
+        from app.semantic.models import GlobalSectionsResponse
+
+        response = GlobalSectionsResponse.model_validate(
+            {
+                "business_metrics": [
+                    {
+                        "name": "Revenue",
+                        "description": "Completed order revenue",
+                        "definition": "orders.total",
+                        "metric_type": "simple",
+                        "aggregation": "sum",
+                        "filters": ["orders.status = 'completed'"],
+                        "related_tables": ["public.orders"],
+                    }
+                ],
+                "segments": [
+                    {"name": "big", "sql_expression": "total > 100", "description": "Big"}
+                ],
+            }
+        )
+        provider = MagicMock()
+        provider.max_output_tokens = 8000
+        provider.generate_structured = AsyncMock(return_value=response)
+        metrics, derived, segments = await SemanticModelGenerator().generate_globals(
+            schema=_schema_with_tables(["orders"], ["status"]),
+            provider=provider,
+            model=None,
+            all_tables={"public.orders": _tbl("id", "status", name="Orders")},
+            relationship_edges=[],
+        )
+        assert [m.name for m in metrics] == ["Revenue"]
+        assert derived == []
+        assert [s.name for s in segments] == ["big"]
 
 
 class TestGenerateNewColumns:
@@ -499,6 +542,93 @@ class TestGenerateNewColumns:
         assert "omitted" not in gen._schema_to_ddl(schema)
         gen._MAX_DDL_CHARS -= 1
         assert "1 additional table(s) omitted" in gen._schema_to_ddl(schema)
+
+
+# ── Value mappings are kept only for columns whose values may reach the LLM ────
+
+
+_PENDING = ValueMapping(raw_value="P", display_value="Pending")
+
+
+def _status_table(column: str = "status") -> dict[str, TableSemantic]:
+    return {
+        "public.orders": TableSemantic(
+            display_name="Orders",
+            columns={
+                "id": ColumnSemantic(display_name="ID"),
+                column: ColumnSemantic(display_name="Status", value_mappings=[_PENDING]),
+            },
+        )
+    }
+
+
+class TestValueMappingsGuard:
+    """A proposed mapping survives only when ``PrivacySettings.column_values_allowed``
+    admits the column: no sample values, no generated mappings."""
+
+    async def test_no_privacy_settings_drops_mappings(self) -> None:
+        schema = _schema_with_tables(["orders"], ["status"])
+        out = await _generate(schema, _provider_returning(_status_table()), ["public.orders"])
+        status = out["public.orders"].columns["status"]
+        assert status.value_mappings == []
+        assert status.display_name == "Status"  # the rest of the annotation stays
+
+    async def test_sample_values_off_drops_mappings(self) -> None:
+        schema = _schema_with_tables(["orders"], ["status"])
+        out = await _generate(
+            schema,
+            _provider_returning(_status_table()),
+            ["public.orders"],
+            privacy=PrivacySettings(include_sample_values=False),
+        )
+        assert out["public.orders"].columns["status"].value_mappings == []
+
+    async def test_sample_values_on_keeps_mappings(self) -> None:
+        schema = _schema_with_tables(["orders"], ["status"])
+        out = await _generate(
+            schema,
+            _provider_returning(_status_table()),
+            ["public.orders"],
+            privacy=PrivacySettings(include_sample_values=True),
+        )
+        assert out["public.orders"].columns["status"].value_mappings == [_PENDING]
+
+    async def test_sensitive_pattern_drops_mappings_despite_sample_values(self) -> None:
+        # "email_status" matches the default sensitive pattern "email": its values may
+        # not reach the LLM, so no generated mapping is kept for it.
+        schema = _schema_with_tables(["orders"], ["email_status"])
+        out = await _generate(
+            schema,
+            _provider_returning(_status_table("email_status")),
+            ["public.orders"],
+            privacy=PrivacySettings(include_sample_values=True),
+        )
+        assert out["public.orders"].columns["email_status"].value_mappings == []
+
+    async def test_new_columns_pass_applies_the_same_rule(self) -> None:
+        schema = _schema_with_tables(["orders"], ["status"])
+        reply = {
+            "public.orders": {"status": ColumnSemantic(display_name="S", value_mappings=[_PENDING])}
+        }
+        off = await _generate_new_columns(
+            schema, _columns_provider(reply), {"public.orders": ["status"]}
+        )
+        assert off["public.orders"]["status"].value_mappings == []
+        on = await _generate_new_columns(
+            schema,
+            _columns_provider(reply),
+            {"public.orders": ["status"]},
+            privacy=PrivacySettings(include_sample_values=True),
+        )
+        assert on["public.orders"]["status"].value_mappings == [_PENDING]
+
+    def test_drop_disallowed_value_mappings_counts_cleared_columns(self) -> None:
+        tables = _status_table()
+        cleared = SemanticModelGenerator._drop_disallowed_value_mappings(tables, None)
+        assert cleared == 1
+        assert tables["public.orders"].columns["status"].value_mappings == []
+        # Idempotent: nothing left to clear.
+        assert SemanticModelGenerator._drop_disallowed_value_mappings(tables, None) == 0
 
 
 class TestGroundTablesToSchema:
@@ -1752,3 +1882,405 @@ class TestDetectDriftNewColumns:
             "1 new column(s) added to tables in the semantic model since it was generated: "
             "public.orders.region",
         ]
+
+
+# ── Metric filter literals against value mappings ─────────────────────────────
+
+
+def _metric(
+    *filters: str, related: list[str] | None = None, measure: list[str] | None = None
+) -> SimpleMetric:
+    return SimpleMetric(
+        name="Revenue",
+        definition="orders.total",
+        aggregation=AggregationType.SUM,
+        filters=list(filters),
+        measure_filters=measure or [],
+        related_tables=related or [],
+    )
+
+
+def _with_invoices() -> dict[str, TableSemantic]:
+    """``orders.status`` (P) next to ``invoices.status`` (paid, open)."""
+    return {
+        **_status_table(),
+        "public.invoices": TableSemantic(
+            display_name="Invoices",
+            columns={
+                "status": ColumnSemantic(
+                    display_name="S",
+                    value_mappings=[
+                        ValueMapping(raw_value="paid", display_value="Paid"),
+                        ValueMapping(raw_value="open", display_value="Open"),
+                    ],
+                )
+            },
+        ),
+    }
+
+
+class TestValidateMetricFilterValues:
+    def test_unmapped_literal_is_reported(self, gen: SemanticModelGenerator) -> None:
+        out = gen._validate_metric_filter_values(
+            [_metric("orders.status = 'completed'")], _status_table()
+        )
+        assert out == [
+            "Metric \"Revenue\" compares public.orders.status with 'completed', but the value "
+            "mappings of public.orders.status list only 'P'. Check the value against the "
+            "database and correct the filter."
+        ]
+
+    def test_mapped_literal_is_silent(self, gen: SemanticModelGenerator) -> None:
+        assert (
+            gen._validate_metric_filter_values(
+                [_metric("status = 'P'", related=["public.orders"])], _status_table()
+            )
+            == []
+        )
+
+    def test_in_list_reports_only_the_unmapped_values(self, gen: SemanticModelGenerator) -> None:
+        out = gen._validate_metric_filter_values(
+            [_metric("o.status NOT IN ('P', 'done')", related=["public.orders"])], _status_table()
+        )
+        assert len(out) == 1 and "'done'" in out[0] and "'P', " not in out[0].split("list only")[0]
+
+    def test_not_equal_on_an_unqualified_column(self, gen: SemanticModelGenerator) -> None:
+        out = gen._validate_metric_filter_values(
+            [_metric("status <> 'void'", "status != 'gone'", related=["orders"])], _status_table()
+        )
+        assert len(out) == 2 and "'void'" in out[0] and "'gone'" in out[1]
+
+    def test_measure_filters_are_checked_too(self, gen: SemanticModelGenerator) -> None:
+        out = gen._validate_metric_filter_values(
+            [_metric(measure=["status = 'shipped'"], related=["public.orders"])], _status_table()
+        )
+        assert len(out) == 1 and "'shipped'" in out[0]
+
+    def test_column_without_mappings_is_skipped(self, gen: SemanticModelGenerator) -> None:
+        tables = {"public.orders": _tbl("id", "status")}
+        assert (
+            gen._validate_metric_filter_values(
+                [_metric("status = 'x'", related=["public.orders"])], tables
+            )
+            == []
+        )
+
+    def test_related_tables_scope_the_lookup(self, gen: SemanticModelGenerator) -> None:
+        # ``status`` on invoices has other mappings; the metric is about orders only.
+        tables = _with_invoices()
+        assert (
+            gen._validate_metric_filter_values(
+                [_metric("status = 'paid'", related=["invoices"])], tables
+            )
+            == []
+        )
+        out = gen._validate_metric_filter_values(
+            [_metric("status = 'paid'", related=["public.orders"])], tables
+        )
+        assert len(out) == 1 and "public.orders.status" in out[0]
+
+    def test_an_alias_falls_back_to_the_related_tables(self, gen: SemanticModelGenerator) -> None:
+        out = gen._validate_metric_filter_values(
+            [_metric("o.status = 'paid'", related=["public.orders"])], _with_invoices()
+        )
+        assert len(out) == 1 and "public.orders.status" in out[0] and "'paid'" in out[0]
+
+    def test_a_table_qualifier_beats_related_tables(self, gen: SemanticModelGenerator) -> None:
+        tables = _with_invoices()
+        silent = _metric("invoices.status = 'paid'", related=["public.orders"])
+        assert gen._validate_metric_filter_values([silent], tables) == []
+        loud = _metric('public."Invoices"."status" = \'void\'', related=["public.orders"])
+        out = gen._validate_metric_filter_values([loud], tables)
+        assert len(out) == 1
+        assert "public.invoices.status" in out[0] and "'open', 'paid'" in out[0]
+
+    def test_ambiguous_column_is_skipped(self, gen: SemanticModelGenerator) -> None:
+        # Both related tables map ``status`` differently: the check does not pick one.
+        assert (
+            gen._validate_metric_filter_values(
+                [_metric("status = 'x'", related=["orders", "invoices"])], _with_invoices()
+            )
+            == []
+        )
+
+    def test_quoted_and_qualified_columns_resolve(self, gen: SemanticModelGenerator) -> None:
+        out = gen._validate_metric_filter_values(
+            [_metric("public.orders.\"status\" <> 'void'")], _status_table()
+        )
+        assert len(out) == 1 and "'void'" in out[0]
+
+    def test_the_column_keeps_its_stored_case(self, gen: SemanticModelGenerator) -> None:
+        out = gen._validate_metric_filter_values(
+            [_metric("status = 'x'", related=["public.orders"])], _status_table(column="Status")
+        )
+        assert len(out) == 1 and "public.orders.Status" in out[0]
+
+    def test_repeats_are_reported_once(self, gen: SemanticModelGenerator) -> None:
+        out = gen._validate_metric_filter_values(
+            [
+                _metric(
+                    "status IN ('x', 'x', 'P')",
+                    "status = 'x'",
+                    measure=["status IN ('x')"],
+                    related=["public.orders"],
+                )
+            ],
+            _status_table(),
+        )
+        assert len(out) == 1 and out[0].count("'x'") == 1
+
+    def test_a_long_allowed_list_is_cut_at_five(self, gen: SemanticModelGenerator) -> None:
+        tables = {
+            "public.orders": TableSemantic(
+                display_name="Orders",
+                columns={
+                    "status": ColumnSemantic(
+                        display_name="S",
+                        value_mappings=[
+                            ValueMapping(raw_value=v, display_value=v.upper()) for v in "gfedcba"
+                        ],
+                    )
+                },
+            )
+        }
+        (out,) = gen._validate_metric_filter_values(
+            [_metric("status = 'z'", related=["public.orders"])], tables
+        )
+        assert "list only 'a', 'b', 'c', 'd', 'e', …. Check" in out
+
+    def test_a_column_with_no_table_in_scope_is_not_checked(
+        self, gen: SemanticModelGenerator
+    ) -> None:
+        """No qualifier (or an alias) and no annotated related table: a same-named
+        column on an unrelated table must not be read as the metric's."""
+        tables = {**_status_table(), "public.payments": _tbl("id", "status")}
+        assert gen._validate_metric_filter_values([_metric("status = 'refund'")], tables) == []
+        assert gen._validate_metric_filter_values([_metric("p.status = 'refund'")], tables) == []
+        # ``events`` is related but has no annotation: nothing to fall back to either.
+        assert (
+            gen._validate_metric_filter_values(
+                [_metric("status = 'refund'", related=["events"])], _status_table()
+            )
+            == []
+        )
+
+    def test_conditions_joined_by_and_or_are_each_checked(
+        self, gen: SemanticModelGenerator
+    ) -> None:
+        out = gen._validate_metric_filter_values(
+            [
+                _metric(
+                    "o.total > 10 AND o.status = 'x' OR o.status IN ('P', 'y')", related=["orders"]
+                )
+            ],
+            _status_table(),
+        )
+        assert len(out) == 2
+        assert "'x'" in out[0] and "'y'" in out[1] and "'P'" not in out[1].split("list only")[0]
+
+    def test_operators_are_case_insensitive(self, gen: SemanticModelGenerator) -> None:
+        out = gen._validate_metric_filter_values(
+            [_metric("status not in ('P', 'z')", related=["orders"])], _status_table()
+        )
+        assert len(out) == 1 and "'z'" in out[0]
+
+    def test_only_string_literals_against_a_column_are_judged(
+        self, gen: SemanticModelGenerator
+    ) -> None:
+        silent = [
+            "status IS NULL",
+            "status IS NOT NULL",
+            "status LIKE 'pend%'",
+            "status = other_col",
+            "status = 3",
+            "status IN (1, 2)",
+            "status IN (SELECT 'x')",
+            "lower(status) = 'x'",
+            "'x' = status",
+            "total > 100",
+            "",
+        ]
+        for clause in silent:
+            assert (
+                gen._validate_metric_filter_values(
+                    [_metric(clause, related=["orders"])], _status_table()
+                )
+                == []
+            ), clause
+
+    def test_literals_compare_exactly_and_keep_inner_spaces(
+        self, gen: SemanticModelGenerator
+    ) -> None:
+        out = gen._validate_metric_filter_values(
+            [_metric("status = 'p'", "status = ' P'", related=["orders"])], _status_table()
+        )
+        assert len(out) == 2 and "'p'" in out[0] and "' P'" in out[1]
+
+    def test_two_metrics_with_the_same_mistake_each_get_a_warning(
+        self, gen: SemanticModelGenerator
+    ) -> None:
+        a = _metric("status = 'x'", related=["orders"]).model_copy(update={"name": "A"})
+        b = _metric("status = 'x'", related=["orders"]).model_copy(update={"name": "B"})
+        out = gen._validate_metric_filter_values([a, b], _status_table())
+        assert [w.split('"')[1] for w in out] == ["A", "B"]
+
+    def test_no_metrics_no_tables_and_no_filters_are_silent(
+        self, gen: SemanticModelGenerator
+    ) -> None:
+        assert gen._validate_metric_filter_values([], _status_table()) == []
+        assert gen._validate_metric_filter_values([_metric("status = 'x'")], {}) == []
+        assert gen._validate_metric_filter_values([_metric()], _status_table()) == []
+
+    def test_a_derived_metric_without_filters_is_skipped(self, gen: SemanticModelGenerator) -> None:
+        from app.semantic.models import DerivedMetric
+
+        derived = DerivedMetric(name="Margin", definition="revenue - cost")
+        assert gen._validate_metric_filter_values([derived], _status_table()) == []
+
+    def test_same_value_set_on_two_related_tables_is_not_ambiguous(
+        self, gen: SemanticModelGenerator
+    ) -> None:
+        """Two tables listing the same raw values give one candidate: the check judges."""
+        tables = {
+            **_status_table(),
+            "public.invoices": TableSemantic(
+                display_name="Invoices",
+                columns={"status": ColumnSemantic(display_name="S", value_mappings=[_PENDING])},
+            ),
+        }
+        out = gen._validate_metric_filter_values(
+            [_metric("status = 'x'", related=["orders", "invoices"])], tables
+        )
+        assert len(out) == 1 and "public.orders.status" in out[0]
+
+
+class TestRelationshipGraphDescriptions:
+    """The edge text is what the LLM reads next to the RELATIONSHIPS header: a required FK no
+    longer promises that INNER JOIN is safe in either direction."""
+
+    @staticmethod
+    def _edges(*, nullable: bool) -> list[RelationshipEdge]:
+        def table(name: str, cols: list[ColumnInfo]) -> TableInfo:
+            return TableInfo(
+                catalog=None, schema_name="public", name=name, table_type="table", columns=cols
+            )
+
+        schema = DataSourceSchema(
+            source_type="postgresql",
+            schemas=[SchemaInfo(name="public")],
+            tables=[
+                table(
+                    "orders",
+                    [
+                        ColumnInfo(name="id", data_type="integer", native_type="int4"),
+                        ColumnInfo(
+                            name="customer_id",
+                            data_type="integer",
+                            native_type="int4",
+                            nullable=nullable,
+                        ),
+                    ],
+                ),
+                table(
+                    "customers", [ColumnInfo(name="id", data_type="integer", native_type="int4")]
+                ),
+            ],
+            relationships=[
+                RelationshipInfo(
+                    from_schema="public",
+                    from_table="orders",
+                    from_column="customer_id",
+                    to_schema="public",
+                    to_table="customers",
+                    to_column="id",
+                )
+            ],
+        )
+        return SemanticModelGenerator()._build_relationship_graph(schema)
+
+    def test_a_not_null_fk_is_required_and_warns_about_a_filtered_parent(self) -> None:
+        (edge,) = self._edges(nullable=False)
+        assert edge.is_required is True
+        assert edge.description == (
+            "Required FK — every public.orders row has a public.customers key; "
+            "INNER JOIN keeps every public.orders row unless the query also "
+            "filters public.customers"
+        )
+        assert "safe in either direction" not in edge.description
+
+    def test_a_nullable_fk_stays_optional(self) -> None:
+        (edge,) = self._edges(nullable=True)
+        assert edge.is_required is False
+        assert edge.description.startswith("Optional FK")
+        assert "LEFT JOIN" in edge.description
+
+    def test_a_missing_column_in_the_schema_is_optional(self) -> None:
+        schema = DataSourceSchema(
+            source_type="postgresql",
+            schemas=[SchemaInfo(name="public")],
+            tables=[],
+            relationships=[
+                RelationshipInfo(
+                    from_schema="public",
+                    from_table="orders",
+                    from_column="customer_id",
+                    to_schema="public",
+                    to_table="customers",
+                    to_column="id",
+                )
+            ],
+        )
+        (edge,) = SemanticModelGenerator()._build_relationship_graph(schema)
+        assert edge.is_required is False
+
+
+class TestGlobalSectionsPrompt:
+    """Joins are not generated: the prompt neither asks for them nor shows an example."""
+
+    async def test_the_prompt_sent_to_the_llm_does_not_ask_for_common_joins(self) -> None:
+        from app.semantic.models import GlobalSectionsResponse
+
+        provider = MagicMock()
+        provider.max_output_tokens = 8000
+        provider.generate_structured = AsyncMock(return_value=GlobalSectionsResponse())
+        await SemanticModelGenerator().generate_globals(
+            schema=_schema_with_tables(["orders"], ["status"]),
+            provider=provider,
+            model=None,
+            all_tables={"public.orders": _tbl("id", "status", name="Orders")},
+            relationship_edges=[],
+        )
+        kwargs = provider.generate_structured.await_args.kwargs
+        prompt = kwargs["user_message"]
+        assert kwargs["schema_type"] is GlobalSectionsResponse
+        assert "common_joins" not in prompt
+        assert "join pattern" not in prompt.lower()
+        assert "join_pattern" not in prompt
+        assert "business_metrics" in prompt and "segments" in prompt
+        assert "derived_columns" in prompt
+
+    async def test_a_reply_that_still_carries_common_joins_is_accepted_and_they_are_ignored(
+        self,
+    ) -> None:
+        """An older model may still answer with the field; validation must not fail on it."""
+        from app.semantic.models import GlobalSectionsResponse
+
+        reply = GlobalSectionsResponse.model_validate(
+            {
+                "business_metrics": [],
+                "common_joins": [
+                    {"description": "x", "tables": ["a"], "join_pattern": "a.id = b.id"}
+                ],
+            }
+        )
+        provider = MagicMock()
+        provider.max_output_tokens = 8000
+        provider.generate_structured = AsyncMock(return_value=reply)
+        result = await SemanticModelGenerator().generate_globals(
+            schema=_schema_with_tables(["orders"]),
+            provider=provider,
+            model=None,
+            all_tables={"public.orders": _tbl("id", name="Orders")},
+            relationship_edges=[],
+        )
+        assert len(result) == 3

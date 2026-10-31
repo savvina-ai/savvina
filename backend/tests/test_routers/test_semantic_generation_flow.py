@@ -28,6 +28,7 @@ from app.database import get_db
 from app.datasources.models import (
     ColumnInfo,
     DataSourceSchema,
+    PrivacySettings,
     RelationshipInfo,
     SchemaInfo,
     TableInfo,
@@ -54,6 +55,7 @@ from app.semantic.generator import SemanticModelGenerator
 from app.semantic.models import (
     AggregationType,
     ColumnSemantic,
+    CommonJoin,
     GenerationStatus,
     SimpleMetric,
     TableSemantic,
@@ -128,6 +130,9 @@ async def db(semantic_db: AsyncSession) -> AsyncIterator[AsyncSession]:  # noqa:
     yield semantic_db
 
 
+_UNSET = object()  # a fake's ``privacy`` when the route did not pass the keyword
+
+
 class _Llm:
     """The mocked LLM: annotates whatever it is asked for, and records the asks."""
 
@@ -141,9 +146,15 @@ class _Llm:
         self.column_batches: list[dict[str, list[str]]] = []  # new-column asks, in order
         # 1-based index of a new-column call → the error message it raises.
         self.column_failures: dict[int, str] = {}
+        # The ``privacy`` each call of the two annotation passes received, in order.
+        self.table_privacy: list[object] = []
+        self.column_privacy: list[object] = []
 
-    async def generate_tables(self, *, schema, table_keys, **_kw) -> dict[str, TableSemantic]:
+    async def generate_tables(
+        self, *, schema, table_keys, privacy=_UNSET, **_kw
+    ) -> dict[str, TableSemantic]:
         self.batches.append(list(table_keys))
+        self.table_privacy.append(privacy)
         if self.during_batch is not None:
             await self.during_batch()
         wanted = set(table_keys)
@@ -162,8 +173,9 @@ class _Llm:
         }
 
     async def generate_new_columns(
-        self, *, columns_by_table, **_kw
+        self, *, columns_by_table, privacy=_UNSET, **_kw
     ) -> dict[str, dict[str, ColumnSemantic]]:
+        self.column_privacy.append(privacy)
         self.column_batches.append({key: list(names) for key, names in columns_by_table.items()})
         if (failure := self.column_failures.get(len(self.column_batches))) is not None:
             # What the generator raises for a provider error, the provider's mark kept.
@@ -180,7 +192,7 @@ class _Llm:
         metric = SimpleMetric(
             name="Row count", definition="COUNT(*)", aggregation=AggregationType.COUNT
         )
-        return [metric], [], [], [], []
+        return [metric], [], []
 
 
 @pytest.fixture
@@ -273,6 +285,25 @@ class TestGenerationFlow:
         assert stored.generation_progress is None
         assert stored.tables["public.orders"].description == "generated orders"
         assert set(stored.tables["public.orders"].columns) == {"id", "total"}
+
+    async def test_a_batch_passes_the_connection_privacy_to_the_generator(
+        self, http_client, db, flow
+    ) -> None:
+        """The value-mapping guard reads ``privacy``: no stored settings is ``None``
+        (consent to nothing), stored settings arrive as the parsed object."""
+        llm, _ = flow
+        await _generate(http_client)
+        assert llm.table_privacy and all(p is None for p in llm.table_privacy)
+
+        conn = await db.get(Connection, _CID)
+        conn.privacy_settings = {"include_sample_values": True}
+        await db.commit()
+        llm.table_privacy.clear()
+        await _generate(http_client)
+        assert llm.table_privacy
+        for privacy in llm.table_privacy:
+            assert isinstance(privacy, PrivacySettings)
+            assert privacy.include_sample_values is True
 
     async def test_generation_records_the_live_columns_as_the_baseline(
         self, http_client, db, flow
@@ -392,6 +423,183 @@ class TestGenerationFlow:
         stored = await store.load_model(db, _CID)
         assert set(stored.tables["public.orders"].columns) == {"id"}
         assert stored.tables["public.orders"].description == "hand written"
+
+    async def test_a_regenerate_keeps_the_joins_an_earlier_run_stored(
+        self, http_client, db, flow
+    ) -> None:
+        """Joins are no longer generated, so a regenerate returns none; the ones an earlier
+        run stored (no provenance) and the one the user wrote both stay."""
+        await _generate(http_client)
+        # What an earlier run left behind: a join saved by the globals route's own
+        # ``save_model`` call (source "generation", no provenance), seeded directly
+        # because the route now ignores any join the generator returns.
+        model = await store.load_model(db, _CID)
+        old = CommonJoin(
+            description="Old orders", tables=["orders"], join_pattern="orders.id = o.id"
+        )
+        await store.save_model(
+            db,
+            _CID,
+            model.model_copy(update={"common_joins": [old]}),
+            updated_by=None,
+            source="generation",
+        )
+        await db.commit()
+        resp = await http_client.put(
+            _BASE,
+            json={
+                "common_joins": [
+                    old.model_dump(),
+                    {
+                        "description": "Hand written",
+                        "tables": ["customers"],
+                        "join_pattern": "customers.id = c.id",
+                    },
+                ]
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        _, snapshot = await store.load_model_with_provenance(db, _CID)
+        assert snapshot.marks.get("global_item", {}).keys() == {"common_join:customers.id = c.id"}
+
+        body = await _generate(http_client)  # the fake LLM returns no joins
+
+        patterns = {"orders.id = o.id", "customers.id = c.id"}
+        assert {j["join_pattern"] for j in body["common_joins"]} == patterns
+        stored = await store.load_model(db, _CID)
+        assert {j.join_pattern for j in stored.common_joins} == patterns
+
+    async def test_a_regenerate_drops_an_unmarked_join_over_a_gone_table_only(
+        self, http_client, db, flow
+    ) -> None:
+        """Check Drift cannot report a table a regenerate already pruned, so the regenerate
+        drops the generated joins over it. A bare-name join over a live table stays, and so
+        does a hand-written join, whatever it names."""
+        _, set_schema = flow
+        await _generate(http_client)
+        model = await store.load_model(db, _CID)
+        gone = CommonJoin(
+            description="Customers", tables=["public.customers", "public.orders"], join_pattern="g"
+        )
+        bare = CommonJoin(description="Orders", tables=["orders"], join_pattern="bare")
+        await store.save_model(
+            db,
+            _CID,
+            model.model_copy(update={"common_joins": [gone, bare]}),
+            updated_by=None,
+            source="generation",
+        )
+        await db.commit()
+        hand = CommonJoin(description="Hand", tables=["public.customers"], join_pattern="hand")
+        resp = await http_client.put(
+            _BASE,
+            json={"common_joins": [j.model_dump() for j in (gone, bare, hand)]},
+        )
+        assert resp.status_code == 200, resp.text
+
+        set_schema({"orders": ["id", "total"]})  # customers left the database
+        body = await _generate(http_client)
+
+        assert {j["join_pattern"] for j in body["common_joins"]} == {"bare", "hand"}
+        stored = await store.load_model(db, _CID)
+        assert {j.join_pattern for j in stored.common_joins} == {"bare", "hand"}
+
+    async def test_a_join_over_a_live_table_without_an_annotation_is_kept(
+        self, http_client, db, flow
+    ) -> None:
+        """ "Gone" means left the database, not "has no annotation row": a live table the run
+        never annotated (here ``events``, created after the tables were generated), one
+        the role cannot read, and one the privacy policy hides and the model never stored
+        all keep their generated joins."""
+        _, set_schema = flow
+        await _generate(http_client)
+        model = await store.load_model(db, _CID)
+        joins = [
+            CommonJoin(description="Events", tables=["public.events"], join_pattern="live"),
+            CommonJoin(description="Bare", tables=["events"], join_pattern="bare"),
+            CommonJoin(description="Vault", tables=["public.vault"], join_pattern="unreadable"),
+            CommonJoin(description="Secret", tables=["public.secret"], join_pattern="hidden"),
+            CommonJoin(description="Gone", tables=["public.dropped"], join_pattern="gone"),
+        ]
+        await store.save_model(
+            db,
+            _CID,
+            model.model_copy(update={"common_joins": joins}),
+            updated_by=None,
+            source="generation",
+        )
+        conn = await db.get(Connection, _CID)
+        conn.privacy_settings = {"excluded_tables": ["public.secret"]}
+        await db.commit()
+        set_schema(
+            {"orders": ["id", "total"], "customers": ["id"], "events": ["id"]},
+            unreadable=["public.vault"],
+        )
+
+        body = await _globals(http_client)  # finishing: events gets no annotation
+
+        assert "public.events" not in body["tables"]
+        assert {j["join_pattern"] for j in body["common_joins"]} == {
+            "live",
+            "bare",
+            "unreadable",
+            "hidden",
+        }
+
+    async def test_a_regenerate_checks_the_metric_filters_it_keeps_not_the_llms(
+        self, http_client, db, flow
+    ) -> None:
+        """The LLM's "Revenue" filters on 'completed', but the user's edited one, which
+        replaces it, filters on a mapped value: the warning follows the stored metric."""
+        _llm, set_schema = flow
+        set_schema({"orders": ["id", "status"], "customers": ["id"]})
+
+        def revenue(value: str) -> SimpleMetric:
+            return SimpleMetric(
+                name="Revenue",
+                definition="orders.id",
+                aggregation=AggregationType.COUNT,
+                filters=[f"orders.status = '{value}'"],
+                related_tables=["public.orders"],
+            )
+
+        async def llm_revenue(self, **kw):
+            return [revenue("completed")], [], []
+
+        with patch.object(SemanticModelGenerator, "generate_globals", new=llm_revenue):
+            body = await _generate(http_client)
+        # Nothing is hand-edited yet, so the LLM's metric stands; status has no mappings.
+        assert body["business_metrics"][0]["filters"] == ["orders.status = 'completed'"]
+        assert body["generation_warnings"] == []
+
+        mappings = [{"raw_value": v, "display_value": v} for v in ("P", "C", "X")]
+        resp = await http_client.put(
+            _BASE,
+            json={
+                "tables": {"public.orders": {"columns": {"status": {"value_mappings": mappings}}}},
+                "business_metrics": [revenue("P").model_dump(mode="json")],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        with patch.object(SemanticModelGenerator, "generate_globals", new=llm_revenue):
+            body = await _globals(http_client)
+        assert body["business_metrics"][0]["filters"] == ["orders.status = 'P'"]
+        assert not any("'completed'" in w for w in body["generation_warnings"])
+
+        # A user-edited mapping set that lacks the stored metric's value is reported.
+        resp = await http_client.put(
+            _BASE,
+            json={"business_metrics": [revenue("Z").model_dump(mode="json")]},
+        )
+        assert resp.status_code == 200, resp.text
+        with patch.object(SemanticModelGenerator, "generate_globals", new=llm_revenue):
+            body = await _globals(http_client)
+        assert [w for w in body["generation_warnings"] if "'Z'" in w] == [
+            "Metric \"Revenue\" compares public.orders.status with 'Z', but the value mappings "
+            "of public.orders.status list only 'C', 'P', 'X'. Check the value against the "
+            "database and correct the filter."
+        ]
 
     async def test_an_interrupted_run_resumes_only_the_pending_keys(
         self, http_client, db, flow
@@ -838,6 +1046,40 @@ class TestApplyDriftFlow:
             )
             assert status.sample_values is None
             assert status.native_type == "enum(…)"
+
+    async def test_both_drift_annotation_passes_receive_the_connection_privacy(
+        self, http_client, db, flow
+    ) -> None:
+        """A new table and a new column are annotated with the connection's ``privacy``
+        (the defaults, sample values off, when it stores none)."""
+        llm, _ = flow
+        await _generate(http_client)
+        live = _schema({"orders": ["id", "total", "region"], "customers": ["id"], "items": ["id"]})
+        generated_calls = len(llm.table_privacy)
+        await _apply_drift(http_client, live)
+        assert len(llm.table_privacy) == generated_calls + 1
+        assert len(llm.column_privacy) == 1
+        for privacy in (llm.table_privacy[-1], llm.column_privacy[-1]):
+            assert isinstance(privacy, PrivacySettings)
+            assert privacy.include_sample_values is False
+
+        conn = await db.get(Connection, _CID)
+        conn.privacy_settings = {"include_sample_values": True}
+        await db.commit()
+        live = _schema(
+            {
+                "orders": ["id", "total", "region", "note"],
+                "customers": ["id"],
+                "items": ["id"],
+                "carts": ["id"],
+            }
+        )
+        await _apply_drift(http_client, live)
+        assert len(llm.table_privacy) == generated_calls + 2
+        assert len(llm.column_privacy) == 2
+        for privacy in (llm.table_privacy[-1], llm.column_privacy[-1]):
+            assert isinstance(privacy, PrivacySettings)
+            assert privacy.include_sample_values is True
 
     async def test_a_legacy_model_is_baselined_then_a_new_column_is_reported_and_applied(
         self, http_client, db, flow

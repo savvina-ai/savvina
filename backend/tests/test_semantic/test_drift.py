@@ -13,6 +13,7 @@ from app.semantic.drift import (
     DriftApplySummary,
     SchemaDrift,
     compute_drift,
+    matching_real_keys,
     policy_hides_column,
     resolve_real_key,
     strip_ident_quotes,
@@ -908,3 +909,18 @@ class TestResolveRealKey:
             assert SemanticModelGenerator._resolve_real_key(
                 name, keys, bare_ok=bare_ok
             ) == resolve_real_key(name, keys, bare_ok=bare_ok)
+
+    def test_matching_real_keys_lists_every_match_of_the_deciding_rule(self) -> None:
+        keys = list(self._TABLES)
+        assert matching_real_keys("events", keys, bare_ok=True) == ["public.events", "sales.events"]
+        assert matching_real_keys("Orders", keys, bare_ok=True) == ["public.orders"]
+        assert matching_real_keys("Orders", keys, bare_ok=False) == []
+        assert matching_real_keys('"public"."orders"', keys, bare_ok=False) == ["public.orders"]
+        assert matching_real_keys("status", ["Status", "status"], bare_ok=False) == ["status"]
+        assert matching_real_keys("STATUS", ["Status", "status"], bare_ok=False) == [
+            "Status",
+            "status",
+        ]
+        assert matching_real_keys("missing", keys, bare_ok=True) == []
+        # A case-insensitive match decides: the bare rule is not tried as well.
+        assert matching_real_keys("Orders", ["orders", "public.orders"], bare_ok=True) == ["orders"]

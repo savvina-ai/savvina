@@ -198,7 +198,7 @@ class TestTpmWarning:
 
         def capturing_compress(**kwargs):
             captured_budget.append(kwargs["budget_chars"])
-            return "compressed-prompt"
+            return "compressed-prompt", "dropped"
 
         with patch(f"{_PIPELINE}._compress_prompt", side_effect=capturing_compress):
             result = await _call_generate(provider, db)

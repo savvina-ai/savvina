@@ -212,7 +212,6 @@ def test_global_sections_filters_metric_missing_definition():
         ],
         "segments": [],
         "derived_columns": [],
-        "common_joins": [],
     }
     r = GlobalSectionsResponse.model_validate(raw)
     assert len(r.business_metrics) == 1
@@ -232,7 +231,6 @@ def test_global_sections_coerces_unknown_aggregation():
         ],
         "segments": [],
         "derived_columns": [],
-        "common_joins": [],
     }
     r = GlobalSectionsResponse.model_validate(raw)
     assert len(r.business_metrics) == 1
@@ -253,7 +251,6 @@ def test_global_sections_filters_ratio_missing_exprs():
         ],
         "segments": [],
         "derived_columns": [],
-        "common_joins": [],
     }
     r = GlobalSectionsResponse.model_validate(raw)
     assert r.business_metrics == []
@@ -268,7 +265,6 @@ def test_global_sections_filters_invalid_segments():
             "not_a_dict",
         ],
         "derived_columns": [],
-        "common_joins": [],
     }
     r = GlobalSectionsResponse.model_validate(raw)
     assert len(r.segments) == 1
@@ -283,24 +279,19 @@ def test_global_sections_filters_derived_missing_sql():
             {"name": "Margin", "sql_expression": "(a-b)/b"},
             {"name": "NoSQL"},  # missing sql_expression → dropped
         ],
-        "common_joins": [],
     }
     r = GlobalSectionsResponse.model_validate(raw)
     assert len(r.derived_columns) == 1
 
 
-def test_global_sections_filters_joins_missing_join_pattern():
-    raw = {
-        "business_metrics": [],
-        "segments": [],
-        "derived_columns": [],
-        "common_joins": [
-            {"description": "Orders→Customers", "join_pattern": "a.id = b.id"},
-            {"description": "Missing pattern"},  # dropped
-        ],
-    }
-    r = GlobalSectionsResponse.model_validate(raw)
-    assert len(r.common_joins) == 1
+def test_global_sections_has_no_common_joins_field():
+    # Joins are not generated: a reply that still carries some is ignored, and the
+    # field is not in the schema the provider is shown.
+    r = GlobalSectionsResponse.model_validate(
+        {"common_joins": [{"description": "Orders→Customers", "join_pattern": "a.id = b.id"}]}
+    )
+    assert not hasattr(r, "common_joins")
+    assert "common_joins" not in GlobalSectionsResponse.model_json_schema()["properties"]
 
 
 # ── SemanticModel round-trip ──────────────────────────────────────────────────
@@ -421,7 +412,6 @@ def test_global_sections_filters_conversion_missing_base_measure():
         ],
         "segments": [],
         "derived_columns": [],
-        "common_joins": [],
     }
     r = GlobalSectionsResponse.model_validate(raw)
     assert r.business_metrics == []
@@ -440,7 +430,6 @@ def test_global_sections_filters_conversion_missing_conversion_measure():
         ],
         "segments": [],
         "derived_columns": [],
-        "common_joins": [],
     }
     r = GlobalSectionsResponse.model_validate(raw)
     assert r.business_metrics == []
@@ -459,7 +448,6 @@ def test_global_sections_valid_conversion_metric_passes():
         ],
         "segments": [],
         "derived_columns": [],
-        "common_joins": [],
     }
     r = GlobalSectionsResponse.model_validate(raw)
     assert len(r.business_metrics) == 1

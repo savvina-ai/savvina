@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 import hashlib
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 from ..datasources.models import (
@@ -32,7 +33,6 @@ from .models import (
     CardinalityClass,
     ColumnsBatchResponse,
     ColumnSemantic,
-    CommonJoin,
     DerivedColumn,
     EntityType,
     GlobalSectionsResponse,
@@ -162,10 +162,10 @@ Respond ONLY with valid JSON:
 }}"""
 )
 
-# Prompt for cross-table business metrics, joins, derived columns (global sections only).
+# Prompt for cross-table business metrics, segments, derived columns (global sections only).
 _GLOBAL_SECTIONS_PROMPT = """\
 You are a data analyst examining a database schema. Based on the table list below, \
-identify cross-table business KPIs, derived columns, and common join patterns.
+identify cross-table business KPIs, named filters and derived columns.
 
 TABLES IN DATABASE (format: schema.table (column:type, ...) [primary_date=col] [primary_ts=col]):
 {tables_summary}
@@ -191,7 +191,6 @@ Use 'conversion' metric_type when two tables represent funnel steps \
 - segments: Named, reusable WHERE-clause fragments for common filter patterns. \
 Each has: name (snake_case), sql_expression, description, applicable_tables.
 - derived_columns: Calculated fields (margins, rates, durations) with SQL expressions
-- common_joins: Common join patterns between tables
 
 Respond ONLY with valid JSON:
 {{
@@ -245,15 +244,19 @@ Respond ONLY with valid JSON:
       "description": "Product gross margin as a percentage",
       "format_hint": "percentage"
     }}
-  ],
-  "common_joins": [
-    {{
-      "description": "Customer orders",
-      "tables": ["customers", "orders"],
-      "join_pattern": "customers.id = orders.customer_id"
-    }}
   ]
 }}"""
+
+# A string literal compared to a column in a metric filter: ``col = 'x'``, ``col <> 'x'``,
+# ``col != 'x'``, ``col [NOT] IN ('x', 'y')``. The column may be qualified
+# (``orders.status``, ``public.orders.status``), aliased (``o.status``) or quoted with
+# the characters ``strip_ident_quotes`` removes (double quotes, backticks).
+_FILTER_LITERAL_RE = re.compile(
+    r"(?P<col>[\w\"`]+(?:\.[\w\"`]+)*)\s*"
+    r"(?:(?:=|<>|!=)\s*'(?P<one>[^']*)'"
+    r"|(?:NOT\s+)?IN\s*\(\s*(?P<many>'[^']*'(?:\s*,\s*'[^']*')*)\s*\))",
+    re.IGNORECASE,
+)
 
 _RATIO_NUMERATOR_KEYWORDS: tuple[str, ...] = (
     "spent",
@@ -746,6 +749,7 @@ class SemanticModelGenerator:
         model: str | None,
         table_keys: Sequence[str],
         relationship_edges: list[RelationshipEdge],
+        privacy: PrivacySettings | None = None,
     ) -> dict[str, TableSemantic]:
         """Generate semantic annotations for the named tables (no adapter required).
 
@@ -753,8 +757,9 @@ class SemanticModelGenerator:
         LLM call. Returns ``schema.table → TableSemantic`` for the resolved tables.
         Near-miss table/column names are remapped to the batch's real keys and invented
         ones are dropped; columns the LLM omits are left absent (so the store keeps any
-        earlier annotation for them). Raises ``ValueError`` on LLM failure so the router
-        can map it to HTTP.
+        earlier annotation for them). ``privacy`` decides which columns keep the value
+        mappings the LLM proposes (``_drop_disallowed_value_mappings``); None keeps none.
+        Raises ``ValueError`` on LLM failure so the router can map it to HTTP.
         """
         wanted = set(table_keys)
         batch = [t for t in schema.tables if table_key(t) in wanted]
@@ -802,6 +807,7 @@ class SemanticModelGenerator:
             raise ValueError(f"LLM call failed in generate_tables: {e}") from e
         # Ground first so fiscal enrichment sees the remapped (real) table keys.
         self._ground_tables_to_schema(result.tables, batch_schema_obj)
+        self._drop_disallowed_value_mappings(result.tables, privacy)
         self._enrich_fiscal_table_annotations(result.tables, schema)
         return result.tables
 
@@ -813,6 +819,7 @@ class SemanticModelGenerator:
         columns_by_table: Mapping[str, Sequence[str]],
         table_context: Mapping[str, TableSemantic],
         relationship_edges: list[RelationshipEdge],
+        privacy: PrivacySettings | None = None,
     ) -> dict[str, dict[str, ColumnSemantic]]:
         """Annotate only the named new columns of tables the model already holds.
 
@@ -825,7 +832,9 @@ class SemanticModelGenerator:
         names remapped, invented ones dropped), given the fiscal audit-timestamp rule
         ``generate_tables`` applies, and filtered to the requested names, so a column the
         LLM re-describes is ignored. The caller packs a batch so its DDL fits
-        ``_MAX_DDL_CHARS`` (``table_ddl_sizes``).
+        ``_MAX_DDL_CHARS`` (``table_ddl_sizes``). ``privacy`` decides which columns keep
+        the value mappings the LLM proposes (``_drop_disallowed_value_mappings``); None
+        keeps none.
 
         Returns ``table key → {column name → ColumnSemantic}``, holding only the tables
         with at least one requested column annotated: a table the LLM answered nothing
@@ -899,6 +908,7 @@ class SemanticModelGenerator:
             for key, entry in result.tables.items()
         }
         self._ground_tables_to_schema(replies, batch_schema_obj)
+        self._drop_disallowed_value_mappings(replies, privacy)
         # The rule ``generate_tables`` applies, so a new ``created_at`` on a fiscal-period
         # table is not described as a business date.
         self._enrich_fiscal_table_annotations(replies, schema)
@@ -922,6 +932,40 @@ class SemanticModelGenerator:
         """``drift.resolve_real_key`` — the one near-miss resolver; kept under this name
         for its callers."""
         return resolve_real_key(name, real_keys, bare_ok=bare_ok)
+
+    @staticmethod
+    def _drop_disallowed_value_mappings(
+        tables: dict[str, TableSemantic], privacy: PrivacySettings | None
+    ) -> int:
+        """Clear the value mappings of columns whose real values may not reach the LLM.
+
+        The rule is ``PrivacySettings.column_values_allowed`` (Include sample values on,
+        no sensitive pattern matched): no sample values, no generated mappings. It is a
+        consent gate, not proof the LLM saw the values: the generation DDL shows values
+        only through MySQL ENUM/SET members, so with the gate open a mapping guessed from
+        a name or read from a comment is kept. Dropped here, in code, rather than by
+        asking the prompt to hold back. ``privacy`` None (a connection with no stored
+        settings) has consented to nothing, as ``PromptBuilder`` reads it.
+        In place; returns the number of columns cleared. Hand-edited mappings are not
+        at stake: this runs on the LLM reply, and the store keeps edited fields anyway.
+        """
+        cleared = 0
+        for key, table in tables.items():
+            for name, col in list(table.columns.items()):
+                if not col.value_mappings:
+                    continue
+                if privacy is not None and privacy.column_values_allowed(name):
+                    continue
+                table.columns[name] = col.model_copy(update={"value_mappings": []})
+                cleared += 1
+                logger.info(
+                    "SemanticModelGenerator: dropped %d proposed value mapping(s) on %s.%s: "
+                    "the column's values may not reach the LLM",
+                    len(col.value_mappings),
+                    key,
+                    name,
+                )
+        return cleared
 
     def _ground_tables_to_schema(
         self,
@@ -999,20 +1043,16 @@ class SemanticModelGenerator:
         model: str | None,
         all_tables: dict[str, TableSemantic],
         relationship_edges: list[RelationshipEdge],
-    ) -> tuple[
-        list[BusinessMetric],
-        list[CommonJoin],
-        list[DerivedColumn],
-        list[str],
-        list[Segment],
-    ]:
+    ) -> tuple[list[BusinessMetric], list[DerivedColumn], list[Segment]]:
         """
-        Generate cross-table business metrics, common joins, derived columns, and segments.
+        Generate cross-table business metrics, derived columns and segments.
 
-        Returns ``(metrics, joins, derived_columns, generation_warnings, segments)``.
-        Derived columns also get the auto-detected ratio-pair supplement from
-        ``_detect_ratio_pairs``. ``generation_warnings`` contains any metric
-        time-column validation issues detected post-generation.
+        Returns ``(metrics, derived_columns, segments)``. Derived columns also get the
+        auto-detected ratio-pair supplement from ``_detect_ratio_pairs``. Common joins
+        are not generated: the prompt does not ask, ``GlobalSectionsResponse`` has no
+        field for them and the formatter has never rendered them. The metric checks
+        (``_validate_metrics_time_columns``, ``_validate_metric_filter_values``) are the
+        caller's to run, over the metrics it finally keeps.
 
         Raises ``ValueError`` on LLM failure so the router can map it to HTTP.
         """
@@ -1045,7 +1085,6 @@ class SemanticModelGenerator:
                 max_tokens=min(65536, provider.max_output_tokens),
             )
             metrics: list[BusinessMetric] = global_result.business_metrics
-            joins: list[CommonJoin] = global_result.common_joins
             derived_columns: list[DerivedColumn] = global_result.derived_columns
             segments: list[Segment] = global_result.segments
         except Exception as exc:
@@ -1072,8 +1111,7 @@ class SemanticModelGenerator:
             d for d in derived_columns if all(t in generated_tables for t in d.base_tables)
         ]
 
-        validation_warnings = self._validate_metrics_time_columns(metrics, schema)
-        return metrics, joins, derived_columns, validation_warnings, segments
+        return metrics, derived_columns, segments
 
     # ── Relationship graph ─────────────────────────────────────────────────────
 
@@ -1095,8 +1133,9 @@ class SemanticModelGenerator:
             is_required = not nullable
             if is_required:
                 description = (
-                    f"Required FK — every {from_table} row has a matching {to_table} row; "
-                    f"INNER JOIN is safe in either direction"
+                    f"Required FK — every {from_table} row has a {to_table} key; "
+                    f"INNER JOIN keeps every {from_table} row unless the query also "
+                    f"filters {to_table}"
                 )
             else:
                 description = (
@@ -1314,6 +1353,95 @@ class SemanticModelGenerator:
                     )
                     break
         return warnings
+
+    def _validate_metric_filter_values(
+        self, metrics: list[BusinessMetric], tables: Mapping[str, TableSemantic]
+    ) -> list[str]:
+        """Warn about a metric filter literal the column's value mappings do not list.
+
+        The LLM guesses status values from its training data (``'completed'`` for a
+        column whose values are ``'P'``/``'C'``/``'X'``), and a metric carrying such a
+        value teaches the chat prompt the wrong one. For every ``col = 'x'`` and
+        ``col IN ('x', …)`` in a metric's ``filters`` and ``measure_filters``, the column
+        is looked up by name (``_mapped_values``) and each literal missing from its
+        mapped raw values is reported, once per metric, column and set of missing values.
+        The match is exact: case is part of the value, so on a database with a
+        case-insensitive collation (the MySQL and SQL Server defaults) a case-only
+        difference can be reported though the query would match. Pure; no LLM, no database.
+        """
+        warnings: list[str] = []
+        for metric in metrics:
+            clauses = [*metric.filters, *getattr(metric, "measure_filters", [])]
+            related = {
+                strip_ident_quotes(r.rpartition(".")[2]).lower() for r in metric.related_tables if r
+            }
+            for clause in clauses:
+                for m in _FILTER_LITERAL_RE.finditer(clause):
+                    *qualifiers, column = m.group("col").split(".")
+                    qualifier = strip_ident_quotes(qualifiers[-1]).lower() if qualifiers else None
+                    if m.group("one") is not None:
+                        literals = [m.group("one")]
+                    else:
+                        literals = re.findall(r"'([^']*)'", m.group("many"))
+                    found = self._mapped_values(
+                        strip_ident_quotes(column).lower(), qualifier, tables, related
+                    )
+                    if found is None:
+                        continue
+                    where, allowed = found
+                    missing = [v for v in dict.fromkeys(literals) if v not in allowed]
+                    if not missing:
+                        continue
+                    listed = sorted(allowed)
+                    warnings.append(
+                        f'Metric "{metric.name}" compares {where} with '
+                        + ", ".join(f"'{v}'" for v in missing)
+                        + f", but the value mappings of {where} list only "
+                        + ", ".join(f"'{v}'" for v in listed[:5])
+                        + (", …" if len(listed) > 5 else "")
+                        + ". Check the value against the database and correct the filter."
+                    )
+        return list(dict.fromkeys(warnings))
+
+    @staticmethod
+    def _mapped_values(
+        column: str,
+        qualifier: str | None,
+        tables: Mapping[str, TableSemantic],
+        related: set[str],
+    ) -> tuple[str, frozenset[str]] | None:
+        """The ``table key.column`` and raw values the value mappings of a column list.
+
+        *column* and *qualifier* are lower-cased bare names; the qualifier is the last
+        part before the column (``invoices`` in ``public.invoices.status``), or None. A
+        qualifier that is the bare name of a table in ``tables`` limits the lookup to
+        those tables; one that is not (an alias like ``o``) and no qualifier fall back to
+        the tables whose bare name is in ``related``. None when no table is in scope (a
+        same-named column on an unrelated table is not the metric's), when no table in
+        scope has mappings for the column, or when two have different ones: the check
+        never guesses.
+        """
+
+        def bare(key: str) -> str:
+            return key.rpartition(".")[2].lower()
+
+        scope = [
+            (k, t) for k, t in tables.items() if qualifier is not None and bare(k) == qualifier
+        ]
+        if not scope:
+            scope = [(k, t) for k, t in tables.items() if bare(k) in related]
+        if not scope:
+            return None
+        candidates: dict[frozenset[str], str] = {}
+        for key, table in scope:
+            for name, col in table.columns.items():
+                if name.lower() == column and col.value_mappings:
+                    values = frozenset(vm.raw_value for vm in col.value_mappings)
+                    candidates.setdefault(values, f"{key}.{name}")
+        if len(candidates) != 1:
+            return None
+        values, where = next(iter(candidates.items()))
+        return where, values
 
     def _auto_generate_notes(self, schema: DataSourceSchema) -> list[str]:
         """Produce cross-table guidance notes for fiscal-period tables.

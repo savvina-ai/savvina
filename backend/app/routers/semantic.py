@@ -47,7 +47,9 @@ from ..semantic import store as semantic_store
 from ..semantic.drift import (
     DriftApplySummary,
     compute_drift,
+    matching_real_keys,
     policy_hides_column,
+    policy_hides_table,
     strip_ident_quotes,
     summarize_model_change,
 )
@@ -731,7 +733,7 @@ class _DriftAssembly(NamedTuple):
     ``removed_items`` names, by the store's kinds (``metric``, ``common_join``,
     ``derived_column``, ``segment``), the items taken out because they named a
     removed table, for ``summarize_model_change(removed_items=...)``.
-    ``llm_warnings`` are the generator's metric checks over the LLM metrics actually
+    ``llm_warnings`` are the two metric checks over the LLM metrics actually
     added (empty without new tables).
     """
 
@@ -756,7 +758,7 @@ def _drift_applied_model(
     new_tables: dict[str, TableSemantic],
     new_columns: Mapping[str, Mapping[str, ColumnSemantic]] | None = None,
     recorded_columns: Mapping[str, Collection[str]],
-    llm_items: tuple[list[BusinessMetric], list[CommonJoin], list[DerivedColumn], list[Segment]],
+    llm_items: tuple[list[BusinessMetric], list[DerivedColumn], list[Segment]],
     connection_id: str,
     log: bool = True,
 ) -> _DriftAssembly:
@@ -850,7 +852,7 @@ def _drift_applied_model(
     }
     llm_warnings: list[str] = []
     if new_tables:
-        llm_metrics, llm_joins, llm_derived, llm_segments = llm_items
+        llm_metrics, llm_derived, llm_segments = llm_items
         # Only items over a newly annotated table are new. The globals pass sees every
         # table, so an item over unchanged tables alone is one the model has had a
         # chance to hold already: if it is missing, the user deleted it (or it is a
@@ -864,23 +866,23 @@ def _drift_applied_model(
             return names_any_table(refs, added_keys, known)
 
         llm_metrics = [m for m in llm_metrics if over_new(m.related_tables)]
-        llm_joins = [j for j in llm_joins if over_new(j.tables)]
         llm_derived = [d for d in llm_derived if over_new(d.base_tables)]
         llm_segments = [s for s in llm_segments if over_new(s.applicable_tables)]
         # Additive: an existing item (hand-written or generated) is never replaced.
-        llm_metrics, llm_joins, llm_derived, llm_segments = _drop_unstorable_items(
-            llm_metrics, llm_joins, llm_derived, llm_segments, connection_id
+        llm_metrics, llm_derived, llm_segments = _drop_unstorable_items(
+            llm_metrics, llm_derived, llm_segments, connection_id
         )
         have_metrics = {m.name for m in metrics}
-        have_joins = {j.join_pattern for j in joins}
         have_derived = {d.name for d in derived_columns}
         have_segments = {s.name for s in segments}
         added_metrics = [m for m in llm_metrics if m.name not in have_metrics]
         metrics = metrics + added_metrics
-        # The globals pass's own warnings may name metrics dropped above, and so point
-        # at the user's same-named one; the same check over what was added cannot.
-        llm_warnings = gen._validate_metrics_time_columns(added_metrics, schema)
-        joins = joins + [j for j in llm_joins if j.join_pattern not in have_joins]
+        # The globals pass's metrics may include ones dropped above in favour of the
+        # user's same-named one, so the checks run over what was added.
+        llm_warnings = [
+            *gen._validate_metrics_time_columns(added_metrics, schema),
+            *gen._validate_metric_filter_values(added_metrics, merged_tables),
+        ]
         derived_columns = derived_columns + [d for d in llm_derived if d.name not in have_derived]
         segments = segments + [s for s in llm_segments if s.name not in have_segments]
 
@@ -1113,7 +1115,7 @@ async def apply_drift(
             relationship_edges=relationship_edges,
             new_tables={},
             recorded_columns=would_send,
-            llm_items=([], [], [], []),
+            llm_items=([], [], []),
             connection_id=connection_id,
             log=False,
         )
@@ -1148,8 +1150,8 @@ async def apply_drift(
 
     new_tables: dict[str, TableSemantic] = {}
     new_columns: dict[str, dict[str, ColumnSemantic]] = {}
-    llm_items: tuple[list[BusinessMetric], list[CommonJoin], list[DerivedColumn], list[Segment]]
-    llm_items = ([], [], [], [])
+    llm_items: tuple[list[BusinessMetric], list[DerivedColumn], list[Segment]]
+    llm_items = ([], [], [])
     configured_model: str | None = None
     provider_name: str | None = None
     provider_failure: str | None = None  # why the provider could not be resolved
@@ -1174,6 +1176,7 @@ async def apply_drift(
                     model=configured_model or None,
                     table_keys=batch,
                     relationship_edges=relationship_edges,
+                    privacy=privacy,
                 ),
                 what=f"Drift batch {batch} generation",
                 connection_id=connection_id,
@@ -1190,9 +1193,9 @@ async def apply_drift(
                 **prune_to_schema(stored_model.tables, schema, log=False),
                 **new_tables,
             }
-            # Its warnings are dropped: ``_drift_applied_model`` re-runs the check over
-            # the metrics it actually adds (``llm_warnings``).
-            metrics, joins, derived, _, segments = await _run_llm_phase(
+            # ``_drift_applied_model`` runs the metric checks over the metrics it actually
+            # adds (``llm_warnings``).
+            metrics, derived, segments = await _run_llm_phase(
                 gen.generate_globals(
                     schema=schema,
                     provider=llm_provider,
@@ -1204,7 +1207,7 @@ async def apply_drift(
                 connection_id=connection_id,
                 provider=provider_name,
             )
-            llm_items = (metrics, joins, derived, segments)
+            llm_items = (metrics, derived, segments)
     # Unlike the phases above, a failure here is not fatal: the removals, the renames, the
     # new tables and the tables an earlier batch answered for are applied without the
     # remaining new columns (named in the warnings and in ``column_tables_failed``), so one
@@ -1233,6 +1236,7 @@ async def apply_drift(
                     columns_by_table=batch,
                     table_context={key: stored_model.tables[key] for key in batch},
                     relationship_edges=relationship_edges,
+                    privacy=privacy,
                 ),
                 what=f"Drift new-columns batch {list(batch)} generation",
                 connection_id=connection_id,
@@ -1788,18 +1792,37 @@ def _drop_unstorable[T](
     return kept
 
 
+def _names_gone_table(
+    refs: Iterable[str], live_keys: list[str], privacy: PrivacySettings | None
+) -> bool:
+    """Whether any of a join's table names is a table that left the database.
+
+    *live_keys* is every table key that exists or is stored: the live schema, the tables
+    the role cannot read, and the model's own tables (``generate_semantic_globals``
+    passes all three). A name matches as elsewhere (``matching_real_keys``:
+    quotes stripped, case-insensitive, a bare name such as ``orders`` for
+    ``public.orders``). A bare name shared by several keys is ambiguous, not gone, and
+    so is a table the privacy policy hides. No names, nothing to judge.
+    """
+    for ref in refs:
+        if matching_real_keys(ref, live_keys, bare_ok=True):
+            continue
+        if policy_hides_table(strip_ident_quotes(ref), privacy, bare_ok=True):
+            continue
+        return True
+    return False
+
+
 def _drop_unstorable_items(
     metrics: list[BusinessMetric],
-    joins: list[CommonJoin],
     derived: list[DerivedColumn],
     segments: list[Segment],
     connection_id: str,
-) -> tuple[list[BusinessMetric], list[CommonJoin], list[DerivedColumn], list[Segment]]:
-    """``_drop_unstorable`` over the four kinds of LLM global item, keyed as the store
-    keys them (metrics, derived columns and segments by name, joins by pattern)."""
+) -> tuple[list[BusinessMetric], list[DerivedColumn], list[Segment]]:
+    """``_drop_unstorable`` over the three kinds of LLM global item, keyed as the store
+    keys them (by name)."""
     return (
         _drop_unstorable(metrics, "metric", lambda m: m.name, connection_id),
-        _drop_unstorable(joins, "common_join", lambda j: j.join_pattern, connection_id),
         _drop_unstorable(derived, "derived_column", lambda d: d.name, connection_id),
         _drop_unstorable(segments, "segment", lambda s: s.name, connection_id),
     )
@@ -2047,6 +2070,8 @@ async def generate_semantic_batch(
     # is defence in depth: no edge on a column outside the schema reaches the prompt.
     relationship_edges = edges_in_schema(gen._build_relationship_graph(schema), schema)
 
+    # The reply's value mappings are kept only for columns whose values may reach the LLM.
+    privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
     generated = await _run_llm_phase(
         gen.generate_tables(
             schema=schema,
@@ -2054,6 +2079,7 @@ async def generate_semantic_batch(
             model=configured_model or None,
             table_keys=body.table_keys,
             relationship_edges=relationship_edges,
+            privacy=privacy,
         ),
         what=f"Batch {body.table_keys} generation",
         connection_id=connection_id,
@@ -2113,9 +2139,6 @@ async def generate_semantic_batch(
         # leaves visible, annotated or not: one the LLM omitted is not a "new column"
         # to the next drift check. A column the policy hides is seen too when the
         # reconciled rows hold it, under its real name (``_held_column_names``).
-        privacy = (
-            PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
-        )
         stored = await semantic_store.load_column_names(db, connection_id, set(batch_tables))
         await semantic_store.update_known_columns(
             db,
@@ -2163,7 +2186,7 @@ async def generate_semantic_globals(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> SemanticModel:
-    """Phase 3 of phased generation: cross-table metrics, joins, derived columns.
+    """Phase 3 of phased generation: cross-table metrics, segments, derived columns.
 
     Finalises the model (``generation_status = "complete"``) over whatever
     tables are stored, which is what makes "Finish with what's generated" work.
@@ -2208,7 +2231,7 @@ async def generate_semantic_globals(
     # removed); pruning must not read that absence as drift.
     privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
 
-    metrics, joins, derived_columns, gen_warnings, segments = await _run_llm_phase(
+    metrics, derived_columns, segments = await _run_llm_phase(
         gen.generate_globals(
             schema=schema,
             provider=llm_provider,
@@ -2293,15 +2316,17 @@ async def generate_semantic_globals(
     # regenerate from replacing it. Drop the dangling names first (a list keeps its live
     # entries and its mark; a scalar or an emptied list is cleared), and tell the user.
     provenance, protected, edit_notes = drop_dangling_edits(marks, protected, schema, privacy)
-    gen_warnings = [*gen_warnings, *edit_notes]
+    # The two metric checks run below over the final metrics and tables: a user-edited
+    # metric replaces the LLM's same-named one, so the LLM's set is not what is checked.
+    gen_warnings = list(edit_notes)
 
     # One bad LLM item must not fail the whole finalisation in save_model.
-    metrics, joins, derived_columns, segments = _drop_unstorable_items(
-        metrics, joins, derived_columns, segments, connection_id
+    metrics, derived_columns, segments = _drop_unstorable_items(
+        metrics, derived_columns, segments, connection_id
     )
 
-    # A user-authored metric, segment, derived column or join carries provenance;
-    # the generator's fresh set must not replace it. Name-keyed, like the store.
+    # A user-authored metric, segment or derived column carries provenance; the
+    # generator's fresh set must not replace it. Name-keyed, like the store.
     edited_metrics = set(provenance.get("metric", {}))
     edited_items = set(provenance.get("global_item", {}))
     metrics = [m for m in metrics if m.name not in edited_metrics] + [
@@ -2313,9 +2338,6 @@ async def generate_semantic_globals(
     derived_columns = [
         d for d in derived_columns if f"derived_column:{d.name}" not in edited_items
     ] + [d for d in current_model.derived_columns if f"derived_column:{d.name}" in edited_items]
-    joins = [j for j in joins if f"common_join:{j.join_pattern}" not in edited_items] + [
-        j for j in current_model.common_joins if f"common_join:{j.join_pattern}" in edited_items
-    ]
 
     # ``current_model.tables`` (with the renames above), not the pre-LLM snapshot: a batch
     # that landed during the globals call is in the stored rows. Pruned by schema
@@ -2324,6 +2346,30 @@ async def generate_semantic_globals(
     # but it exists: ``keep_unreadable`` stops a narrower role from deleting its
     # annotations.
     pruned = prune_to_schema(tables, schema, privacy, keep_unreadable=True)
+    # Joins are no longer generated: every stored join stays, a hand-written or edited one
+    # (marked) unconditionally and a generated one unless it names a table that left the
+    # database. Not "has no annotation": a live table the run skipped, or the role cannot
+    # read, or the policy hides, still exists. Check Drift cannot report a gone table
+    # once this regenerate has pruned it (it reads removed tables from the stored model),
+    # so Apply Drift would never remove the join.
+    existing_tables = sorted(
+        {
+            *pruned,
+            *(table_key(t) for t in schema.tables),
+            *schema.unreadable_tables,
+        }
+    )
+    joins = [
+        j
+        for j in current_model.common_joins
+        if f"common_join:{j.join_pattern}" in edited_items
+        or not _names_gone_table(j.tables, existing_tables, privacy)
+    ]
+    gen_warnings = [
+        *gen._validate_metrics_time_columns(metrics, schema),
+        *gen._validate_metric_filter_values(metrics, pruned),
+        *gen_warnings,
+    ]
     # Every table of the schema should have a row by now. One without is a table the
     # LLM returned nothing for (twice, after the client's re-queue), one a "Finish
     # with what's generated" never reached, or one created since the run started; the

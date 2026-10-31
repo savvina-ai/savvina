@@ -146,7 +146,7 @@ export default function DriftSummaryPanel({
       {preview && summary.tables_added.length > 0 && (
         <p className="mt-2 text-xs text-muted-foreground">
           New tables are annotated by the LLM when you apply. Relationships to them, and the
-          metrics, joins and other items the LLM writes over them, appear only then and are
+          metrics and other items the LLM writes over them, appear only then and are
           not listed here.
         </p>
       )}

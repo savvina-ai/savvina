@@ -234,7 +234,7 @@ function GenerateConfirmDialog({ action, onConfirm, onCancel }: ConfirmDialogPro
           </li>
           <li className="flex items-start gap-2">
             <span className="mt-0.5 shrink-0 text-primary">•</span>
-            One final LLM call builds business metrics, common joins, derived columns and
+            One final LLM call builds business metrics, derived columns and
             segments from the annotated tables.
           </li>
           <li className="flex items-start gap-2">
@@ -460,7 +460,7 @@ export default function SemanticModelPageV2() {
     tables_total: number;
     batch_size: number;
     // Which phase the label describes. Tables is the batch loop; globals is the single
-    // trailing call that builds metrics and joins over whatever tables exist.
+    // trailing call that builds metrics over whatever tables exist.
     phase?: 'tables' | 'globals';
   } | null>(null);
 
@@ -1302,7 +1302,7 @@ export default function SemanticModelPageV2() {
               <div className="flex justify-between text-xs text-muted-foreground">
                 <span>
                   {genProgress.phase === 'globals'
-                    ? 'Building metrics and joins…'
+                    ? 'Building metrics…'
                     : 'Analysing tables…'}
                 </span>
                 <span>{genProgress.tables_done} / {genProgress.tables_total}</span>

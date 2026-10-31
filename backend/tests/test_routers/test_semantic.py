@@ -35,7 +35,6 @@ from app.semantic.models import (
     GENERATION_BATCH_SIZE,
     AggregationType,
     ColumnSemantic,
-    CommonJoin,
     DerivedColumn,
     GenerationProgress,
     GenerationStatus,
@@ -44,6 +43,7 @@ from app.semantic.models import (
     SemanticModel,
     SimpleMetric,
     TableSemantic,
+    ValueMapping,
 )
 
 from .conftest import MockResult, _make_conn, _mock_db
@@ -845,6 +845,33 @@ def _fk_schema() -> DataSourceSchema:
         ["orders", "customers"],
         columns={"orders": ["id", "customer_id"], "customers": ["id"]},
     )
+
+
+class TestNamesGoneTable:
+    """The join prune's table test: gone means no key matches and the policy does not
+    hide the name."""
+
+    _LIVE: ClassVar[list[str]] = ["archive.orders", "public.customers", "public.orders"]
+
+    def test_a_matching_or_ambiguous_name_is_not_gone(self) -> None:
+        from app.routers.semantic import _names_gone_table
+
+        assert _names_gone_table(["customers", '"PUBLIC"."Orders"'], self._LIVE, None) is False
+        assert _names_gone_table(["orders"], self._LIVE, None) is False  # ambiguous, not gone
+        assert _names_gone_table([], self._LIVE, None) is False
+
+    def test_a_hidden_table_is_not_gone(self) -> None:
+        from app.routers.semantic import _names_gone_table
+
+        privacy = PrivacySettings(excluded_tables=["public.secret"])
+        assert _names_gone_table(["secret"], self._LIVE, privacy) is False
+        assert _names_gone_table(["public.secret"], self._LIVE, privacy) is False
+        assert _names_gone_table(["public.secret"], self._LIVE, None) is True
+
+    def test_an_absent_name_is_gone(self) -> None:
+        from app.routers.semantic import _names_gone_table
+
+        assert _names_gone_table(["public.customers", "public.dropped"], self._LIVE, None) is True
 
 
 def _fk_edges() -> tuple[RelationshipEdge, RelationshipEdge]:
@@ -1772,7 +1799,7 @@ class TestGenerateGlobals:
         *,
         model: SemanticModel,
         schema: DataSourceSchema,
-        llm=([], [], [], [], []),
+        llm=([], [], []),
         provenance: dict | None = None,
         protected: dict | None = None,
         save: AsyncMock | None = None,
@@ -1869,7 +1896,7 @@ class TestGenerateGlobals:
             http_client,
             model=partial,
             schema=_schema(["orders"]),
-            llm=(llm_metrics, [], [], [], []),
+            llm=(llm_metrics, [], []),
             provenance=provenance,
             protected=protected,
             db=db,
@@ -2107,7 +2134,7 @@ class TestGenerateGlobals:
     ) -> None:
         long_name = "x" * 513
         fits_once_nuls_go = "a" * 512 + "\x00"
-        # Segments, derived columns and joins share a Text ``name`` column that only
+        # Segments and derived columns share a Text ``name`` column that only
         # the unique index's byte limit bounds; a metric name is VARCHAR(512).
         too_long_for_index = "x" * (semantic_store._MAX_INDEXED_TEXT_BYTES + 1)
         metrics = [
@@ -2123,21 +2150,12 @@ class TestGenerateGlobals:
             DerivedColumn(name=too_long_for_index, sql_expression="a/b"),
             DerivedColumn(name="ratio", sql_expression="a/b"),
         ]
-        # A join is keyed by its pattern, which is Text bounded by the unique index.
-        joins = [
-            CommonJoin(
-                description="too long for the index",
-                tables=["public.orders"],
-                join_pattern="j" * (semantic_store._MAX_INDEXED_TEXT_BYTES + 1),
-            ),
-            CommonJoin(description="fine", tables=["public.orders"], join_pattern="o.id = c.id"),
-        ]
         with caplog.at_level(logging.WARNING, logger="app.routers.semantic"):
             resp, save, _ = await self._run(
                 http_client,
                 model=self._partial(),
                 schema=_schema(["orders"]),
-                llm=(metrics, joins, derived, [], segments),
+                llm=(metrics, derived, segments),
             )
 
         assert resp.status_code == 200
@@ -2145,9 +2163,8 @@ class TestGenerateGlobals:
         assert [m.name for m in saved.business_metrics] == ["ok", fits_once_nuls_go]
         assert [s.name for s in saved.segments] == ["seg"]
         assert [d.name for d in saved.derived_columns] == ["ratio"]
-        assert [j.join_pattern for j in saved.common_joins] == ["o.id = c.id"]
         dropped = [r for r in caplog.records if "dropped generated" in r.getMessage()]
-        assert len(dropped) == 4
+        assert len(dropped) == 3
 
     async def test_store_value_error_is_400_not_500(self, http_client) -> None:
         db = _mock_db(MockResult(single=_make_conn()))
@@ -3148,7 +3165,7 @@ class TestDriftAppliedModelNewColumns:
             new_tables={},
             new_columns=new_columns,
             recorded_columns=recorded,
-            llm_items=([], [], [], []),
+            llm_items=([], [], []),
             connection_id="conn-123",
             log=False,
         ).model
@@ -3294,7 +3311,7 @@ class TestApplyDrift:
         post_lock_status: GenerationStatus | None = None,
         generated: dict | BaseException | Callable | None = None,
         generated_columns: dict | BaseException | Callable | None = None,
-        llm=([], [], [], [], []),
+        llm=([], [], []),
         provenance: dict | None = None,
         protected: dict | None = None,
         current: tuple | None = None,
@@ -3407,6 +3424,9 @@ class TestApplyDrift:
             # The real check: the apply re-runs it over the metrics it actually added.
             gen._validate_metrics_time_columns.side_effect = (
                 _RealGenerator()._validate_metrics_time_columns
+            )
+            gen._validate_metric_filter_values.side_effect = (
+                _RealGenerator()._validate_metric_filter_values
             )
             app.dependency_overrides[get_db] = lambda: db
             resp = await http_client.post(_APPLY_DRIFT_URL + ("?dry_run=true" if dry_run else ""))
@@ -3535,14 +3555,21 @@ class TestApplyDrift:
             ],
         )
         db = self._db()
+        mark = "common_join:orders.coupon_id = coupons.id"
         resp, save, gen, resolve = await self._run(
-            http_client, model=model, schema=_schema(["orders"]), db=db
+            http_client,
+            model=model,
+            schema=_schema(["orders"]),
+            db=db,
+            provenance={**_no_provenance(), "global_item": {mark: ["payload"]}},
         )
         assert resp.status_code == 200
         body = resp.json()["semantic_model"]
         assert set(body["tables"]) == {"public.orders"}
         assert [m["name"] for m in body["business_metrics"]] == ["Orders"]
         assert body["common_joins"] == []
+        # The removed join's mark leaves with it.
+        assert mark not in save.await_args.kwargs["provenance"]["global_item"]
         assert body["derived_columns"] == []
         assert [s["name"] for s in body["segments"]] == ["all"]
         assert body["relationships"] == []
@@ -3702,7 +3729,7 @@ class TestApplyDrift:
             model=model,
             schema=_schema(["orders", "coupons", "events"]),
             generated={"public.events": TableSemantic(display_name="Events")},
-            llm=(llm_metrics, [], [], ["llm said so"], []),
+            llm=(llm_metrics, [], []),
         )
         assert resp.status_code == 200
         body = resp.json()["semantic_model"]
@@ -3716,8 +3743,8 @@ class TestApplyDrift:
         }
         names = {m["name"]: m["description"] for m in body["business_metrics"]}
         assert names == {"Orders": "mine", "Events": "llm"}
-        # The globals pass's own warnings are not carried: they may name LLM metrics
-        # the merge discarded. The time-column check re-runs over the added ones.
+        # ``generate_globals`` returns no warnings; the two metric checks run over the
+        # added metrics only (the filter-value check is mocked in this fixture).
         assert body["generation_warnings"] == []
         # New LLM content: review state is reset, like a generation run.
         assert body["is_user_reviewed"] is False
@@ -3729,6 +3756,62 @@ class TestApplyDrift:
         assert summary["warnings"] == []
         resolve.assert_awaited_once()
         save.assert_awaited_once()
+
+    async def test_the_filter_check_runs_over_the_metrics_it_adds_not_the_dropped_ones(
+        self, http_client
+    ) -> None:
+        """A new metric whose filter literal the new table's value mappings do not list is
+        reported; the LLM's same-named copy of a hand-written metric is dropped, so its
+        bad literal is not (it would point at the user's metric)."""
+        model = self._complete(
+            business_metrics=[
+                {
+                    "name": "Orders",
+                    "metric_type": "simple",
+                    "definition": "COUNT(*)",
+                    "description": "mine",
+                    "aggregation": "count",
+                    "related_tables": ["public.orders"],
+                }
+            ],
+        )
+        mapped = ColumnSemantic(
+            display_name="S", value_mappings=[ValueMapping(raw_value="open", display_value="Open")]
+        )
+        llm_metrics = [
+            SimpleMetric(
+                name="Orders",
+                definition="1",
+                aggregation=AggregationType.SUM,
+                filters=["status = 'bogus_dropped'"],
+                related_tables=["public.events"],
+            ),
+            SimpleMetric(
+                name="Open events",
+                definition="2",
+                aggregation=AggregationType.SUM,
+                filters=["events.status = 'completed'"],
+                related_tables=["public.events"],
+            ),
+        ]
+        resp, _, _, _ = await self._run(
+            http_client,
+            model=model,
+            schema=_schema(["orders", "events"], columns={"events": ["id", "status"]}),
+            generated={
+                "public.events": TableSemantic(
+                    display_name="Events",
+                    columns={"id": ColumnSemantic(display_name="Id"), "status": mapped},
+                )
+            },
+            llm=(llm_metrics, [], []),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()["semantic_model"]
+        [warning] = body["generation_warnings"]
+        assert warning.startswith('Metric "Open events" compares public.events.status')
+        assert "'completed'" in warning and "'open'" in warning
+        assert resp.json()["summary"]["warnings"] == [warning]
 
     async def test_new_tables_are_sent_in_batches_and_skipped_ones_reported(
         self, http_client
@@ -3819,14 +3902,13 @@ class TestApplyDrift:
         assert order == ["commit", "llm", "commit"]
 
     async def test_no_globals_pass_when_the_llm_annotated_no_new_table(self, http_client) -> None:
-        """Globals over tables the LLM returned nothing for would be a wasted call
-        whose warnings would pollute the model."""
+        """Globals over tables the LLM returned nothing for would be a wasted call."""
         resp, _, gen, _ = await self._run(
             http_client,
             model=self._complete(),
             schema=_schema(["orders", "coupons", "events"]),
             generated={},
-            llm=([], [], [], ["stray warning"], []),
+            llm=([], [], []),
         )
         assert resp.status_code == 200
         gen.generate_tables.assert_awaited_once()
@@ -4209,7 +4291,7 @@ class TestApplyDrift:
             schema=_schema(["orders", "vouchers"]),
             provenance={**_no_provenance(), "metric": {"Coupon uses": ["definition"]}},
             generated=self._annotate_all,
-            llm=([llm_metric], [], [], [], []),
+            llm=([llm_metric], [], []),
         )
         assert resp.status_code == 200
         [metric] = resp.json()["semantic_model"]["business_metrics"]
@@ -4231,7 +4313,7 @@ class TestApplyDrift:
                     "sql_expression": "coupon_id IS NOT NULL",
                     "applicable_tables": ["public.coupons"],
                 },
-                4,
+                2,
                 Segment(
                     name="discounted",
                     description="llm",
@@ -4239,22 +4321,6 @@ class TestApplyDrift:
                     applicable_tables=["public.vouchers"],
                 ),
                 "discounted",
-            ),
-            (
-                "common_join",
-                "joins",
-                {
-                    "tables": ["public.orders", "public.coupons"],
-                    "join_pattern": "orders.ref = refs.id",
-                    "description": "hand",
-                },
-                1,
-                CommonJoin(
-                    tables=["public.orders", "public.vouchers"],
-                    join_pattern="orders.ref = refs.id",
-                    description="llm",
-                ),
-                "orders.ref = refs.id",
             ),
             (
                 "derived_column",
@@ -4265,7 +4331,7 @@ class TestApplyDrift:
                     "description": "hand",
                     "base_tables": ["public.coupons"],
                 },
-                2,
+                1,
                 DerivedColumn(
                     name="rate",
                     sql_expression="2",
@@ -4275,27 +4341,26 @@ class TestApplyDrift:
                 "rate",
             ),
         ],
-        ids=["segment", "common_join", "derived_column"],
+        ids=["segment", "derived_column"],
     )
     async def test_a_removed_global_item_replaced_by_the_llm_does_not_keep_its_mark(
         self, http_client, kind, section, stored, llm_at, llm_item, identity
     ) -> None:
-        """Global items are marked as ``kind:identity`` (a join's identity is its
-        ``join_pattern``); each kind's mark leaves with its removed item."""
-        model_field = {"joins": "common_joins"}.get(section, section)
-        llm: list = [[], [], [], [], []]
+        """Global items are marked as ``kind:identity``; each kind's mark leaves with its
+        removed item."""
+        llm: list = [[], [], []]
         llm[llm_at] = [llm_item]
         mark = f"{kind}:{identity}"
         resp, save, _, _ = await self._run(
             http_client,
-            model=self._complete(**{model_field: [stored]}),
+            model=self._complete(**{section: [stored]}),
             schema=_schema(["orders", "vouchers"]),
             provenance={**_no_provenance(), "global_item": {mark: ["payload"]}},
             generated=self._annotate_all,
             llm=tuple(llm),
         )
         assert resp.status_code == 200
-        [item] = resp.json()["semantic_model"][model_field]
+        [item] = resp.json()["semantic_model"][section]
         assert item["description"] == "llm"
         assert mark not in save.await_args.kwargs["provenance"]["global_item"]
         summary = resp.json()["summary"]
@@ -4515,7 +4580,7 @@ class TestApplyDrift:
             "public.events",
         }
 
-    async def test_same_named_llm_joins_derived_columns_and_segments_never_replace(
+    async def test_same_named_llm_derived_columns_and_segments_never_replace(
         self, http_client
     ) -> None:
         model = self._complete(
@@ -4530,11 +4595,6 @@ class TestApplyDrift:
                 {"name": "net", "sql_expression": "1", "description": "mine", "base_tables": []}
             ],
             segments=[{"name": "big", "description": "mine", "sql_expression": "1=1"}],
-        )
-        llm_join = CommonJoin(
-            tables=["public.orders", "public.events"],
-            join_pattern="orders.coupon_id = coupons.id",
-            description="llm",
         )
         # Each names the new table, so only the never-replace rule keeps them out.
         llm_derived = DerivedColumn(
@@ -4551,10 +4611,11 @@ class TestApplyDrift:
             model=model,
             schema=_schema(["orders", "coupons", "events"]),
             generated=self._annotate_all,
-            llm=([], [llm_join], [llm_derived], [], [llm_segment]),
+            llm=([], [llm_derived], [llm_segment]),
         )
         assert resp.status_code == 200
         body = resp.json()["semantic_model"]
+        # Stored joins pass through an apply untouched: nothing generates them.
         assert [j["description"] for j in body["common_joins"]] == ["mine"]
         assert [d["description"] for d in body["derived_columns"]] == ["mine"]
         assert [s["description"] for s in body["segments"]] == ["mine"]
@@ -4723,7 +4784,7 @@ class TestApplyDrift:
             model=self._complete(),
             schema=_schema(["orders", "coupons", "events"]),
             generated=self._annotate_all,
-            llm=(llm_metrics, [], [], [], []),
+            llm=(llm_metrics, [], []),
         )
         assert resp.status_code == 200
         assert [m["name"] for m in resp.json()["semantic_model"]["business_metrics"]] == ["Events"]
@@ -4805,20 +4866,11 @@ class TestApplyDrift:
                 metric("events_per_order", "orders", "events"),  # bare names
             ],
             [
-                CommonJoin(tables=["public.orders"], join_pattern="o.a = o.b", description="x"),
-                CommonJoin(
-                    tables=["public.orders", "public.events"],
-                    join_pattern="orders.id = events.order_id",
-                    description="x",
-                ),
-            ],
-            [
                 DerivedColumn(name="old", sql_expression="1", description="x"),
                 DerivedColumn(
                     name="new", sql_expression="1", description="x", base_tables=["public.events"]
                 ),
             ],
-            [],
             [
                 Segment(name="everywhere", description="x", sql_expression="1=1"),
                 Segment(
@@ -4842,7 +4894,7 @@ class TestApplyDrift:
             "event_count",
             "events_per_order",
         ]
-        assert [j["join_pattern"] for j in body["common_joins"]] == ["orders.id = events.order_id"]
+        assert body["common_joins"] == []
         assert [d["name"] for d in body["derived_columns"]] == ["new"]
         # A segment with no tables applies everywhere: not about the new table.
         assert [s["name"] for s in body["segments"]] == ["recent"]
@@ -4880,7 +4932,7 @@ class TestApplyDrift:
                 {"budgets": ["id", "fiscal_year", "fiscal_quarter", "created_at"]},
             ),
             generated=self._annotate_all,
-            llm=([fiscal("Budget trend"), fiscal("Budget pace")], [], [], ["stale"], []),
+            llm=([fiscal("Budget trend"), fiscal("Budget pace")], [], []),
         )
         assert resp.status_code == 200
         warnings = resp.json()["semantic_model"]["generation_warnings"]
@@ -4936,7 +4988,7 @@ class TestApplyDrift:
             model=self._complete(),
             schema=_schema(["orders", "coupons", "events"], {"orders": [], "coupons": []}),
             generated=lambda **_kw: {"public.events": TableSemantic(display_name="Events (apply)")},
-            llm=([llm_metric], [], [], [], []),
+            llm=([llm_metric], [], []),
             current=(with_events, _snapshot()),
         )
         assert resp.status_code == 200
@@ -5093,13 +5145,7 @@ class TestApplyDrift:
             model=model,
             schema=schema,
             generated=self._annotate_all,
-            llm=(
-                [metric("ambiguous", "events"), metric("qualified", "sales.events")],
-                [],
-                [],
-                [],
-                [],
-            ),
+            llm=([metric("ambiguous", "events"), metric("qualified", "sales.events")], [], []),
         )
         assert resp.status_code == 200
         assert gen.generate_tables.await_args.kwargs["table_keys"] == ["sales.events"]

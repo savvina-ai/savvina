@@ -816,7 +816,7 @@ class ChatService:
                 token_count=gen.tokens_used,
                 input_tokens=gen.input_tokens,
                 output_tokens=gen.output_tokens,
-                warning=gen.tpm_warning,
+                warning=gen.user_warning,
             )
 
         except Exception as exc:

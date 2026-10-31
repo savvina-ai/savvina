@@ -389,7 +389,7 @@ function ChatMessageBubble({ message, onRetry, onEdit, userQuestion: _userQuesti
           </div>
         )}
 
-        {/* TPM warning — prompt was compressed due to token-per-minute limit; result may be degraded */}
+        {/* Pipeline warning — the prompt was compressed (TPM limit or context window) and the result may be degraded */}
         {message.warning && (
           <div className="flex items-start gap-3 rounded-xl border border-warning/50 bg-warning/15 px-4 py-3">
             <Info className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
