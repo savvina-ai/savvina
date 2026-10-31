@@ -15,7 +15,17 @@ from app.datasources.models import (
     SchemaInfo,
     TableInfo,
 )
-from app.semantic.models import AggregationType, SemanticModel, SimpleMetric, TableSemantic
+from app.semantic.models import (
+    AggregationType,
+    ColumnSemantic,
+    DerivedColumn,
+    RelationshipEdge,
+    Segment,
+    SemanticModel,
+    SimpleMetric,
+    TableSemantic,
+    ValueMapping,
+)
 from app.services.prompt_builder import PromptBuilder
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -240,6 +250,144 @@ class TestPromptBuilderSemanticModel:
             user_question="what happened last week",
         )
         assert "## Business Context" in prompt
+
+
+def _edge(*, required: bool) -> RelationshipEdge:
+    return RelationshipEdge(
+        from_table="public.orders",
+        from_column="customer_id",
+        to_table="public.customers",
+        to_column="id",
+        join_sql="public.orders.customer_id = public.customers.id",
+        is_required=required,
+    )
+
+
+class TestHasBusinessContext:
+    """``has_business_context`` is the one test of whether ``build_system_prompt`` writes a
+    ``## Business Context`` section; the pipeline's compression warning reads it too."""
+
+    def test_none_and_empty_models_have_none(self):
+        assert PromptBuilder.has_business_context(None) is False
+        assert PromptBuilder.has_business_context(SemanticModel()) is False
+
+    def test_each_rendered_part_alone_counts(self):
+        metric = SimpleMetric(name="R", definition="SUM(x)", aggregation=AggregationType.SUM)
+        for model in (
+            _make_semantic_model_with_tables(),
+            SemanticModel(business_metrics=[metric]),
+            SemanticModel(segments=[Segment(name="big", sql_expression="t > 1", description="d")]),
+            SemanticModel(time_expressions={"today": "CURRENT_DATE"}),
+        ):
+            assert PromptBuilder.has_business_context(model) is True
+
+    def test_parts_the_prompt_never_renders_alone_do_not_count(self):
+        derived = DerivedColumn(
+            name="margin", sql_expression="a - b", description="d", base_tables=["public.orders"]
+        )
+        for model in (
+            SemanticModel(relationships=[_edge(required=True)]),
+            SemanticModel(derived_columns=[derived]),
+            SemanticModel(notes=["fiscal year starts in April"]),
+        ):
+            assert PromptBuilder.has_business_context(model) is False
+
+    def test_it_agrees_with_what_the_prompt_writes(self):
+        derived = DerivedColumn(
+            name="margin", sql_expression="a - b", description="d", base_tables=["public.orders"]
+        )
+        models = [
+            None,
+            SemanticModel(),
+            SemanticModel(relationships=[_edge(required=False)]),
+            SemanticModel(derived_columns=[derived], notes=["n"]),
+            _make_semantic_model_with_tables(),
+            SemanticModel(time_expressions={"today": "CURRENT_DATE"}),
+        ]
+        for model in models:
+            prompt = _build_prompt(semantic_model=model)
+            assert ("## Business Context" in prompt) is PromptBuilder.has_business_context(model)
+
+
+class TestPromptBuilderRelationships:
+    """What the LLM reads about joins: the header says when to prefer LEFT JOIN."""
+
+    @staticmethod
+    def _model(*edges: RelationshipEdge) -> SemanticModel:
+        return SemanticModel(
+            tables={
+                "public.orders": TableSemantic(display_name="Orders"),
+                "public.customers": TableSemantic(display_name="Customers"),
+            },
+            relationships=list(edges),
+        )
+
+    def test_the_header_explains_inner_and_left_join(self):
+        prompt = _build_prompt(semantic_model=self._model(_edge(required=True)))
+        header = next(line for line in prompt.splitlines() if line.startswith("RELATIONSHIPS"))
+        assert "INNER JOIN marks a NOT NULL foreign key" in header
+        assert "use LEFT JOIN either way when every row of the left table must stay" in header
+        assert "put that filter in the ON clause" in header
+
+    def test_a_required_edge_is_an_inner_join_and_an_optional_one_a_left_join(self):
+        prompt = _build_prompt(semantic_model=self._model(_edge(required=True)))
+        assert "FROM orders INNER JOIN customers ON" in prompt
+        prompt = _build_prompt(semantic_model=self._model(_edge(required=False)))
+        assert "FROM orders LEFT JOIN customers ON" in prompt
+        assert "INNER JOIN customers" not in prompt
+
+    def test_the_old_promise_that_an_inner_join_is_safe_is_gone(self):
+        prompt = _build_prompt(semantic_model=self._model(_edge(required=True)))
+        assert "safe in either direction" not in prompt
+
+    def test_stored_common_joins_are_never_rendered(self):
+        from app.semantic.models import CommonJoin
+
+        model = self._model(_edge(required=False)).model_copy(
+            update={
+                "common_joins": [
+                    CommonJoin(
+                        description="Customer orders",
+                        tables=["orders", "customers"],
+                        join_pattern="customers.id = orders.customer_id",
+                    )
+                ]
+            }
+        )
+        prompt = _build_prompt(semantic_model=model)
+        assert "Customer orders" not in prompt
+
+
+class TestPromptBuilderValueMappings:
+    """A value mapping reaches the prompt as the user keeps it (the generator already
+    dropped the ones the privacy gate refuses); an empty list leaves no trace."""
+
+    @staticmethod
+    def _model(mappings: list[ValueMapping]) -> SemanticModel:
+        return SemanticModel(
+            tables={
+                "public.orders": TableSemantic(
+                    display_name="Orders",
+                    columns={
+                        "status": ColumnSemantic(display_name="Status", value_mappings=mappings)
+                    },
+                )
+            }
+        )
+
+    def test_mappings_are_listed_with_their_raw_values(self):
+        model = self._model(
+            [
+                ValueMapping(raw_value="P", display_value="Pending"),
+                ValueMapping(raw_value="C", display_value="Confirmed"),
+            ]
+        )
+        prompt = _build_prompt(semantic_model=model)
+        assert "Pending='P'" in prompt and "Confirmed='C'" in prompt
+
+    def test_a_dropped_mapping_leaves_nothing_in_the_prompt(self):
+        prompt = _build_prompt(semantic_model=self._model([]))
+        assert "Pending" not in prompt and "='P'" not in prompt
 
 
 # ── Few-shot examples section ──────────────────────────────────────────────────

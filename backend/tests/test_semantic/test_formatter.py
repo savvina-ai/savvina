@@ -36,40 +36,50 @@ def test_empty_model_returns_empty_string():
 # ── JOIN type selection ────────────────────────────────────────────────────────
 
 
-def test_inner_join_when_is_required_true():
-    model = SemanticModel(
-        relationships=[
-            RelationshipEdge(
-                from_table="public.orders",
-                from_column="customer_id",
-                to_table="public.customers",
-                to_column="id",
-                join_sql="public.orders.customer_id = public.customers.id",
-                is_required=True,
-            )
-        ]
+_REL_HEADER = "RELATIONSHIPS (INNER JOIN marks a NOT NULL foreign key"
+
+
+def _edge_lines(output: str) -> list[str]:
+    return [line for line in output.splitlines() if line.startswith("  FROM ")]
+
+
+def _edge(is_required: bool) -> RelationshipEdge:
+    return RelationshipEdge(
+        from_table="public.orders",
+        from_column="customer_id",
+        to_table="public.customers",
+        to_column="id",
+        join_sql="public.orders.customer_id = public.customers.id",
+        is_required=is_required,
     )
-    output = _fmt.format_for_prompt(model)
-    assert "INNER JOIN" in output
-    assert "LEFT JOIN" not in output
+
+
+def test_inner_join_when_is_required_true():
+    output = _fmt.format_for_prompt(SemanticModel(relationships=[_edge(True)]))
+    (line,) = _edge_lines(output)
+    assert "INNER JOIN" in line
+    assert "LEFT JOIN" not in line
 
 
 def test_left_join_when_is_required_false():
-    model = SemanticModel(
-        relationships=[
-            RelationshipEdge(
-                from_table="public.orders",
-                from_column="customer_id",
-                to_table="public.customers",
-                to_column="id",
-                join_sql="public.orders.customer_id = public.customers.id",
-                is_required=False,
-            )
-        ]
+    output = _fmt.format_for_prompt(SemanticModel(relationships=[_edge(False)]))
+    (line,) = _edge_lines(output)
+    assert "LEFT JOIN" in line
+    assert "INNER JOIN" not in line
+
+
+def test_relationships_header_says_when_to_prefer_left_join():
+    output = _fmt.format_for_prompt(SemanticModel(relationships=[_edge(True)]))
+    header = next(line for line in output.splitlines() if line.startswith("RELATIONSHIPS"))
+    assert header.startswith(_REL_HEADER)
+    assert "use LEFT JOIN" in header and "right table is filtered" in header
+    assert "ON clause" in header
+
+
+def test_no_relationships_no_header():
+    assert "RELATIONSHIPS" not in _fmt.format_for_prompt(
+        SemanticModel(tables={"public.t": TableSemantic(display_name="T")})
     )
-    output = _fmt.format_for_prompt(model)
-    assert "LEFT JOIN" in output
-    assert "INNER JOIN" not in output
 
 
 # ── Metric rendering ───────────────────────────────────────────────────────────

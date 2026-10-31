@@ -1,7 +1,7 @@
 # Copyright (c) 2025 Savvina AI Ltd
 # Licensed under the Business Source License 1.1 — see LICENSE for details.
 
-"""Unit tests for _compress_prompt() and _compact_semantic_model() in chat_service."""
+"""Unit tests for _compress_prompt() and _compact_semantic_model() in pipeline."""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ class TestCompressPrompt:
         builder = _make_builder(100)
         schema = DataSourceSchema(source_type="postgresql")
 
-        result = _compress_prompt(
+        result, _ = _compress_prompt(
             builder=builder,
             datasource=MagicMock(),
             schema=schema,
@@ -96,7 +96,7 @@ class TestCompressPrompt:
         builder = _make_builder(300, 90)
         schema = DataSourceSchema(source_type="postgresql")
 
-        result = _compress_prompt(
+        result, _ = _compress_prompt(
             builder=builder,
             datasource=MagicMock(),
             schema=schema,
@@ -122,7 +122,7 @@ class TestCompressPrompt:
             tables={"public.orders": TableSemantic(display_name="Orders")},
         )
 
-        result = _compress_prompt(
+        result, _ = _compress_prompt(
             builder=builder,
             datasource=MagicMock(),
             schema=schema,
@@ -148,7 +148,7 @@ class TestCompressPrompt:
         builder = _make_builder(300, 300, 300, 80)
         schema = DataSourceSchema(source_type="postgresql")
 
-        result = _compress_prompt(
+        result, _ = _compress_prompt(
             builder=builder,
             datasource=MagicMock(),
             schema=schema,
@@ -171,7 +171,7 @@ class TestCompressPrompt:
         builder = _make_builder(300, 250, 200, 150, 120)  # all over budget of 100
         schema = DataSourceSchema(source_type="postgresql")
 
-        result = _compress_prompt(
+        result, _ = _compress_prompt(
             builder=builder,
             datasource=MagicMock(),
             schema=schema,
@@ -195,7 +195,7 @@ class TestCompressPrompt:
         datasource = MagicMock()
         datasource.format_schema_for_llm.return_value = "-- schema part --"
 
-        result = _compress_prompt(
+        result, _ = _compress_prompt(
             builder=builder,
             datasource=datasource,
             schema=schema,
@@ -276,7 +276,7 @@ class TestCompressPrompt:
         builder = _make_builder(300, 300, 300, 80)
         schema = DataSourceSchema(source_type="postgresql")
 
-        result = _compress_prompt(
+        result, _ = _compress_prompt(
             builder=builder,
             datasource=MagicMock(),
             schema=schema,
