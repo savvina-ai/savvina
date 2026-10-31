@@ -2,6 +2,29 @@
 
 <!-- version list -->
 
+## v3.0.1 (2026-10-31)
+
+### Bug Fixes
+
+- **semantic**: Drop value mappings the privacy gate refuses, lint metric filter literals, stop
+  generating common joins, and warn in chat when compression removes the semantic model
+  ([#23](https://github.com/savvina-ai/savvina/pull/23),
+  [`7417994`](https://github.com/savvina-ai/savvina/commit/7417994b1d49efd86aa58636d5035d6568c262cf))
+
+### Documentation
+
+- **semantic**: Correct the user guide on filters and cardinality, document the new generation
+  rules, and update the semantic UI wording ([#23](https://github.com/savvina-ai/savvina/pull/23),
+  [`7417994`](https://github.com/savvina-ai/savvina/commit/7417994b1d49efd86aa58636d5035d6568c262cf))
+
+### Testing
+
+- **semantic**: Cover the value-mapping guard, filter lint, prompt rendering and compression
+  warning, with live-database and opt-in live-Gemini runs
+  ([#23](https://github.com/savvina-ai/savvina/pull/23),
+  [`7417994`](https://github.com/savvina-ai/savvina/commit/7417994b1d49efd86aa58636d5035d6568c262cf))
+
+
 ## v3.0.0 (2026-10-30)
 
 ### Bug Fixes
