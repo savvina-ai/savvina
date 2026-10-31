@@ -383,6 +383,8 @@ The resulting examples are injected into the prompt under `## Example Queries`.
 4. No few-shot, no semantic model
 5. No few-shot, no semantic model, minimal schema (no sample values / comments / row counts — `PrivacySettings` overridden in-memory)
 
+When the compression dropped or compacted the semantic model, the user is told. `_compress_prompt` returns, with the prompt, what it kept of the model (`"full"`, `"compact"` or `"dropped"`), and `pipeline._semantic_context_warning(fit, semantic_model)` turns that into the warning: dropped, when the prompt would have rendered the model at all (`PromptBuilder.has_business_context`: it has tables, metrics, segments or time expressions); compacted, when the compact copy still renders a Business Context section and had tables, relationships or derived columns to strip (a compact copy that renders nothing counts as dropped). The result is `_GenerationResult.semantic_warning`; `_GenerationResult.user_warning` joins it with the TPM compression note when there is one, and the chat's `DoneEvent.warning` carries it under the answer.
+
 ### Step 11: Conversation History
 
 **File:** `services/pipeline.py` → `_load_history(session_id, db)`  

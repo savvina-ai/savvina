@@ -70,7 +70,7 @@ export default function GenerationBanner({
           title={
             disabledReason ??
             finishReason ??
-            'Generate metrics and joins from the tables already generated'
+            'Generate metrics, segments and derived columns from the tables already generated'
           }
           className={cn(button, 'bg-warning/20 hover:bg-warning/30')}
         >

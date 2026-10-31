@@ -37,7 +37,7 @@ If the prompt exceeds the provider's context window, a compression cascade drops
 6. Review the output carefully — especially **Business Metrics** and their filters.
 7. Click **Save Changes**.
 
-Once a model exists the button reads **Regenerate**. Regenerating asks the LLM to re-annotate the model from your current schema. Saved fields you edited by hand are kept, and tables and columns that are no longer in the database are removed. Deleting a generated item is not remembered: a metric, segment, derived column, join or relationship the LLM generated and you deleted (or renamed) may come back on the next regenerate, so delete it again after regenerating if you do not want it. A hand edit that names a column the table no longer has (for example a primary timestamp column) is cleared or trimmed, and the **Incomplete generation** box at the top of the page says so.
+Once a model exists the button reads **Regenerate**. Regenerating asks the LLM to re-annotate the model from your current schema. Saved fields you edited by hand are kept, and tables and columns that are no longer in the database are removed. Deleting a generated item is not remembered: a metric, segment, derived column or relationship the LLM generated and you deleted (or renamed) may come back on the next regenerate, so delete it again after regenerating if you do not want it. A hand edit that names a column the table no longer has (for example a primary timestamp column) is cleared or trimmed, and the **Incomplete generation** box at the top of the page says so.
 
 A run starts from the saved model, so generation is disabled while you have unsaved edits: save them first. While a run is in progress the editors are read-only ("Editing is paused while generation runs."), **Save Changes** and applying suggestions are disabled, and **Regenerate** shows *Generating…* until the run ends.
 
@@ -49,8 +49,8 @@ A provider rate limit, a timeout or a closed tab can stop a run part-way (a rate
 
 | Action | What it does |
 |--------|--------------|
-| **Resume** | Generates only the tables that are still missing, then the metrics and joins. |
-| **Finish with what's generated** | Skips the missing tables and builds the metrics and joins from the tables already generated. Disabled when no tables were generated. |
+| **Resume** | Generates only the tables that are still missing, then the metrics, segments and derived columns. |
+| **Finish with what's generated** | Skips the missing tables and builds the metrics, segments and derived columns from the tables already generated. Disabled when no tables were generated. |
 | **Restart from scratch** | Deletes the model, including your edits, and generates it again. The only action that discards work; it asks for confirmation first. |
 
 Resume is refused if the database schema changed since the interrupted run. Use **Regenerate** in that case: it generates against the current schema and keeps your edits. **Restart from scratch** also works but discards them.
@@ -68,7 +68,7 @@ POST /api/v1/connections/{id}/semantic/generate/init?provider=claude
 POST /api/v1/connections/{id}/semantic/generate/batch?provider=claude
 {"table_keys": ["public.customers", "public.orders"]}
 
-# Phase 3 — generate cross-table metrics, joins, and derived columns
+# Phase 3 — generate cross-table metrics, segments and derived columns
 POST /api/v1/connections/{id}/semantic/generate/globals?provider=claude
 ```
 
@@ -94,8 +94,8 @@ Fields you edit by hand are remembered as yours: a later regenerate refreshes th
 
 **Preview & apply** syncs the model to the changes **Check Drift** found, without regenerating the tables that did not change.
 
-1. **Preview.** Click **Preview & apply**. A panel headed "Apply Drift will:" lists, by name, what the apply would change — for example "Will remove 1 table: ecommerce.coupons" — the new tables and new columns it would annotate, and the columns it would rename (at most 12 new tables per apply; any more are counted in a warning that names up to five of them). Nothing is written to the model until you click **Apply these changes**; **Cancel** closes the preview. The preview makes no LLM call, so the annotations of new columns, relationships to new tables and the metrics, joins and other items the LLM writes over new tables appear only after you apply. The relationships the database defines on the new columns between tables the model already holds are listed.
-2. **Apply.** Removed tables leave the model with the relationships that use them and the metrics, joins and derived columns that list the table by its qualified name (a metric that names the table by bare name stays, and Check Drift reports it; a bare-name reference in a join or derived column, or one only inside SQL, stays and is not reported), and with the segments that apply only to them (a segment that also covers a surviving table stays and stops applying to the removed one). Removed columns leave their table with the relationships and table settings that used them (primary timestamp and date columns, partition and cluster columns, hierarchy levels); free SQL such as default filters and metric expressions is left as written. A renamed column keeps its annotation, your edits, those table settings and its relationships under its new name (see [New columns](#new-columns)). New columns are annotated by the LLM and added to their table; the columns the table already had, and its settings such as the primary timestamp column, are not touched. New tables are annotated by the LLM, and the new metrics, joins, derived columns and segments the LLM writes over them are added beside the ones you have (nothing is added over tables that did not change, so an item you deleted stays deleted). A metric, join or segment removed with its table loses any edit mark, and one of the same name written by the LLM is a fresh item. Your hand edits on surviving tables are kept. Tables hidden by privacy settings, and on PostgreSQL (if the role can read the system catalog) tables unreadable by the connection's role, are left alone.
+1. **Preview.** Click **Preview & apply**. A panel headed "Apply Drift will:" lists, by name, what the apply would change — for example "Will remove 1 table: ecommerce.coupons" — the new tables and new columns it would annotate, and the columns it would rename (at most 12 new tables per apply; any more are counted in a warning that names up to five of them). Nothing is written to the model until you click **Apply these changes**; **Cancel** closes the preview. The preview makes no LLM call, so the annotations of new columns, relationships to new tables and the metrics and other items the LLM writes over new tables appear only after you apply. The relationships the database defines on the new columns between tables the model already holds are listed.
+2. **Apply.** Removed tables leave the model with the relationships that use them and the metrics, joins and derived columns that list the table by its qualified name (a metric that names the table by bare name stays, and Check Drift reports it; a bare-name reference in a join or derived column, or one only inside SQL, stays and is not reported), and with the segments that apply only to them (a segment that also covers a surviving table stays and stops applying to the removed one). Removed columns leave their table with the relationships and table settings that used them (primary timestamp and date columns, partition and cluster columns, hierarchy levels); free SQL such as default filters and metric expressions is left as written. A renamed column keeps its annotation, your edits, those table settings and its relationships under its new name (see [New columns](#new-columns)). New columns are annotated by the LLM and added to their table; the columns the table already had, and its settings such as the primary timestamp column, are not touched. New tables are annotated by the LLM, and the new metrics, derived columns and segments the LLM writes over them are added beside the ones you have (nothing is added over tables that did not change, so an item you deleted stays deleted). A metric or segment removed with its table loses any edit mark, and one of the same name written by the LLM is a fresh item. Your hand edits on surviving tables are kept. Tables hidden by privacy settings, and on PostgreSQL (if the role can read the system catalog) tables unreadable by the connection's role, are left alone.
 3. **Result.** A "Schema drift applied" summary of what actually changed stays on the page until you dismiss it or start another preview, apply or run, and the apply is added to **Drift history**.
 
 Things to know:
@@ -133,7 +133,7 @@ Editable view of every table in the model. Each table entry contains:
 |-------|-------------|
 | **Display name** | Human-readable table name shown to the LLM (e.g. `Orders` instead of `tbl_ord_mstr`). |
 | **Description** | One-sentence description of what the table contains. |
-| **Default filters** | SQL conditions always applied to this table (e.g. `o.status NOT IN ('cancelled', 'refunded')`). The LLM is instructed to apply these unless the user explicitly asks to override. **This is the strongest way to enforce domain constraints on generated SQL.** |
+| **Default filters** | SQL conditions the LLM is told to apply to this table in every query (e.g. `o.status NOT IN ('cancelled', 'refunded')`). The LLM applies them unless the user explicitly asks to include the filtered-out rows. **This is an instruction to the LLM, not a guarantee:** nothing checks the generated SQL for them. A condition that must hold on every query belongs in the connection's [row filters](04_privacy-controls.md#row-filters), which are applied to the SQL before it runs. |
 | **Domain** | Optional business domain tag (e.g. `finance`, `marketing`, `ops`). Tables sharing the same domain receive a cosine-score boost during schema pruning so they tend to be selected together even if some have lower individual similarity scores. Leave blank if your schema is not partitioned by domain. |
 | **Grain** | Describes what one row represents (e.g. `one row per order`, `one row per daily snapshot per user`). Injected verbatim so the LLM understands the table's granularity and avoids incorrect fan-out joins. |
 | **Primary timestamp column** | Column to use for time-based questions by default (e.g. `created_at`). Rendered with a `[primary timestamp]` label in the column summary block. |
@@ -152,24 +152,24 @@ Click any column row to expand it:
 |-------|-------------|
 | **Display name** | Human-readable column name. |
 | **Description** | What the column contains. |
-| **Value mappings** | Maps raw coded values to display labels (e.g. `confirmed → Confirmed`). Enumerates all valid values in the prompt — prevents the LLM from hallucinating values like `'completed'` that don't exist in the data. Add entries for every status/type column. The raw values are sent to the LLM on every question, whatever **Include sample values** says and whether or not the column matches a sensitive pattern; see [Privacy Controls](04_privacy-controls.md#semantic-value-mappings). |
+| **Value mappings** | Maps raw coded values to display labels (e.g. `confirmed → Confirmed`). Enumerates all valid values in the prompt — prevents the LLM from hallucinating values like `'completed'` that don't exist in the data. Add entries for every status/type column. Generation keeps the mappings it proposes only for a column whose values may reach the LLM (**Include sample values** on, no sensitive pattern); for other columns, add them by hand. A generated mapping on a column that is not a MySQL ENUM/SET may be inferred from the column's name or comment: check it against the data. The raw values are sent to the LLM on every question, whatever **Include sample values** says and whether or not the column matches a sensitive pattern; see [Privacy Controls](04_privacy-controls.md#semantic-value-mappings). |
 | **Sensitive** | Marks the column `[SENSITIVE]`. The column is omitted entirely from the LLM prompt (not just from SELECT clauses). |
 | **Default aggregation** | Prescribes the aggregation function to use for this column: `sum`, `count`, `count_distinct`, `count_distinct_approx`, `average`, `max`, `min`, `median`. Appended as `[aggregate: sum]` in the prompt. |
 | **Non-additive** | When `true`, the LLM is told never to SUM this column across dimensions (e.g. distinct-count metrics, percentages, balances). Use for any measure that is not safely addable across rows. |
 | **Time granularity** | The coarsest meaningful time grain for DATE or TIMESTAMP columns: `second`, `minute`, `hour`, `day`, `week`, `month`, `quarter`, `year`. Appended as `[grain: month]` in the prompt. |
 
-> Column Intelligence fields (`semantic_type`, `cardinality`, `currency`, `unit`) are auto-generated and shown in the Column Intelligence tab. They are not editable in the Tables tab UI but are preserved when you save.
+> Column Intelligence fields: `semantic_type`, `currency` and `unit` are proposed by the LLM; `cardinality` is never generated. The Column Intelligence tab shows `semantic_type` and `cardinality`; all four are edited in the column editor of the **Tables** tab.
 
 ---
 
 ### Column Intelligence
 
-Read-only panel summarising auto-generated metadata for every column across all tables:
+Read-only panel showing the semantic type and cardinality of every column across all tables. The values of all four fields are listed below; `currency` and `unit` appear only in the column editor:
 
 | Attribute | Values |
 |-----------|--------|
 | **Semantic type** | `identifier`, `status_flag`, `monetary`, `percentage`, `timestamp`, `date`, `free_text`, `categorical`, `boolean_flag`, `foreign_key`, `url`, `email`, `phone`, `measurement`, `count`, `unknown` |
-| **Cardinality** | `unique`, `high` (>100 distinct), `medium` (10–100), `low` (<10 — good for filtering/grouping) |
+| **Cardinality** | `unique`, `high` (>100 distinct), `medium` (10–100), `low` (<10). Not generated: set it yourself in the column editor or via the API when you know it. Only `low` changes the prompt: it puts the column on the *Group by* line, unless its semantic type already lists it under aggregates, dates or identifiers. `unique`, `high` and `medium` have no effect on the prompt. |
 | **Currency** | ISO code for `monetary` columns (e.g. `EUR`, `USD`). |
 | **Unit** | Physical unit for `measurement` columns (e.g. `kg`, `km`). |
 
@@ -189,7 +189,7 @@ Named, reusable calculations for common KPIs. The LLM is instructed to use the e
 |-------|-------------|
 | **Name** | Short label (e.g. `Total Revenue`, `Customer Total Spend`). |
 | **Description** | Plain-English explanation of what the metric measures. |
-| **Filters** | SQL conditions applied as a post-aggregation filter when this metric is used (e.g. `o.status NOT IN ('cancelled', 'refunded')`). Rendered as `[filter: ...]` in the prompt. |
+| **Filters** | SQL conditions the LLM is told to apply as row filters (`WHERE` conditions) whenever this metric is used (e.g. `o.status NOT IN ('cancelled', 'refunded')`). Rendered as `[filter: ...]` in the prompt. For a condition inside the aggregate itself use **Measure filters** below; there is no post-aggregation (`HAVING`) field. |
 | **Related tables** | Comma-separated table keys (e.g. `store.orders, store.customers`). |
 | **Format hint** | Optional display format: `currency_eur`, `currency_usd`, `currency_gbp`, `percentage`, `integer`. |
 | **Non-additive** | When `true`, the LLM is warned not to SUM this metric across dimensions and is told to use `LAST_VALUE` or a snapshot approach instead. |
@@ -239,7 +239,7 @@ The `metric_type` field selects the calculation variant. The UI creates `simple`
 | **Window** | Time window for attribution (e.g. `7 days`). |
 | **Calculation** | `conversion_rate` (default) or `conversions` (absolute count). |
 
-> **Warning:** Auto-generated metrics often have wrong filter values — the LLM guesses status values from training data (e.g. `status = 'completed'`) that may not exist in your database. Always verify with `SELECT DISTINCT status FROM table` and correct accordingly. A wrong filter here actively teaches the LLM to use the wrong value for every spend-related query.
+> **Warning:** Auto-generated metrics often have wrong filter values — the LLM guesses status values from training data (e.g. `status = 'completed'`) that may not exist in your database. Always verify with `SELECT DISTINCT status FROM table` and correct accordingly. A wrong filter here actively teaches the LLM to use the wrong value for every spend-related query. When the column has value mappings, a metric filter whose value is not among them is reported in the **Incomplete generation** box at the top of the page, naming the metric, the column, the value and the mapped values; a column without mappings is not checked. The column is found through the filter's table name (`orders.status`) or the metric's **Related tables**: a filter whose column belongs to neither is not checked, and neither is one whose column two of those tables map differently. **Regenerate** runs the check over every metric the model keeps, hand-edited ones included, and **Apply Drift** over the metrics it adds. The warning stays until the next Regenerate or Apply Drift.
 
 ---
 
@@ -253,13 +253,13 @@ Frequently-used join patterns stored as model metadata.
 | **Tables** | Tables involved. |
 | **Join pattern** | SQL ON condition (e.g. `customers.id = orders.customer_id`). |
 
-> **Common Joins are not injected into the LLM prompt.** The **Relationships** tab covers formal FK joins, which the LLM prefers. Common Joins are retained for documentation and tooling purposes only.
+> **Common Joins are not injected into the LLM prompt and are no longer generated.** The **Relationships** tab covers formal FK joins, which the LLM uses. Joins already stored, or added through the API, are kept and shown here for documentation only, except that a Regenerate removes a generated join over a table that left the database (a join you edited is always kept).
 
 ---
 
 ### Relationships
 
-Formal foreign-key relationships sourced from `information_schema` (never inferred). Rendered under `RELATIONSHIPS (use these for JOINs)`. The LLM prefers these over ad-hoc join patterns.
+Formal foreign-key relationships sourced from `information_schema` (never inferred). Rendered under the prompt's `RELATIONSHIPS` block, whose header tells the LLM when to prefer `LEFT JOIN`. The LLM prefers these over ad-hoc join patterns.
 
 | Field | Description |
 |-------|-------------|
@@ -267,7 +267,7 @@ Formal foreign-key relationships sourced from `information_schema` (never inferr
 | **To table / column** | Parent side of the FK (e.g. `store.customers.id`). |
 | **Relationship type** | `many_to_one`, `one_to_one`, `one_to_many`. |
 | **Join SQL** | Full join condition included verbatim in the prompt. |
-| **Required** | `true` if the FK column is NOT NULL — the LLM uses `INNER JOIN`. `false` (nullable FK) — the LLM uses `LEFT JOIN` to preserve rows. |
+| **Required** | `true` if the FK column is NOT NULL — rendered as `INNER JOIN`. `false` (nullable FK) — rendered as `LEFT JOIN`. The block's header tells the LLM to use `LEFT JOIN` either way when every row of the left table must stay, for example when the right table is filtered, with that filter in the `ON` clause: NOT NULL guarantees the key, not that the parent row survives the query's other conditions. |
 | **Entity type** | Role of the `from_table` in the relationship: `primary` (PK/dimension side), `unique` (alternate key), `foreign` (FK/fact side), `natural` (business key, may not be unique). Appended as a hint in the prompt. |
 | **Description** | Optional contextual note. |
 
@@ -373,7 +373,7 @@ Table "store.orders" → Orders
   Identifiers:    id, customer_id  [do not aggregate]
   Drill path (Date Hierarchy): year → quarter → month → week → day
 
-RELATIONSHIPS:
+RELATIONSHIPS (INNER JOIN marks a NOT NULL foreign key, LEFT JOIN a nullable one; use LEFT JOIN either way when every row of the left table must stay, e.g. when the right table is filtered, and put that filter in the ON clause):
   FROM orders INNER JOIN customers ON store.orders.customer_id = store.customers.id
 
 Business Metrics:
@@ -401,7 +401,7 @@ TIME EXPRESSIONS (use these for date-based questions):
 
 ## Priority of Constraints (Strongest → Weakest)
 
-1. **Default filters** on tables — always applied; override training data bias.
+1. **Default filters** on tables — the LLM is told to apply them to every query against the table; the strongest instruction, but not checked on the generated SQL.
 2. **Business Metric filters** — `[filter: ...]` on named calculations.
 3. **Named Filters (Segments)** — reusable WHERE-clause fragments; referenced by name.
 4. **Value mappings** — enumerate valid values; prevent hallucinated values.
@@ -421,7 +421,7 @@ The LLM guesses status values from training data (e.g. `'completed'`) that may n
 SELECT DISTINCT status FROM schema.table ORDER BY 1;
 ```
 
-Correct the metric filter and — for strongest enforcement — also set a **Default filter** on the table itself (e.g. `o.status NOT IN ('cancelled', 'refunded')`).
+Correct the metric filter and also set a **Default filter** on the table itself (e.g. `o.status NOT IN ('cancelled', 'refunded')`), which the LLM is told to apply to every query against the table. For a rule that must hold whatever the question says, use the connection's [row filters](04_privacy-controls.md#row-filters).
 
 ### Sensitive columns blocking entire queries
 
@@ -436,7 +436,7 @@ For connections with many tables and columns, the full semantic model may not fi
 3. If still too large, the entire semantic model is dropped.
 4. Finally, schema annotations (sample values, comments, row counts) are stripped.
 
-Check backend logs for `semantic_context=False` to confirm the model was dropped entirely. Mitigations:
+When step 2 or 3 happened, the answer in the chat carries a warning saying whether the model was compacted or left out; with debug logging on, the backend log also shows `semantic_context=False` when it was dropped. Mitigations:
 
 - Use a provider with a larger context window (Claude, GPT-4o).
 - Exclude unused schemas/tables via connection privacy settings.

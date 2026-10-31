@@ -186,14 +186,14 @@ describe('SemanticModelPage — finishing an interrupted generation', () => {
     renderPage();
     await user.click(await screen.findByRole('button', { name: /Finish with what's generated/i }));
 
-    expect(await screen.findByText('Building metrics and joins…')).toBeInTheDocument();
+    expect(await screen.findByText('Building metrics…')).toBeInTheDocument();
     expect(screen.queryByText('Analysing tables…')).not.toBeInTheDocument();
     // The banner must go while the call is in flight, or the user can double-fire it.
     expect(screen.queryByText(/Generation was interrupted at table/)).not.toBeInTheDocument();
 
     gate.resolve(COMPLETE_MODEL);
     await waitFor(() =>
-      expect(screen.queryByText('Building metrics and joins…')).not.toBeInTheDocument(),
+      expect(screen.queryByText('Building metrics…')).not.toBeInTheDocument(),
     );
   });
 
@@ -209,7 +209,7 @@ describe('SemanticModelPage — finishing an interrupted generation', () => {
 
     renderPage();
     await user.click(await screen.findByRole('button', { name: /Finish with what's generated/i }));
-    await screen.findByText('Building metrics and joins…');
+    await screen.findByText('Building metrics…');
 
     // The toolbar button reads 'Generating…' for the duration of ANY generation run.
     const regenerate = screen.getByRole('button', { name: 'Generating…' });
@@ -1154,12 +1154,12 @@ describe('SemanticModelPage — switching connections mid-run', () => {
     );
 
     await user.click(await screen.findByRole('button', { name: /Finish with what's generated/i }));
-    expect(await screen.findByText('Building metrics and joins…')).toBeInTheDocument();
+    expect(await screen.findByText('Building metrics…')).toBeInTheDocument();
 
     await user.click(screen.getByRole('link', { name: 'Go to B' }));
     expect(await screen.findByText('Customers')).toBeInTheDocument();
     // A's run does not follow the user to B.
-    expect(screen.queryByText('Building metrics and joins…')).not.toBeInTheDocument();
+    expect(screen.queryByText('Building metrics…')).not.toBeInTheDocument();
     await waitFor(() =>
       expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled(),
     );
