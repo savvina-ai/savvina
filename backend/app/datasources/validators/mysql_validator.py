@@ -48,10 +48,12 @@ _LEADING_READ = re.compile(
 # and the strict guard use the same opener (``services.result_masking.EXECUTABLE_COMMENT``);
 # keep the two in step.
 _EXECUTABLE_OPENER = re.compile(r"/\*M?!\d*")
-# Text sqlparse reads as a comment while the server runs it: an executable-comment opener, or
-# two dashes the server does not read as a comment. Where one is present, sqlparse's tokens
-# do not show all the code, so the INTO check falls back to the scan text.
-_HIDDEN_FROM_SQLPARSE = re.compile(rf"/\*M?!|{_DASHES_AS_CODE}")
+# Text sqlparse reads differently from the server: an executable-comment opener or two dashes
+# the server does not read as a comment (sqlparse takes both for comments while the server
+# runs them), or a # (sqlparse reads INTO#x as one name, the server ends the word at the #).
+# Where one is present, sqlparse's tokens do not show all the code, so the INTO check falls
+# back to the scan text.
+_HIDDEN_FROM_SQLPARSE = re.compile(rf"/\*M?!|{_DASHES_AS_CODE}|#")
 
 
 class MySQLValidator(BaseSQLValidator):
@@ -125,10 +127,11 @@ class MySQLValidator(BaseSQLValidator):
         # reads sqlparse's tokens, and sqlparse takes /*! INTO @x */ and the rest of the line
         # after --1 for a comment while the server runs them: the value then sits in a
         # variable on the pooled connection that a later SELECT @x returns past result
-        # masking. When the text holds an executable comment or dashes the server does not
-        # read as a comment, INTO is refused anywhere in the scan text, a literal or comment
-        # included. Executable comments themselves stay allowed (/*! STRAIGHT_JOIN */), as for
-        # every other pattern here; the strict sensitive-column mode refuses them outright.
+        # masking; INTO#x then @v on the next line likewise reads as one name. When the text
+        # holds an executable comment, dashes the server does not read as a comment or a #,
+        # INTO is refused anywhere in the scan text, a literal or comment included. Executable
+        # comments themselves stay allowed (/*! STRAIGHT_JOIN */), as for every other pattern
+        # here; the strict sensitive-column mode refuses them outright.
         if _HIDDEN_FROM_SQLPARSE.search(query) and re.search(r"\bINTO\b", scan):
             return ValidationResult(
                 is_valid=False,

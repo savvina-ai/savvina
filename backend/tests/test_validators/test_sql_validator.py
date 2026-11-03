@@ -546,6 +546,42 @@ class TestMySQLExecutableCommentInto:
         assert self.v.validate(query).is_valid
 
 
+class TestMySQLHashCommentInto:
+    """sqlparse reads ``INTO#x`` as one name, while the server ends the word at ``#`` and
+    skips the comment to the end of the line, so ``SELECT 1 INTO#x\\n@v`` sets ``@v``
+    (verified on MySQL 8.0.46). When the text holds a ``#``, INTO is refused anywhere in it."""
+
+    def setup_method(self):
+        self.v = MySQLValidator()
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT 1 FROM u LIMIT 1 INTO#x\n@v",
+            "SELECT 1 FROM u INTO#\n@v",
+            "SELECT 1 FROM u INTO#x\nOUTFILE '/tmp/x'",
+            "SELECT 1 FROM u INTO#x\nDUMPFILE '/tmp/x'",
+            "SELECT 1 FROM u into#x\n@v",
+            "SELECT 1 FROM u #c\nINTO#x\n@v",
+        ],
+    )
+    def test_into_with_a_hash_comment_is_refused(self, query):
+        result = self.v.validate(query)
+        assert not result.is_valid
+        assert result.error_message == "SELECT … INTO is not allowed: it writes to the database"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT a FROM t #note\nWHERE b = 1",
+            "SELECT 1 FROM notes WHERE body LIKE '%#tag%'",
+            "SELECT 1 FROM notes WHERE body LIKE '%logged into%'",
+        ],
+    )
+    def test_a_hash_without_into_or_into_without_a_hash_pass(self, query):
+        assert self.v.validate(query).is_valid
+
+
 class TestMultiStatementAfterAComment:
     """A comment between the semicolon and the next statement is a gap to the server, so
     ``;/**/SET`` is two statements as much as ``; SET``."""
