@@ -94,7 +94,7 @@ When a query is served from the cache:
 
 | Mode | Behavior |
 |---|---|
-| Auto-Execute | Cached query executes immediately; response tagged `status: cached` |
+| Auto-Execute | Cached query executes immediately; response tagged `status: cached`. If the query itself fails, the entry is dropped and a fresh query is generated and run in the same request (not tagged cached) |
 | Review First | Cached query is still shown for review before execution |
 | Generate Only | Cached query is shown; no execution |
 

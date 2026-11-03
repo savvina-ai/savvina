@@ -100,6 +100,13 @@ class SemanticModelRow(_Provenanced, Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now
     )
+    # The latest drift report (a ``DriftReport`` dump) of either Check Drift or the
+    # background monitor, and when it was made (``store.record_drift_report``). Bookkeeping:
+    # no version bump, no history, not part of ``SemanticModel``.
+    last_drift_report: Mapped[dict[str, Any] | None] = mapped_column(_JSON, nullable=True)
+    last_drift_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class SemanticKnownColumnsRow(Base):
@@ -124,6 +131,37 @@ class SemanticKnownColumnsRow(Base):
     table_key: Mapped[str] = mapped_column(String(512), nullable=False)
     # Sorted column names, replaced whole per table (bounded by the table's width).
     columns: Mapped[list[str]] = mapped_column(_JSON, nullable=False, default=list)
+
+
+class SemanticTombstoneRow(Base):
+    """A metric, segment, derived column, common join or relationship the user deleted
+    from the model (``store.apply_user_patch`` writes one per item that left a rewritten
+    section, whatever its marks). The globals finalisation and Apply Drift leave a generated
+    item whose key is tombstoned out, so the deletion holds across regenerations; adding the
+    item back, or **Restore** on the page, deletes the row.
+
+    ``key`` is the item's identity as the store keys it: the metric, segment or derived-
+    column name, the join pattern, or ``relationship_key(edge)``. Bookkeeping like
+    ``SemanticKnownColumnsRow``: not ``_Provenanced``, no version bump, no history, never
+    rebuilt by ``save_model``, gone with the model (cascade).
+    """
+
+    __tablename__ = "semantic_tombstones"
+    __table_args__ = (
+        PrimaryKeyConstraint("connection_id", "kind", "key"),
+        Index("ix_semantic_tombstones_model", "model_id"),
+    )
+
+    model_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("semantic_models.id", ondelete="CASCADE"), nullable=False
+    )
+    connection_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    key: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+    created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
 
 class SemanticTableRow(_Provenanced, Base):
@@ -291,7 +329,7 @@ class SemanticHistoryRow(Base):
     entity_key: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
     # 'insert' | 'update' | 'delete'
     action: Mapped[str] = mapped_column(String(16), nullable=False)
-    # 'user' | 'generation' | 'migration' | 'drift'
+    # 'user' | 'generation' | 'drift' ('migration' is unused: 0003 writes no history rows)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="user")
     old_value: Mapped[dict[str, Any] | None] = mapped_column(_JSON, nullable=True)
     new_value: Mapped[dict[str, Any] | None] = mapped_column(_JSON, nullable=True)

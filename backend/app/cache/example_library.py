@@ -126,22 +126,3 @@ class ExampleLibrary:
             for ex, distance in rows
             if (1.0 - distance) >= min_similarity
         ][:limit]
-
-    async def list_examples(self, connection_id: str, db: AsyncSession) -> list[ExampleEntry]:
-        """Return all examples for *connection_id*, ordered by creation time."""
-        result = await db.execute(
-            select(VerifiedExample)
-            .where(VerifiedExample.connection_id == connection_id)
-            .order_by(VerifiedExample.created_at)
-        )
-        examples = result.scalars().all()
-        return [
-            ExampleEntry(
-                id=ex.id,
-                question=ex.question,
-                query=ex.query,
-                query_dialect=ex.query_dialect,
-                created_at=ex.created_at.isoformat() if ex.created_at else None,
-            )
-            for ex in examples
-        ]

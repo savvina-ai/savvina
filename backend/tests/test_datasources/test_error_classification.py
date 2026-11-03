@@ -44,6 +44,11 @@ class TestCategoryForSqlstate:
             ("0A000", ErrorCategory.UNSUPPORTED),
             ("25006", ErrorCategory.UNSUPPORTED),  # read_only_sql_transaction
             ("57014", ErrorCategory.TIMEOUT),  # query_canceled
+            ("08003", ErrorCategory.CONNECTION),  # connection_does_not_exist
+            ("08006", ErrorCategory.CONNECTION),  # connection_failure
+            ("57P01", ErrorCategory.CONNECTION),  # admin_shutdown
+            ("57P02", ErrorCategory.CONNECTION),  # crash_shutdown
+            ("57P03", ErrorCategory.CONNECTION),  # cannot_connect_now
             ("XX000", ErrorCategory.OTHER),
             ("4270", ErrorCategory.OTHER),  # wrong length
             ("", ErrorCategory.OTHER),
@@ -256,6 +261,42 @@ class TestPostgreSQLClassifyError:
     def test_plain_exception_is_other(self) -> None:
         assert self.adapter.classify_error(ValueError("x")) is ErrorCategory.OTHER
 
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            asyncpg_exc.ConnectionDoesNotExistError(
+                "connection was closed in the middle of operation"
+            ),
+            asyncpg_exc.AdminShutdownError("terminating connection due to administrator command"),
+            asyncpg_exc.InterfaceError("connection is closed"),
+            asyncpg_exc.InterfaceError(
+                "cannot call Connection.fetch(): connection has been released back to the pool"
+            ),
+        ],
+    )
+    def test_a_lost_connection_is_a_connection_error(self, exc: Exception) -> None:
+        assert self.adapter.classify_error(exc) is ErrorCategory.CONNECTION
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # The model wrote a $1 placeholder: the query's fault, worth a correction.
+            "the server expects 1 argument for this query, 0 were passed",
+            "cannot perform operation: another operation is in progress",
+        ],
+    )
+    def test_an_interface_error_about_something_else_is_not_a_connection_error(
+        self, text: str
+    ) -> None:
+        exc = asyncpg_exc.InterfaceError(text)
+        assert self.adapter.classify_error(exc) is not ErrorCategory.CONNECTION
+
+    def test_an_interface_error_subclass_is_not_a_connection_error(self) -> None:
+        # The client-side InterfaceError subclasses (unsupported feature, configuration,
+        # argument encoding) are not a lost link.
+        exc = asyncpg_exc.UnsupportedClientFeatureError("feature not supported")
+        assert self.adapter.classify_error(exc) is ErrorCategory.OTHER
+
 
 class TestPostgreSQLValueQuotingErrors:
     """A name-quoting SQLSTATE counts as a name error only with a position in the query.
@@ -452,6 +493,8 @@ class TestMySQLClassifyError:
             (3065, ErrorCategory.GROUPING),  # ER_FIELD_IN_ORDER_NOT_SELECT
             (1227, ErrorCategory.PERMISSION),  # ER_SPECIFIC_ACCESS_DENIED_ERROR
             (1290, ErrorCategory.UNSUPPORTED),  # ER_OPTION_PREVENTS_STATEMENT
+            (2006, ErrorCategory.CONNECTION),  # CR_SERVER_GONE_ERROR
+            (2013, ErrorCategory.CONNECTION),  # CR_SERVER_LOST
             (1317, ErrorCategory.OTHER),  # ER_QUERY_INTERRUPTED: also KILL QUERY, not mapped
             (9999, ErrorCategory.OTHER),
         ],
@@ -469,3 +512,9 @@ class TestMySQLClassifyError:
 
     def test_malformed_args_never_raise(self) -> None:
         assert self.adapter.classify_error(aiomysql.OperationalError()) is ErrorCategory.OTHER
+
+    @pytest.mark.parametrize("text", ["Cancelled during execution", "(0, 'Not connected')"])
+    def test_the_drivers_closed_connection_error_is_a_connection_error(self, text: str) -> None:
+        # aiomysql raises InterfaceError with a text first arg on a dropped connection.
+        exc = aiomysql.InterfaceError(text)
+        assert self.adapter.classify_error(exc) is ErrorCategory.CONNECTION

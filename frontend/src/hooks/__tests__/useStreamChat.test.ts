@@ -84,6 +84,45 @@ describe('useStreamChat', () => {
     expect(msg.results_json?.row_count).toBe(3)
   })
 
+  it('starts the rows over when a new sql event arrives', async () => {
+    mockStreamChat.mockImplementation(async (_payload, callbacks: StreamCallbacks) => {
+      callbacks.onEvent({ type: 'sql', query: 'SELECT a FROM t', dialect: 'postgresql' })
+      callbacks.onEvent({ type: 'row_batch', columns: ['a'], column_types: ['integer'], rows: [[1], [2]], batch_index: 0, truncated: false })
+      callbacks.onEvent({ type: 'sql', query: 'SELECT b FROM t', dialect: 'postgresql' })
+      callbacks.onEvent({ type: 'row_batch', columns: ['b'], column_types: ['integer'], rows: [[9]], batch_index: 0, truncated: false })
+      callbacks.onDone(makeDoneEvent())
+    })
+
+    const { result } = renderHook(() => useStreamChat())
+    await act(async () => {
+      await result.current.send(PAYLOAD)
+    })
+
+    const msg = useAppStore.getState().messages[0]
+    expect(msg.query_generated).toBe('SELECT b FROM t')
+    expect(msg.results_json?.columns).toEqual(['b'])
+    expect(msg.results_json?.rows).toEqual([[9]])
+    expect(msg.results_json?.row_count).toBe(1)
+  })
+
+  it('starts the rows over when a row_batch with batch_index 0 follows earlier batches', async () => {
+    mockStreamChat.mockImplementation(async (_payload, callbacks: StreamCallbacks) => {
+      callbacks.onEvent({ type: 'row_batch', columns: ['id'], column_types: ['integer'], rows: [[1], [2]], batch_index: 0, truncated: false })
+      callbacks.onEvent({ type: 'row_batch', columns: ['id'], column_types: ['integer'], rows: [[3]], batch_index: 1, truncated: false })
+      callbacks.onEvent({ type: 'row_batch', columns: ['id'], column_types: ['integer'], rows: [[7]], batch_index: 0, truncated: false })
+      callbacks.onDone(makeDoneEvent())
+    })
+
+    const { result } = renderHook(() => useStreamChat())
+    await act(async () => {
+      await result.current.send(PAYLOAD)
+    })
+
+    const msg = useAppStore.getState().messages[0]
+    expect(msg.results_json?.rows).toEqual([[7]])
+    expect(msg.results_json?.row_count).toBe(1)
+  })
+
   it('promotes assistant message to store on done event', async () => {
     mockStreamChat.mockImplementation(async (_payload, callbacks: StreamCallbacks) => {
       callbacks.onEvent({ type: 'sql', query: 'SELECT count(*) FROM orders', dialect: 'postgresql' })

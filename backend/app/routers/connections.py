@@ -28,7 +28,7 @@ from ..config import get_settings
 from ..database import get_db
 from ..datasources.adapters.postgresql import evict_pool as _evict_pg_pool
 from ..datasources.errors import ErrorCategory, ExplainError
-from ..datasources.models import ConnectionResult, PrivacySettings
+from ..datasources.models import ConnectionResult, DataSourceSchema, PrivacySettings
 from ..datasources.registry import create_datasource, get_datasource_class
 from ..models.chat import ChatMessage, ChatSession
 from ..models.connection import Connection
@@ -45,6 +45,7 @@ from ..schemas.connection import (
     ConnectionTest,
     ExecutionModeUpdate,
     PrivacySettingsUpdate,
+    privacy_version,
 )
 from ..schemas.pagination import PaginatedResponse
 from ..semantic import store as semantic_store
@@ -52,18 +53,25 @@ from ..services.error_feedback import redact_error_for_user
 from ..services.privilege_audit import evaluate as evaluate_privileges
 from ..services.privilege_audit import to_dict as audit_to_dict
 from ..services.privilege_audit import unavailable as audit_unavailable
+from ..services.result_masking import _backslash_is_escape
 from ..services.row_filter import (
+    _NO_BACKSLASH_CHARS,
     RowFilterInvalidError,
     RowFilterRejectedError,
     validate_row_filters,
 )
 from ..services.row_filter_rewrite import apply_row_filters, sqlglot_dialect
-from ..services.schema_utils import SchemaRefreshError, refresh_user_schema_cache
+from ..services.schema_utils import (
+    SchemaRefreshError,
+    _apply_privacy_to_schema,
+    _schema_from_dict,
+    refresh_user_schema_cache,
+)
 from ..utils.encryption import decrypt_value, encrypt_value
 from ._utils import (
     _invalidate_connection_caches,
-    cached_json_response,
     get_connection_or_404,
+    json_response,
     lock_and_reread_connection,
 )
 
@@ -127,11 +135,14 @@ def _explain_budget() -> float:
 
 
 def _check_statement(key: str, condition: str, source_type: str) -> str:
-    """The statement planned to verify one pair: ``SELECT * FROM <schema>.<table>`` (both
-    parts quoted, so the engine-normalised stored names match the reference exactly) run
-    through the same ``apply_row_filters`` every query goes through. What is planned is thus
-    the condition as sqlglot reads and writes it back, inside the fenced derived table, and
-    nothing outside that table can supply a column the condition names. HTTP 422 naming the
+    """The statement planned to verify one pair: ``SELECT * FROM <schema>.<table> WHERE
+    EXISTS (SELECT 1 FROM <schema>.<table>)`` (both parts quoted, so the engine-normalised
+    stored names match the reference exactly) run through the same ``apply_row_filters``
+    every query goes through. What is planned is thus the condition as sqlglot reads and
+    writes it back, in both forms the runtime sends: as written at the top level and, inside
+    the subquery, with its columns qualified with the table name
+    (``row_filter_rewrite._qualified``), each inside a fenced derived table, where nothing
+    outside that table can supply a column the condition names. HTTP 422 naming the
     key when the rewriter refuses the pair (a construct it cannot write back for the dialect)
     or leaves the statement unchanged (it matched no table reference, so the condition would
     never be planned).
@@ -141,7 +152,8 @@ def _check_statement(key: str, condition: str, source_type: str) -> str:
     reference = exp.Table(
         this=exp.to_identifier(table, quoted=True), db=exp.to_identifier(schema, quoted=True)
     )
-    base = exp.select("*").from_(reference).sql(dialect=sqlglot_dialect(dialect))
+    nested = exp.Exists(this=exp.select("1").from_(reference.copy()))
+    base = exp.select("*").from_(reference).where(nested).sql(dialect=sqlglot_dialect(dialect))
     try:
         sql = apply_row_filters(base, {key: condition}, dialect)
     except RowFilterRejectedError as exc:
@@ -210,19 +222,24 @@ async def _verify_row_filters(
 ) -> None:
     """Plan every pair of *pairs* on the live database, or raise HTTP 422.
 
-    The statement is the one the runtime would send for ``SELECT * FROM <schema>.<table>``
-    (``_check_statement``): ``EXPLAIN SELECT * FROM (SELECT * FROM "s"."t" WHERE (<cond>)
-    OFFSET 0) AS "t"`` on PostgreSQL, the MySQL fence on MySQL. It returns no row and fails
-    inside the derived table when the table does not exist or the condition names a column
-    it does not have (no outer scope can supply one). The statements are built before the
-    connection is opened, so a pair the rewriter refuses is 422 naming the key and opens
-    nothing. An engine error is 422 naming the key, with the engine's text redacted by
-    category as every execution error is. A timeout, a plan that does not return within
-    ``_explain_budget()`` seconds, a refused connection or a driver error is 422 "could not
-    be verified" and nothing is stored. Opens the connection as the schema refresh does,
-    from the decrypted *config*, or uses *session*, the handler's adapter shared with the
-    privilege audit and closed by the handler; the callers pass only new or changed pairs
-    and call only when there is one, so an unchanged map opens nothing.
+    The statement is the one the runtime would send for ``SELECT * FROM <schema>.<table>
+    WHERE EXISTS (SELECT 1 FROM <schema>.<table>)`` (``_check_statement``), so the condition
+    is planned in both forms it runs in: as written at the top level and qualified with the
+    table name inside a subquery, each inside its fenced derived table (``OFFSET 0`` on
+    PostgreSQL, the MySQL fence on MySQL). It returns no row and fails inside a derived
+    table when the table does not exist or the condition names a column it does not have.
+    The statements are built before the connection is opened, so a pair the rewriter refuses
+    is 422 naming the key and opens nothing. An engine error is 422 naming the key, with the
+    engine's text redacted by category as every execution error is. A timeout, a plan that
+    does not return within ``_explain_budget()`` seconds, a refused connection or a driver
+    error is 422 "could not be verified" and nothing is stored. Opens the connection as the
+    schema refresh does, from the decrypted *config*, or uses *session*, the handler's
+    adapter shared with the privilege audit and closed by the handler; the callers pass only
+    new or changed pairs and call only when there is one, so an unchanged map opens nothing.
+    On a MySQL server under NO_BACKSLASH_ESCAPES (read off the opened adapter), a pair whose
+    condition holds a backslash, tab, carriage return or line break is 422 naming the key
+    before anything is planned, since ``_executable`` would refuse every query of such a
+    map.
     """
     # Built before the connection is opened: a pair the rewriter refuses opens nothing.
     statements = {key: _check_statement(key, cond, source_type) for key, cond in pairs.items()}
@@ -236,6 +253,22 @@ async def _verify_row_filters(
             raise HTTPException(
                 status_code=422, detail=_UNVERIFIED_DETAIL.format(reason=result.message)
             )
+        if source_type.lower() == "mysql" and not _backslash_is_escape(adapter):
+            # The rewriter reads these as escapes; this server reads them literally. The
+            # run-time check in row_filter._executable refuses every query of such a map, so
+            # the admin learns here, where they can fix it. Gated on the dialect as well:
+            # _backslash_is_escape reads a missing attribute as False.
+            for key, cond in pairs.items():
+                if any(ch in cond for ch in _NO_BACKSLASH_CHARS):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f'row_filters["{key}"]: the condition contains a backslash, tab,'
+                            " carriage return or line break, which this MySQL server"
+                            " (NO_BACKSLASH_ESCAPES) reads differently from the way the filter"
+                            " is applied; remove it"
+                        ),
+                    )
         for key, sql in statements.items():
             try:
                 await asyncio.wait_for(
@@ -385,19 +418,42 @@ def _readable_config(config_encrypted: bytes) -> dict | None:
     return config
 
 
+_STALE_PRIVACY_DETAIL = (
+    "The privacy settings changed since this form was loaded. "
+    "Reload them and apply your changes again."
+)
 _UNREADABLE_ENTER_ALL = "The stored connection settings could not be read; enter every field again."
 _UNREADABLE_TEST = (
     "The stored connection settings could not be read; edit the connection and enter them again."
 )
 
 
-def _clean_sensitive_columns(names: list[str]) -> list[str]:
+def _clean_sensitive_columns(names: list[str], *, stored: object = None) -> list[str]:
     """*names* trimmed, without empty entries, de-duplicated on the lower-cased name (the
     column match is whole-name and case-insensitive, ``PrivacySettings.is_column_sensitive``)
-    keeping the first spelling."""
+    keeping the first spelling.
+
+    A new entry with a dot is refused (422): the list holds bare column names, and a
+    qualified ``table.column`` entry would never match (``_exact_sensitive_names``), a silent
+    no-op. One already in *stored* (the saved list, from before the refusal existed) is let
+    through, matched case-insensitively, so the whole form an upgraded connection sends still
+    saves; it stays ignored until the admin removes it.
+    """
+    kept = (
+        {str(item).strip().lower() for item in stored if isinstance(item, str)}
+        if isinstance(stored, list)
+        else set()
+    )
     unique: dict[str, str] = {}
     for entry in names:
         name = (entry or "").strip()
+        if "." in name and name.lower() not in kept:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"sensitive_columns lists column names only, without a table or schema: {name}"
+                ),
+            )
         if name:
             unique.setdefault(name.lower(), name)
     return list(unique.values())
@@ -646,17 +702,17 @@ async def delete_connection(
 
 @router.get("/{connection_id}/schema")
 async def get_schema(
-    request: Request,
     connection_id: str,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """Return the cached DataSourceSchema dict for this connection."""
-    await get_connection_or_404(connection_id, db)
+    """Return the cached DataSourceSchema dict for this connection, through the privacy
+    pass every LLM path applies (``_explorer_schema``)."""
+    conn = await get_connection_or_404(connection_id, db)
     usc = await _get_user_schema_cache(connection_id, current_user.id, db)
     if not usc or not usc.schema_cache:
         raise HTTPException(status_code=404, detail="No schema cached — run a refresh first")
-    return cached_json_response(usc.schema_cache, request)
+    return json_response(_explorer_schema(_schema_from_dict(usc.schema_cache), conn))
 
 
 @router.post("/{connection_id}/schema/refresh")
@@ -677,7 +733,20 @@ async def refresh_schema(
     except SchemaRefreshError as e:
         raise HTTPException(status_code=400, detail=f"Schema refresh failed: {e}") from e
     await db.commit()
-    return asdict(schema)
+    return _explorer_schema(schema, conn)
+
+
+def _explorer_schema(schema: DataSourceSchema, conn: Connection) -> dict:
+    """*schema* as the schema explorer shows it: through ``_apply_privacy_to_schema``, as
+    every LLM path reads it, so the page shows no excluded object a cache written before a
+    privacy change still carries, and no hint the policy withholds (sample values, the row
+    count and statistics samples of a row-filtered table)."""
+    privacy = (
+        PrivacySettings.from_dict(conn.privacy_settings)
+        if conn.privacy_settings
+        else PrivacySettings()
+    )
+    return asdict(_apply_privacy_to_schema(schema, privacy))
 
 
 # ── Privacy & execution mode ───────────────────────────────────────────────────
@@ -691,13 +760,24 @@ async def update_privacy(
     db: AsyncSession = Depends(get_db),
 ) -> ConnectionDetail:
     # Row lock: two simultaneous saves cannot both read the old JSON and let the later one
-    # overwrite the earlier one's map. A stale tab sending an old map is not covered.
+    # overwrite the earlier one's map. A stale tab is caught by base_privacy_version: the
+    # version of the settings its form was loaded with, compared under the lock (a save that
+    # commits after this read waits for ours).
     conn = await lock_and_reread_connection(connection_id, db)
+    if body.base_privacy_version is not None and body.base_privacy_version != privacy_version(
+        conn.privacy_settings
+    ):
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_STALE_PRIVACY_DETAIL)
     prior: dict = dict(conn.privacy_settings) if conn.privacy_settings else {}
     existing: dict = dict(prior)
-    changes = body.model_dump(exclude_none=True, exclude={"clear_legacy_row_filter"})
+    changes = body.model_dump(
+        exclude_none=True, exclude={"clear_legacy_row_filter", "base_privacy_version"}
+    )
     if body.sensitive_columns is not None:
-        changes["sensitive_columns"] = _clean_sensitive_columns(body.sensitive_columns)
+        changes["sensitive_columns"] = _clean_sensitive_columns(
+            body.sensitive_columns, stored=prior.get("sensitive_columns")
+        )
     existing.update(changes)
     legacy = bool(existing.get("row_filter_sql"))
     # Decrypted at most once, through the fail-safe reader: the verification needs the config
@@ -737,7 +817,7 @@ async def update_privacy(
         before = asdict(PrivacySettings.from_dict(prior))
         after = asdict(PrivacySettings.from_dict(existing))
         changed = {key for key, value in after.items() if before[key] != value}
-        values: dict = {"privacy_settings": existing}
+        values: dict = {"privacy_settings": existing, "updated_at": datetime.now(UTC)}
         # The audit reads facts about the row-filtered and the excluded tables, and the
         # stored remediation script lists the schemas minus excluded_schemas: rerun it when
         # any of the three changed. A 422 above has already left the stored audit as it was.
@@ -763,9 +843,13 @@ async def update_privacy(
     # embeddings, which the helper flushes together with them) is a safe extra, not a
     # correctness need.
     # The UI sends the whole form, so what counts is what changed, not what was sent. Neither
-    # the row-filter map nor the legacy filter alters introspection.
+    # the row-filter map, the legacy filter nor the strict toggle alters introspection or the
+    # formatted schema (strict mode changes what may run; the [SENSITIVE] marks come from the
+    # patterns and names, which do flush it).
     await _invalidate_connection_caches(
-        connection_id, db, keep_schema=changed <= {"row_filters", "row_filter_sql"}
+        connection_id,
+        db,
+        keep_schema=changed <= {"row_filters", "row_filter_sql", "strict_sensitive_columns"},
     )
     await db.commit()
     await db.refresh(conn)

@@ -3,7 +3,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
 import { createElement } from 'react';
 import { http, HttpResponse } from 'msw';
 import { server } from '../../test/server';
@@ -14,6 +14,7 @@ import {
   useDeleteConnection,
   useConnectionSchema,
 } from '../useConnections';
+import { schemaQueryOptions } from '../../lib/schemaQuery';
 
 function createWrapper() {
   const queryClient = new QueryClient({
@@ -179,5 +180,62 @@ describe('useConnectionSchema', () => {
     expect(fetchCount).toBe(1);
     const query = queryClient.getQueryCache().find({ queryKey: ['schema', 'conn-1'] });
     expect(query).toBeDefined();
+  });
+});
+
+describe('schema query shared by useConnectionSchema and the semantic page', () => {
+  beforeEach(resetStore);
+
+  const notFound = () =>
+    server.use(
+      http.get('http://localhost:8000/api/v1/connections/conn-1/schema', () =>
+        HttpResponse.json({ detail: 'No cached schema' }, { status: 404 }),
+      ),
+    );
+
+  it('useConnectionSchema reads a 404 as no cached schema', async () => {
+    notFound();
+    const { wrapper, queryClient } = createWrapper();
+    const { result } = renderHook(() => useConnectionSchema('conn-1'), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toBeNull();
+    // The page reading the same key gets the same shape, not an error.
+    const { result: page } = renderHook(
+      () => useQuery({ ...schemaQueryOptions('conn-1'), retry: false }),
+      { wrapper },
+    );
+    await waitFor(() => expect(page.current.isSuccess).toBe(true));
+    expect(page.current.data).toBeNull();
+    expect(queryClient.getQueryState(['schema', 'conn-1'])?.status).toBe('success');
+  });
+
+  it('the page query run first on a 404 leaves null for useConnectionSchema, not an error', async () => {
+    notFound();
+    const { wrapper } = createWrapper();
+    const { result: page } = renderHook(
+      () => useQuery({ ...schemaQueryOptions('conn-1'), retry: false }),
+      { wrapper },
+    );
+    await waitFor(() => expect(page.current.isSuccess).toBe(true));
+    expect(page.current.data).toBeNull();
+    const { result } = renderHook(() => useConnectionSchema('conn-1'), { wrapper });
+    expect(result.current.isError).toBe(false);
+    expect(result.current.data).toBeNull();
+  });
+
+  it('a schema the page fetched first still reaches the app store', async () => {
+    const schemaData = { source_type: 'postgresql', schemas: [], tables: [], relationships: [] };
+    server.use(
+      http.get('http://localhost:8000/api/v1/connections/conn-1/schema', () =>
+        HttpResponse.json(schemaData),
+      ),
+    );
+    const { wrapper } = createWrapper();
+    const { result: page } = renderHook(() => useQuery(schemaQueryOptions('conn-1')), {
+      wrapper,
+    });
+    await waitFor(() => expect(page.current.isSuccess).toBe(true));
+    renderHook(() => useConnectionSchema('conn-1'), { wrapper });
+    await waitFor(() => expect(useAppStore.getState().schema).toEqual(schemaData));
   });
 });

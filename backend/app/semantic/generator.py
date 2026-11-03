@@ -20,8 +20,10 @@ from ..datasources.models import (
     table_key,
 )
 from .drift import (
+    TABLE_REFERENCE_FIELDS,
     SchemaDrift,
     compute_drift,
+    matching_real_keys,
     policy_hides_column,
     policy_hides_table,
     resolve_real_key,
@@ -325,10 +327,10 @@ def _warn_near_miss(kind: str, name: str, target: str | None, where: str) -> Non
     No remap here: a migrated row's user-edit marks are keyed by the old spelling, so a
     remap would keep the value but silently lose the marks, and the next regenerate
     would overwrite the edit anyway. The saves that prune (``/apply-drift``,
-    ``/generate/globals``) first rename the column keys the drift renames
-    (``SchemaDrift.renamed_columns``), marks included (``rename_columns``), so a key
-    their prune drops is one the drift does not rename: a duplicate of a stored column,
-    say.
+    ``/generate/globals``) first rename the table and column keys the drift renames
+    (``SchemaDrift.renamed_tables`` and ``renamed_columns``), marks included
+    (``rename_tables``, ``rename_columns``), so a key their prune drops is one the drift
+    does not rename: a duplicate of a stored table or column, say.
     """
     if target is None:
         return
@@ -415,9 +417,9 @@ def prune_to_schema(
     are keyed by the old spelling — and, when ``log``, a warning names the key it
     would have matched (``_resolve_real_key``'s rules). ``log=False`` is for a
     second call over the same model, so the warnings are not duplicated. The saves that
-    prune (``/apply-drift``, ``/generate/globals``) first rename the column keys the
-    drift renames, marks included (``rename_columns``), so this sees such a column
-    under its real name and keeps it.
+    prune (``/apply-drift``, ``/generate/globals``) first rename the table and column
+    keys the drift renames, marks included (``rename_tables``, ``rename_columns``), so
+    this sees such a table or column under its real name and keeps it.
 
     ``default_filters`` are free SQL and are NOT rewritten: a filter naming a
     dropped column stays as written.
@@ -483,13 +485,7 @@ def names_any_table(refs: Iterable[str], targets: set[str], real_keys: list[str]
     )
 
 
-_TABLE_REFERENCE_FIELDS = (
-    "primary_timestamp_column",
-    "primary_date_column",
-    "partition_columns",
-    "cluster_columns",
-    "hierarchies",
-)
+_TABLE_REFERENCE_FIELDS = TABLE_REFERENCE_FIELDS
 
 
 def _unique(names: Iterable[str]) -> list[str]:
@@ -648,6 +644,86 @@ def _renamed_table(table: TableSemantic, mapping: Mapping[str, str]) -> TableSem
             **_map_table_references(table, new, drop_empty=False),
         }
     )
+
+
+def rename_tables(
+    tables: Mapping[str, TableSemantic],
+    relationships: Sequence[RelationshipEdge],
+    marks: dict[str, dict[str, list[str]]],
+    protected: dict[str, dict[str, dict[str, Any]]],
+    renames: Mapping[str, str],
+) -> tuple[
+    dict[str, TableSemantic],
+    list[RelationshipEdge],
+    dict[str, dict[str, list[str]]],
+    dict[str, dict[str, dict[str, Any]]],
+]:
+    """``tables``, ``relationships``, ``marks`` and ``protected`` with each table key of
+    ``renames`` rekeyed to its new key.
+
+    ``renames`` is ``SchemaDrift.renamed_tables`` of a diff against ``tables``: old key →
+    new key, where the old key is a table of ``tables`` and the new one is not. A renamed
+    table is the table the live schema has, stored under a stale spelling (a blob-era
+    ``public.Orders``), so everything that names it by key follows, and it keeps its
+    annotation, its columns and its user edits:
+
+    - the ``TableSemantic`` moves to the new key (in place, so the table order holds);
+    - the table's marks and protected values (keyed by the table key) and its columns'
+      (keyed ``"table.column"``);
+    - each relationship endpoint on it, with the edge's marks moved to its new
+      ``relationship_key``. A renamed edge whose new key another edge already has is a
+      duplicate and is dropped with its marks, as ``rename_columns`` does.
+
+    A metric's ``related_tables``, a derived column's ``base_tables``, a segment's
+    ``applicable_tables`` and a join's ``tables`` are not rewritten: they are matched
+    against the live tables the way ``matching_real_keys`` matches (quotes stripped,
+    case-insensitive), so a near-miss spelling there still names the table. Free SQL is
+    not rewritten either.
+
+    Runs before ``rename_columns``, whose renames are keyed by the new table keys, and
+    before ``drop_dangling_edits`` and ``prune_to_schema``, which then see the table
+    under its live key and keep it. Pure: the returned containers are new and the inputs
+    are never mutated; an edge with no renamed endpoint is the input's object.
+    """
+
+    def new(key: str) -> str:
+        return renames.get(key, key)
+
+    out_tables = {new(key): table for key, table in tables.items()}
+    out_marks = {kind: {k: list(v) for k, v in entries.items()} for kind, entries in marks.items()}
+    out_protected = {
+        kind: {k: dict(v) for k, v in entries.items()} for kind, entries in protected.items()
+    }
+    for old, target in renames.items():
+        for out in (out_marks, out_protected):
+            table_entries = out.get("table")
+            if table_entries is not None and old in table_entries:
+                table_entries[target] = table_entries.pop(old)
+            column_entries = out.get("column")
+            if column_entries is not None:
+                # By the table's own columns, not a key prefix: a table key may hold a dot.
+                for column in tables[old].columns:
+                    if f"{old}.{column}" in column_entries:
+                        column_entries[f"{target}.{column}"] = column_entries.pop(f"{old}.{column}")
+
+    held = {relationship_key(e) for e in relationships}
+    out_relationships: list[RelationshipEdge] = []
+    for edge in relationships:
+        moved = edge.model_copy(
+            update={"from_table": new(edge.from_table), "to_table": new(edge.to_table)}
+        )
+        if moved == edge:
+            out_relationships.append(edge)
+            continue
+        old_key, new_key = relationship_key(edge), relationship_key(moved)
+        edge_marks = out_marks.get("relationship", {}).pop(old_key, None)
+        if new_key in held:
+            continue
+        held.add(new_key)
+        if edge_marks is not None:
+            out_marks.setdefault("relationship", {})[new_key] = edge_marks
+        out_relationships.append(moved)
+    return out_tables, out_relationships, out_marks, out_protected
 
 
 def rename_columns(
@@ -1628,6 +1704,10 @@ class SemanticModelGenerator:
         otherwise it is computed here without a baseline, so no column is reported added
         and no removed key counts as a drop.
 
+        A stored table key in the diff's ``renamed_tables`` is a near-miss spelling the
+        apply renames to its live table, keeping its annotation; its column warnings name
+        the live key.
+
         Each removed or renamed column key is worded by what the apply does to it. A key
         in the diff's ``renamed_columns`` is a near-miss spelling the apply renames to its
         live column, keeping its annotation; that column is not listed as new. A key in
@@ -1656,13 +1736,21 @@ class SemanticModelGenerator:
         live_columns = {
             table_key(t): sorted(c.name for c in t.columns) for t in current_schema.tables
         }
-        for tbl_key, table in stored_model.tables.items():
-            if tbl_key in drift.removed_table_keys:
+        for stored_key, table in stored_model.tables.items():
+            if stored_key in drift.removed_table_keys:
                 warnings.append(
-                    f'Table "{tbl_key}" referenced in semantic model '
+                    f'Table "{stored_key}" referenced in semantic model '
                     f"no longer exists in the database"
                 )
                 continue
+            # A renamed table's columns are diffed, and named, under its live key.
+            tbl_key = drift.renamed_tables.get(stored_key, stored_key)
+            if tbl_key != stored_key:
+                warnings.append(
+                    f'Table key "{stored_key}" in the semantic model is a near-miss '
+                    f'spelling of "{tbl_key}"; Apply Drift renames it to "{tbl_key}", '
+                    "keeping its annotation"
+                )
             live = live_columns.get(tbl_key, [])
             renamed = drift.renamed_columns.get(tbl_key, {})
             dropped = drift.dropped_columns.get(tbl_key, set())
@@ -1749,29 +1837,29 @@ class SemanticModelGenerator:
             )
 
         current_tables = {table_key(t) for t in current_schema.tables}
-        # Bare names (without schema prefix) for metrics generated by LLMs that omit schema
-        current_tables_bare = {t.name for t in current_schema.tables}
-        # A metric may name a table bare, so match an unreadable one either way.
-        unreadable = set(current_schema.unreadable_tables)
-        unreadable_names = unreadable | {key.rpartition(".")[2] for key in unreadable}
-        # A bare metric table under an excluded schema: the policy cannot be asked
-        # about a bare name, but the stored model holds the qualified key it came from.
-        stored_hidden_bare = {
-            key.rpartition(".")[2]
-            for key in stored_model.tables
-            if key not in current_tables and policy_hides_table(key, privacy)
-        }
+        # The tables a metric may name without being broken: the live ones, the ones the
+        # role cannot read, and the stored ones the policy hides (a bare metric table
+        # under an excluded schema: the policy cannot be asked about a bare name, but the
+        # stored model holds the qualified key it came from). A name matches as
+        # ``matching_real_keys`` reads it, the rule the finalisation's join prune uses:
+        # quotes stripped, case-insensitive, and a bare name (an LLM may omit the
+        # schema) against the part after the dot; a bare name several tables share
+        # exists.
+        existing = sorted(
+            current_tables
+            | set(current_schema.unreadable_tables)
+            | {
+                key
+                for key in stored_model.tables
+                if key not in current_tables and policy_hides_table(key, privacy)
+            }
+        )
         for metric in stored_model.business_metrics:
             for t in metric.related_tables:
                 norm_t = strip_ident_quotes(t)
-                # Accept both "public.orders" (qualified) and "orders" (bare)
-                if (
-                    norm_t not in current_tables
-                    and norm_t not in current_tables_bare
-                    and norm_t not in stored_hidden_bare
-                    and norm_t not in unreadable_names
-                    and not policy_hides_table(norm_t, privacy, bare_ok=True)
-                ):
+                if not matching_real_keys(
+                    norm_t, existing, bare_ok=True
+                ) and not policy_hides_table(norm_t, privacy, bare_ok=True):
                     warnings.append(
                         f'Business metric "{metric.name}" references '
                         f'table "{t}" which no longer exists'

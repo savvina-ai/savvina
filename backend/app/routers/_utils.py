@@ -5,11 +5,10 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from typing import TYPE_CHECKING
 
-from fastapi import HTTPException, Request
+from fastapi import HTTPException
 from fastapi.responses import Response
 from sqlalchemy import delete, select
 
@@ -20,8 +19,6 @@ from ..models.cache import QueryCacheEntry
 from ..models.connection import Connection
 from ..models.table_embedding_cache import TableEmbeddingCache
 from ..models.user_schema_cache import UserSchemaCache
-
-_CACHE_MAX_AGE = 300
 
 
 async def get_connection_or_404(
@@ -93,24 +90,13 @@ async def _invalidate_connection_caches(
     await db.execute(delete(QueryCacheEntry).where(QueryCacheEntry.connection_id == connection_id))
 
 
-def cached_json_response(data: dict | list, request: Request) -> Response:
-    """Return a JSON response with ETag and Cache-Control headers.
+def json_response(data: dict | list) -> Response:
+    """Return *data* as a compact JSON response.
 
-    If the client sends a matching ``If-None-Match`` header, return 304.
+    No caching headers of its own: every ``/api/`` response carries the security
+    middleware's single ``Cache-Control: no-store, private`` (``main.py``), the safe
+    default for a data app, so a browser stores nothing and never revalidates (an ETag
+    or a ``max-age`` here would be dead, and a second Cache-Control header).
     """
     body = json.dumps(data, default=str, separators=(",", ":"))
-    etag = '"' + hashlib.sha256(body.encode()).hexdigest()[:32] + '"'
-
-    if_none_match = request.headers.get("if-none-match")
-    if if_none_match and if_none_match == etag:
-        return Response(status_code=304, headers={"ETag": etag, "Vary": "Authorization"})
-
-    return Response(
-        content=body,
-        media_type="application/json",
-        headers={
-            "Cache-Control": f"private, max-age={_CACHE_MAX_AGE}, must-revalidate",
-            "ETag": etag,
-            "Vary": "Authorization",
-        },
-    )
+    return Response(content=body, media_type="application/json")

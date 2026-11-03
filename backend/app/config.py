@@ -132,6 +132,16 @@ class Settings(BaseSettings):
     # Through PgBouncer in transaction mode the startup parameter must be allowed via
     # `ignore_startup_parameters = lock_timeout`, or set DB_LOCK_TIMEOUT_SECONDS=0.
     db_lock_timeout_seconds: int = Field(30, ge=0)
+    # Minutes between background schema drift checks of every active connection with a
+    # complete semantic model (services/drift_monitor.py). 0, the default, disables the
+    # monitor. Environment-only (DRIFT_CHECK_INTERVAL_MINUTES), not a UI setting: it is
+    # read once, when the app starts. The monitor detects and reports only; it never
+    # applies drift (no LLM call unattended).
+    drift_check_interval_minutes: int = Field(0, ge=0)
+    # How many connections' semantic models each worker process keeps assembled for
+    # the chat path (semantic/store.load_model_cached). 0 disables the cache, so every
+    # turn reassembles the model. Environment-only (SEMANTIC_MODEL_CACHE_SIZE).
+    semantic_model_cache_size: int = Field(32, ge=0)
 
     _WEAK_DEFAULTS: frozenset[str] = frozenset(
         {"change-this", "secret", "changeme", "your-secret-key"}

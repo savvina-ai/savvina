@@ -19,6 +19,7 @@ from app.services.execution import (
     _classify,
     _correctable,
     _exec_error_text,
+    _is_query_fault,
     _is_rejection,
     _llm_hint,
     _user_facing_error,
@@ -155,3 +156,37 @@ class TestCorrectable:
         self, rejected: bool, hint: str | None, expected: bool
     ) -> None:
         assert _correctable(rejected, hint) is expected
+
+    @pytest.mark.parametrize("category", [ErrorCategory.PERMISSION, ErrorCategory.CONNECTION])
+    def test_a_denial_or_a_lost_connection_is_not_correctable(
+        self, category: ErrorCategory
+    ) -> None:
+        # A rewrite cannot lift a denial or restore a connection: no LLM call is made.
+        assert _correctable(False, None, category) is False
+
+    @pytest.mark.parametrize("category", [ErrorCategory.TIMEOUT, ErrorCategory.UNKNOWN_NAME])
+    def test_other_engine_categories_stay_correctable(self, category: ErrorCategory) -> None:
+        assert _correctable(False, None, category) is True
+
+
+class TestIsQueryFault:
+    @pytest.mark.parametrize(
+        "category", [ErrorCategory.TIMEOUT, ErrorCategory.PERMISSION, ErrorCategory.CONNECTION]
+    )
+    def test_the_databases_state_is_not_a_query_fault(self, category: ErrorCategory) -> None:
+        assert _is_query_fault(category, False, None) is False
+
+    def test_an_unknown_name_is_a_query_fault(self) -> None:
+        assert _is_query_fault(ErrorCategory.UNKNOWN_NAME, False, None) is True
+
+
+class TestConnectionLostText:
+    def test_a_lost_connection_shows_our_own_sentence(self) -> None:
+        shown = _user_facing_error(
+            "(2013, 'Lost connection to MySQL server during query')", ErrorCategory.CONNECTION
+        )
+        assert shown == "The connection to the database was lost while the query ran. Try again."
+
+    def test_the_note_still_follows(self) -> None:
+        shown = _user_facing_error("x", ErrorCategory.CONNECTION, "a note")
+        assert shown.endswith("\n\nNote: a note")

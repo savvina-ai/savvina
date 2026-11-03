@@ -40,18 +40,23 @@ from ..schemas.semantic import (
     GenerateBatchRequest,
     GenerateBatchResponse,
     GenerateInitResponse,
+    LastDriftResponse,
+    SemanticModelResponse,
     SemanticModelUpdate,
     SemanticSuggestionResponse,
+    TombstoneEntry,
+    TombstoneRestore,
 )
 from ..semantic import store as semantic_store
 from ..semantic.drift import (
     DriftApplySummary,
     compute_drift,
     matching_real_keys,
-    policy_hides_column,
     policy_hides_table,
+    resolve_real_key,
     strip_ident_quotes,
     summarize_model_change,
+    table_renames,
 )
 from ..semantic.generator import (
     SemanticModelGenerator,
@@ -60,6 +65,7 @@ from ..semantic.generator import (
     names_any_table,
     prune_to_schema,
     rename_columns,
+    rename_tables,
 )
 from ..semantic.models import (
     GENERATION_BATCH_SIZE,
@@ -73,6 +79,13 @@ from ..semantic.models import (
     TableSemantic,
     ValueMapping,
 )
+from ..services import drift_check
+from ..services.drift_check import (
+    _baseline_changes,
+    _baseline_entries,
+    _effective_known_columns,
+    _live_columns,
+)
 from ..services.schema_utils import (
     SchemaRefreshError,
     _apply_privacy_to_schema,
@@ -82,8 +95,8 @@ from ..services.schema_utils import (
 )
 from ._utils import (
     _invalidate_connection_caches,
-    cached_json_response,
     get_connection_or_404,
+    json_response,
     lock_and_reread_connection,
 )
 
@@ -96,41 +109,81 @@ logger = logging.getLogger(__name__)
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
-@router.get("/{connection_id}/semantic", response_model=SemanticModel)
+def _as_response(model: SemanticModel, version: int | None) -> SemanticModelResponse:
+    """*model* as the response, carrying *version* (``0`` when the header is gone)."""
+    return SemanticModelResponse(**model.model_dump(), version=version or 0)
+
+
+async def _with_version(
+    db: AsyncSession, connection_id: str, model: SemanticModel
+) -> SemanticModelResponse:
+    """*model* as the response, carrying the header's content version as this transaction
+    sees it. Call it under the connection lock and before the commit or rollback, never
+    after: a version read after the commit could belong to another writer's later change,
+    and a draft seeded with content N and version N+1 would pass the PUT check and
+    overwrite that change. Without the lock, read the version before the content
+    (``_as_response``): a version older than the content only costs a spurious 409."""
+    return _as_response(model, await semantic_store.load_version(db, connection_id))
+
+
+@router.get("/{connection_id}/semantic", response_model=SemanticModelResponse)
 async def get_semantic_model(
-    request: Request,
     connection_id: str,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     await get_connection_or_404(connection_id, db)
-    model = await semantic_store.load_model(db, connection_id)
-    if model is None:
+    # One read for both: the version is the one the content's rows were read at, so a
+    # draft seeded from this response carries exactly its content's version.
+    loaded = await semantic_store.load_model_with_version(db, connection_id)
+    if loaded is None:
         # Deliberately 404, not an empty model: SemanticModelPage derives
         # "has a model" from whether this call errors.
         raise HTTPException(
             status_code=404,
             detail="No semantic model — call /generate/init, /generate/batch, /generate/globals",
         )
-    return cached_json_response(model.model_dump(mode="json"), request)
+    model, version = loaded
+    response = _as_response(model, version)
+    return json_response(response.model_dump(mode="json"))
 
 
-@router.put("/{connection_id}/semantic", response_model=SemanticModel)
+@router.put("/{connection_id}/semantic", response_model=SemanticModelResponse)
 async def update_semantic_model(
     connection_id: str,
     body: SemanticModelUpdate,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
-) -> SemanticModel:
+) -> SemanticModelResponse:
     """Partially update the semantic model.
 
     All merge semantics (null = not supplied, [] = explicit clear, per-field
     provenance) live in ``semantic/store.apply_user_patch``; this route only
     maps the store's exceptions onto HTTP status codes.
+
+    A ``base_version`` (the ``version`` the draft was loaded from) makes the write
+    conditional: when the stored version has moved, or the model is gone, the route answers
+    409 and writes nothing, and the page merges the stored model into its draft and saves
+    again. Without one the PUT is unconditional (API clients, "save anyway").
     """
     # Hold the connection row lock for the whole write: column rows carry no
     # optimistic version predicate, so the lock is what serialises concurrent writers.
     await lock_and_reread_connection(connection_id, db)
+    if body.base_version is not None:
+        # Under the lock: a writer that commits after this read waits for ours.
+        current = await semantic_store.load_version(db, connection_id)
+        if current != body.base_version:
+            await db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                # The page tells this 409 from the store's own by this opening (STALE_DRAFT
+                # in frontend/src/lib/semanticMerge.ts); keep the two in step.
+                detail=(
+                    "The semantic model changed since this draft was loaded (version"
+                    f" {body.base_version}, now {current if current is not None else 'deleted'})."
+                    " Reload it and apply your changes again, or save anyway to overwrite."
+                ),
+            )
     try:
         new_model = await semantic_store.apply_user_patch(
             db, connection_id, body, updated_by=current_user.id
@@ -143,8 +196,9 @@ async def update_semantic_model(
         await db.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await _invalidate_connection_caches(connection_id, db)
+    response = await _with_version(db, connection_id, new_model)  # under the lock
     await db.commit()
-    return new_model
+    return response
 
 
 @router.delete("/{connection_id}/semantic", status_code=status.HTTP_204_NO_CONTENT)
@@ -165,33 +219,65 @@ async def delete_semantic_model(
 # ── Drift detection ─────────────────────────────────────────────────────────────
 
 
-def _effective_known_columns(
-    known: Mapping[str, Collection[str]],
-    stored_tables: Mapping[str, TableSemantic],
-    schema: DataSourceSchema,
-    privacy: PrivacySettings | None,
-) -> dict[str, frozenset[str]]:
-    """The baseline ``compute_drift`` reads: *known*, with the entry of each stored table
-    the live schema holds completed to what a baseline write records for it
-    (``_baseline_entries``): a table with no entry gets its live columns, and every entry
-    gains the real names of the table's stored keys the policy hides and its stored live
-    columns.
+@router.get("/{connection_id}/semantic/tombstones", response_model=list[TombstoneEntry])
+async def list_tombstones(
+    connection_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[TombstoneEntry]:
+    """The items deleted from the model (``store.list_tombstones``), newest first: what the
+    next Regenerate or Apply Drift will leave out. 404 without a model."""
+    await get_connection_or_404(connection_id, db)
+    if await semantic_store.load_version(db, connection_id) is None:
+        raise HTTPException(status_code=404, detail="No semantic model")
+    rows = await semantic_store.list_tombstones(db, connection_id)
+    return [TombstoneEntry(kind=r.kind, key=r.key, created_at=r.created_at) for r in rows]
 
-    A table with no entry (a model from before the baseline existed, or a table a user
-    added) is baselined at first sight: whatever it holds now is "seen", so no live column
-    is reported new on that account, and a column the model holds only under a near-miss
-    key is renamed to its live name (``compute_drift``'s ``renamed_columns``), now or,
-    for a hidden one, once the policy shows it. A column added before that first sight is
-    not reported either; a Regenerate annotates it. A table whose entry predates the
-    recording of hidden names gains them the same way, so un-hiding such a column renames
-    its near-miss key too; ``check_drift`` persists what this completed, so the name is
-    on record by the time the policy stops hiding it.
-    """
-    effective = {key: frozenset(names) for key, names in known.items()}
-    stored_columns = {key: table.columns for key, table in stored_tables.items()}
-    for key, names in _baseline_entries(known, stored_columns, schema, privacy).items():
-        effective[key] = frozenset(names)
-    return effective
+
+@router.post("/{connection_id}/semantic/tombstones/restore", status_code=status.HTTP_204_NO_CONTENT)
+async def restore_tombstone(
+    connection_id: str,
+    body: TombstoneRestore,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Lift one tombstone (**Restore** on the page): the next Regenerate, or Apply Drift for
+    a relationship, may bring the generator's item back. Bookkeeping: no lock, no version
+    bump, no history, no cache purge (the stored model is unchanged). 404 when there is no
+    such tombstone."""
+    await get_connection_or_404(connection_id, db)
+    if not await semantic_store.delete_tombstone(db, connection_id, body.kind, body.key):
+        raise HTTPException(status_code=404, detail="No such deleted item")
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/{connection_id}/semantic/drift/last", response_model=LastDriftResponse)
+async def last_drift_report(
+    connection_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> LastDriftResponse:
+    """The background monitor's latest report, when it still describes the stored model,
+    and the monitor's interval: no introspection, no rate limit. The page polls this while
+    the monitor is on and shows a notice for the report. The stored report (the latest of
+    Check Drift and the monitor) is withheld when a Check Drift wrote it (the page shows
+    its own), when the model's version moved since it was computed, or when it no longer
+    validates as a ``DriftReport`` (an older shape)."""
+    await get_connection_or_404(connection_id, db)
+    interval = get_settings().drift_check_interval_minutes
+    stored = await semantic_store.load_last_drift_report(db, connection_id)
+    if (
+        stored is None
+        or stored.get("source") != "monitor"
+        or stored.get("model_version") != await semantic_store.load_version(db, connection_id)
+    ):
+        return LastDriftResponse(monitor_interval_minutes=interval)
+    try:
+        report = DriftReport.model_validate(stored)
+    except ValidationError:
+        return LastDriftResponse(monitor_interval_minutes=interval)
+    return LastDriftResponse(report=report, monitor_interval_minutes=interval)
 
 
 @router.get("/{connection_id}/semantic/drift", response_model=DriftReport)
@@ -221,6 +307,8 @@ async def check_drift(
     then diffs structure against the stored semantic model. No statistical re-queries.
     """
     conn = await get_connection_or_404(connection_id, db)
+    # The version before the content (see ``drift_check.drift_report``).
+    model_version = await semantic_store.load_version(db, connection_id)
     stored_model = await semantic_store.load_model(db, connection_id)
     if stored_model is None:
         raise HTTPException(status_code=404, detail="No semantic model — generate one first")
@@ -258,71 +346,17 @@ async def check_drift(
         schema_cached_at = cached_at.isoformat() if cached_at else None
         refresh_error = str(exc)
 
-    privacy = (
-        PrivacySettings.from_dict(conn.privacy_settings)
-        if conn.privacy_settings
-        else PrivacySettings()
-    )
-    schema = _apply_privacy_to_schema(schema, privacy)
-
-    known = await semantic_store.load_known_columns(db, connection_id)
-    effective = _effective_known_columns(known, stored_model.tables, schema, privacy)
-    if (
-        _baseline_changes(known, effective)
-        and schema_source == "live"
-        and stored_model.generation_status != GenerationStatus.TABLES_PARTIAL
-    ):
-        # Persist what the read completed: the first-sight entry of a table with none, and
-        # the names an entry from before they were recorded lacks (the real name of a
-        # stored key the policy hides, a column annotated by hand), so the next check can
-        # tell a new column from one the model already had, and an un-hidden column's
-        # near-miss key is renamed rather than the column reported new. Bookkeeping under
-        # the row lock: no version bump, no history. Not from a cached schema (it is not
-        # what the model has seen), and not under a run in progress (its batches write
-        # the baseline themselves).
-        # The refreshed schema cache is committed first, in its own transaction, as
-        # ``apply_drift`` does: the refresh always writes the user's schema-cache row and,
-        # when the schema changed, deletes the query and embedding cache rows. Every writer
-        # that takes this lock and then purges caches (``_invalidate_connection_caches``: a
-        # save, a suggestion apply, a model delete, a generation batch, a finalisation, an
-        # apply) deletes those same rows, so holding them while waiting for the lock can
-        # deadlock. Safe: the session keeps its loaded objects on commit.
-        await db.commit()
-        await _lock_generation(connection_id, db, "check-drift")
-        # ``stored_model`` was loaded before the introspection, so a Regenerate another tab
-        # started meanwhile is only seen by re-reading the header under the lock; its
-        # batches write the baseline themselves, so the write is skipped. The baseline is
-        # re-read too: a batch or an apply may have moved it since the read above, and a
-        # row is replaced whole, so what is written must complete the entry as the lock
-        # sees it. The model is still the pre-lock read, and so is the report below.
-        header = await semantic_store.load_header(db, connection_id)
-        if header is not None and header.generation_status != GenerationStatus.TABLES_PARTIAL:
-            locked = await semantic_store.load_known_columns(db, connection_id)
-            changes = _baseline_changes(
-                locked, _effective_known_columns(locked, stored_model.tables, schema, privacy)
-            )
-            if changes:
-                await semantic_store.update_known_columns(db, connection_id, changes)
-        # Commit now, with or without a write: releases the connection lock instead of
-        # holding it through the diff and the response.
-        await db.commit()
-    # The store keeps what the policy hides; that absence from ``schema`` is not drift.
-    # One diff for the warnings and the flag, the same diff apply-drift acts on.
-    drift = compute_drift(schema, stored_model, privacy, effective)
-    warnings = SemanticModelGenerator().detect_drift(schema, stored_model, privacy, drift=drift)
-    # Persist the refreshed cache (a no-op on the fallback path, and after the baseline
-    # commit above).
-    await db.commit()
-
-    return DriftReport(
-        connection_id=connection_id,
-        warnings=warnings,
-        warning_count=len(warnings),
-        checked_at=datetime.now(UTC).isoformat(),
+    return await drift_check.drift_report(
+        db,
+        conn,
+        stored_model,
+        schema,
         schema_source=schema_source,
         schema_cached_at=schema_cached_at,
         refresh_error=refresh_error,
-        has_actionable_changes=not drift.is_empty,
+        lock=lambda: _lock_generation(connection_id, db, "check-drift"),
+        source="manual",
+        model_version=model_version,
     )
 
 
@@ -330,16 +364,22 @@ async def check_drift(
 
 
 def _without_removed_tables(
-    model: SemanticModel, removed: set[str]
+    model: SemanticModel, removed: set[str], live_keys: Collection[str]
 ) -> tuple[list[BusinessMetric], list[CommonJoin], list[DerivedColumn], list[Segment]]:
     """The model's global items minus the ones naming a removed table by its stored key.
 
     Exact-key only (``schema.table``): a bare-name reference is not evidence enough
-    to delete a hand-written metric, so it stays and ``detect_drift`` reports it.
+    to delete a hand-written metric, so it stays and ``detect_drift`` reports it. A
+    removed key that ``resolve_real_key`` (``bare_ok``) maps to one of *live_keys* does
+    not count: it is a near-miss duplicate of a table that survives under its live key
+    (a stored ``public.Orders`` beside ``public.orders``), so an item naming it names
+    that table, as ``detect_drift`` reads it, and stays.
     A segment is removed when every table it applies to is removed; otherwise the
     removed tables are dropped from its ``applicable_tables`` and it stays. A
     segment with no ``applicable_tables`` applies everywhere and is kept.
     """
+    live = sorted(live_keys)
+    removed = {t for t in removed if resolve_real_key(t, live, bare_ok=True) is None}
     metrics = [m for m in model.business_metrics if not any(t in removed for t in m.related_tables)]
     joins = [j for j in model.common_joins if not any(t in removed for t in j.tables)]
     derived = [d for d in model.derived_columns if not any(t in removed for t in d.base_tables)]
@@ -353,93 +393,6 @@ def _without_removed_tables(
         if not (s.applicable_tables and all(t in removed for t in s.applicable_tables))
     ]
     return metrics, joins, derived, segments
-
-
-def _live_columns(
-    schema: DataSourceSchema, keys: Collection[str] | None = None
-) -> dict[str, list[str]]:
-    """Table key → the live column names of *schema* (of the tables in *keys* when given).
-    The shape ``store.update_known_columns`` takes. The routes' schema is policy-filtered,
-    so a hidden column is not here; ``_baseline_entries`` adds the hidden ones the model
-    stores (``_held_column_names``)."""
-    return {
-        table_key(table): [c.name for c in table.columns]
-        for table in schema.tables
-        if keys is None or table_key(table) in keys
-    }
-
-
-def _held_column_names(
-    key: str, live: Collection[str], stored: Collection[str], privacy: PrivacySettings | None
-) -> set[str]:
-    """The column names table *key*'s baseline must hold because the model stores them:
-    each of its *stored* column keys that is a *live* column, and the real name
-    (``strip_ident_quotes``) of each stored key the policy hides.
-
-    ``_baseline_entries`` adds these to every entry it builds, for every reader and
-    writer of the baseline, so an entry is a superset of the stored live columns and of
-    the real names of the stored hidden keys. The schema the routes see is
-    policy-filtered, so without the second part a hidden column would leave the entry.
-    That is right for one the model never annotated: once un-hidden it is reported new.
-    One it stores stays seen, so once un-hidden a near-miss key of it (a blob-era
-    ``'"ssn"'``) is renamed to ``ssn`` rather than ``ssn`` being reported new.
-
-    Only a key the policy itself keeps is covered: ``policy_hides_column`` matches the
-    key or its quote-stripped form exactly, so a case-only ``SSN`` of a hidden ``ssn`` is
-    not hidden, the prune drops it like any gone key, and it is not recorded here.
-    """
-    live_names = set(live)
-    return {name for name in stored if name in live_names} | {
-        strip_ident_quotes(name) for name in stored if policy_hides_column(key, name, privacy)
-    }
-
-
-def _baseline_entries(
-    seen: Mapping[str, Collection[str]],
-    stored_columns: Mapping[str, Collection[str]],
-    schema: DataSourceSchema,
-    privacy: PrivacySettings | None,
-) -> dict[str, set[str]]:
-    """The baseline entry of each table of *stored_columns* that the live *schema* holds:
-    the names *seen* gives it (its live columns when *seen* has no entry for it) plus the
-    names the model stores (``_held_column_names``: its stored live columns, and the real
-    names of its stored keys the policy hides).
-
-    The one builder behind every reader and writer of the baseline, so an entry is always
-    a superset of what the table stores and no writer can leave the hidden names out:
-    ``_effective_known_columns`` (the drift check, the apply and the finalisation read
-    through it) passes the stored baseline as *seen*; a generation batch passes nothing
-    (its tables have seen their live columns, so the stored live columns add nothing and
-    only the hidden names count); the apply and the finalisation pass what each table had
-    seen that is still live. A table absent from the live schema (hidden, unreadable or
-    gone) gets no entry here: the caller keeps or prunes the one it has. Nothing is
-    dropped: a name in *seen* that left the database stays, so a stored key the baseline
-    knew is still a drop to ``compute_drift``; the writers intersect with the live
-    columns themselves, before passing *seen*.
-    """
-    entries: dict[str, set[str]] = {}
-    for key, live in _live_columns(schema, set(stored_columns)).items():
-        base = seen.get(key)
-        entries[key] = set(live if base is None else base) | _held_column_names(
-            key, live, stored_columns[key], privacy
-        )
-    return entries
-
-
-def _baseline_changes(
-    known: Mapping[str, Collection[str]], wanted: Mapping[str, Collection[str]]
-) -> dict[str, set[str]]:
-    """The entries of *wanted* that differ from the baseline *known*, or that it lacks.
-
-    ``update_known_columns`` reads and writes only the tables it is given (plus, with
-    ``prune``, one delete of the rows of tables the model no longer holds), so the
-    finalisation and the apply pass it just these: the cost of keeping the baseline
-    follows what changed, not the size of the schema."""
-    return {
-        key: set(names)
-        for key, names in wanted.items()
-        if key not in known or set(known[key]) != set(names)
-    }
 
 
 def _with_new_columns(
@@ -486,6 +439,42 @@ def _drift_new_columns(
     return out
 
 
+def _renamed_relationship_tombstones(
+    tombstoned: Collection[str],
+    catalog: Sequence[RelationshipEdge],
+    renamed_tables: Mapping[str, str],
+    renamed_columns: Mapping[str, Mapping[str, str]],
+) -> set[str]:
+    """*tombstoned* (relationship tombstone keys) plus the key of each *catalog* edge whose
+    endpoints, spelled as the model stored them before *renamed_tables* (old → new table
+    key) and *renamed_columns* (new table key → old column key → new name), are
+    tombstoned: the tombstone of an edge the user deleted while the model held a stale
+    key, rekeyed to the live names the rename gives it, so the edge stays deleted.
+
+    Rekeyed through the catalog rather than by parsing the keys, which join dotted names
+    and may be hashed (``store.tombstone_key``)."""
+    dead = set(tombstoned)
+    if not (renamed_tables or renamed_columns):
+        return dead
+    old_table = {new: old for old, new in renamed_tables.items()}
+    old_column = {
+        table: {new: old for old, new in mapping.items()}
+        for table, mapping in renamed_columns.items()
+    }
+    tkey = semantic_store.tombstone_key
+
+    def stored(table: str, column: str) -> str:
+        return f"{old_table.get(table, table)}.{old_column.get(table, {}).get(column, column)}"
+
+    for edge in catalog:
+        before = (
+            f"{stored(edge.from_table, edge.from_column)}->{stored(edge.to_table, edge.to_column)}"
+        )
+        if tkey(before) in dead:
+            dead.add(tkey(semantic_store.relationship_key(edge)))
+    return dead
+
+
 def _rebuild_relationships(
     current: Sequence[RelationshipEdge],
     catalog: list[RelationshipEdge],
@@ -497,8 +486,13 @@ def _rebuild_relationships(
     keep_hidden_endpoints: bool,
     new_tables: set[str] | None,
     new_columns: Mapping[str, set[str]] | None = None,
+    tombstoned: Collection[str] = frozenset(),
 ) -> list[RelationshipEdge]:
     """The relationship list a rebuild saves — one rule for globals and apply-drift.
+
+    ``tombstoned`` — the ``relationship_key``s the user deleted (``store.load_tombstones``):
+    those catalog edges are not rebuilt, for globals and for the apply alike, so a deletion
+    holds until the user re-adds the edge or restores it from the page.
 
     Edges of ``current`` with a gone endpoint leave first (``edges_in_schema``; a
     hidden or unreadable endpoint counts as live). Marked edges are then carried over
@@ -528,6 +522,7 @@ def _rebuild_relationships(
     endpoint is visible again (see "Finalisation" in semantic-model-generation.md).
     """
     key = semantic_store.relationship_key
+    catalog = [e for e in catalog if semantic_store.tombstone_key(key(e)) not in tombstoned]
     survivors = edges_in_schema(current, schema, privacy, keep_unreadable=True)
     rebuilt = semantic_store.carry_edited_relationships(
         survivors, catalog, provenance, render_tables=render_tables
@@ -760,6 +755,7 @@ def _drift_applied_model(
     recorded_columns: Mapping[str, Collection[str]],
     llm_items: tuple[list[BusinessMetric], list[DerivedColumn], list[Segment]],
     connection_id: str,
+    tombstoned: Mapping[str, Collection[str]] | None = None,
     log: bool = True,
 ) -> _DriftAssembly:
     """*current_model* with *drift* applied, and what ``save_model`` needs to store it.
@@ -771,10 +767,13 @@ def _drift_applied_model(
     run passes ``log=False``: the hand-edit trims and near-miss drops it previews did
     not happen, so they must not be logged as if they had.
 
-    The drift's ``renamed_columns`` are applied first (``rename_columns``): each near-miss
-    key becomes its live column's name, with its annotation, its user-edit marks and
-    protected values, its table's references and its relationship endpoints, so the
-    hand-edit trims, the prune and the edge rebuild below see it under its live name.
+    The drift's ``renamed_tables`` and then its ``renamed_columns`` are applied first
+    (``rename_tables``, ``rename_columns``): each near-miss table key becomes its live
+    table's key, with its columns, marks, protected values and relationship endpoints,
+    and each near-miss column key its live column's name, with its annotation, its
+    user-edit marks and protected values, its table's references and its relationship
+    endpoints, so the hand-edit trims, the prune and the edge rebuild below see them
+    under their live names.
 
     ``new_columns`` are the LLM annotations of new columns of tables the model already
     holds, added additively (``_with_new_columns``).
@@ -804,12 +803,15 @@ def _drift_applied_model(
     ``generation_model``, ``is_user_reviewed``, ``generation_warnings``) are left to
     the caller.
     """
-    tables, relationships, marks, protected = rename_columns(
+    tables, relationships, marks, protected = rename_tables(
         current_model.tables,
         current_model.relationships,
         snapshot.marks,
         snapshot.protected,
-        drift.renamed_columns,
+        drift.renamed_tables,
+    )
+    tables, relationships, marks, protected = rename_columns(
+        tables, relationships, marks, protected, drift.renamed_columns
     )
     renamed = current_model.model_copy(update={"tables": tables, "relationships": relationships})
     provenance, protected, edit_notes = drop_dangling_edits(
@@ -821,7 +823,7 @@ def _drift_applied_model(
     pruned = _with_new_columns(pruned, new_columns or {})
     merged_tables = {**pruned, **new_tables}
     metrics, joins, derived_columns, segments = _without_removed_tables(
-        renamed, drift.removed_table_keys
+        renamed, drift.removed_table_keys, [table_key(t) for t in schema.tables]
     )
     removed_items = {
         "metric": {m.name for m in renamed.business_metrics} - {m.name for m in metrics},
@@ -872,6 +874,12 @@ def _drift_applied_model(
         llm_metrics, llm_derived, llm_segments = _drop_unstorable_items(
             llm_metrics, llm_derived, llm_segments, connection_id
         )
+        # An item the user deleted (a tombstone) stays out, as the finalisation keeps it out.
+        dead = tombstoned or {}
+        tkey = semantic_store.tombstone_key
+        llm_metrics = [m for m in llm_metrics if tkey(m.name) not in dead.get("metric", ())]
+        llm_derived = [d for d in llm_derived if tkey(d.name) not in dead.get("derived_column", ())]
+        llm_segments = [s for s in llm_segments if tkey(s.name) not in dead.get("segment", ())]
         have_metrics = {m.name for m in metrics}
         have_derived = {d.name for d in derived_columns}
         have_segments = {s.name for s in segments}
@@ -896,6 +904,12 @@ def _drift_applied_model(
         keep_hidden_endpoints=True,
         new_tables=set(new_tables),
         new_columns=_drift_new_columns(drift, recorded_columns),
+        tombstoned=_renamed_relationship_tombstones(
+            (tombstoned or {}).get("relationship", frozenset()),
+            relationship_edges,
+            drift.renamed_tables,
+            drift.renamed_columns,
+        ),
     )
 
     model = renamed.model_copy(
@@ -936,6 +950,11 @@ async def apply_drift(
       (``compute_drift``'s ``renamed_columns``) is renamed to that name, keeping its
       annotation, its hand edits, its table's references and its relationships
       (``rename_columns``). No LLM call: the model already holds the column.
+    - Renamed tables: a stored table key that is a near-miss spelling of a live table
+      the model does not store under its real key (a blob-era ``public.Orders``;
+      ``compute_drift``'s ``renamed_tables``) is renamed to the live key, with its
+      columns, hand edits and relationship endpoints (``rename_tables``), before the
+      column renames. No LLM call.
     - New tables: annotated by the LLM (in batches, at most ``_DRIFT_MAX_NEW_TABLES``
       per apply so one request stays inside the proxy timeout; a warning names the
       rest, which the next apply takes), then — if it annotated any — one globals
@@ -993,10 +1012,11 @@ async def apply_drift(
     refreshed schema cache (which every call commits). New tables are listed by name in
     ``tables_added`` — exactly the ones the apply would send, in its order
     (``_new_tables_in_send_order``) — and new columns in ``columns_added``: exactly the
-    ones the apply would ask for (``_plan_column_batches``); renamed columns are in
-    ``columns_renamed``, as on apply. ``relationships_added`` includes the catalog edges
-    on the new columns it would send, between held tables; relationships to new tables
-    and the LLM's items over them appear only on apply. The preview's ``warnings`` are
+    ones the apply would ask for (``_plan_column_batches``); renamed tables and columns
+    are in ``tables_renamed`` and ``columns_renamed``, as on apply.
+    ``relationships_added`` includes the catalog edges on the new columns it would send,
+    between held tables; relationships to new tables and the LLM's items over them
+    appear only on apply. The preview's ``warnings`` are
     the hand-edit notes and the warnings naming the new tables (past
     ``_DRIFT_MAX_NEW_TABLES``) and the new columns (past the batch budget or the column
     cap) the apply would defer or cut.
@@ -1020,11 +1040,14 @@ async def apply_drift(
     conn = await get_connection_or_404(connection_id, db)
     # With provenance in the same pass: the dry run previews this very read, so the
     # drift it diffs and the model it assembles cannot come from two different states.
+    # Unlocked: the version before the content (see ``_with_version``).
+    stored_version = await semantic_store.load_version(db, connection_id)
     stored_model, stored_snapshot = await semantic_store.load_model_with_provenance(
         db, connection_id
     )
     if stored_model is None:
         raise HTTPException(status_code=404, detail="No semantic model — generate one first")
+    tombstoned = await semantic_store.load_tombstones(db, connection_id)
     header = await semantic_store.load_header(db, connection_id)
     if header is not None and header.generation_status == GenerationStatus.TABLES_PARTIAL:
         raise HTTPException(
@@ -1065,10 +1088,17 @@ async def apply_drift(
     await db.commit()
     if drift.is_empty:
         return ApplyDriftResponse(
-            semantic_model=stored_model, summary=DriftApplySummary(dry_run=dry_run)
+            semantic_model=_as_response(stored_model, stored_version),
+            summary=DriftApplySummary(dry_run=dry_run),
         )
 
     gen = SemanticModelGenerator()
+    # The stored tables under the keys the drift reads them by: a table held under a
+    # near-miss key it renames is the live table, so its new columns are asked for with
+    # its stored annotation as context, and the globals prompt sees it.
+    stored_by_live_key = {
+        drift.renamed_tables.get(key, key): table for key, table in stored_model.tables.items()
+    }
     # Strict (no ``privacy``), as in the generation routes: no edge on a column
     # outside the schema reaches a prompt or is saved as a fresh edge.
     relationship_edges = edges_in_schema(gen._build_relationship_graph(schema), schema)
@@ -1094,6 +1124,7 @@ async def apply_drift(
     only_columns = not (
         drift.new_table_keys
         or drift.removed_table_keys
+        or drift.renamed_tables
         or drift.removed_columns
         or drift.renamed_columns
     )
@@ -1117,6 +1148,7 @@ async def apply_drift(
             recorded_columns=would_send,
             llm_items=([], [], []),
             connection_id=connection_id,
+            tombstoned=tombstoned,
             log=False,
         )
         notes = list(preview.notes)
@@ -1132,9 +1164,10 @@ async def apply_drift(
             warnings=notes,
             removed_items=preview.removed_items,
             columns_renamed=drift.renamed_columns,
+            tables_renamed=drift.renamed_tables,
         )
         return ApplyDriftResponse(
-            semantic_model=stored_model,
+            semantic_model=_as_response(stored_model, stored_version),
             summary=summary.model_copy(
                 update={
                     "dry_run": True,
@@ -1190,7 +1223,7 @@ async def apply_drift(
             # Pruned strictly so the LLM is not invited to write metrics over gone or
             # hidden tables; log=False, the post-lock prune warns about the same drops.
             prompt_tables = {
-                **prune_to_schema(stored_model.tables, schema, log=False),
+                **prune_to_schema(stored_by_live_key, schema, log=False),
                 **new_tables,
             }
             # ``_drift_applied_model`` runs the metric checks over the metrics it actually
@@ -1234,7 +1267,7 @@ async def apply_drift(
                     provider=llm_provider,
                     model=configured_model or None,
                     columns_by_table=batch,
-                    table_context={key: stored_model.tables[key] for key in batch},
+                    table_context={key: stored_by_live_key[key] for key in batch},
                     relationship_edges=relationship_edges,
                     privacy=privacy,
                 ),
@@ -1262,6 +1295,8 @@ async def apply_drift(
     if current_model is None:
         await db.rollback()
         raise HTTPException(status_code=409, detail="Semantic model was deleted during apply-drift")
+    # Re-read with the model: a PUT during the LLM calls may have deleted or re-added items.
+    tombstoned = await semantic_store.load_tombstones(db, connection_id)
     current_header = await semantic_store.load_header(db, connection_id)
     if (
         current_header is not None
@@ -1279,12 +1314,21 @@ async def apply_drift(
     # A Regenerate or another apply may have stored a "new" table while the LLM ran.
     # The re-read holds it now: it is not new, so its stored annotation is not
     # overwritten, and items over it do not count as "over a new table".
-    new_tables = {k: v for k, v in new_tables.items() if k not in current_model.tables}
+    # The baseline as the lock sees it (the drift below reads it too): a generation batch
+    # or another apply may have moved it while the LLM ran.
+    known = await semantic_store.load_known_columns(db, connection_id)
+    # The re-read's tables by live key: one held under a near-miss key the drift below
+    # renames (``table_renames``, the rule ``compute_drift`` applies) is held.
+    held_tables = {
+        table_renames(current_model.tables, schema, privacy, known).get(key, key): table
+        for key, table in current_model.tables.items()
+    }
+    new_tables = {k: v for k, v in new_tables.items() if k not in held_tables}
     # Likewise a column another writer stored while the LLM ran is not new any more, and
     # a table the re-read no longer holds gets nothing.
     kept_columns: dict[str, dict[str, ColumnSemantic]] = {}
     for key, cols in new_columns.items():
-        table = current_model.tables.get(key)
+        table = held_tables.get(key)
         if table is None:
             continue
         if fresh := {name: col for name, col in cols.items() if name not in table.columns}:
@@ -1293,16 +1337,16 @@ async def apply_drift(
     # The drift the apply acts on is the one against the model it saves over, not the
     # pre-lock read: a table a PUT added during the LLM calls that the database no
     # longer has leaves with its items, and a drift another tab applied meanwhile is
-    # not applied — or logged — twice. Against the baseline as the lock sees it, too: a
-    # generation batch or another apply may have moved it while the LLM ran.
-    known = await semantic_store.load_known_columns(db, connection_id)
+    # not applied — or logged — twice. Against the baseline as the lock sees it, too
+    # (``known``, read above).
     effective = _effective_known_columns(known, current_model.tables, schema, privacy)
     drift = compute_drift(schema, current_model, privacy, effective)
     if drift.is_empty:
         # Every table sent to the LLM is stored by now too (``new_tables`` is empty).
         # Nothing to do: no row rewrite, no version bump, no cache purge, no log entry.
+        response = await _with_version(db, connection_id, current_model)  # under the lock
         await db.rollback()
-        return ApplyDriftResponse(semantic_model=current_model, summary=DriftApplySummary())
+        return ApplyDriftResponse(semantic_model=response, summary=DriftApplySummary())
     assembly = _drift_applied_model(
         current_model,
         snapshot,
@@ -1318,6 +1362,7 @@ async def apply_drift(
         recorded_columns=answered,
         llm_items=llm_items,
         connection_id=connection_id,
+        tombstoned=tombstoned,
     )
     gen_warnings = [*assembly.llm_warnings, *assembly.notes]
     # The plan was made before the lock: what another writer stored meanwhile is not new
@@ -1418,22 +1463,21 @@ async def apply_drift(
     live_now = _live_columns(schema)
     # ``effective`` has an entry for every stored live table (``_effective_known_columns``
     # over the same model and schema), so each one below has a base to complete.
+    # By live key (``held_tables``): a renamed table's entry is its live key's.
     seen = {
         key: set(names) & set(live_now[key]) if key in live_now else set(names)
         for key, names in effective.items()
-        if key in current_model.tables
+        if key in held_tables
     }
     seen.update(
-        _baseline_entries(
-            seen, {key: t.columns for key, t in current_model.tables.items()}, schema, privacy
-        )
+        _baseline_entries(seen, {key: t.columns for key, t in held_tables.items()}, schema, privacy)
     )
     # A new table has seen every live column, whatever row it left behind (a check that
     # seeded it before an earlier apply removed it): that row is overwritten.
     for key, names in _live_columns(schema, set(new_tables)).items():
         seen[key] = set(names)
     for key, names in answered.items():
-        if key in current_model.tables:
+        if key in held_tables:
             seen.setdefault(key, set()).update(names)
     moved = _baseline_changes(known, seen)  # all the store is asked to write
     header_update: dict[str, Any] = {"generation_warnings": gen_warnings}
@@ -1459,13 +1503,15 @@ async def apply_drift(
             warnings=gen_warnings,
             removed_items=assembly.removed_items,
             columns_renamed=drift.renamed_columns,
+            tables_renamed=drift.renamed_tables,
         )
 
     summary = summary_of(final)
     if not summary.changed and not assembly.notes:
         # The LLM returned nothing for the only new tables or columns, or a batch failed:
-        # the model is as it was. (A trimmed hand edit — ``notes`` — is a change the lists
-        # do not show, so it is saved.) Not saved or purged. Skipped tables and failed
+        # the model is as it was. (A trimmed hand edit — ``notes`` — is saved: the lists
+        # name it in ``references_cleared``, and ``notes`` keeps it saved regardless.)
+        # Not saved or purged. Skipped tables and failed
         # batches are still logged, and the commit releases the lock: the next apply
         # orders its tables by the newest log entry (``_new_tables_in_send_order``,
         # ``_column_tables_in_send_order``), so without the entry the tables that keep
@@ -1480,10 +1526,12 @@ async def apply_drift(
                 await semantic_store.record_drift_apply(
                     db, connection_id, summary.model_dump(mode="json"), applied_by=user_id
                 )
+        response = await _with_version(db, connection_id, current_model)  # under the lock
+        if skipped or moved:
             await db.commit()
         else:
             await db.rollback()
-        return ApplyDriftResponse(semantic_model=current_model, summary=summary)
+        return ApplyDriftResponse(semantic_model=response, summary=summary)
 
     try:
         stored = await semantic_store.save_model(
@@ -1510,8 +1558,9 @@ async def apply_drift(
     # The schema cache holds this apply's own live introspection: kept (the page's
     # column lists read it); the query and embedding caches go.
     await _invalidate_connection_caches(connection_id, db, keep_schema=True)
+    response = await _with_version(db, connection_id, stored)  # under the lock
     await db.commit()
-    return ApplyDriftResponse(semantic_model=stored, summary=summary)
+    return ApplyDriftResponse(semantic_model=response, summary=summary)
 
 
 @router.get("/{connection_id}/semantic/drift/history", response_model=list[DriftApplyHistoryEntry])
@@ -1615,14 +1664,14 @@ async def list_suggestions(
 
 @router.post(
     "/{connection_id}/semantic/suggestions/{suggestion_id}/apply",
-    response_model=SemanticModel,
+    response_model=SemanticModelResponse,
 )
 async def apply_suggestion(
     connection_id: str,
     suggestion_id: str,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
-) -> SemanticModel:
+) -> SemanticModelResponse:
     """Apply a specific semantic suggestion to the stored model.
 
     OVERHEAD: app-only — reads/writes PostgreSQL app DB only.
@@ -1726,8 +1775,9 @@ async def apply_suggestion(
         .values(is_applied=True)
     )
     await _invalidate_connection_caches(connection_id, db)
+    response = await _with_version(db, connection_id, new_model)  # under the lock
     await db.commit()
-    return new_model
+    return response
 
 
 # ── Phased generation helpers + endpoints ──────────────────────────────────────
@@ -2177,7 +2227,7 @@ async def generate_semantic_batch(
     )
 
 
-@router.post("/{connection_id}/semantic/generate/globals", response_model=SemanticModel)
+@router.post("/{connection_id}/semantic/generate/globals", response_model=SemanticModelResponse)
 @limiter.limit("10/minute")
 async def generate_semantic_globals(
     request: Request,
@@ -2185,7 +2235,7 @@ async def generate_semantic_globals(
     provider: str = "claude",
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
-) -> SemanticModel:
+) -> SemanticModelResponse:
     """Phase 3 of phased generation: cross-table metrics, segments, derived columns.
 
     Finalises the model (``generation_status = "complete"``) over whatever
@@ -2196,6 +2246,10 @@ async def generate_semantic_globals(
     renames (a near-miss spelling of a live column the model has seen, which this run
     did not annotate under its real name) is renamed first, as ``/apply-drift`` renames
     it, so its annotation and hand edits are kept rather than pruned.
+
+    A generated metric, segment, derived column or catalog relationship the user deleted
+    (``store.load_tombstones``, read under the lock) is left out silently: the deletion
+    was the user's own, so it earns no warning. Restoring it from the page lifts that.
     """
     user_id: str = current_user.id
     schema, conn = await _load_schema_for_connection(connection_id, current_user, db)
@@ -2230,6 +2284,9 @@ async def generate_semantic_globals(
     # ``schema`` has the policy applied (excluded schemas, tables and columns
     # removed); pruning must not read that absence as drift.
     privacy = PrivacySettings.from_dict(conn.privacy_settings) if conn.privacy_settings else None
+    # For the prompt's table renames only (``table_renames`` never renames a key the
+    # baseline knows); the finalisation re-reads it under the lock.
+    prompt_known = await semantic_store.load_known_columns(db, connection_id)
 
     metrics, derived_columns, segments = await _run_llm_phase(
         gen.generate_globals(
@@ -2239,8 +2296,19 @@ async def generate_semantic_globals(
             # Pruned so the LLM is not invited to write metrics over gone tables.
             # Strictly, without ``privacy``: what the policy hides is kept in the
             # stored model below but must never reach the LLM.
-            # log=False: the post-lock prune below warns about the same drops.
-            all_tables=prune_to_schema(partial_model.tables, schema, log=False),
+            # log=False: the post-lock prune below warns about the same drops. A table
+            # held under a near-miss key the finalisation renames is read under its live
+            # key (``table_renames``), so it is not left out.
+            all_tables=prune_to_schema(
+                {
+                    table_renames(partial_model.tables, schema, privacy, prompt_known).get(
+                        key, key
+                    ): table
+                    for key, table in partial_model.tables.items()
+                },
+                schema,
+                log=False,
+            ),
             relationship_edges=relationship_edges,
         ),
         what="Globals generation",
@@ -2259,6 +2327,7 @@ async def generate_semantic_globals(
         raise HTTPException(
             status_code=409, detail="Semantic model was deleted during globals generation"
         )
+    tombstoned = await semantic_store.load_tombstones(db, connection_id)
     if current_model.generation_status not in (
         GenerationStatus.TABLES_PARTIAL,
         GenerationStatus.COMPLETE,
@@ -2292,24 +2361,29 @@ async def generate_semantic_globals(
                 "finish the new run"
             ),
         )
-    # A near-miss key of a live column the baseline has seen, held while the table stores
-    # no column of that name, is renamed to it with its annotation, marks and references:
-    # ``compute_drift``'s rule, read through the same effective baseline as Check Drift and
-    # Apply Drift. A column this run annotated under its real name is stored, so its
-    # near-miss key is a duplicate the prune below drops.
+    # A near-miss table key of a live table the model does not store under its real key
+    # (a blob-era ``public.Orders``), and a near-miss key of a live column the baseline has
+    # seen, held while the table stores no column of that name, are renamed to it with
+    # their annotation, marks and references: ``compute_drift``'s rules, read through the
+    # same effective baseline as Check Drift and Apply Drift. A table or column this run
+    # annotated under its real name is stored, so its near-miss key is a duplicate the
+    # prune below drops.
     known = await semantic_store.load_known_columns(db, connection_id)
     renames = compute_drift(
         schema,
         current_model,
         privacy,
         _effective_known_columns(known, current_model.tables, schema, privacy),
-    ).renamed_columns
-    tables, relationships, marks, protected = rename_columns(
+    )
+    tables, relationships, marks, protected = rename_tables(
         current_model.tables,
         current_model.relationships,
         snapshot.marks,
         snapshot.protected,
-        renames,
+        renames.renamed_tables,
+    )
+    tables, relationships, marks, protected = rename_columns(
+        tables, relationships, marks, protected, renames.renamed_columns
     )
     # A hand edit that names a column the table no longer has would be written back
     # over the pruned row as a dangling reference, with a mark that stops every later
@@ -2338,6 +2412,24 @@ async def generate_semantic_globals(
     derived_columns = [
         d for d in derived_columns if f"derived_column:{d.name}" not in edited_items
     ] + [d for d in current_model.derived_columns if f"derived_column:{d.name}" in edited_items]
+    # An item the user deleted (``store.load_tombstones``, written by ``apply_user_patch``)
+    # stays out, silently: the deletion was the user's own. A hand-authored item cannot be
+    # tombstoned (re-adding it lifted the tombstone); the guard only keeps the rule honest.
+    tkey = semantic_store.tombstone_key
+    metrics = [
+        m for m in metrics if m.name in edited_metrics or tkey(m.name) not in tombstoned["metric"]
+    ]
+    segments = [
+        s
+        for s in segments
+        if f"segment:{s.name}" in edited_items or tkey(s.name) not in tombstoned["segment"]
+    ]
+    derived_columns = [
+        d
+        for d in derived_columns
+        if f"derived_column:{d.name}" in edited_items
+        or tkey(d.name) not in tombstoned["derived_column"]
+    ]
 
     # ``current_model.tables`` (with the renames above), not the pre-LLM snapshot: a batch
     # that landed during the globals call is in the stored rows. Pruned by schema
@@ -2395,6 +2487,12 @@ async def generate_semantic_globals(
         render_tables=set(pruned),
         keep_hidden_endpoints=False,
         new_tables=None,
+        tombstoned=_renamed_relationship_tombstones(
+            tombstoned["relationship"],
+            relationship_edges,
+            renames.renamed_tables,
+            renames.renamed_columns,
+        ),
     )
 
     dialect = conn.source_type
@@ -2456,7 +2554,8 @@ async def generate_semantic_globals(
         db, connection_id, _baseline_changes(known, wanted), prune=True
     )
     await _invalidate_connection_caches(connection_id, db)
-    await db.commit()
     # What was stored, not ``final``: the store fits values (NULs, VARCHAR lengths)
-    # and dedupes name-keyed items, and returns the result.
-    return stored
+    # and dedupes name-keyed items, and returns the result. Versioned under the lock.
+    response = await _with_version(db, connection_id, stored)
+    await db.commit()
+    return response

@@ -22,6 +22,11 @@ def _privacy(**kwargs) -> PrivacySettings:
     )
 
 
+_EXACT_SSN = PrivacySettings(
+    strict_sensitive_columns=True, sensitive_column_patterns=[], sensitive_columns=["ssn"]
+)
+
+
 def _rejected(sql: str, privacy: PrivacySettings | None = None, dialect: str = "postgresql"):
     with pytest.raises(SensitiveColumnRejectedError) as info:
         check_strict_sensitive(sql, privacy or _privacy(), dialect)
@@ -65,7 +70,6 @@ class TestAllowed:
             "SELECT email FROM u",
             "SELECT u.email AS e FROM u",
             "SELECT email, id FROM u WHERE id = 1",
-            "SELECT DISTINCT email FROM u",
             "SELECT * FROM u",
             "SELECT u.* FROM u JOIN o ON o.uid = u.id",
             "SELECT count(*) FROM u",
@@ -185,13 +189,60 @@ class TestAliasesAndPositions:
         _column_message(_rejected("SELECT email, * FROM u ORDER BY 1"), "email")
         _column_message(_rejected("SELECT email, * FROM u ORDER BY 1", dialect="mysql"), "email")
 
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id, email FROM u ORDER BY (2)",
+            "SELECT id, email FROM u ORDER BY ((2))",
+            "SELECT email, count(*) FROM u GROUP BY (1)",
+            "SELECT DISTINCT ON ((2)) id, email FROM u",
+            "SELECT email, count(*) FROM u GROUP BY ROLLUP (1)",
+            "SELECT email, count(*) FROM u GROUP BY CUBE (1)",
+            "SELECT email, count(*) FROM u GROUP BY GROUPING SETS ((1))",
+            "SELECT id, email, count(*) FROM u GROUP BY ROLLUP (id, (2))",
+            "SELECT id, email, count(*) FROM u GROUP BY GROUPING SETS ((id), (2, id))",
+        ],
+    )
+    def test_a_position_in_parentheses_or_a_grouping_set_is_resolved(self, sql: str) -> None:
+        _column_message(_rejected(sql), "email")
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT email, count(*) FROM u GROUP BY GROUPING SETS (ROLLUP (1))",
+            "SELECT email, count(*) FROM u GROUP BY GROUPING SETS (CUBE (1), ())",
+            "SELECT email, count(*) FROM u GROUP BY GROUPING SETS (GROUPING SETS (1))",
+            "SELECT email, count(*) FROM u GROUP BY (1, 1)",
+            "SELECT email, count(*) FROM u GROUP BY ((1, 1))",
+            "SELECT email, count(*) FROM u GROUP BY ((1), 1)",
+            "SELECT email, count(*) FROM u GROUP BY GROUPING SETS (((1, 1)))",
+        ],
+    )
+    def test_a_position_in_a_nested_grouping_set_or_a_parenthesised_list_is_resolved(
+        self, sql: str
+    ) -> None:
+        _column_message(_rejected(sql), "email")
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id, email FROM u ORDER BY (1)",
+            "SELECT id, count(*) FROM u GROUP BY ROLLUP (1)",
+            "SELECT id, name, count(*) FROM u GROUP BY GROUPING SETS ((1), (2), ())",
+            "SELECT id, email FROM u ORDER BY (2, 1)",
+            "SELECT id, count(*) FROM u GROUP BY GROUPING SETS (ROLLUP (1))",
+            "SELECT id, count(*) FROM u GROUP BY (1, 1)",
+        ],
+    )
+    def test_a_position_in_parentheses_on_a_plain_item_passes(self, sql: str) -> None:
+        check_strict_sensitive(sql, _privacy(), "postgresql")
+
     def test_count_star_before_a_position_is_not_a_star(self) -> None:
         check_strict_sensitive("SELECT count(*), id FROM u GROUP BY 2", _privacy(), "postgresql")
 
     @pytest.mark.parametrize(
         "sql",
         [
-            "SELECT (SELECT email FROM u LIMIT 1) FROM t ORDER BY 1",
             "SELECT (SELECT email FROM u LIMIT 1) AS e FROM t ORDER BY 1",
             "SELECT (SELECT email FROM u LIMIT 1) AS e, count(*) FROM t GROUP BY 1",
         ],
@@ -273,6 +324,99 @@ class TestAliasesAndPositions:
     def test_a_number_in_a_window_order_by_is_a_constant(self, sql: str) -> None:
         check_strict_sensitive(sql, _privacy(), "postgresql")
 
+    @pytest.mark.parametrize(
+        ("sql", "dialect"),
+        [
+            # PostgreSQL reads a number in an aggregate's own ORDER BY as a constant.
+            ("SELECT email, percentile_cont(0.5) WITHIN GROUP (ORDER BY 1) FROM u", "postgresql"),
+            ("SELECT email, mode() WITHIN GROUP (ORDER BY 1) FROM u", "postgresql"),
+            ("SELECT email, string_agg(name, ',' ORDER BY 1) FROM u GROUP BY id", "postgresql"),
+            ("SELECT array_agg(id ORDER BY (2)), email FROM u GROUP BY id", "postgresql"),
+            ("SELECT email, jsonb_agg(name ORDER BY 1) FROM u GROUP BY id", "postgresql"),
+            (
+                "SELECT email, array_agg(name ORDER BY 1) FILTER (WHERE true) FROM u GROUP BY id",
+                "postgresql",
+            ),
+            # MySQL reads it as a position among the GROUP_CONCAT arguments, which the column
+            # rules check anyway.
+            ("SELECT email, group_concat(name ORDER BY 1) FROM u GROUP BY id", "mysql"),
+            (
+                "SELECT email, group_concat(DISTINCT name ORDER BY 1 SEPARATOR ',') FROM u"
+                " GROUP BY id",
+                "mysql",
+            ),
+        ],
+    )
+    def test_a_number_in_an_aggregate_order_by_is_not_a_select_list_position(
+        self, sql: str, dialect: str
+    ) -> None:
+        check_strict_sensitive(sql, _privacy(), dialect)
+
+    @pytest.mark.parametrize(
+        ("sql", "dialect"),
+        [
+            (
+                "SELECT email, string_agg(name, ',' ORDER BY 1) FROM u GROUP BY id ORDER BY 1",
+                "postgresql",
+            ),
+            (
+                "SELECT id, array_agg(id ORDER BY 1), email FROM u GROUP BY id ORDER BY 3",
+                "postgresql",
+            ),
+            ("SELECT string_agg(email, ',' ORDER BY 1) FROM u", "postgresql"),
+            ("SELECT array_agg(id ORDER BY email) FROM u", "postgresql"),
+            ("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY salary) FROM u", "postgresql"),
+            (
+                "SELECT email, group_concat(name ORDER BY 1) FROM u GROUP BY id ORDER BY 1",
+                "mysql",
+            ),
+            ("SELECT group_concat(email ORDER BY 1) FROM u", "mysql"),
+        ],
+    )
+    def test_a_query_position_or_a_column_next_to_an_aggregate_order_by_is_rejected(
+        self, sql: str, dialect: str
+    ) -> None:
+        exc = _rejected(sql, dialect=dialect)
+        assert "the column" in str(exc)
+
+    @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 1 FROM t WHERE EXISTS ((SELECT id, email FROM u) ORDER BY 1)",
+            "SELECT 1 FROM t WHERE EXISTS ((SELECT id, email FROM u) ORDER BY 1 LIMIT 1)",
+            "SELECT 1 FROM t WHERE EXISTS ((SELECT id, email FROM u) LIMIT 1)",
+            "SELECT 1 FROM t WHERE EXISTS ((SELECT id, name FROM a UNION ALL SELECT id, email"
+            " FROM b) ORDER BY 1)",
+        ],
+    )
+    def test_an_order_by_on_a_parenthesised_exists_query_is_resolved_against_it(
+        self, sql: str, dialect: str
+    ) -> None:
+        # sqlglot reads these as Exists(Order(Subquery)) or Exists(Limit(...)): the query is
+        # still an EXISTS test, and the position names its own first item.
+        check_strict_sensitive(sql, _privacy(), dialect)
+
+    @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 1 FROM t WHERE EXISTS ((SELECT id, email FROM u) ORDER BY 2)",
+            "SELECT 1 FROM t WHERE EXISTS ((SELECT id, email FROM u) ORDER BY 2 LIMIT 1)",
+            "SELECT 1 FROM t WHERE EXISTS ((SELECT id, email FROM u WHERE email LIKE 'a%')"
+            " ORDER BY 1)",
+            # The position reaches every branch of the set operation it sorts.
+            "SELECT 1 FROM t WHERE EXISTS ((SELECT id FROM a UNION ALL SELECT email FROM b)"
+            " ORDER BY 1)",
+            "SELECT id FROM t WHERE x IN ((SELECT email FROM u) ORDER BY 1)",
+            "SELECT id FROM t WHERE x IN ((SELECT email FROM u) LIMIT 1)",
+        ],
+    )
+    def test_a_sensitive_use_in_a_parenthesised_exists_or_value_query_is_rejected(
+        self, sql: str, dialect: str
+    ) -> None:
+        _column_message(_rejected(sql, dialect=dialect), "email")
+
 
 class TestJoins:
     def test_using_a_sensitive_column_is_rejected(self) -> None:
@@ -307,6 +451,98 @@ class TestWholeRow:
         assert "country.country" in exc.llm_hint
         assert "table or alias" in exc.llm_hint
 
+    @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # An aliased table is read as a row only through its alias: country is a column.
+            "SELECT country FROM sales s JOIN country c ON c.id = s.country_id",
+            "SELECT status FROM orders AS status_table JOIN status AS st ON st.id = 1",
+        ],
+    )
+    def test_the_name_of_an_aliased_table_is_a_column(self, sql: str, dialect: str) -> None:
+        check_strict_sensitive(sql, _privacy(), dialect)
+
+    @pytest.mark.parametrize(
+        ("sql", "table"),
+        [
+            ("SELECT c FROM sales s JOIN country c ON c.id = s.country_id", "c"),
+            # The same table unaliased elsewhere in the query is still a row there.
+            ("SELECT country FROM country c JOIN country ON country.id = c.id", "country"),
+            ("SELECT id FROM country c WHERE EXISTS (SELECT country FROM country)", "country"),
+        ],
+    )
+    def test_the_alias_or_an_unaliased_name_is_still_a_whole_row(
+        self, sql: str, table: str
+    ) -> None:
+        assert f"the whole row of {table}" in str(_rejected(sql))
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT status FROM status",
+            "SELECT u FROM u",
+            "SELECT id FROM u AS t WHERE t = 1",
+            "SELECT d FROM (VALUES ROW(1)) d",
+        ],
+    )
+    def test_mysql_has_no_whole_row_references(self, sql: str) -> None:
+        # MySQL reads a bare name as a column, never as the row of a table.
+        check_strict_sensitive(sql, _privacy(), "mysql")
+
+    def test_on_mysql_a_sensitive_column_named_like_its_table_is_still_checked(self) -> None:
+        _column_message(
+            _rejected("SELECT id FROM email WHERE email = 'x'", dialect="mysql"), "email"
+        )
+
+    @pytest.mark.parametrize(
+        ("sql", "name"),
+        [
+            # PostgreSQL names an unaliased function in FROM after the function.
+            ("SELECT generate_series FROM generate_series(1, 3)", "generate_series"),
+            ("SELECT my_fn FROM public.my_fn(1)", "my_fn"),
+            ("SELECT unnest FROM unnest(ARRAY[1])", "unnest"),
+            ("SELECT id FROM t CROSS JOIN LATERAL unnest(t.a) WHERE unnest::text = 'x'", "unnest"),
+            ("SELECT generate_series FROM t, LATERAL generate_series(1, t.n)", "generate_series"),
+            # An alias names the row instead.
+            ("SELECT x FROM unnest(ARRAY[1]) AS x", "x"),
+            ("SELECT g FROM t, LATERAL generate_series(1, t.n) AS g", "g"),
+            ("SELECT g FROM t CROSS JOIN LATERAL unnest(t.a) AS g", "g"),
+            ("SELECT s FROM t, LATERAL (SELECT email FROM u) s", "s"),
+            # A schema-qualified function under LATERAL (sqlglot: Lateral(Dot(...))).
+            (
+                "SELECT get_users FROM orders CROSS JOIN LATERAL public.get_users(orders.id)",
+                "get_users",
+            ),
+            ("SELECT f FROM orders, LATERAL public.f(orders.id)", "f"),
+            ("SELECT f FROM orders JOIN LATERAL public.f(orders.id) ON true", "f"),
+            ("SELECT f FROM orders, LATERAL a.b.f(orders.id)", "f"),
+            # A VALUES list in FROM is named by its alias.
+            ("SELECT d FROM (VALUES (1)) d", "d"),
+        ],
+    )
+    def test_a_function_or_lateral_source_is_a_whole_row(self, sql: str, name: str) -> None:
+        assert f"the whole row of {name}" in str(_rejected(sql))
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT g.g FROM generate_series(1, 3) g",
+            "SELECT generate_series FROM generate_series(1, 3) AS g",
+            "SELECT generate_series.generate_series FROM generate_series(1, 3)",
+            "SELECT unnest FROM unnest(ARRAY[1]) AS u",
+            "SELECT x.x FROM unnest(ARRAY[1]) AS x",
+            "SELECT unnest FROM t CROSS JOIN LATERAL unnest(t.a) AS g",
+            # unnest called in an expression is not a row source.
+            "SELECT unnest(a) AS v, t.unnest FROM t",
+            "SELECT get_users FROM orders CROSS JOIN LATERAL public.get_users(orders.id) AS g",
+            "SELECT g.get_users FROM orders, LATERAL public.get_users(orders.id) g",
+            "SELECT d.column1 FROM (VALUES (1)) d",
+        ],
+    )
+    def test_an_aliased_or_qualified_function_source_passes(self, sql: str) -> None:
+        check_strict_sensitive(sql, _privacy(), "postgresql")
+
     @pytest.mark.parametrize(
         "sql",
         [
@@ -330,6 +566,49 @@ class TestUnparsed:
     )
     def test_anything_but_one_plain_statement_is_rejected(self, sql: str) -> None:
         assert "could not be parsed" in str(_rejected(sql))
+
+
+class TestEscapeStringContinuation:
+    """PostgreSQL continues an ``E'…'`` across a newline as an escape string, where sqlglot's
+    tokenizer reads the next segment as a standard string: refused before parsing, with the
+    lexer check result masking uses, not only because sqlglot happens to fail on it."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM u WHERE name = E'x'\n'y'",
+            "SELECT id FROM u WHERE name = E'\\\\'\n'\\' OR email = ''a'' --'",
+            "SELECT id FROM u WHERE name = e'x'  \n  'y'",
+            # /*! is a plain comment on PostgreSQL: the scan reads past it.
+            "/*!*/ SELECT E'a'\n'b' FROM u",
+        ],
+    )
+    def test_a_continued_escape_string_is_rejected(self, sql: str) -> None:
+        exc = _rejected(sql)
+        assert "an escape string continued on a later line" in str(exc)
+        assert "'" not in str(exc) and '"' not in str(exc)
+        assert "E'" in exc.llm_hint
+
+    def test_it_is_refused_even_when_sqlglot_could_parse_it(self) -> None:
+        from unittest.mock import patch
+
+        import sqlglot
+
+        with patch.object(sqlglot, "parse", return_value=[sqlglot.parse_one("SELECT id FROM u")]):
+            exc = _rejected("SELECT id FROM u WHERE name = E'x'\n'y'")
+        assert "an escape string continued on a later line" in str(exc)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM u WHERE name = E'x'",
+            "SELECT id FROM u WHERE name = E'a\nb'",
+            "SELECT id FROM u WHERE name = 'x'\n'y'",
+            "SELECT id FROM u WHERE name = E'x' || \n'y'",
+        ],
+    )
+    def test_an_escape_string_on_one_line_or_a_standard_continuation_passes(self, sql: str) -> None:
+        check_strict_sensitive(sql, _privacy(), "postgresql")
 
 
 class TestSubqueriesUsedAsValues:
@@ -393,8 +672,7 @@ class TestSubqueriesUsedAsValues:
         "sql",
         [
             "SELECT (SELECT email FROM users LIMIT 1) AS e FROM t",
-            "SELECT (SELECT email FROM users LIMIT 1) FROM t",
-            "SELECT ((SELECT email FROM users LIMIT 1)) FROM t",
+            "SELECT ((SELECT email FROM users LIMIT 1)) AS e FROM t",
             "SELECT id FROM orders o WHERE (SELECT count(*) FROM users u WHERE u.id = o.user_id)"
             " > 0",
             "SELECT 1 FROM u WHERE EXISTS (SELECT email FROM v)",
@@ -432,7 +710,7 @@ class TestSetOperations:
                 "email",
             ),
             (
-                "SELECT id FROM a UNION ALL SELECT (SELECT email FROM b LIMIT 1) ORDER BY 1",
+                "SELECT id FROM a UNION ALL SELECT (SELECT email FROM b LIMIT 1) AS e ORDER BY 1",
                 "email",
             ),
             (
@@ -511,6 +789,15 @@ def _compared_message(exc: SensitiveColumnRejectedError, column: str) -> None:
     assert "'" not in stripped and '"' not in stripped
 
 
+def _distinct_message(exc: SensitiveColumnRejectedError, column: str) -> None:
+    message = str(exc)
+    assert f"removes duplicates of the column {column} with DISTINCT or GROUP BY ALL" in message
+    assert "reveals whether its values match" in message
+    assert column in exc.llm_hint
+    stripped = message.replace(column, "")
+    assert "'" not in stripped and '"' not in stripped
+
+
 class TestSetOperationComparisons:
     # Duplicate removal and row comparison reveal whether values match, so only UNION ALL
     # may carry a sensitive item.
@@ -571,6 +858,97 @@ class TestSetOperationComparisons:
     def test_union_all_and_non_sensitive_comparisons_pass(self, sql: str) -> None:
         check_strict_sensitive(sql, _privacy(), "postgresql")
         check_strict_sensitive(sql, _privacy(), "mysql")
+
+
+class TestDistinct:
+    """DISTINCT (MySQL DISTINCTROW too) and GROUP BY ALL remove duplicates: the rows kept reveal
+    whether the values of a sensitive item match. Checked on every SELECT of the tree."""
+
+    @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+    @pytest.mark.parametrize(
+        ("sql", "column"),
+        [
+            ("SELECT DISTINCT email FROM u", "email"),
+            ("SELECT DISTINCT email AS e FROM u", "email"),
+            ("SELECT DISTINCT id, email FROM u WHERE id IN (1, 2)", "email"),
+            ("SELECT count(*) FROM (SELECT DISTINCT email FROM u) s", "email"),
+            (
+                "SELECT count(*) FROM (SELECT DISTINCT x FROM"
+                " (SELECT email AS x FROM u UNION ALL SELECT 'a@x.com') t) s",
+                "x",
+            ),
+            ("SELECT DISTINCT e FROM (SELECT email AS e FROM u) s", "e"),
+            ("SELECT DISTINCT id FROM a UNION ALL SELECT email FROM b", "id"),
+            ("SELECT DISTINCT (SELECT email FROM u LIMIT 1) AS e FROM t", "email"),
+            ("WITH c AS (SELECT DISTINCT email FROM u) SELECT 1 FROM c", "email"),
+            ("SELECT 1 FROM t WHERE EXISTS (SELECT DISTINCT email FROM u)", "email"),
+            ("SELECT 1 FROM t, LATERAL (SELECT DISTINCT email FROM u) l", "email"),
+            (
+                "SELECT count(*) FROM (SELECT 1 FROM (SELECT DISTINCT email FROM u) a) b",
+                "email",
+            ),
+        ],
+    )
+    def test_distinct_over_a_sensitive_item_is_rejected(
+        self, sql: str, column: str, dialect: str
+    ) -> None:
+        _distinct_message(_rejected(sql, dialect=dialect), column)
+
+    def test_mysql_distinctrow_is_distinct(self) -> None:
+        _distinct_message(_rejected("SELECT DISTINCTROW email FROM u", dialect="mysql"), "email")
+
+    @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT email FROM u GROUP BY ALL",
+            "SELECT count(*) FROM (SELECT email FROM u GROUP BY ALL) s",
+        ],
+    )
+    def test_group_by_all_over_a_sensitive_item_is_rejected(self, sql: str, dialect: str) -> None:
+        _distinct_message(_rejected(sql, dialect=dialect), "email")
+
+    @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT DISTINCT * FROM u",
+            "SELECT DISTINCT u.* FROM u",
+            "SELECT count(*) FROM (SELECT DISTINCT * FROM u) s",
+            "SELECT DISTINCT (SELECT * FROM v LIMIT 1) AS x FROM t",
+            "SELECT DISTINCT x FROM (SELECT (SELECT * FROM v LIMIT 1) AS x FROM t) s",
+            "SELECT * FROM u GROUP BY ALL",
+        ],
+    )
+    def test_distinct_over_a_star_is_a_shape(self, sql: str, dialect: str) -> None:
+        exc = _rejected(sql, dialect=dialect)
+        assert "a DISTINCT or GROUP BY ALL over a star" in str(exc)
+
+    @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT DISTINCT id FROM u",
+            "SELECT DISTINCT id, name FROM u",
+            "SELECT DISTINCT id FROM (SELECT id, email FROM u) s",
+            "SELECT email FROM (SELECT DISTINCT id FROM u) s JOIN u USING (id)",
+            "SELECT id FROM u GROUP BY ALL",
+        ],
+    )
+    def test_distinct_without_a_sensitive_item_runs(self, sql: str, dialect: str) -> None:
+        check_strict_sensitive(sql, _privacy(), dialect)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT DISTINCT ON (id) id, email FROM u",
+            "SELECT DISTINCT ON (id) * FROM u",
+        ],
+    )
+    def test_distinct_on_another_column_runs(self, sql: str) -> None:
+        # DISTINCT ON removes duplicates by its own expressions, which are checked as column
+        # uses (DISTINCT ON (email) is refused already); the projection is not compared.
+        check_strict_sensitive(sql, _privacy(), "postgresql")
 
 
 class TestSetOperationOperands:
@@ -637,7 +1015,10 @@ class TestStarAliases:
 
 
 class TestUnnamedSubqueryItems:
-    # MySQL names an unaliased item after its SQL text, which the check cannot follow.
+    # An unaliased scalar subquery item is named by the engine: MySQL after its SQL text, a
+    # name ORDER BY, GROUP BY, HAVING and an outer query can use and the check cannot follow;
+    # PostgreSQL after the subquery's own output column. The alias is required wherever the
+    # item stands, on every engine.
     @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
     @pytest.mark.parametrize(
         "sql",
@@ -649,30 +1030,65 @@ class TestUnnamedSubqueryItems:
             "SELECT 1 FROM t, LATERAL (SELECT (SELECT ssn FROM u LIMIT 1) FROM v) l",
             "SELECT 1 FROM (SELECT 1 AS a UNION ALL SELECT (SELECT ssn FROM u LIMIT 1)) d",
             "SELECT 1 FROM (SELECT (SELECT * FROM u LIMIT 1) FROM t) d",
+            "SELECT (SELECT ssn FROM u LIMIT 1) FROM t",
+            "SELECT id FROM a UNION ALL SELECT (SELECT ssn FROM u LIMIT 1)",
+            "(SELECT (SELECT ssn FROM u LIMIT 1) FROM t)",
+            "SELECT (SELECT * FROM u LIMIT 1) FROM t",
         ],
     )
-    def test_an_unnamed_sensitive_subquery_item_below_the_top_is_rejected(
+    def test_an_unnamed_sensitive_subquery_item_is_rejected_wherever_it_stands(
         self, sql: str, dialect: str
     ) -> None:
         if dialect == "postgresql":
             sql = sql.replace("`", '"')
-        privacy = _privacy(sensitive_columns=["ssn"])
-        exc = _rejected(sql, privacy, dialect)
+        exc = _rejected(sql, _EXACT_SSN, dialect)
         assert "an unnamed subquery item that reads a sensitive column" in str(exc)
+        assert "alias" in exc.llm_hint
 
     @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
     @pytest.mark.parametrize(
         "sql",
         [
             "SELECT 1 FROM (SELECT (SELECT ssn FROM u LIMIT 1) AS s FROM t) d",
-            "SELECT (SELECT ssn FROM u LIMIT 1) FROM t",
-            "SELECT id FROM a UNION ALL SELECT (SELECT ssn FROM u LIMIT 1)",
-            "(SELECT (SELECT ssn FROM u LIMIT 1) FROM t)",
             "SELECT 1 FROM (SELECT (SELECT id FROM u LIMIT 1) FROM t) d",
         ],
     )
-    def test_a_named_or_top_level_subquery_item_passes(self, sql: str, dialect: str) -> None:
-        check_strict_sensitive(sql, _privacy(sensitive_columns=["ssn"]), dialect)
+    def test_a_named_subquery_item_or_a_harmless_one_passes(self, sql: str, dialect: str) -> None:
+        check_strict_sensitive(sql, _EXACT_SSN, dialect)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # MySQL 8.0.46 names the item after its SQL text; ORDER BY, GROUP BY and HAVING
+            # can use that name (verified 2026-11-03).
+            "SELECT (SELECT ssn FROM u LIMIT 1) FROM t ORDER BY `(SELECT ssn FROM u LIMIT 1)`",
+            "SELECT (SELECT ssn FROM u LIMIT 1) FROM t GROUP BY `(SELECT ssn FROM u LIMIT 1)`",
+            "SELECT (SELECT ssn FROM u LIMIT 1) FROM t"
+            " HAVING `(SELECT ssn FROM u LIMIT 1)` LIKE 'a%'",
+            "SELECT (SELECT * FROM u LIMIT 1) FROM t ORDER BY `(SELECT * FROM u LIMIT 1)`",
+        ],
+    )
+    def test_mysql_sql_text_name_of_an_unnamed_item_is_closed(self, sql: str) -> None:
+        # The message is pinned, not just the refusal: the walk reaches the SELECT item
+        # before the ORDER BY / GROUP BY / HAVING reference, so this rule is what fires.
+        exc = _rejected(sql, _EXACT_SSN, "mysql")
+        assert "an unnamed subquery item that reads a sensitive column" in str(exc)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # PostgreSQL 16 names the item after the subquery's own output column (ssn) and
+            # lets ORDER BY / GROUP BY use it (verified 2026-11-03; ``?column?`` is only the
+            # name of an unnamed expression). The column rules refuse ssn there as well;
+            # the alias rule fires first.
+            "SELECT (SELECT ssn FROM u LIMIT 1) FROM t ORDER BY ssn",
+            "SELECT (SELECT ssn FROM u LIMIT 1) FROM t GROUP BY ssn",
+            "SELECT (SELECT ssn AS z FROM u LIMIT 1) FROM t ORDER BY z",
+        ],
+    )
+    def test_postgresql_inner_name_of_an_unnamed_item_is_closed(self, sql: str) -> None:
+        exc = _rejected(sql, _EXACT_SSN, "postgresql")
+        assert "an unnamed subquery item that reads a sensitive column" in str(exc)
 
 
 class TestNesting:
@@ -697,3 +1113,133 @@ class TestNesting:
         with patch("app.services.sensitive_guard._laundered_names", side_effect=RecursionError):
             exc = _rejected("SELECT id FROM u")
         assert "nested too deeply to check" in str(exc)
+
+
+def _reverse_alias_chain(length: int, source: str) -> str:
+    """CTEs listed against the walk order: c0 reads x1 from c1, …, and the last one reads
+    *source*, so every alias is laundered only after the ones written after it."""
+    ctes = [f"c{i} AS (SELECT x{i + 1} AS x{i} FROM c{i + 1})" for i in range(length)]  # noqa: S608
+    ctes.append(f"c{length} AS (SELECT {source} AS x{length} FROM u)")  # noqa: S608
+    return "WITH " + ", ".join(ctes) + " SELECT id FROM c0 WHERE x0 = 'a'"  # noqa: S608
+
+
+class TestLaunderingScale:
+    def test_a_long_reverse_alias_chain_is_laundered_in_linear_time(self) -> None:
+        import time
+
+        import sqlglot
+
+        from app.services.sensitive_guard import _laundered_names
+
+        tree = sqlglot.parse_one(_reverse_alias_chain(2000, "email"), read="postgres")
+        start = time.perf_counter()
+        names = _laundered_names(tree, _privacy())
+        assert time.perf_counter() - start < 1.0
+        assert {f"x{i}" for i in range(2001)} <= names.keys()
+
+    def test_the_end_of_a_long_chain_is_rejected(self) -> None:
+        _column_message(_rejected(_reverse_alias_chain(2000, "email")), "x0")
+
+    def test_a_long_chain_without_a_sensitive_source_passes(self) -> None:
+        check_strict_sensitive(_reverse_alias_chain(2000, "name"), _privacy(), "postgresql")
+
+    def test_a_wide_set_operation_fed_by_a_reverse_alias_chain_is_laundered_quickly(
+        self,
+    ) -> None:
+        # Every laundered x_i re-checks the set operation, which must then not re-walk its
+        # whole branch and first-branch prefix.
+        import time
+
+        import sqlglot
+
+        from app.services.sensitive_guard import _laundered_names
+
+        length = 800
+        chain = _reverse_alias_chain(length, "email").rsplit(" SELECT id FROM c0", 1)[0]
+        heads = ", ".join(f"a{i}" for i in range(length + 1))
+        items = ", ".join(f"x{i}" for i in range(length + 1))
+        sql = f"{chain} SELECT {heads} FROM t UNION ALL SELECT {items} FROM c0"  # noqa: S608
+        tree = sqlglot.parse_one(sql, read="postgres")
+        start = time.perf_counter()
+        names = _laundered_names(tree, _privacy())
+        assert time.perf_counter() - start < 1.0
+        assert {f"a{i}" for i in range(length + 1)} <= names.keys()
+
+    @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+    def test_a_set_operation_and_an_alias_launder_each_other_in_any_order(
+        self, dialect: str
+    ) -> None:
+        # f reads e, which the set operation launders from email, written after f.
+        sql = (
+            "WITH d AS (SELECT e AS f FROM c), c AS (SELECT id AS e FROM a UNION ALL"
+            " SELECT email FROM b) SELECT id FROM d WHERE f = 'x'"
+        )
+        _column_message(_rejected(sql, dialect=dialect), "f")
+
+
+class TestExecutableComments:
+    """MySQL runs the content of ``/*! … */``; sqlglot drops it, so a condition inside is
+    never seen. Refused on the raw text, so the opener inside a string is refused too."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM u /*! WHERE email LIKE 'a%' */",
+            "SELECT id FROM u /*!80000 WHERE email LIKE 'a%' */",
+            "SELECT id FROM u /*M! WHERE email LIKE 'a%' */",
+            "SELECT id FROM u /*M!100000 WHERE email LIKE 'a%' */",
+            "SELECT id, '/*!' FROM u",
+        ],
+    )
+    def test_an_executable_comment_is_rejected_on_mysql(self, sql: str) -> None:
+        exc = _rejected(sql, dialect="mysql")
+        assert "a MySQL executable comment" in str(exc)
+        assert "/*!" in exc.llm_hint
+
+    def test_a_plain_comment_passes_on_mysql(self) -> None:
+        check_strict_sensitive("SELECT id FROM u /* note */ -- x", _privacy(), "mysql")
+
+    def test_on_postgresql_the_opener_is_a_plain_comment(self) -> None:
+        check_strict_sensitive("SELECT id FROM u /*! note */", _privacy(), "postgresql")
+
+
+class TestRecordFunctionsOnARow:
+    """PostgreSQL attribute notation: ``u.to_jsonb`` is ``to_jsonb(u)``, a whole row."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT u.to_jsonb FROM users u",
+            "SELECT users.row_to_json FROM users",
+            "SELECT id FROM users u WHERE u.concat LIKE '%@%'",
+            "SELECT id FROM users u ORDER BY u.quote_literal",
+            "SELECT d.to_json FROM (SELECT email FROM users) d",
+            "WITH c AS (SELECT email FROM users) SELECT c.quote_nullable FROM c",
+            "SELECT u.json_agg FROM users u",
+            "SELECT u.jsonb_agg_strict FROM users u",
+        ],
+    )
+    def test_attribute_notation_on_a_record_function_is_a_whole_row(self, sql: str) -> None:
+        exc = _rejected(sql)
+        assert "the whole row of" in str(exc)
+        assert "whole row" in exc.llm_hint
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT concat(id, status) FROM users",
+            "SELECT to_jsonb(id) FROM users",
+            "SELECT u.id FROM users u",
+            "SELECT u.json_build_object FROM users u",
+        ],
+    )
+    def test_a_call_or_a_plain_column_passes(self, sql: str) -> None:
+        check_strict_sensitive(sql, _privacy(), "postgresql")
+
+    def test_a_listed_name_is_a_plain_column_on_mysql(self) -> None:
+        # MySQL has no attribute notation: u.concat is the column concat of u.
+        check_strict_sensitive("SELECT u.concat FROM users u", _privacy(), "mysql")
+
+    def test_an_unlisted_text_first_built_in_is_a_plain_column(self) -> None:
+        # format(text, ...) cannot take the row alone, so u.format is a column.
+        check_strict_sensitive("SELECT u.format FROM users u", _privacy(), "postgresql")

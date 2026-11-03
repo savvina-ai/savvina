@@ -30,14 +30,6 @@ export function downloadCsv(results: QueryResults, filename = 'query-results.csv
   triggerBlobDownload(new Blob([csv], { type: 'text/csv;charset=utf-8' }), filename);
 }
 
-export function downloadJson(results: QueryResults, filename = 'query-results.json'): void {
-  const records = results.rows.map((row) =>
-    Object.fromEntries(results.columns.map((col, i) => [col, row[i]])),
-  );
-  const json = JSON.stringify(records, null, 2);
-  triggerBlobDownload(new Blob([json], { type: 'application/json' }), filename);
-}
-
 /** Trigger a browser download from an API blob response. */
 export function downloadBlob(data: Blob, filename: string): void {
   triggerBlobDownload(data, filename);

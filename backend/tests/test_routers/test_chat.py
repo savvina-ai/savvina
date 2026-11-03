@@ -141,6 +141,24 @@ class TestProcessMessage:
         assert resp.status_code == 200
         assert "text/event-stream" in resp.headers.get("content-type", "")
 
+    async def test_stream_carries_one_no_store_cache_control(self, http_client):
+        """The security middleware's ``no-store`` is the stream's only Cache-Control: the
+        route sets none of its own, so there is no second, weaker value."""
+        svc = _mock_streaming_service(
+            {
+                "type": "done",
+                "session_id": "s-1",
+                "message_id": "m-1",
+                "execution_time_ms": None,
+                "cache_hit": False,
+                "status": "executed",
+            },
+        )
+        with patch("app.routers.chat._make_chat_service", return_value=svc):
+            resp = await http_client.post("/api/v1/chat", json=self._payload)
+        assert resp.headers.get_list("cache-control") == ["no-store, private"]
+        assert resp.headers["x-accel-buffering"] == "no"
+
     async def test_done_event_carries_session_and_message_ids(self, http_client):
         svc = _mock_streaming_service(
             {
@@ -791,6 +809,56 @@ class TestDeleteExample:
         db = _mock_db(MockResult(single=None))
         app.dependency_overrides[get_db] = lambda: db
         resp = await http_client.delete("/api/v1/chat/examples/missing-ex")
+        assert resp.status_code == 404
+
+
+# ── PUT /api/v1/chat/examples/{example_id} ──────────────────────────────────────
+
+
+class TestUpdateExample:
+    _WRAPPED = "SELECT * FROM (\nSELECT id, tenant_id FROM users\n) AS _sift_q WHERE tenant_id = 7"
+
+    @staticmethod
+    def _row(query: str) -> MagicMock:
+        row = MagicMock()
+        row.id = "ex-1"
+        row.question = "Active users"
+        row.query = query
+        row.query_dialect = "postgresql"
+        row.created_at = datetime(2025, 1, 1, tzinfo=UTC)
+        return row
+
+    async def test_a_question_only_change_serves_a_wrapped_row_without_the_wrap(self, http_client):
+        # As the list does: a row from before clean storage is served unwrapped.
+        row = self._row(self._WRAPPED)
+        db = _mock_db(MockResult(single=row))
+        app.dependency_overrides[get_db] = lambda: db
+        cache = MagicMock(compute_embedding_async=AsyncMock(return_value=[0.1]))
+        with patch("app.routers.chat._get_shared_cache", return_value=cache):
+            resp = await http_client.put(
+                "/api/v1/chat/examples/ex-1", json={"question": "All active users"}
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["question"] == "All active users"
+        assert body["query"] == "SELECT id, tenant_id FROM users"
+        assert row.query == self._WRAPPED  # the stored row is not rewritten
+
+    async def test_a_query_change_is_stored_and_served(self, http_client):
+        row = self._row(self._WRAPPED)
+        db = _mock_db(MockResult(single=row))
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put(
+            "/api/v1/chat/examples/ex-1", json={"query": "SELECT count(*) FROM users"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["query"] == "SELECT count(*) FROM users"
+        assert row.query == "SELECT count(*) FROM users"
+
+    async def test_not_found_returns_404(self, http_client):
+        db = _mock_db(MockResult(single=None))
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.put("/api/v1/chat/examples/missing", json={"query": "SELECT 1"})
         assert resp.status_code == 404
 
 

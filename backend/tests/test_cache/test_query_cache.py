@@ -381,6 +381,31 @@ class TestQueryCacheInvalidate:
         db.commit.assert_called_once()
 
 
+# ── QueryCache.evict_question ─────────────────────────────────────────────────
+
+
+class TestQueryCacheEvictQuestion:
+    async def test_deletes_the_entry_for_the_normalised_question_and_commits(self):
+        cache = QueryCache("all-MiniLM-L6-v2", 0.92)
+        db = _mock_db()
+        db.execute = AsyncMock(return_value=MockResult(rowcount=1))
+        deleted = await cache.evict_question("conn-1", "  How Many Users?  ", db)
+        assert deleted == 1
+        db.execute.assert_called_once()
+        statement = db.execute.call_args.args[0]
+        compiled = statement.compile(compile_kwargs={"literal_binds": True})
+        assert "DELETE FROM query_cache" in str(compiled)
+        assert "'how many users?'" in str(compiled)
+        assert "'conn-1'" in str(compiled)
+        db.commit.assert_called_once()
+
+    async def test_no_entry_returns_zero(self):
+        cache = QueryCache("all-MiniLM-L6-v2", 0.92)
+        db = _mock_db()
+        db.execute = AsyncMock(return_value=MockResult(rowcount=0))
+        assert await cache.evict_question("conn-1", "nothing", db) == 0
+
+
 # ── _fresh_condition helper ────────────────────────────────────────────────────
 
 
@@ -653,42 +678,6 @@ class TestExampleLibraryFindSimilar:
             "conn-1", "?", [1.0, 0.0], limit=5, db=db, query_dialect=""
         )
         assert len(results) == 2
-
-
-# ── ExampleLibrary.list_examples ─────────────────────────────────────────────
-
-
-class TestExampleLibraryList:
-    async def test_returns_all_examples(self):
-        lib = ExampleLibrary()
-        ex1 = _make_example(id="1", question="Q1")
-        ex2 = _make_example(id="2", question="Q2")
-        db = _mock_db(multiple=[ex1, ex2])
-        results = await lib.list_examples("conn-1", db)
-        assert len(results) == 2
-
-    async def test_maps_to_example_entry(self):
-        lib = ExampleLibrary()
-        ex = _make_example(id="x", question="Q", query="SELECT 1", query_dialect="postgresql")
-        db = _mock_db(multiple=[ex])
-        results = await lib.list_examples("conn-1", db)
-        assert results[0].id == "x"
-        assert results[0].question == "Q"
-        assert results[0].query == "SELECT 1"
-
-    async def test_created_at_iso_formatted(self):
-        lib = ExampleLibrary()
-        ts = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
-        ex = _make_example(created_at=ts)
-        db = _mock_db(multiple=[ex])
-        results = await lib.list_examples("conn-1", db)
-        assert "2024-06-15" in results[0].created_at
-
-    async def test_empty_connection_returns_empty_list(self):
-        lib = ExampleLibrary()
-        db = _mock_db(multiple=[])
-        results = await lib.list_examples("conn-999", db)
-        assert results == []
 
 
 # ── EmbeddingCache ────────────────────────────────────────────────────────────

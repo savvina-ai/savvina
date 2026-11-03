@@ -40,7 +40,7 @@ function sentence(finding: AuditFinding, mysql: boolean): string {
       return 'The role has BYPASSRLS. No row policy applies to it.';
     case 'owner_without_force': {
       const plural = finding.tables.length > 1;
-      return `The role owns ${list(finding.tables)} and the ${plural ? 'tables do' : 'table does'} not force row-level security, so no policy applies to the owner.`;
+      return `The role owns ${list(finding.tables)} and the ${plural ? 'tables do' : 'table does'} not force row-level security, so no policy applies to the owner. After FORCE the role reads no rows from a table where no SELECT policy applies to it; the fix marks each such table with a comment: create a policy there first.`;
     }
     case 'write_privileges':
       return `The role can write to ${finding.tables.length ? tableList(finding) : 'the database'}. Savvina only reads; a read-only role is the third layer after the validator and the read-only transaction.`;
@@ -48,7 +48,7 @@ function sentence(finding: AuditFinding, mysql: boolean): string {
       return `The role can read ${tableList(finding)}, which this connection excludes. The LLM never sees them; the edit-query path can still read them.`;
     case 'sql_from_string': {
       const plural = finding.functions.length > 1;
-      return `The role can execute ${list(finding.functions)}, which ${plural ? 'run' : 'runs'} SQL passed as a string. Savvina rejects ${plural ? 'them' : 'it'} by name; revoking ${plural ? 'them' : 'it'} closes the path for good.`;
+      return `The role can execute ${list(finding.functions)}, which ${plural ? 'run' : 'runs'} SQL passed as a string. Savvina refuses dblink and dblink_exec in every query, and the other functions of this kind only on a connection with row filters; revoking ${plural ? 'them' : 'it'} closes the path for good. The fix revokes ${plural ? 'them' : 'it'} from PUBLIC, so every role loses EXECUTE, not only this one.`;
     }
     default:
       return 'The role has a privilege Savvina does not need.';

@@ -290,6 +290,23 @@ class QueryCache:
         )
         await db.commit()
 
+    async def evict_question(self, connection_id: str, question: str, db: AsyncSession) -> int:
+        """Delete the entry stored for *question* (its normalised text) on *connection_id*;
+        the number of rows deleted (0 or 1). Commits.
+
+        Used when a cached query fails at execution: the entry was served by
+        :meth:`lookup`, whose ``CacheHit.cached_question`` is the entry's own question (for
+        a semantic hit too), so the next lookup regenerates instead of serving it again.
+        """
+        result = await db.execute(
+            delete(QueryCacheEntry).where(
+                QueryCacheEntry.connection_id == connection_id,
+                QueryCacheEntry.question_normalized == _normalize(question),
+            )
+        )
+        await db.commit()
+        return result.rowcount or 0
+
     async def evict_similar(
         self,
         connection_id: str,

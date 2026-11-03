@@ -13,6 +13,7 @@ vi.mock('html-to-image', () => ({ toPng: vi.fn() }));
 vi.mock('../../api/chat', () => ({ chatApi: { sortResults: vi.fn() } }));
 vi.mock('../../api/export', () => ({ exportApi: { downloadXlsx: vi.fn() } }));
 vi.mock('../../api/share', () => ({ shareApi: { shareMessage: vi.fn() } }));
+vi.mock('../../hooks/useConnections', () => ({ useConnection: () => ({ data: undefined }) }));
 
 const NOTICE = 'These results were computed under a different row filter. Re-run the question.';
 

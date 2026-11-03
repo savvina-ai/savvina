@@ -20,6 +20,8 @@ import faulthandler
 # (fastembed / ONNX Runtime) are imported transitively below.
 faulthandler.enable()
 
+import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 import logging
@@ -192,7 +194,9 @@ class SecurityHeadersMiddleware:
                         ),
                     )
                 if path.startswith("/api/"):
-                    headers.append("Cache-Control", "no-store, private")
+                    # Set, not appended: one Cache-Control header, and a route's own
+                    # value (an SSE stream's ``no-cache``) cannot weaken ``no-store``.
+                    headers["Cache-Control"] = "no-store, private"
             elif message["type"] == "http.response.body" and second_response_active:
                 return  # suppress orphaned body frames from the dropped second response
             await send(message)
@@ -350,10 +354,26 @@ async def lifespan(app: FastAPI):
             _warmup_err,
         )
 
+    # Background schema drift check, off unless DRIFT_CHECK_INTERVAL_MINUTES > 0.
+    _drift_task: asyncio.Task | None = None
+    if settings.drift_check_interval_minutes > 0:
+        from .services import drift_monitor
+
+        _drift_task = asyncio.create_task(
+            drift_monitor.run_forever(settings.drift_check_interval_minutes)
+        )
+        logger.info(
+            "Background drift check every %d minute(s)", settings.drift_check_interval_minutes
+        )
+
     yield
 
     # Shutdown
     logger.info("Shutting down %s", settings.app_name)
+    if _drift_task is not None:
+        _drift_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _drift_task
     import app.database as _db_mod  # deferred to avoid circular import at module level
 
     await _db_mod.engine.dispose()

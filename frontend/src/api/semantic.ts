@@ -6,9 +6,12 @@ import type {
   ApplyDriftResponse,
   DriftApplyHistoryEntry,
   DriftReport,
+  LastDriftResponse,
   PaginatedResponse,
   SemanticModel,
   SemanticSuggestionResponse,
+  TombstoneEntry,
+  TombstoneKind,
 } from '../types';
 
 export interface GenerateInitResult {
@@ -66,9 +69,15 @@ export const semanticApi = {
       )
       .then(r => r.data),
 
-  update: (connectionId: string, model: Partial<SemanticModel>) =>
+  // `baseVersion` is the `version` of the server model the draft was seeded from; the
+  // backend answers 409 when the stored model has moved since. Without it the PUT is
+  // unconditional.
+  update: (connectionId: string, model: Partial<SemanticModel>, baseVersion?: number) =>
     apiClient
-      .put<SemanticModel>(`/api/v1/connections/${connectionId}/semantic`, model)
+      .put<SemanticModel>(
+        `/api/v1/connections/${connectionId}/semantic`,
+        baseVersion === undefined ? model : { ...model, base_version: baseVersion },
+      )
       .then(r => r.data),
 
   delete: (connectionId: string) =>
@@ -84,6 +93,15 @@ export const semanticApi = {
   getDrift: (connectionId: string) =>
     apiClient
       .get<DriftReport>(`/api/v1/connections/${connectionId}/semantic/drift`)
+      .then(r => r.data),
+
+  /**
+   * The background monitor's latest report while it still describes the stored model, and
+   * the monitor's interval (`DRIFT_CHECK_INTERVAL_MINUTES`, 0 = off). No introspection.
+   */
+  getLastDrift: (connectionId: string) =>
+    apiClient
+      .get<LastDriftResponse>(`/api/v1/connections/${connectionId}/semantic/drift/last`)
       .then(r => r.data),
 
   /**
@@ -130,4 +148,16 @@ export const semanticApi = {
         `/api/v1/connections/${connectionId}/semantic/suggestions/${suggestionId}/apply`,
       )
       .then(r => r.data),
+
+  // Items deleted from the model, newest first.
+  getTombstones: (connectionId: string) =>
+    apiClient
+      .get<TombstoneEntry[]>(`/api/v1/connections/${connectionId}/semantic/tombstones`)
+      .then(r => r.data),
+
+  // Lift one: the next Regenerate (or Apply Drift, for a relationship) may bring it back.
+  restoreTombstone: (connectionId: string, kind: TombstoneKind, key: string) =>
+    apiClient
+      .post(`/api/v1/connections/${connectionId}/semantic/tombstones/restore`, { kind, key })
+      .then(() => undefined),
 };

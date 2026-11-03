@@ -572,8 +572,64 @@ describe('PrivacySettingsForm duplicate entry hint', () => {
     );
     await userEvent.type(screen.getByLabelText('Sensitive columns (exact names)'), 'name{enter}');
     await userEvent.click(
-      within(screen.getByText('Name', { selector: 'span' })).getByRole('button', { name: '×' }),
+      within(screen.getByText('Name', { selector: 'span' })).getByRole('button', { name: 'Remove Name' }),
     );
     expect(screen.queryByText(/Already listed/)).not.toBeInTheDocument();
+  });
+});
+
+describe('PrivacySettingsForm qualified sensitive column', () => {
+  it('refuses a table.column entry with a hint, the draft kept', async () => {
+    const onChange = vi.fn();
+    render(<PrivacySettingsForm settings={makeSettings()} onChange={onChange} />);
+    const input = screen.getByLabelText('Sensitive columns (exact names)');
+    await userEvent.type(input, 'customers.notes{enter}');
+    expect(onChange).not.toHaveBeenCalled();
+    expect(input).toHaveValue('customers.notes');
+    expect(input).toHaveAccessibleDescription(
+      'Column names only: enter notes instead of customers.notes.',
+    );
+    await userEvent.type(input, 'x');
+    expect(screen.queryByText(/instead of customers.notes/)).not.toBeInTheDocument();
+  });
+
+  it('still accepts a dotted name in the other lists', async () => {
+    const onChange = vi.fn();
+    render(<PrivacySettingsForm settings={makeSettings()} onChange={onChange} />);
+    await userEvent.type(screen.getByLabelText('Excluded tables'), 'public.audit{enter}');
+    expect(lastEmitted(onChange).excluded_tables).toEqual(['audit_log', 'public.audit']);
+  });
+});
+
+describe('PrivacySettingsForm accessible names', () => {
+  it('names each Add button after its list and each remove button after its entry', () => {
+    render(
+      <PrivacySettingsForm
+        settings={makeSettings({ sensitive_columns: ['notes'] })}
+        onChange={vi.fn()}
+      />,
+    );
+    for (const label of [
+      'Sensitive column patterns (values masked)',
+      'Sensitive columns (exact names)',
+      'Excluded schemas',
+      'Excluded tables',
+      'Excluded columns',
+    ]) {
+      expect(screen.getByRole('button', { name: `Add ${label}` })).toBeInTheDocument();
+    }
+    expect(screen.queryByRole('button', { name: 'Add' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove notes' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove password' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '×' })).not.toBeInTheDocument();
+  });
+
+  it('names a toggle by its title and describes it by its description', () => {
+    render(<PrivacySettingsForm settings={makeSettings()} onChange={vi.fn()} />);
+    const strict = screen.getByRole('checkbox', { name: 'Strict sensitive columns' });
+    expect(strict).toHaveAccessibleDescription(/^Refuse any query that uses a sensitive column/);
+    expect(screen.getByRole('checkbox', { name: 'Include row counts' })).toHaveAccessibleDescription(
+      'Sends approximate row counts for each table.',
+    );
   });
 });

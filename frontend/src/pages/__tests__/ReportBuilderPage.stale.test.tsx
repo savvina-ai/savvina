@@ -89,3 +89,35 @@ describe('ReportBuilderPage stale results', () => {
     ]);
   });
 });
+
+describe('ReportBuilderPage chart editor with duplicate column names', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(chatApi.getHistory).mockResolvedValue([
+      message(
+        'dups',
+        makeQueryResults({
+          columns: ['region', 'count', 'count'],
+          column_types: ['text', 'int', 'int'],
+          rows: [['north', 1, 2], ['south', 3, 4]],
+          row_count: 2,
+        }),
+      ),
+    ] as never);
+  });
+
+  it('offers each duplicate under its own chart key', async () => {
+    render(<ReportBuilderPage />);
+    await userEvent.click(await screen.findByText('Orders'));
+    await userEvent.click(await screen.findByText('Question dups'));
+    await userEvent.click(screen.getByRole('button', { name: /Add chart/ }));
+    const yOptions = screen
+      .getAllByRole('option')
+      .map((o) => (o as HTMLOptionElement).value)
+      .filter((v) => v.startsWith('count'));
+    // Both pickers list count and count_2; neither offers the same key twice.
+    expect(new Set(yOptions)).toEqual(new Set(['count', 'count_2']));
+    expect(screen.getByRole('button', { name: 'count_2' })).toBeInTheDocument();
+  });
+});
+

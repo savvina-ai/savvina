@@ -17,6 +17,10 @@ const DETAIL = "Row filter must be a single condition without ';'";
 const LEGACY_DETAIL =
   'row_filters: this connection still has the old whole-query filter. Define per-table ' +
   'filters, or send clear_legacy_row_filter to remove it.';
+const LOADED = 'a1b2c3d4e5f60718';
+const STALE =
+  'The privacy settings changed since this form was loaded. They have been reloaded: apply ' +
+  'your changes again.';
 const LEGACY = {
   privacy_settings: { row_filter_sql: 'tenant_id = 42' },
   row_filter_needs_migration: true,
@@ -27,7 +31,7 @@ interface RenderOptions {
   /** Status of GET /connections/{id}; anything but 200 makes the detail fail to load. */
   detailStatus?: number;
   /** Answers PUT /privacy; defaults to a 422 with DETAIL. May change `state.detail`. */
-  privacyResponse?: (state: { detail: Record<string, unknown> }) => Response;
+  privacyResponse?: (state: { detail: Record<string, unknown>; detailStatus: number }) => Response;
 }
 
 function renderPage(options: RenderOptions = {}) {
@@ -38,19 +42,20 @@ function renderPage(options: RenderOptions = {}) {
     detail: {
       ...conn,
       privacy_settings: null,
-      schema_cache: null,
+      privacy_version: LOADED,
       row_filter_needs_migration: false,
       privilege_audit: null,
       ...options.detail,
     } as Record<string, unknown>,
+    detailStatus: options.detailStatus ?? 200,
   };
   server.use(
     http.get(`${API}/api/v1/connections`, () =>
       HttpResponse.json({ items: [conn], total: 1, limit: 50, offset: 0 }),
     ),
     http.get(`${API}/api/v1/connections/${conn.id}`, () =>
-      options.detailStatus && options.detailStatus !== 200
-        ? HttpResponse.json({ detail: 'boom' }, { status: options.detailStatus })
+      state.detailStatus !== 200
+        ? HttpResponse.json({ detail: 'boom' }, { status: state.detailStatus })
         : HttpResponse.json(state.detail),
     ),
     http.get(`${API}/api/v1/connections/${conn.id}/schema`, () =>
@@ -145,7 +150,9 @@ describe('ConnectionPage edit settings panel', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Remove the old filter' }));
 
     expect(confirm).toHaveBeenCalledTimes(1);
-    expect(privacyPuts).toEqual([{ row_filters: {}, clear_legacy_row_filter: true }]);
+    expect(privacyPuts).toEqual([
+      { row_filters: {}, clear_legacy_row_filter: true, base_privacy_version: LOADED },
+    ]);
     confirm.mockRestore();
   });
 
@@ -280,7 +287,11 @@ describe('ConnectionPage edit settings panel', () => {
       'Remove the old whole-query filter? The per-table filters in the form are saved with it; tables without one run unfiltered.',
     );
     expect(privacyPuts).toEqual([
-      { row_filters: { 'public.orders': 'tenant_id = 7' }, clear_legacy_row_filter: true },
+      {
+        row_filters: { 'public.orders': 'tenant_id = 7' },
+        clear_legacy_row_filter: true,
+        base_privacy_version: LOADED,
+      },
     ]);
     await waitFor(() =>
       expect(screen.queryByRole('button', { name: 'Remove the old filter' })).not.toBeInTheDocument(),
@@ -288,6 +299,104 @@ describe('ConnectionPage edit settings panel', () => {
     expect(screen.queryByText(/rejected until the row filter is redefined/)).not.toBeInTheDocument();
     // The typed row stays in the form.
     expect(screen.getByLabelText('Table 1')).toHaveValue('public.orders');
+    confirm.mockRestore();
+  });
+
+  it('sends the version the form was loaded with', async () => {
+    const { privacyPuts } = renderPage();
+    await openEditPanel();
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Save' }));
+
+    expect(privacyPuts[0]).toMatchObject({ base_privacy_version: LOADED });
+  });
+
+  it('a 409 shows that the settings moved on and reloads them into the form', async () => {
+    const NEWER = 'ffffffffffff0001';
+    const { privacyPuts, modePuts } = renderPage({
+      privacyResponse: (state) => {
+        if (privacyPuts.length === 1) {
+          // Another tab saved first: the stored settings and their version moved on.
+          state.detail = {
+            ...state.detail,
+            privacy_settings: { excluded_tables: ['payroll'] },
+            privacy_version: NEWER,
+          };
+          return HttpResponse.json({ detail: 'stale' }, { status: 409 });
+        }
+        return HttpResponse.json(state.detail);
+      },
+    });
+    await openEditPanel();
+    await userEvent.click(await screen.findByRole('button', { name: /Privacy Settings/ }));
+    await userEvent.type(screen.getByLabelText('Excluded tables'), 'audit{enter}');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    expect(await screen.findByText(STALE)).toBeInTheDocument();
+    expect(modePuts).toHaveLength(0);
+    // The form now shows what is stored: the other tab's entry, not the unsaved one.
+    expect(await screen.findByRole('button', { name: 'Remove payroll' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Remove audit' })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(modePuts).toHaveLength(1));
+    expect(privacyPuts[1]).toMatchObject({
+      excluded_tables: ['payroll'],
+      base_privacy_version: NEWER,
+    });
+  });
+
+  it('a 409 whose reload fails shows the load error and keeps the form as it was', async () => {
+    const { modePuts } = renderPage({
+      privacyResponse: (state) => {
+        state.detailStatus = 500;
+        return HttpResponse.json({ detail: 'stale' }, { status: 409 });
+      },
+    });
+    await openEditPanel();
+    await userEvent.click(await screen.findByRole('button', { name: /Privacy Settings/ }));
+    await userEvent.type(screen.getByLabelText('Excluded tables'), 'audit{enter}');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    expect(
+      await screen.findByText(
+        'The privacy settings changed since this form was loaded, and reloading them failed: boom',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(STALE)).not.toBeInTheDocument();
+    expect(modePuts).toHaveLength(0);
+    // Not re-initialised from the old detail: the typed entry is still there.
+    expect(screen.getByRole('button', { name: 'Remove audit' })).toBeInTheDocument();
+  });
+
+  it('a save that keeps the panel open moves the version the next save sends', async () => {
+    const MOVED = '0000aaaa0000bbbb';
+    const { privacyPuts } = renderPage({
+      detail: LEGACY,
+      privacyResponse: (state) => {
+        state.detail = {
+          ...state.detail,
+          privacy_settings: { row_filters: {} },
+          row_filter_needs_migration: false,
+          privacy_version: MOVED,
+        };
+        return HttpResponse.json(state.detail);
+      },
+    });
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    await openEditPanel();
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove the old filter' }));
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: 'Remove the old filter' })).not.toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(privacyPuts).toHaveLength(2));
+    expect(privacyPuts[0]).toMatchObject({ base_privacy_version: LOADED });
+    expect(privacyPuts[1]).toMatchObject({ base_privacy_version: MOVED });
     confirm.mockRestore();
   });
 
@@ -446,7 +555,7 @@ describe('ConnectionPage privilege audit banner', () => {
         HttpResponse.json({
           ...conn,
           privacy_settings: null,
-          schema_cache: null,
+          privacy_version: LOADED,
           row_filter_needs_migration: false,
           privilege_audit: state.audit,
         }),

@@ -6,43 +6,47 @@
 
 import type { DriftApplySummary } from '@/types';
 
-type ColumnKey = 'columns_added' | 'columns_removed';
-type RenameKey = 'columns_renamed';
-type ListKey = Exclude<
-  keyof DriftApplySummary,
-  | 'changed'
-  | 'dry_run'
-  | ColumnKey
-  | RenameKey
-  | 'tables_not_annotated'
-  | 'column_tables_failed'
-  | 'warnings'
->;
-type Change = 'remove' | 'rename' | 'add';
+/** The lists that are not changes to the model: flags and the apply's own notes. */
+type NoteKey = 'changed' | 'dry_run' | 'tables_not_annotated' | 'column_tables_failed' | 'warnings';
+/** Every change list of the summary: each one must have a row below. */
+type RowKey = Exclude<keyof DriftApplySummary, NoteKey>;
+type Change = 'remove' | 'clear' | 'rename' | 'add';
 
-// Removals first: they are what the user cannot get back without a regenerate. Renames
-// next: they lose nothing, but change the names the model uses. Additions last.
-const ROWS: { key: ListKey | ColumnKey | RenameKey; change: Change; noun: string }[] = [
-  { key: 'tables_removed', change: 'remove', noun: 'table' },
-  { key: 'columns_removed', change: 'remove', noun: 'column' },
-  { key: 'metrics_removed', change: 'remove', noun: 'metric' },
-  { key: 'joins_removed', change: 'remove', noun: 'join' },
-  { key: 'derived_columns_removed', change: 'remove', noun: 'derived column' },
-  { key: 'segments_removed', change: 'remove', noun: 'segment' },
-  { key: 'relationships_removed', change: 'remove', noun: 'relationship' },
-  { key: 'columns_renamed', change: 'rename', noun: 'column' },
-  { key: 'tables_added', change: 'add', noun: 'table' },
-  { key: 'columns_added', change: 'add', noun: 'column' },
-  { key: 'metrics_added', change: 'add', noun: 'metric' },
-  { key: 'joins_added', change: 'add', noun: 'join' },
-  { key: 'derived_columns_added', change: 'add', noun: 'derived column' },
-  { key: 'segments_added', change: 'add', noun: 'segment' },
-  { key: 'relationships_added', change: 'add', noun: 'relationship' },
-];
+// One entry per change list, typed exhaustively: a list added to the summary type without
+// a row here is a compile error, so it cannot silently vanish from the panel. The `order`
+// sorts the rows: removals first (what the user cannot get back without a regenerate),
+// then cleared references, then renames (they lose nothing, but change the names the model
+// uses), additions last.
+const ROW_SPECS: Record<RowKey, { order: number; change: Change; noun: string }> = {
+  tables_removed: { order: 0, change: 'remove', noun: 'table' },
+  columns_removed: { order: 1, change: 'remove', noun: 'column' },
+  metrics_removed: { order: 2, change: 'remove', noun: 'metric' },
+  joins_removed: { order: 3, change: 'remove', noun: 'join' },
+  derived_columns_removed: { order: 4, change: 'remove', noun: 'derived column' },
+  segments_removed: { order: 5, change: 'remove', noun: 'segment' },
+  relationships_removed: { order: 6, change: 'remove', noun: 'relationship' },
+  references_cleared: { order: 7, change: 'clear', noun: 'table reference' },
+  tables_renamed: { order: 8, change: 'rename', noun: 'table' },
+  columns_renamed: { order: 9, change: 'rename', noun: 'column' },
+  tables_added: { order: 10, change: 'add', noun: 'table' },
+  columns_added: { order: 11, change: 'add', noun: 'column' },
+  metrics_added: { order: 12, change: 'add', noun: 'metric' },
+  joins_added: { order: 13, change: 'add', noun: 'join' },
+  derived_columns_added: { order: 14, change: 'add', noun: 'derived column' },
+  segments_added: { order: 15, change: 'add', noun: 'segment' },
+  relationships_added: { order: 16, change: 'add', noun: 'relationship' },
+};
+
+const ROWS = (Object.entries(ROW_SPECS) as [RowKey, (typeof ROW_SPECS)[RowKey]][])
+  .sort(([, a], [, b]) => a.order - b.order)
+  .map(([key, spec]) => ({ key, ...spec }));
+
+/** The change lists that get a row, in display order. */
+export const SUMMARY_ROW_KEYS: readonly RowKey[] = ROWS.map((r) => r.key);
 
 const VERBS: Record<'preview' | 'applied', Record<Change, string>> = {
-  preview: { remove: 'Will remove', rename: 'Will rename', add: 'Will add' },
-  applied: { remove: 'Removed', rename: 'Renamed', add: 'Added' },
+  preview: { remove: 'Will remove', clear: 'Will clear', rename: 'Will rename', add: 'Will add' },
+  applied: { remove: 'Removed', clear: 'Cleared', rename: 'Renamed', add: 'Added' },
 };
 
 export const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
@@ -55,7 +59,8 @@ export interface SummaryRow {
 
 /**
  * The non-empty categories of `summary`, removals first, labelled for display. A renamed
- * column is named `table.old → new`.
+ * column is named `table.old → new`, a renamed table `old → new`, and a cleared reference
+ * `table.field`.
  */
 export function summaryRows(summary: DriftApplySummary): SummaryRow[] {
   const verbs = VERBS[summary.dry_run ? 'preview' : 'applied'];
@@ -65,7 +70,9 @@ export function summaryRows(summary: DriftApplySummary): SummaryRow[] {
       names = Object.entries(summary[key]).flatMap(([table, renames]) =>
         Object.entries(renames).map(([old, live]) => `${table}.${old} → ${live}`),
       );
-    } else if (key === 'columns_added' || key === 'columns_removed') {
+    } else if (key === 'tables_renamed') {
+      names = Object.entries(summary[key]).map(([old, live]) => `${old} → ${live}`);
+    } else if (key === 'columns_added' || key === 'columns_removed' || key === 'references_cleared') {
       names = Object.entries(summary[key]).flatMap(([table, cols]) =>
         cols.map((c) => `${table}.${c}`),
       );

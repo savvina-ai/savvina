@@ -336,6 +336,31 @@ class TestStaleRowFilter:
         assert served["results_json"]["stale_row_filter"] is True
         assert served["results_json"]["row_filter_fingerprint"] is None
 
+    @pytest.mark.parametrize("path", ["", "/csv", "/xlsx"])
+    @pytest.mark.parametrize("stored", [["x"], [], "rows", 7, {}, {"rows": [[1, "a@x.io"]]}])
+    async def test_a_single_share_of_an_invalid_result_is_410(
+        self, http_client: AsyncClient, path: str, stored: object
+    ):
+        db = _mock_db(_privacy_rows())
+        db.scalar = AsyncMock(return_value=_message(results_json=stored))
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get(f"/api/v1/public/share/tok{path}")
+        assert resp.status_code == 410
+        assert resp.json()["detail"] == STALE_ROW_FILTER_TEXT
+
+    @pytest.mark.parametrize("stored", [["x"], [], "rows", 7, {}, {"rows": [[1, "a@x.io"]]}])
+    async def test_an_invalid_result_in_a_shared_session_is_served_stale(
+        self, http_client: AsyncClient, stored: object
+    ):
+        db = _mock_db(MockResult(rows=[_message(results_json=stored)]), _privacy_rows())
+        db.scalar = AsyncMock(return_value=_session())
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/public/share/session/tok")
+        assert resp.status_code == 200
+        [served] = resp.json()["messages"]
+        assert served["results_json"]["rows"] == []
+        assert served["results_json"]["stale_row_filter"] is True
+
     async def test_single_shared_fresh_result_is_served(self, http_client: AsyncClient):
         db = _mock_db(_filtered_rows())
         db.scalar = AsyncMock(return_value=_message(results_json=_fresh_results()))
@@ -365,6 +390,38 @@ class TestStaleRowFilter:
         resp = await http_client.get(f"/api/v1/export/messages/msg-12345678/{path}")
         assert resp.status_code == 410
         assert resp.json()["detail"] == STALE_ROW_FILTER_TEXT
+
+    @pytest.mark.parametrize("path", ["csv", "xlsx"])
+    @pytest.mark.parametrize("stored", [["x"], "rows", 7, {"rows": [[1, "a@x.io"]]}])
+    async def test_a_single_export_of_an_invalid_result_is_410(
+        self, http_client: AsyncClient, path: str, stored: object
+    ):
+        db = _mock_db(_privacy_rows())
+        db.scalar = AsyncMock(return_value=_message(results_json=stored))
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get(f"/api/v1/export/messages/msg-12345678/{path}")
+        assert resp.status_code == 410
+        assert resp.json()["detail"] == STALE_ROW_FILTER_TEXT
+
+    @pytest.mark.parametrize("stored", [["x"], {"rows": [[1, "a@x.io"]]}])
+    async def test_an_invalid_report_section_carries_the_flag(
+        self, http_client: AsyncClient, stored: object
+    ):
+        db = _mock_db(MockResult(rows=[_message(results_json=stored)]), _privacy_rows())
+        app.dependency_overrides[get_db] = lambda: db
+        captured: dict = {}
+
+        def fake_report(title: str, sections: list[dict]) -> bytes:
+            captured["sections"] = sections
+            return b"%PDF-1.4"
+
+        with patch("app.routers.export.generate_report", side_effect=fake_report):
+            resp = await http_client.post(
+                "/api/v1/export/report",
+                json={"title": "Users", "sections": [{"message_id": "msg-12345678"}]},
+            )
+        assert resp.status_code == 200
+        assert captured["sections"][0]["results_json"]["stale_row_filter"] is True
 
     async def test_report_section_carries_the_flag(self, http_client: AsyncClient):
         db = _mock_db(MockResult(rows=[_message()]), _filtered_rows())

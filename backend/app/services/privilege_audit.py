@@ -165,6 +165,20 @@ def _wide_grant_comment(tables: list[str], scope: str) -> str:
     )
 
 
+def _no_policy_comment(table: str) -> str:
+    """Before the FORCE of *table* (quoted, qualified) on which no SELECT policy applies to
+    the role."""
+    return _comment(
+        f"{table}: no SELECT policy applies to this role; after FORCE it reads no rows:"
+        " create a policy first."
+    )
+
+
+_PUBLIC_REVOKE_COMMENT = _comment(
+    "Revoking from PUBLIC removes EXECUTE from every role, not only this one."
+)
+
+
 def _read_all_comment(tables: list[str]) -> str:
     """Before the REVOKEs of the pg_read_all_data memberships that let the role read
     *tables*."""
@@ -510,10 +524,15 @@ def _least_privilege(
                 Finding.SQL_FROM_STRING,
                 functions=functions,
                 remediation="\n".join(
-                    # Extension functions are granted to PUBLIC on install: revoking from
-                    # the role alone would change nothing.
-                    f"REVOKE EXECUTE ON FUNCTION {fn} FROM PUBLIC, {role};"
-                    for fn in functions
+                    [
+                        _PUBLIC_REVOKE_COMMENT,
+                        # Extension functions are granted to PUBLIC on install: revoking
+                        # from the role alone would change nothing.
+                        *(
+                            f"REVOKE EXECUTE ON FUNCTION {fn} FROM PUBLIC, {role};"
+                            for fn in functions
+                        ),
+                    ]
                 ),
             )
         )
@@ -561,14 +580,19 @@ def evaluate(
         if fact is not None and fact.rls_enabled and fact.is_owner and not fact.rls_forced
     ]
     if owned:
+        lines: list[str] = []
+        for _, fact in owned:
+            name = _qualified(fact, dialect)
+            # FORCE subjects the owner to the policies: with none for the role, every query
+            # on the table returns no rows.
+            if not fact.select_policy_applies:
+                lines.append(_no_policy_comment(name))
+            lines.append(f"ALTER TABLE {name} FORCE ROW LEVEL SECURITY;")
         findings.append(
             AuditFinding(
                 Finding.OWNER_WITHOUT_FORCE,
                 tables=[key for key, _ in owned],
-                remediation="\n".join(
-                    f"ALTER TABLE {_qualified(fact, dialect)} FORCE ROW LEVEL SECURITY;"
-                    for _, fact in owned
-                ),
+                remediation="\n".join(lines),
             )
         )
     if not facts.is_superuser:

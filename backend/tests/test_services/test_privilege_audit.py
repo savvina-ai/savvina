@@ -178,6 +178,22 @@ class TestOwnerWithoutForce:
         assert audit.rls_in_use is True
         assert audit.rls_effective == {"public.orders": False}
 
+    def test_a_table_without_a_select_policy_for_the_role_gets_a_warning_first(self) -> None:
+        facts = _facts(
+            tables=[
+                _table(is_owner=True, rls_enabled=True),
+                _table(table="items", is_owner=True, rls_enabled=True, policy=True),
+            ]
+        )
+        audit = evaluate(facts, _privacy(["public.orders", "public.items"]), "postgresql")
+        finding = _finding(audit, Finding.OWNER_WITHOUT_FORCE)
+        assert finding.remediation.splitlines() == [
+            '-- "public"."orders": no SELECT policy applies to this role; after FORCE it reads'
+            " no rows: create a policy first.",
+            'ALTER TABLE "public"."orders" FORCE ROW LEVEL SECURITY;',
+            'ALTER TABLE "public"."items" FORCE ROW LEVEL SECURITY;',
+        ]
+
     def test_owner_without_rls_is_not_reported(self) -> None:
         facts = _facts(tables=[_table(is_owner=True)])
         audit = evaluate(facts, _privacy(["public.orders"]), "postgresql")
@@ -749,6 +765,7 @@ class TestCommentInjection:
     def test_postgresql_names_cannot_break_out_of_a_comment(self) -> None:
         schema, table = f"x\n{_EVIL}", f"y\r{_EVIL}"
         member, grantor = f"g\n{_EVIL}", f"h\r\n{_EVIL}"
+        owned = f"o\n{_EVIL}"
         facts = _facts(
             schemas=[schema],
             writes=[_grant(schema, table, grantee=None)]
@@ -757,12 +774,18 @@ class TestCommentInjection:
                 RoleMembership("pg_write_all_data", member, grantor=grantor),
                 RoleMembership("pg_read_all_data", member, grantor=grantor),
             ],
-            tables=[_table(schema, table, select_grantees=[None])],
+            tables=[
+                _table(schema, table, select_grantees=[None]),
+                _table(schema, owned, is_owner=True, rls_enabled=True),
+            ],
         )
-        audit = evaluate(
-            facts, _privacy(excluded=[f"{schema}.{table}"]), "postgresql", database=f"d\n{_EVIL}"
-        )
-        assert _codes(audit) == [Finding.WRITE_PRIVILEGES, Finding.READS_EXCLUDED_TABLES]
+        privacy = _privacy([f"{schema}.{owned}"], excluded=[f"{schema}.{table}"])
+        audit = evaluate(facts, privacy, "postgresql", database=f"d\n{_EVIL}")
+        assert _codes(audit) == [
+            Finding.OWNER_WITHOUT_FORCE,
+            Finding.WRITE_PRIVILEGES,
+            Finding.READS_EXCLUDED_TABLES,
+        ]
         for finding in audit.findings:
             _assert_no_breakout(finding.remediation)
         writes = _finding(audit, Finding.WRITE_PRIVILEGES).remediation
@@ -774,9 +797,16 @@ class TestCommentInjection:
         assert f"GRANT USAGE ON SCHEMA {quote_identifier(schema, 'postgresql')}" in writes
         reads = _finding(audit, Finding.READS_EXCLUDED_TABLES).remediation
         assert f'-- "x?{_EVIL}"."y?{_EVIL}": SELECT comes from membership' in reads  # noqa: S608
-        script = dedicated_role_script(
-            facts, _privacy(excluded=[f"{schema}.{table}"]), "postgresql", f"d\n{_EVIL}"
+        force = _finding(audit, Finding.OWNER_WITHOUT_FORCE).remediation
+        assert force.splitlines()[0] == (
+            f'-- "x?{_EVIL}"."o?{_EVIL}": no SELECT policy applies to this role; after FORCE'
+            " it reads no rows: create a policy first."
         )
+        assert (
+            f"ALTER TABLE {quote_identifier(schema, 'postgresql')}."
+            f"{quote_identifier(owned, 'postgresql')} FORCE ROW LEVEL SECURITY;"
+        ) in force
+        script = dedicated_role_script(facts, privacy, "postgresql", f"d\n{_EVIL}")
         _assert_no_breakout(script)
 
     def test_mysql_names_cannot_break_out_of_a_comment(self) -> None:
@@ -1126,6 +1156,7 @@ class TestSqlFromString:
         assert finding.functions == ["public.dblink(text)", "public.crosstab(text)"]
         assert finding.tables == []
         assert finding.remediation == (
+            "-- Revoking from PUBLIC removes EXECUTE from every role, not only this one.\n"
             'REVOKE EXECUTE ON FUNCTION public.dblink(text) FROM PUBLIC, "savvina";\n'
             'REVOKE EXECUTE ON FUNCTION public.crosstab(text) FROM PUBLIC, "savvina";'
         )

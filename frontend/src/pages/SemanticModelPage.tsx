@@ -21,30 +21,36 @@ import axios from 'axios';
 import { AlertTriangle, Check, ChevronRight, Pencil, Plus, X } from 'lucide-react';
 
 import { semanticApi } from '../api/semantic';
-import { connectionsApi } from '../api/connections';
-import { metricValidationError } from '../lib/semanticUtils';
+import { buildSchemaTableMap, metricValidationError } from '../lib/semanticUtils';
 import SemanticModelEditor from '../components/SemanticModelEditor';
 import BusinessMetricEditor from '../components/BusinessMetricEditor';
 import GenerationBanner from '../components/semantic/GenerationBanner';
 import DriftSummaryPanel from '../components/semantic/DriftSummaryPanel';
 import DriftHistory from '../components/semantic/DriftHistory';
+import DeletedItems from '../components/semantic/DeletedItems';
+import BackgroundDriftNotice from '../components/semantic/BackgroundDriftNotice';
+import { tombstonesKey } from '../components/semantic/tombstonesKey';
 import { summaryAnnouncement } from '../components/semantic/driftSummaryRows';
 import { useProviders } from '../hooks/useProviders';
 import { useConnections } from '../hooks/useConnections';
 import { useAuthStore } from '../store/authStore';
 import { cn } from '@/lib/utils';
 import { apiErrorMessage } from '@/lib/apiError';
+import { mergeSemanticModel, STALE_DRAFT } from '../lib/semanticMerge';
+import { schemaQueryOptions } from '../lib/schemaQuery';
 import type {
   ApplyDriftResponse,
   DerivedColumn,
   DriftApplyHistoryEntry,
   DriftApplySummary,
   DriftReport,
+  LastDriftResponse,
   RelationshipEdge,
   SchemaTable,
   Segment,
   SemanticModel,
   SemanticSuggestionResponse,
+  TableSemantic,
 } from '../types';
 
 const SUGGESTION_PENDING_REASON = 'Wait for the suggestion to finish applying';
@@ -126,7 +132,7 @@ function ColumnIntelligencePanel({ model }: { model: SemanticModel }) {
   return (
     <div className="space-y-2">
       <p className="text-xs text-muted-foreground">
-        Auto-inferred semantic types from catalog statistics. Edit in the Tables tab.
+        Semantic types proposed by the LLM when the model was generated. Edit in the Tables tab.
       </p>
       {Object.entries(model.tables).map(([tableKey, table]) => {
         const cols = table.columns as Record<
@@ -401,6 +407,97 @@ type Tab =
 
 const MAX_GENERATION_RETRIES = 4;
 
+const relFieldClass =
+  'w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring';
+
+/** The columns a manual relationship can name on one side. With the table in the cached
+ *  schema (`schemaKnown`), `options` are the schema's columns: the list the next generation
+ *  checks edges against. Without it (no schema cached yet, a 404 until the next refresh, or
+ *  a table the schema does not list), `options` are the model's annotated columns, offered
+ *  only as suggestions, since a real column may be one the model does not annotate. */
+interface RelationshipColumns {
+  schemaKnown: boolean;
+  options: string[];
+}
+
+function relationshipColumnOptions(
+  tableKey: string,
+  schemaTableMap: Map<string, SchemaTable>,
+  modelTable: TableSemantic | undefined,
+): RelationshipColumns {
+  if (!tableKey) return { schemaKnown: false, options: [] };
+  const schemaTable =
+    schemaTableMap.get(tableKey) ?? schemaTableMap.get(tableKey.split('.').pop() ?? tableKey);
+  if (schemaTable) {
+    return { schemaKnown: true, options: schemaTable.columns.map((c) => c.name) };
+  }
+  return { schemaKnown: false, options: Object.keys(modelTable?.columns ?? {}) };
+}
+
+/** A chosen column the schema lists for its table no more (a refresh removed it). */
+function relationshipColumnStale(cols: RelationshipColumns, value: string): boolean {
+  return cols.schemaKnown && !!value && !cols.options.includes(value);
+}
+
+/** From/To Column of the manual relationship form. With the table in the schema, a select
+ *  of its columns, so a typo cannot name a column the next generation drops the edge for;
+ *  a chosen value the schema no longer lists stays shown, marked (Add is then disabled),
+ *  rather than the select falling back to its first option while the form keeps the old
+ *  value. Otherwise free text, with the model's annotated columns as suggestions. */
+function RelationshipColumnField({
+  id,
+  table,
+  value,
+  columns,
+  onChange,
+}: {
+  id: string;
+  table: string;
+  value: string;
+  columns: RelationshipColumns;
+  onChange: (value: string) => void;
+}) {
+  if (table && !columns.schemaKnown) {
+    return (
+      <>
+        <input
+          id={id}
+          type="text"
+          list={`${id}-suggestions`}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="column_name"
+          className={relFieldClass}
+        />
+        <datalist id={`${id}-suggestions`}>
+          {columns.options.map((c) => (
+            <option key={c} value={c} />
+          ))}
+        </datalist>
+      </>
+    );
+  }
+  return (
+    <select
+      id={id}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      disabled={!table}
+      className={cn(relFieldClass, 'disabled:opacity-50')}
+    >
+      <option value="">{table ? 'Select…' : 'Choose a table first'}</option>
+      {relationshipColumnStale(columns, value) && (
+        <option value={value}>{value} (not in schema)</option>
+      )}
+      {columns.options.map((c) => (
+        <option key={c} value={c}>
+          {c}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 /** Cancellation flag shared by every call in one generation run. */
 type RetryToken = { cancelled: boolean };
 
@@ -451,6 +548,23 @@ export default function SemanticModelPageV2() {
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [draft, setDraft] = useState<SemanticModel | null>(null);
+  // The server model the draft was seeded from: its `version` goes with every save as
+  // `base_version`, and it is the base of the three-way merge when the save is refused
+  // because the model moved meanwhile. A ref, not state: nothing renders from it.
+  const draftBase = useRef<SemanticModel | null>(null);
+  // The draft as last rendered, for code that resumes after an await (the 409 merge): a
+  // closure would hold the draft from before the await and drop what was typed since.
+  const draftRef = useRef<SemanticModel | null>(null);
+  draftRef.current = draft;
+  const seedDraft = (m: SemanticModel) => {
+    draftBase.current = m;
+    setDraft(m);
+  };
+  // Set by a save refused with 409 and merged; cleared by the next successful save.
+  const [mergeNotice, setMergeNotice] = useState<{
+    serverChanges: number;
+    conflicts: string[];
+  } | null>(null);
   const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null);
   // Dismissals are intentionally session-local: the backend has no "rejected" state
   // for a suggestion, only is_applied.
@@ -513,6 +627,21 @@ export default function SemanticModelPageV2() {
     retry: false,
   });
 
+  // The background monitor's latest report, while it still describes the stored model.
+  // Fetched once per page load; polled every minute only while the monitor is on, so a
+  // deployment with DRIFT_CHECK_INTERVAL_MINUTES=0 makes one request per load.
+  const { data: lastDriftData } = useQuery<LastDriftResponse>({
+    queryKey: ['semantic-drift-last', connectionId],
+    queryFn: () => semanticApi.getLastDrift(connectionId!),
+    enabled: !!connectionId && !!model,
+    refetchInterval: (q) => ((q.state.data?.monitor_interval_minutes ?? 0) > 0 ? 60_000 : false),
+    refetchIntervalInBackground: false,
+  });
+  const lastDrift = lastDriftData?.report ?? null;
+  // The `checked_at` of the stored report this page has answered: dismissed, produced by
+  // its own Check Drift, or made stale by its own Apply Drift. A newer report shows again.
+  const [answeredDriftAt, setAnsweredDriftAt] = useState<string | null>(null);
+
   // What the last Apply Drift changed. The route returns it (and logs it, see Drift
   // history); it stays on screen until dismissed, the next preview or apply, or the next
   // run.
@@ -566,6 +695,12 @@ export default function SemanticModelPageV2() {
     // `dataUpdatedAt` only when a fetch (or a cache write) lands, so a stale one is older.
     const fresh = result.status === 'success' && result.dataUpdatedAt >= started;
     if (!fresh) return;
+    // The check stored its report as the latest one, so the server now withholds the
+    // monitor's: the background notice is answered.
+    queryClient.setQueryData<LastDriftResponse>(['semantic-drift-last', connectionId], (prev) =>
+      prev ? { ...prev, report: null } : prev,
+    );
+    if (lastDrift) setAnsweredDriftAt(lastDrift.checked_at);
     // A live check refreshed the schema cache; the column dropdowns read it.
     if (result.data.schema_source === 'live') {
       void queryClient.invalidateQueries({ queryKey: ['schema', connectionId] });
@@ -578,13 +713,15 @@ export default function SemanticModelPageV2() {
 
   // Schema — the authoritative column list behind the table editor's column dropdowns.
   // `table.columns` only holds columns the generator annotated, a subset on a partial model.
+  // The key is shared with useConnectionSchema, so both use one definition (a 404, no schema
+  // cached yet, is null for both). This page refetches on mount, as it always has.
   const { data: schemaData } = useQuery({
-    queryKey: ['schema', connectionId],
-    queryFn: () => connectionsApi.getSchema(connectionId!),
-    enabled: !!connectionId,
+    ...schemaQueryOptions(connectionId),
+    staleTime: 0,
     retry: false,
   });
   const schemaTables = (schemaData as { tables?: SchemaTable[] } | undefined)?.tables;
+  const schemaTableMap = useMemo(() => buildSchemaTableMap(schemaTables), [schemaTables]);
 
   // Suggestions — corrections captured from thumbs-down feedback in chat.
   const { data: suggestions } = useQuery<SemanticSuggestionResponse[]>({
@@ -635,7 +772,14 @@ export default function SemanticModelPageV2() {
     const run = runSeq.current;
     fetchFreshModel()
       .then((m) => {
-        if (m && runSeq.current === run) setDraft((d) => d ?? m);
+        if (m && runSeq.current === run) {
+          setDraft((d) => {
+            if (d) return d;
+            // Only when this call seeds: the base belongs to the draft it seeded.
+            draftBase.current = m;
+            return m;
+          });
+        }
       })
       .catch(() => {});
   };
@@ -647,7 +791,7 @@ export default function SemanticModelPageV2() {
     // The cache write is what retires the partial banner: it reads `model` (server
     // truth), not `draft`, and the response carries generation_status: 'complete'.
     queryClient.setQueryData(['semantic', connectionId], m);
-    setDraft(m);
+    seedDraft(m);
     setConfirmAction(null);
     setGenProgress(null);
   };
@@ -768,6 +912,8 @@ export default function SemanticModelPageV2() {
           // `null` rather than removed: removing an observed query makes it refetch at
           // once, and the page's loading spinner would replace the progress bar mid-run.
           queryClient.setQueryData<SemanticModel | null>(['semantic', connectionId], null);
+          // The deleted-items list went with the model (cascade).
+          queryClient.setQueryData(tombstonesKey(connectionId!), []);
           return runGeneration(false);
         case 'finish': {
           const done = model?.generation_progress?.tables_done ?? 0;
@@ -821,7 +967,11 @@ export default function SemanticModelPageV2() {
     },
     onSuccess: ({ semantic_model: m, summary }) => {
       queryClient.setQueryData(['semantic', connectionId], m);
-      setDraft(m);
+      seedDraft(m);
+      // The stored report described the model before this apply; the server withholds it
+      // now (the version moved), and the refetch confirms it.
+      if (lastDrift) setAnsweredDriftAt(lastDrift.checked_at);
+      void queryClient.invalidateQueries({ queryKey: ['semantic-drift-last', connectionId] });
       // The report is stale now; the next Check Drift reads the applied model.
       queryClient.removeQueries({ queryKey: ['semantic-drift', connectionId] });
       // The apply introspected live and the purge keeps that schema cached; the column
@@ -952,25 +1102,68 @@ export default function SemanticModelPageV2() {
   // editor inert) until a reload.
   // Not while a run is in flight: a focus refetch would otherwise re-arm the editor mid-run.
   useEffect(() => {
-    if (model && !draft && !anyGenerationPending) setDraft(model);
+    if (model && !draft && !anyGenerationPending) seedDraft(model);
   }, [dataUpdatedAt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // The sent draft is the mutation variable so onSuccess can tell whether the user kept
   // typing while the PUT was in flight.
   const save = useMutation({
-    mutationFn: (sent: SemanticModel) => semanticApi.update(connectionId!, sent),
+    mutationFn: (sent: SemanticModel) =>
+      semanticApi.update(connectionId!, sent, draftBase.current?.version),
     onSuccess: (m, sent) => {
       queryClient.setQueryData(['semantic', connectionId], m);
       // The store normalises and fits what it is given, so the editor shows what was
       // stored — unless the draft moved on mid-save, when replacing it would drop edits.
+      // Either way the stored model is now what the draft is relative to.
+      draftBase.current = m;
       setDraft((cur) => (cur === sent ? m : cur));
       // A preview is stale once the stored model changes.
       dropPreview();
       setSaveError(null);
+      setMergeNotice(null);
+      // A save that removed an item tombstoned it; one that re-added an item lifted it.
+      void queryClient.invalidateQueries({ queryKey: tombstonesKey(connectionId!) });
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 3000);
     },
-    onError: () => setSaveError('Failed to save — please try again'),
+    onError: async (err) => {
+      // 409: the stored model moved since this draft was seeded (another tab saved, a run
+      // finished elsewhere). Merge the stored model into the draft rather than overwrite
+      // it or throw the edits away: untouched units take the server's value, edited ones
+      // keep the user's, and places changed on both sides are listed. The merged draft is
+      // dirty against the latest version, so the next Save sends that version.
+      const base = draftBase.current;
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      const staleDraft =
+        axios.isAxiosError(err) &&
+        err.response?.status === 409 &&
+        typeof detail === 'string' &&
+        detail.startsWith(STALE_DRAFT);
+      if (staleDraft && base) {
+        const run = runSeq.current;
+        try {
+          const latest = await fetchFreshModel();
+          // The draft as it is now, edits typed during the fetch included. A run started
+          // meanwhile dropped it on purpose: leave it dropped.
+          const current = draftRef.current;
+          if (latest && current && runSeq.current === run) {
+            const { merged, conflicts, serverChanges } = mergeSemanticModel(
+              base,
+              current,
+              latest,
+            );
+            draftBase.current = latest;
+            setDraft(merged);
+            setMergeNotice({ serverChanges, conflicts });
+            setSaveError(null);
+            return;
+          }
+        } catch {
+          // Fall through to the generic error: the draft is untouched and can be retried.
+        }
+      }
+      setSaveError(apiErrorMessage(err, 'Failed to save — please try again'));
+    },
   });
 
   const applySuggestion = useMutation({
@@ -978,7 +1171,7 @@ export default function SemanticModelPageV2() {
       semanticApi.applySuggestion(connectionId!, suggestionId),
     onSuccess: (updated) => {
       queryClient.setQueryData(['semantic', connectionId], updated);
-      setDraft(updated);
+      seedDraft(updated);
       dropPreview();
       queryClient.invalidateQueries({ queryKey: ['semantic-suggestions', connectionId] });
     },
@@ -992,7 +1185,13 @@ export default function SemanticModelPageV2() {
       const run = runSeq.current;
       fetchFreshModel()
         .then((m) => {
-          if (m && runSeq.current === run) setDraft((cur) => (cur === before ? m : cur));
+          if (m && runSeq.current === run) {
+            setDraft((cur) => {
+              if (cur !== before) return cur;
+              draftBase.current = m;
+              return m;
+            });
+          }
         })
         .catch(() => {});
     },
@@ -1049,14 +1248,17 @@ export default function SemanticModelPageV2() {
       : previewReasonOnceChecked;
   // New tables and new columns are annotated by the LLM. Without a provider the backend
   // fails an apply that adds tables, or one whose only changes are new columns (it has
-  // nothing else to do), with a 400. New columns beside a removed table, a removed column
-  // or a renamed column do not block it: those apply with no LLM call, and the summary
-  // warns that the new columns were not annotated.
+  // nothing else to do), with a 400. New columns beside a removed or renamed table, or a
+  // removed or renamed column, do not block it: those apply with no LLM call, and the
+  // summary warns that the new columns were not annotated. A cleared table reference does
+  // not count: the backend judges by the schema drift, where a reference to a column the
+  // model never annotated is no change of its own.
   const needsProvider =
     driftPreview !== null &&
     (driftPreview.tables_added.length > 0 ||
       (Object.keys(driftPreview.columns_added).length > 0 &&
         driftPreview.tables_removed.length === 0 &&
+        Object.keys(driftPreview.tables_renamed).length === 0 &&
         Object.keys(driftPreview.columns_removed).length === 0 &&
         Object.keys(driftPreview.columns_renamed).length === 0));
   const applyDisabledReason =
@@ -1100,6 +1302,33 @@ export default function SemanticModelPageV2() {
     { id: 'time', label: 'Time Expressions' },
     { id: 'suggestions', label: 'Suggestions', count: pendingSuggestions.length },
   ];
+
+  // Manual relationship form: the columns each side can name, and a chosen column the
+  // schema no longer lists (Add waits until it is replaced).
+  const relFromCols = relationshipColumnOptions(
+    newRel.from_table,
+    schemaTableMap,
+    displayModel?.tables[newRel.from_table],
+  );
+  const relToCols = relationshipColumnOptions(
+    newRel.to_table,
+    schemaTableMap,
+    displayModel?.tables[newRel.to_table],
+  );
+  const relStaleHints = [
+    relationshipColumnStale(relFromCols, newRel.from_column)
+      ? `${newRel.from_column} is not in the schema of ${newRel.from_table}. Pick another column.`
+      : null,
+    relationshipColumnStale(relToCols, newRel.to_column)
+      ? `${newRel.to_column} is not in the schema of ${newRel.to_table}. Pick another column.`
+      : null,
+  ].filter((h): h is string => h !== null);
+  const relAddDisabled =
+    !newRel.from_table ||
+    !newRel.from_column ||
+    !newRel.to_table ||
+    !newRel.to_column ||
+    relStaleHints.length > 0;
 
   if (isLoading) {
     return (
@@ -1296,6 +1525,44 @@ export default function SemanticModelPageV2() {
             )}
           </div>
 
+          {/* A save refused because the model moved: the server's changes were merged in. */}
+          {mergeNotice && (
+            <div
+              role="status"
+              className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-700 dark:text-amber-400"
+            >
+              <p>
+                {mergeNotice.serverChanges === 0 ? (
+                  <>The model changed elsewhere; your draft already carries its changes. Review and save.</>
+                ) : (
+                  <>
+                    The model changed elsewhere; {mergeNotice.serverChanges}{' '}
+                    {mergeNotice.serverChanges === 1 ? 'change' : 'changes'} from the server{' '}
+                    {mergeNotice.serverChanges === 1 ? 'was' : 'were'} merged into your draft.
+                    Review and save.
+                  </>
+                )}
+              </p>
+              {mergeNotice.conflicts.length > 0 && (
+                <p className="mt-1">
+                  {mergeNotice.conflicts.length}{' '}
+                  {mergeNotice.conflicts.length === 1 ? 'place was' : 'places were'} changed on
+                  both sides; your version was kept: {mergeNotice.conflicts.join(', ')}
+                </p>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  if (model) seedDraft(model);
+                  setMergeNotice(null);
+                }}
+                className="mt-2 rounded-md border border-border px-3 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted"
+              >
+                Discard my changes
+              </button>
+            </div>
+          )}
+
           {/* Phased generation progress bar */}
           {genProgress && (
             <div className="space-y-1.5">
@@ -1368,6 +1635,19 @@ export default function SemanticModelPageV2() {
               </ul>
             </div>
           )}
+
+          {/* The background monitor's latest finding, until a newer check answers it. */}
+          {lastDrift &&
+            lastDrift.warning_count > 0 &&
+            lastDrift.checked_at !== answeredDriftAt &&
+            (!driftReport || new Date(lastDrift.checked_at) > new Date(driftReport.checked_at)) && (
+              <BackgroundDriftNotice
+                report={lastDrift}
+                onCheck={() => void checkDrift()}
+                checkDisabled={driftChecking || !displayModel || anyGenerationPending}
+                onDismiss={() => setAnsweredDriftAt(lastDrift.checked_at)}
+              />
+            )}
 
           {/* Drift check outcome — an error, a clean result, or the warnings below */}
           {driftError && !driftChecking && (
@@ -1525,6 +1805,12 @@ export default function SemanticModelPageV2() {
           )}
 
           <DriftHistory entries={driftHistory ?? []} limit={DRIFT_HISTORY_LIMIT} />
+
+          <DeletedItems
+            connectionId={connectionId!}
+            enabled={!!connectionId && !!model}
+            disabled={anyGenerationPending}
+          />
 
           {/* Always mounted, so a change to its text is announced (see driftStatus). */}
           <p role="status" className="sr-only">
@@ -1740,15 +2026,31 @@ export default function SemanticModelPageV2() {
                       </p>
                       <div className="grid grid-cols-2 gap-3">
                         <div>
-                          <label className="mb-1 block text-xs text-muted-foreground">
+                          <label
+                            htmlFor="rel-from-table"
+                            className="mb-1 block text-xs text-muted-foreground"
+                          >
                             From Table
                           </label>
                           <select
+                            id="rel-from-table"
                             value={newRel.from_table}
-                            onChange={(e) =>
-                              setNewRel((r) => ({ ...r, from_table: e.target.value }))
-                            }
-                            className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                            onChange={(e) => {
+                              const t = e.target.value;
+                              const cols = relationshipColumnOptions(
+                                t,
+                                schemaTableMap,
+                                displayModel.tables[t],
+                              );
+                              setNewRel((r) => ({
+                                ...r,
+                                from_table: t,
+                                from_column: cols.options.includes(r.from_column)
+                                  ? r.from_column
+                                  : '',
+                              }));
+                            }}
+                            className={relFieldClass}
                           >
                             <option value="">Select…</option>
                             {Object.keys(displayModel.tables).map((t) => (
@@ -1759,29 +2061,46 @@ export default function SemanticModelPageV2() {
                           </select>
                         </div>
                         <div>
-                          <label className="mb-1 block text-xs text-muted-foreground">
+                          <label
+                            htmlFor="rel-from-column"
+                            className="mb-1 block text-xs text-muted-foreground"
+                          >
                             From Column
                           </label>
-                          <input
-                            type="text"
+                          <RelationshipColumnField
+                            id="rel-from-column"
+                            table={newRel.from_table}
                             value={newRel.from_column}
-                            onChange={(e) =>
-                              setNewRel((r) => ({ ...r, from_column: e.target.value }))
-                            }
-                            placeholder="column_name"
-                            className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                            columns={relFromCols}
+                            onChange={(v) => setNewRel((r) => ({ ...r, from_column: v }))}
                           />
                         </div>
                         <div>
-                          <label className="mb-1 block text-xs text-muted-foreground">
+                          <label
+                            htmlFor="rel-to-table"
+                            className="mb-1 block text-xs text-muted-foreground"
+                          >
                             To Table
                           </label>
                           <select
+                            id="rel-to-table"
                             value={newRel.to_table}
-                            onChange={(e) =>
-                              setNewRel((r) => ({ ...r, to_table: e.target.value }))
-                            }
-                            className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                            onChange={(e) => {
+                              const t = e.target.value;
+                              const cols = relationshipColumnOptions(
+                                t,
+                                schemaTableMap,
+                                displayModel.tables[t],
+                              );
+                              setNewRel((r) => ({
+                                ...r,
+                                to_table: t,
+                                to_column: cols.options.includes(r.to_column)
+                                  ? r.to_column
+                                  : '',
+                              }));
+                            }}
+                            className={relFieldClass}
                           >
                             <option value="">Select…</option>
                             {Object.keys(displayModel.tables).map((t) => (
@@ -1792,17 +2111,18 @@ export default function SemanticModelPageV2() {
                           </select>
                         </div>
                         <div>
-                          <label className="mb-1 block text-xs text-muted-foreground">
+                          <label
+                            htmlFor="rel-to-column"
+                            className="mb-1 block text-xs text-muted-foreground"
+                          >
                             To Column
                           </label>
-                          <input
-                            type="text"
+                          <RelationshipColumnField
+                            id="rel-to-column"
+                            table={newRel.to_table}
                             value={newRel.to_column}
-                            onChange={(e) =>
-                              setNewRel((r) => ({ ...r, to_column: e.target.value }))
-                            }
-                            placeholder="column_name"
-                            className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                            columns={relToCols}
+                            onChange={(v) => setNewRel((r) => ({ ...r, to_column: v }))}
                           />
                         </div>
                       </div>
@@ -1820,6 +2140,11 @@ export default function SemanticModelPageV2() {
                           className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
                         />
                       </div>
+                      {relStaleHints.map((hint) => (
+                        <p key={hint} className="text-xs text-destructive">
+                          {hint}
+                        </p>
+                      ))}
                       <div className="flex justify-end gap-2">
                         <button
                           onClick={() => {
@@ -1838,13 +2163,7 @@ export default function SemanticModelPageV2() {
                         </button>
                         <button
                           onClick={() => {
-                            if (
-                              !newRel.from_table ||
-                              !newRel.from_column ||
-                              !newRel.to_table ||
-                              !newRel.to_column
-                            )
-                              return;
+                            if (relAddDisabled) return;
                             const edge: RelationshipEdge = {
                               from_table: newRel.from_table,
                               from_column: newRel.from_column,
@@ -1869,12 +2188,7 @@ export default function SemanticModelPageV2() {
                               description: '',
                             });
                           }}
-                          disabled={
-                            !newRel.from_table ||
-                            !newRel.from_column ||
-                            !newRel.to_table ||
-                            !newRel.to_column
-                          }
+                          disabled={relAddDisabled}
                           className="rounded-md bg-brand-gradient px-3 py-1.5 text-sm font-medium text-white shadow-gradient-btn hover:opacity-90 disabled:opacity-50"
                         >
                           Add

@@ -136,8 +136,9 @@ async def process_message(
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
+        # No Cache-Control here: the security middleware sets ``no-store, private`` on
+        # every /api/ response, which also keeps proxies from caching the stream.
         headers={
-            "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
@@ -724,4 +725,12 @@ async def update_example(
 
     await db.commit()
     await db.refresh(row)
-    return ExampleResponse.model_validate(row)
+    # A question-only change keeps the stored query, which for a row from before clean
+    # storage holds the row-filter wrap: serve it as the list does.
+    return ExampleResponse(
+        id=row.id,
+        question=row.question,
+        query=unwrap_row_filter(row.query),
+        query_dialect=row.query_dialect,
+        created_at=row.created_at,
+    )

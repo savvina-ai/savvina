@@ -22,10 +22,16 @@ from pathlib import Path
 
 _APP = Path(__file__).resolve().parents[2] / "app"
 
-# Bases known to be something other than a Connection ORM row. Empty today: the
-# CE has no dataclass carrying a same-named field. Add a name here, with a
-# comment saying what it is, when one appears.
-_NON_CONNECTION_BASES: frozenset[str] = frozenset()
+# Bases known to be something other than a Connection ORM row. Add a name here,
+# with a comment saying what it is, when one appears.
+_NON_CONNECTION_BASES: frozenset[str] = frozenset(
+    {
+        # services/chat_service.py: ``ctx`` is a ``_PipelineContext``, whose
+        # ``semantic_model`` is the model loaded from the semantic store and filtered
+        # for this request, not the Connection column.
+        "ctx",
+    }
+)
 
 
 def _offending_lines(path: Path, source: str) -> list[int]:

@@ -113,7 +113,8 @@ Click **+ New Chart** in the tab bar to add a chart tab. Charts can be deleted f
 ### Table view details
 
 - Column headers are clickable to **sort** ascending/descending
-- For truncated result sets, sorting re-executes the query with `ORDER BY` against the database (shown as "sorted by db" in the footer)
+- For truncated result sets, sorting re-executes the query with `ORDER BY` against the database (shown as "sorted by db" in the footer). The sort replaces the outer query's own `ORDER BY` and keeps its `LIMIT` and `OFFSET`; a query that cannot be parsed as a single `SELECT` is not sorted
+- With **Strict sensitive columns** on, a masked column (all values `[REDACTED]`) cannot be sorted; its header tooltip says why (see [Privacy Controls](04_privacy-controls.md))
 - NULL values are shown as italic _NULL_
 - Long cell values truncate with a tooltip showing the full value
 - Footer (left): row count, `· truncated` if the result was capped, `· sorted by db` if a server-side sort was applied
@@ -145,6 +146,10 @@ The cache uses two levels:
 
 A **Refresh** button appears next to the **✓ Cached** badge. Clicking it bypasses the cache and asks the LLM to regenerate the query, then re-executes it. Use this if the underlying data has changed or you want a fresh query.
 
+### When a cached query fails
+
+If the cached query itself fails when it runs (a table or column it names was dropped or renamed since it was stored, say), Savvina AI drops that entry from the cache and asks the LLM for a new query in the same request, then runs the new one, with the usual automatic correction. The answer is then not marked as cached. This does not happen when the database is unreachable, the connection drops while the query runs, the query times out or the database refuses permission: the query is not at fault, so the entry stays in the cache and the failure is shown. If no new query could be generated, the failure of the cached query is shown.
+
 ---
 
 ## Feedback Buttons
@@ -153,7 +158,7 @@ Every successful assistant response shows two feedback buttons next to the expla
 
 | Button | What it does | Side-effect |
 |---|---|---|
-| **👍 Thumbs up** | Marks this answer as correct | Saves the question → SQL pair to the **Example Library**. Future semantically similar questions will include this pair as a few-shot hint, improving generation accuracy over time. |
+| **👍 Thumbs up** | Marks this answer as correct | Saves the question → SQL pair to the **Example Library**. Future semantically similar questions will include this pair as a few-shot hint, improving generation accuracy over time. A query that failed, or one still awaiting approval, is not saved: the rating is recorded but nothing is added to the library. In generate-only mode the query you reviewed is saved. |
 | **👎 Thumbs down** | Marks this answer as wrong | Evicts this question and semantically similar entries from the **query cache**. The next time the same (or similar) question is asked the LLM regenerates the query from scratch instead of reusing a cached result. |
 
 > **Note:** Thumbs down clears the cache but does not prevent the LLM from generating the same query again. If the query is structurally wrong, use the **Edit SQL** button to correct it, or refine your question.

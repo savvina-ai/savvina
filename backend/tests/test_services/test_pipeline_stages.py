@@ -430,6 +430,95 @@ class TestStagePruneAndFilter:
         # ...and left all three untouched.
         assert [m.model_dump(mode="json") for m in (stored, cleaned, narrowed)] == before
 
+    async def test_pruning_with_embeddings_leaves_the_shared_cached_model_untouched(
+        self, stored_semantic_model
+    ):
+        """The same guard with embeddings on: relevance pruning
+        (``_select_relevant_tables``) and the domain boost (``_apply_domain_boost``)
+        read the shared stored model, and the copies the later steps build (relevance,
+        compacting, rendering for the prompt) must leave it and the memoised copy as
+        they were."""
+        from app.semantic.formatter import SemanticFormatter
+        from app.services import schema_pruning
+        from app.services.pipeline import _compact_semantic_model
+        from app.services.semantic_privacy import without_hidden_identifiers
+
+        def _table(name: str) -> TableInfo:
+            return TableInfo(
+                catalog=None,
+                name=name,
+                schema_name="public",
+                table_type="BASE TABLE",
+                columns=[ColumnInfo(name="id", data_type="integer", native_type="int4")],
+            )
+
+        names = [f"t{i}" for i in range(12)]
+        schema = DataSourceSchema(
+            source_type="postgresql", schemas=[], tables=[_table(n) for n in names]
+        )
+        stored = SemanticModel(
+            tables={
+                f"public.{n}": TableSemantic(
+                    display_name=n,
+                    domain="sales" if i % 2 == 0 else "hr",
+                    columns={
+                        "id": ColumnSemantic(display_name="Id"),
+                        "gone": ColumnSemantic(display_name="Gone"),
+                    },
+                )
+                for i, n in enumerate(names)
+            },
+            notes=["n", "the gone column is legacy"],
+        )
+        privacy = PrivacySettings(excluded_columns=[f"public.{n}.gone" for n in names])
+        cleaned = without_hidden_identifiers(stored, schema, privacy)
+        before = [m.model_dump(mode="json") for m in (stored, cleaned)]
+        stored_semantic_model.return_value = stored
+        sr = _make_schema_result(schema=schema, embeddings_available=True)
+
+        # The ANN read: every table but t0 (the one the question names) ranked, the
+        # first five well above the threshold, the rest below it.
+        def _row(key: str, distance: float) -> MagicMock:
+            row = MagicMock()
+            row.table_key = key
+            row.distance = distance
+            return row
+
+        rows = [_row(f"public.t{i}", 0.1 if i <= 5 else 0.95) for i in range(1, 12)]
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=MagicMock(all=MagicMock(return_value=rows)))
+        cache = MagicMock()
+        cache.compute_embedding_async = AsyncMock(return_value=[0.1] * 4)
+
+        with patch.object(
+            schema_pruning, "_apply_domain_boost", wraps=schema_pruning._apply_domain_boost
+        ) as boost:
+            out_schema, filtered = await _stage_prune_and_filter(
+                sr,
+                _make_conn_row(),
+                "t0",
+                _make_settings(schema_pruning_top_k=5),
+                cache,
+                db,
+                "c",
+                "u",
+                privacy,
+            )
+        compact = _compact_semantic_model(filtered)
+        SemanticFormatter().format_for_prompt(filtered)
+        SemanticFormatter().format_for_prompt(compact)
+
+        # The relevance path ran on the shared model: the boost saw it, and the schema
+        # and the model were narrowed to the pinned table plus the five ranked ones.
+        boost.assert_called_once()
+        assert boost.call_args.args[1] is stored
+        assert sorted(t.name for t in out_schema.tables) == ["t0", "t1", "t2", "t3", "t4", "t5"]
+        assert sorted(filtered.tables) == [f"public.t{i}" for i in range(6)]
+        assert filtered.notes == ["n"]
+        assert without_hidden_identifiers(stored, schema, privacy) is cleaned
+        # ...and nothing it touched changed the shared instances.
+        assert [m.model_dump(mode="json") for m in (stored, cleaned)] == before
+
     async def test_semantic_model_comes_from_the_store_not_the_blob(self, stored_semantic_model):
         schema = DataSourceSchema(
             source_type="postgresql",

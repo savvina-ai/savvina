@@ -20,26 +20,47 @@ branch gives a position that a later branch fills with a sensitive column
 (``SELECT id AS x … UNION ALL SELECT email …`` makes ``x`` sensitive; a star in a later
 branch, a star in the first branch at or before such a position, or an unaliased expression
 there is rejected as a shape); a positional ``ORDER BY 2`` / ``GROUP BY 1`` /
-``DISTINCT ON (1)`` is resolved to the projection item it names (an ORDER BY on a
+``DISTINCT ON (1)``, in parentheses or inside ``ROLLUP``, ``CUBE`` or ``GROUPING SETS`` too, is
+resolved to the projection item it names (an ORDER BY on a
 parenthesised query, to that query's), and is rejected when a star stands at or before that
 position (on a set operation, against every branch) or the item is a subquery that projects
 a star; a number in a window's ORDER BY is not checked as a position (PostgreSQL reads it
-as a constant, MySQL refuses it); a subquery used as a value (a scalar subquery in
+as a constant, MySQL refuses it), nor is one in an aggregate's own ORDER BY or a ``WITHIN
+GROUP`` (PostgreSQL reads it as a constant, MySQL's ``GROUP_CONCAT`` as one of its own
+arguments); a subquery used as a value (a scalar subquery in
 WHERE/ON/ORDER BY, an ``IN``/``ANY``/``ARRAY`` operand) is rejected when its own SELECT list
 carries a sensitive column, a laundered alias or a star, unless it is itself a plain SELECT
 item (masked; its alias is laundered, or kept as a "star" name when the subquery projects a
 star, and such a name used anywhere else is a star shape); such an item must have an alias
-unless its query is the outermost one (MySQL names an unaliased item after its SQL text);
-``JOIN ... USING (email)`` and every NATURAL join are rejected; a whole-row reference
-(``u::text``, ``to_jsonb(u)``, ``(u).email``, ``SELECT u FROM u``) and a star anywhere but
+wherever it stands (an unaliased one is named by the engine: MySQL after its SQL text, a
+name ORDER BY, GROUP BY, HAVING and an outer query can use and the check cannot follow;
+PostgreSQL after the subquery's own output column, or ``?column?`` for an unnamed
+expression, which the column rules see already; requiring the alias everywhere keeps the
+rule the same on every engine);
+``JOIN ... USING (email)`` and every NATURAL join are rejected; on PostgreSQL (MySQL has no
+whole-row references) a whole-row reference (``u::text``, ``to_jsonb(u)``, ``(u).email``,
+``SELECT u FROM u``: a bare name that is an alias, or the name of a table or a FROM/LATERAL
+function that has none;
+also ``u.to_jsonb`` and the other record-taking built-ins and aggregates written as an
+attribute, ``result_masking.RECORD_FUNCTIONS``) and everywhere a star anywhere but
 as a projection item or in ``count(*)`` are rejected; a column list on a table alias
-(``c(e) AS (...)``) is rejected.
+(``c(e) AS (...)``) is rejected. On MySQL a statement that contains the opener of an
+executable comment (``/*!``, ``/*M!``) anywhere in its text is rejected: the server runs the
+content, sqlglot drops it. On any other dialect a PostgreSQL ``E'…'`` continued on a later
+line is rejected before the parse (``result_masking.has_escape_string_continuation``): the
+engine and sqlglot's tokenizer read the continuation differently.
 
 Set operations: only ``UNION ALL`` may carry a sensitive item or a star in a branch; a
 ``UNION`` that removes duplicates, an ``INTERSECT`` or an ``EXCEPT`` reveals whether values
 match, so it is rejected wherever it stands (``_check_comparison``). Every operand must be a
 SELECT or a set operation (sqlglot misreads ``TABLE users``), and a VALUES list (which
 sqlglot rewrites to ``SELECT * FROM (VALUES …)``) is named as such in the shape rejection.
+
+``DISTINCT`` (MySQL ``DISTINCTROW`` too) and ``GROUP BY ALL`` remove duplicates of the whole
+projection, which reveals whether the values of a sensitive item match (a count over a derived
+``SELECT DISTINCT email`` is the oracle), so a SELECT with either whose list carries a sensitive
+column, a laundered alias, a subquery item carrying one, or a star is rejected wherever it
+stands (``_check_distinct``). ``DISTINCT ON (…)`` is not affected (``_removes_duplicates``).
 
 Fail closed: in strict mode every query is parsed, and one that sqlglot cannot read as one
 plain statement is rejected whether or not its text names a sensitive column (a whole-row
@@ -49,12 +70,20 @@ or a helper) is rejected too. Pure: no I/O, no settings beyond *privacy*.
 
 from __future__ import annotations
 
+from collections import deque
+from typing import NamedTuple
+
 import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ErrorLevel, ParseError, TokenError
 
 from ..datasources.models import PrivacySettings
-from .result_masking import is_sensitive_name
+from .result_masking import (
+    EXECUTABLE_COMMENT,
+    RECORD_FUNCTIONS,
+    has_escape_string_continuation,
+    is_sensitive_name,
+)
 from .row_filter_errors import SensitiveColumnRejectedError
 from .row_filter_rewrite import sqlglot_dialect
 
@@ -64,6 +93,16 @@ _TOO_DEEP = "Strict sensitive columns: the query is nested too deeply to check, 
 _SHAPE_HINT = (
     "Name the columns you need explicitly, join with an ON condition and refer to columns"
     " by name, not by position."
+)
+_EXECUTABLE_COMMENT_HINT = (
+    "Remove the /*! ... */ comment: write the query without MySQL executable comments."
+)
+_ESCAPE_STRING_HINT = (
+    "Write each E'...' string as one literal on one line, or join the pieces with ||."
+)
+_ALIAS_HINT = (
+    "Give the subquery item an alias, as in (SELECT ... LIMIT 1) AS name, or leave it out;"
+    " the alias is masked like the column."
 )
 
 
@@ -105,12 +144,26 @@ def _reject_compared(column: str) -> SensitiveColumnRejectedError:
     )
 
 
+def _reject_distinct(column: str) -> SensitiveColumnRejectedError:
+    """A sensitive column under a DISTINCT or a GROUP BY ALL: the rows kept reveal whether
+    its values match."""
+    return SensitiveColumnRejectedError(
+        f"Strict sensitive columns: the query removes duplicates of the column {column} with"
+        " DISTINCT or GROUP BY ALL, which reveals whether its values match. This connection"
+        " does not allow that.",
+        llm_hint=(
+            f"Remove DISTINCT and GROUP BY ALL from any SELECT whose list carries the column"
+            f" {column}: the column is masked, so its distinct values would all show the same."
+        ),
+    )
+
+
 def _too_deep() -> SensitiveColumnRejectedError:
     return SensitiveColumnRejectedError(_TOO_DEEP, llm_hint="Simplify the query.")
 
 
-def _reject_shape(what: str) -> SensitiveColumnRejectedError:
-    return SensitiveColumnRejectedError(_shape(what), llm_hint=_SHAPE_HINT)
+def _reject_shape(what: str, hint: str = _SHAPE_HINT) -> SensitiveColumnRejectedError:
+    return SensitiveColumnRejectedError(_shape(what), llm_hint=hint)
 
 
 def _reject_whole_row(name: str) -> SensitiveColumnRejectedError:
@@ -122,6 +175,19 @@ def _reject_whole_row(name: str) -> SensitiveColumnRejectedError:
             f"If {name} is a column, write it with its table or alias ({name}.{name}, or an"
             " alias you give the table in FROM). Do not read a whole row as a value, cast it"
             " or pass it to a function."
+        ),
+    )
+
+
+def _reject_record_function(table: str, name: str) -> SensitiveColumnRejectedError:
+    """``u.to_jsonb``: PostgreSQL reads ``u.f`` as ``f(u)`` for a built-in that takes a
+    record, so the item is every column of ``u``."""
+    return SensitiveColumnRejectedError(
+        _shape(f"the whole row of {table} through {table}.{name}"),
+        llm_hint=(
+            f"Do not call a function on the whole row ({table}.{name} is {name}({table})):"
+            f" name the columns you need. If {name} is a column of {table}, write it without"
+            " the qualifier."
         ),
     )
 
@@ -160,41 +226,115 @@ def _is_sensitive(privacy: PrivacySettings, name: str, laundered: _Laundered) ->
     return bool(name) and (is_sensitive_name(privacy, name) or name.lower() in laundered)
 
 
+class _Position(NamedTuple):
+    """One item of a later branch of a set operation, with what laundering it needs: the
+    first branch and the index of its first star (``None`` without one), computed once."""
+
+    first: exp.Select
+    first_star: int | None
+    branch: exp.Select
+    index: int
+    item: exp.Expression
+
+
 def _laundered_names(tree: exp.Expression, privacy: PrivacySettings) -> _Laundered:
     """Lower-cased names under which a sensitive value is read in *tree*, to a fixed point:
     an alias given to a sensitive column or to a subquery that projects one (``email AS e``,
     then ``e AS f``; ``(SELECT email …) AS e``), and a set operation's first-branch output
-    name at a position a later branch fills with one (``_launder_set_operations``, which
-    raises the shape rejections of its docstring). An alias of a subquery that projects a
-    star, and an alias of such an alias, is kept as a "star" name, not a column: the check
-    cannot tell which column it reads."""
+    name at a position a later branch fills with one (``_launder_position``, which raises the
+    shape rejections of its docstring). An alias of a subquery that projects a star, and an
+    alias of such an alias, is kept as a "star" name, not a column: the check cannot tell
+    which column it reads.
+
+    A worklist, not repeated passes over the tree. The tasks are every alias and every item
+    of a later set-operation branch; each is checked once, and again only when a column
+    name under it becomes laundered (at most once per such name). A task costs about the
+    size of its item, so a chain of aliases written against the walk order (``c0`` reads
+    ``c1``, …) or a wide set operation fed by one costs linear time; only an item that reads
+    many laundered names (a subquery with a long SELECT list) is re-checked once per name."""
     names: _Laundered = {}
-    changed = True
-    while changed:
-        changed = False
-        for alias in tree.find_all(exp.Alias):
-            if not alias.alias or alias.alias.lower() in names:
-                continue
-            found = _sensitive_item(alias, privacy, names)
-            if found is not None:
-                names[alias.alias.lower()] = found[0]
-                changed = True
-        changed = _launder_set_operations(tree, privacy, names) or changed
+    tasks: list[exp.Alias | _Position] = [a for a in tree.find_all(exp.Alias) if a.alias]
+    for setop in tree.find_all(exp.SetOperation):
+        first, *rest = _branches(setop) or [None]
+        if first is None:
+            continue
+        first_star = next(
+            (i for i, head in enumerate(first.expressions) if _is_star(_unaliased(head))), None
+        )
+        for branch in rest:
+            for index, item in enumerate(branch.expressions):
+                tasks.append(_Position(first, first_star, branch, index, item))
+    readers: dict[str, set[int]] = {}
+    for index, task in enumerate(tasks):
+        under = task.this if isinstance(task, exp.Alias) else task.item
+        for column in under.find_all(exp.Column):
+            readers.setdefault(column.name.lower(), set()).add(index)
+    queue = deque(range(len(tasks)))
+    queued = [True] * len(tasks)
+    while queue:
+        index = queue.popleft()
+        queued[index] = False
+        task = tasks[index]
+        if isinstance(task, exp.Alias):
+            added = _launder_alias(task, privacy, names)
+        else:
+            added = _launder_position(task, privacy, names)
+        if added is None:
+            continue
+        for reader in readers.get(added, ()):
+            if not queued[reader]:
+                queued[reader] = True
+                queue.append(reader)
     return names
+
+
+def _launder_alias(alias: exp.Alias, privacy: PrivacySettings, names: _Laundered) -> str | None:
+    """Add *alias*'s name to *names* when the item it names is sensitive; the name added."""
+    name = alias.alias.lower()
+    if name in names:
+        return None
+    found = _sensitive_item(alias, privacy, names)
+    if found is None:
+        return None
+    names[name] = found[0]
+    return name
 
 
 def _table_names(tree: exp.Expression) -> set[str]:
-    """Lower-cased names and aliases of every table, derived table and CTE in *tree*: a
-    bare column of such a name is a whole-row reference."""
+    """Lower-cased names under which a row of *tree* can be read whole: every row source's
+    alias, or the name PostgreSQL gives it when it has none (an aliased table's own name is
+    hidden; an unaliased function in FROM or under LATERAL, ``unnest(…)`` included, is named
+    after the function), and the alias of every derived table, VALUES list and CTE. On
+    PostgreSQL a bare column of such a name is a whole-row reference."""
     names: set[str] = set()
-    for table in tree.find_all(exp.Table):
-        names.add(table.name.lower())
-        if table.alias:
-            names.add(table.alias.lower())
-    for node in tree.find_all(exp.Subquery, exp.CTE):
+    for source in tree.find_all(exp.Table, exp.Lateral, exp.Unnest):
+        if isinstance(source, exp.Unnest) and not isinstance(source.parent, (exp.From, exp.Join)):
+            continue  # a call in an expression, or under a LATERAL that names it
+        name = source.alias or _unaliased_source_name(source)
+        if name:
+            names.add(name.lower())
+    for node in tree.find_all(exp.Subquery, exp.CTE, exp.Values):
         if node.alias:
             names.add(node.alias.lower())
     return names
+
+
+def _unaliased_source_name(source: exp.Expression) -> str:
+    """The name PostgreSQL gives an unaliased row source: a table's name, a function's name
+    (``generate_series(1, 3)`` is ``generate_series``, ``public.my_fn(1)`` is ``my_fn``, under
+    LATERAL too);
+    ``""`` when there is none to give (a LATERAL subquery must have an alias)."""
+    if isinstance(source, exp.Table) and not isinstance(source.this, exp.Func):
+        return source.name
+    func = source if isinstance(source, exp.Unnest) else source.this
+    while isinstance(func, exp.Dot):  # LATERAL public.f(…): Dot(public, f(…))
+        func = func.expression
+    if not isinstance(func, exp.Func):
+        return ""
+    if isinstance(func, exp.Anonymous):
+        return func.name
+    # A typed function (sqlglot's ExplodingGenerateSeries): its PostgreSQL spelling.
+    return func.sql(dialect="postgres").split("(", 1)[0].rsplit(".", 1)[-1]
 
 
 def _is_plain_select_item(node: exp.Expression) -> bool:
@@ -248,27 +388,21 @@ def _branches(query: exp.Expression | None) -> list[exp.Select]:
     return [query] if isinstance(query, exp.Select) else []
 
 
+# What sqlglot hangs around a parenthesised query it reads with a trailing ORDER BY or LIMIT
+# in some places (``EXISTS ((SELECT …) ORDER BY 1 LIMIT 1)`` is Exists(Limit(Order(Subquery)))):
+# the query is their ``this``, and they sort or cut its rows, not a value.
+_QUERY_MODIFIERS = (exp.Order, exp.Limit)
+
+
 def _is_expression_query(query: exp.Expression) -> bool:
     """*query* is used as a value: a scalar subquery, an IN/ANY/ALL/ARRAY operand, an ORDER
-    BY item, a SELECT item. Not the statement, not a source (``_SOURCE_PARENTS``)."""
-    parent = _outer_wrapper(query).parent
+    BY item, a SELECT item. Not the statement, not a source (``_SOURCE_PARENTS``), seen
+    through wrappers and through an ORDER BY or LIMIT on the parenthesised query."""
+    node = _outer_wrapper(query)
+    while isinstance(node.parent, _QUERY_MODIFIERS) and node.parent.this is node:
+        node = _outer_wrapper(node.parent)
+    parent = node.parent
     return parent is not None and not isinstance(parent, _SOURCE_PARENTS)
-
-
-def _is_outermost(query: exp.Expression) -> bool:
-    """*query* is the statement's outermost query, or a branch of its outermost set
-    operation, through parenthesis/subquery wrappers. A query under a FROM, JOIN, LATERAL,
-    CTE, nested set operation or anything else is not."""
-    node = query
-    while node.parent is not None:
-        parent = node.parent
-        if isinstance(parent, exp.SetOperation):
-            if node is not parent.this and node is not parent.expression:
-                return False
-        elif not isinstance(parent, _WRAPPERS):
-            return False
-        node = parent
-    return True
 
 
 def _is_values_branch(branch: exp.Select) -> bool:
@@ -322,6 +456,31 @@ def _check_comparison(
         raise _reject_compared(found[1])
 
 
+def _removes_duplicates(select: exp.Select) -> bool:
+    """*select* removes duplicate rows of its whole projection: a plain ``DISTINCT``
+    (``DISTINCTROW`` parses the same) or a ``GROUP BY ALL``. Not ``DISTINCT ON (…)``: its
+    expressions are checked as column uses, and the projection is not compared."""
+    distinct = select.args.get("distinct")
+    if isinstance(distinct, exp.Distinct) and distinct.args.get("on") is None:
+        return True
+    group = select.args.get("group")
+    return isinstance(group, exp.Group) and bool(group.args.get("all"))
+
+
+def _check_distinct(select: exp.Select, privacy: PrivacySettings, laundered: _Laundered) -> None:
+    """Reject *select* when it removes duplicates and its projection carries a sensitive item
+    (``_sensitive_item``: a column, a laundered alias, a subquery item carrying one) or a
+    star (the check cannot see what the star brings in)."""
+    if not _removes_duplicates(select):
+        return
+    found = _sensitive_projection(select, privacy, laundered)
+    if found is None:
+        return
+    if found[0] == "star":
+        raise _reject_shape("a DISTINCT or GROUP BY ALL over a star")
+    raise _reject_distinct(found[1])
+
+
 def _sensitive_item(
     item: exp.Expression, privacy: PrivacySettings, laundered: _Laundered
 ) -> tuple[str, str] | None:
@@ -366,67 +525,96 @@ def _output_name(item: exp.Expression) -> str | None:
     return item.name if isinstance(item, exp.Column) and not _is_star(item) else None
 
 
-def _launder_set_operations(
-    tree: exp.Expression, privacy: PrivacySettings, names: _Laundered
-) -> bool:
-    """Add to *names* the first-branch output names that a later branch of a set operation
-    fills with a sensitive item, position by position: the engine merges the columns, so
-    ``SELECT id AS x … UNION ALL SELECT email …`` makes ``x`` an email. True when a name was
+def _launder_position(
+    position: _Position, privacy: PrivacySettings, names: _Laundered
+) -> str | None:
+    """Add to *names* the first-branch output name at *position* when the later branch's
+    item there is sensitive: the engine merges the columns, so
+    ``SELECT id AS x … UNION ALL SELECT email …`` makes ``x`` an email. Returns the name
     added. Rejects what the mapping cannot follow: a star in a later branch, a star in the
     first branch at or before such a position (where inside its expansion the position
     lands is unknown) and an unnamed first-branch output there."""
-    changed = False
-    for setop in tree.find_all(exp.SetOperation):
-        first, *rest = _branches(setop) or [None]
-        if first is None:
-            continue
-        for branch in rest:
-            for index, item in enumerate(branch.expressions):
-                found = _sensitive_item(item, privacy, names)
-                if found is None:
-                    continue
-                if found[0] == "star":
-                    raise _set_operation_star(branch, "a star in a later branch of a set operation")
-                heads = first.expressions
-                if any(_is_star(_unaliased(head)) for head in heads[: index + 1]):
-                    raise _set_operation_star(
-                        first, "a star in the first branch of a set operation"
-                    )
-                if index >= len(heads):
-                    continue  # the engine reports the branch mismatch
-                output = _output_name(heads[index])
-                if output is None:
-                    raise _reject_shape(
-                        "a set operation that reads a sensitive column under an unnamed output"
-                    )
-                if output.lower() not in names:
-                    names[output.lower()] = "column"
-                    changed = True
-    return changed
+    first, first_star, branch, index, item = position
+    found = _sensitive_item(item, privacy, names)
+    if found is None:
+        return None
+    if found[0] == "star":
+        raise _set_operation_star(branch, "a star in a later branch of a set operation")
+    if first_star is not None and first_star <= index:
+        raise _set_operation_star(first, "a star in the first branch of a set operation")
+    heads = first.expressions
+    if index >= len(heads):
+        return None  # the engine reports the branch mismatch
+    output = _output_name(heads[index])
+    if output is None:
+        raise _reject_shape("a set operation that reads a sensitive column under an unnamed output")
+    if output.lower() in names:
+        return None
+    names[output.lower()] = "column"
+    return output.lower()
 
 
-def _is_positional(literal: exp.Literal) -> bool:
-    """*literal* is the whole of an ORDER BY item, a GROUP BY item or a ``DISTINCT ON``
-    element. Not an ORDER BY inside a window (``OVER (ORDER BY 1)``): PostgreSQL reads that
-    number as a constant and MySQL refuses it (error 3592), so it is never a position."""
-    parent = literal.parent
+_GROUPING_SETS = (exp.Rollup, exp.Cube, exp.GroupingSets)
+
+
+def _position_query(literal: exp.Literal) -> exp.Expression | None:
+    """The query whose SELECT list *literal* names a position of, or ``None`` when it is not
+    a position. A position is the whole of an ORDER BY item, a GROUP BY item or a
+    ``DISTINCT ON`` element, through any parentheses around it (``ORDER BY (2)``,
+    ``GROUP BY (1)``, ``DISTINCT ON ((2))``). Under a GROUP BY a number nested at any depth in
+    parentheses, tuples, ``ROLLUP``, ``CUBE`` or ``GROUPING SETS`` is a position too
+    (``GROUP BY (1, 2)``, ``GROUPING SETS (ROLLUP (1))``), while under ORDER BY only
+    parentheses around the number itself count (``ORDER BY (2, 1)`` sorts by a constant row).
+    PostgreSQL resolves all of these to the projection item, MySQL the plain and
+    parenthesised ones (it has no ``ROLLUP (...)`` syntax, only ``GROUP BY ... WITH ROLLUP``,
+    whose items are plain GROUP BY items). An ORDER BY that belongs to a function call is
+    not a query's (``_sorted_query``)."""
+    node: exp.Expression = literal
+    while isinstance(node.parent, exp.Paren):
+        node = node.parent
+    parent = node.parent
     if isinstance(parent, exp.Ordered):
-        if isinstance(parent.find_ancestor(exp.Window, exp.Select), exp.Window):
-            return False
-        return parent.this is literal
+        return _sorted_query(parent) if parent.this is node else None
     if isinstance(parent, exp.Distinct):
-        return parent.args.get("on") is literal
-    if isinstance(parent, exp.Tuple) and isinstance(parent.parent, exp.Distinct):
-        return parent.parent.args.get("on") is parent
-    return isinstance(parent, exp.Group) and any(e is literal for e in parent.expressions)
+        positional = parent.args.get("on") is node
+    elif isinstance(parent, exp.Tuple) and isinstance(parent.parent, exp.Distinct):
+        positional = parent.parent.args.get("on") is parent
+    else:
+        while isinstance(parent, (exp.Paren, exp.Tuple, *_GROUPING_SETS)):
+            node, parent = parent, parent.parent
+        positional = isinstance(parent, exp.Group) and any(e is node for e in parent.expressions)
+    return _enclosing_query(literal) if positional else None
 
 
-def _projections(node: exp.Expression) -> list[list[exp.Expression]]:
-    """The SELECT lists a positional item under *node* can refer to: the query's own list,
-    or every branch's list when the ORDER BY belongs to a set operation (the engine sorts
-    the merged column, so the position reaches every branch's item there). An ORDER BY on
-    a parenthesised query hangs on its ``Subquery`` wrapper and refers to the query inside."""
-    query = node.find_ancestor(exp.Select, exp.SetOperation, exp.Subquery)
+def _enclosing_query(node: exp.Expression) -> exp.Expression | None:
+    """The query a clause under *node* belongs to. An ORDER BY on a parenthesised query hangs
+    on its ``Subquery`` wrapper and refers to the query inside."""
+    return node.find_ancestor(exp.Select, exp.SetOperation, exp.Subquery)
+
+
+def _sorted_query(ordered: exp.Ordered) -> exp.Expression | None:
+    """The query an ORDER BY item sorts, whose SELECT list a number in it names: the query
+    the ORDER BY hangs on, or the parenthesised query sqlglot puts under it
+    (``EXISTS ((SELECT id, email FROM u) ORDER BY 1)`` is Exists(Order(Subquery)), and the 1
+    is the inner ``id``). ``None`` for an ORDER BY of a function call: a window
+    (``OVER (ORDER BY 1)``), ``WITHIN GROUP (ORDER BY 1)`` or an aggregate's own
+    (``string_agg(name, ',' ORDER BY 1)``, ``array_agg(id ORDER BY (2))``). PostgreSQL reads
+    that number as a constant, MySQL refuses it in a window (error 3592) and reads it in
+    ``GROUP_CONCAT`` as a position among the function's own arguments, whose columns the
+    walk checks anyway, so it is never a position in the SELECT list."""
+    order = ordered.parent
+    if isinstance(order, exp.Order):
+        if isinstance(order.this, exp.Expression) and _query_of(order.this) is not None:
+            return order.this
+        if isinstance(order.parent, (exp.Window, exp.WithinGroup, exp.Func)):
+            return None
+    return _enclosing_query(ordered)
+
+
+def _projections(query: exp.Expression | None) -> list[list[exp.Expression]]:
+    """The SELECT lists a position in *query* can refer to: the query's own list, or every
+    branch's list when it is a set operation (the engine sorts the merged column, so the
+    position reaches every branch's item there)."""
     return [list(branch.expressions) for branch in _branches(query)]
 
 
@@ -446,13 +634,35 @@ def check_strict_sensitive(
         raise _too_deep() from exc
 
 
+def _check_escape_strings(sql: str) -> None:
+    """Reject a PostgreSQL ``E'…'`` continued on a later line: PostgreSQL reads the next
+    segment as part of the escape string, sqlglot's tokenizer as a standard string, so where
+    the literal ends differs. Result masking's lexer check
+    (``result_masking.has_escape_string_continuation``), run before the parse so the refusal
+    does not depend on sqlglot failing on it; any other lexer error is left to the parse,
+    which fails closed on its own."""
+    if has_escape_string_continuation(sql):
+        raise _reject_shape("an escape string continued on a later line", _ESCAPE_STRING_HINT)
+
+
 def _check(sql: str, privacy: PrivacySettings, dialect: str) -> exp.Expression:
+    mysql = (dialect or "").lower() == "mysql"
+    if mysql and EXECUTABLE_COMMENT.search(sql):
+        # The server runs the content, sqlglot drops it: a condition inside is never seen.
+        # Checked on the raw text, so the opener inside a string is refused too.
+        raise _reject_shape("a MySQL executable comment (/*! ... */)", _EXECUTABLE_COMMENT_HINT)
+    if not mysql:
+        _check_escape_strings(sql)
     tree = _parse_one_statement(sql, dialect)
     _check_operands(tree)
     laundered = _laundered_names(tree, privacy)
     for setop in tree.find_all(exp.SetOperation):
         _check_comparison(setop, privacy, laundered)
+    for select in tree.find_all(exp.Select):
+        _check_distinct(select, privacy, laundered)
     tables = _table_names(tree)
+    # Attribute notation (u.to_jsonb is to_jsonb(u)) exists on PostgreSQL only.
+    attribute_calls = sqlglot_dialect(dialect) == "postgres"
     for node in tree.walk():
         if isinstance(node, exp.Join):
             if (node.method or "").upper() == "NATURAL":
@@ -476,7 +686,15 @@ def _check(sql: str, privacy: PrivacySettings, dialect: str) -> exp.Expression:
             if isinstance(node.this, exp.Star):
                 if not _is_plain_select_item(node):
                     raise _reject_shape("a star outside the SELECT list")
-            elif not node.table and name.lower() in tables:
+            elif (
+                attribute_calls
+                and node.table
+                and node.table.lower() in tables
+                and name.lower() in RECORD_FUNCTIONS
+            ):
+                raise _reject_record_function(node.table, name)
+            elif not mysql and not node.table and name.lower() in tables:
+                # MySQL has no whole-row reference: a bare name there is always a column.
                 raise _reject_whole_row(name)
             elif _is_sensitive(privacy, name, laundered) and not _is_plain_select_item(node):
                 if _sensitive_item(node, privacy, laundered) == ("star", "*"):
@@ -488,27 +706,29 @@ def _check(sql: str, privacy: PrivacySettings, dialect: str) -> exp.Expression:
                 continue
             item = _outer_wrapper(node)
             if _is_plain_select_item(item):
-                # A scalar subquery as a SELECT item: masked. Below the outermost query an
-                # unaliased one is named by the engine (MySQL: after its SQL text), a name
-                # the check cannot follow.
-                if not isinstance(item.parent, exp.Alias) and not _is_outermost(item.parent):
+                # A scalar subquery as a SELECT item: masked, when it has an alias. An
+                # unaliased one is named by the engine: MySQL after its SQL text, a name
+                # ORDER BY, GROUP BY, HAVING and an outer query can use and the check
+                # cannot follow (PostgreSQL uses the inner column's name, which the
+                # column rules see; the alias is required on every engine alike).
+                if not isinstance(item.parent, exp.Alias):
                     raise _reject_shape(
-                        "an unnamed subquery item that reads a sensitive column inside a"
-                        " derived table or CTE"
+                        "an unnamed subquery item that reads a sensitive column", _ALIAS_HINT
                     )
                 continue
             if found[0] == "star":
                 raise _reject_shape("a star inside a subquery used as a value")
             raise _reject_column(found[1])
-        elif isinstance(node, exp.Literal) and not node.is_string and _is_positional(node):
-            if not node.this.isdigit():
+        elif isinstance(node, exp.Literal) and not node.is_string:
+            query = _position_query(node)
+            if query is None or not node.this.isdigit():
                 continue
             index = int(node.this) - 1
             if index < 0:
                 continue  # the engine refuses position 0
             # Later branches first: the first branch's name at this position may be
             # laundered by a later branch, and the message should name the column itself.
-            for items in reversed(_projections(node)):
+            for items in reversed(_projections(query)):
                 # A star at or before the position expands to an unknown number of columns,
                 # so the position can land anywhere inside it (SELECT * … ORDER BY 2).
                 if any(_is_star(_unaliased(item)) for item in items[: index + 1]):

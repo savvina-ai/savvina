@@ -110,7 +110,10 @@ class TestCheckDrift:
                 new=AsyncMock(return_value=MagicMock(generation_status=GenerationStatus.COMPLETE)),
             ),
             patch(f"{_STORE}.update_known_columns", new=AsyncMock()),
+            patch(f"{_STORE}.load_column_names", new=AsyncMock(return_value={})),
             patch("app.routers.semantic._lock_generation", new=AsyncMock()),
+            # The report is stored as the connection's last one; the db queue is not reached.
+            patch(f"{_STORE}.record_drift_report", new=AsyncMock()),
         ):
             yield
 

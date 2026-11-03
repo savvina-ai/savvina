@@ -17,6 +17,9 @@ from app.services.correction import (
     _CATEGORY_FALLBACK_HINTS as _FALLBACKS,
 )
 from app.services.correction import (
+    _EXEC_ERROR_HINTS as _HINTS,
+)
+from app.services.correction import (
     _attempt_sql_execution_correction,
 )
 
@@ -285,12 +288,47 @@ class TestCorrectionPromptComposition:
         assert "more than one row" in prompt
         assert "EXISTS" in prompt
 
+    async def test_an_ambiguous_function_gets_the_cast_advice(self) -> None:
+        # PostgreSQL 42725 (ambiguous_function) is AMBIGUOUS_NAME, but the column advice
+        # (ORDER BY ordinals, qualify the column) does not fit a function call.
+        prompt = await self._prompt(
+            "function round(unknown, integer) is not unique", ErrorCategory.AMBIGUOUS_NAME
+        )
+        assert "Cast the arguments" in prompt
+        assert "ORDER BY" not in prompt
+
+    async def test_an_ambiguous_operator_gets_the_cast_advice(self) -> None:
+        prompt = await self._prompt(
+            "operator is not unique: unknown + unknown", ErrorCategory.AMBIGUOUS_NAME
+        )
+        assert "Cast the arguments" in prompt
+
+    async def test_an_ambiguous_column_keeps_the_column_advice(self) -> None:
+        prompt = await self._prompt(
+            'column reference "id" is ambiguous', ErrorCategory.AMBIGUOUS_NAME
+        )
+        assert "qualify the column" in prompt
+        assert "Cast the arguments" not in prompt
+
     def test_every_engine_category_has_a_fallback_hint(self) -> None:
         # OTHER has no signal; REJECTED is our own refusal, described in its own words
         # (describe_error_for_llm) with its own llm_hint, so an engine hint would mislead.
-        exempt = {ErrorCategory.OTHER, ErrorCategory.REJECTED}
+        # PERMISSION and CONNECTION never reach a correction prompt
+        # (execution._correctable): a rewrite cannot fix either.
+        exempt = {
+            ErrorCategory.OTHER,
+            ErrorCategory.REJECTED,
+            ErrorCategory.PERMISSION,
+            ErrorCategory.CONNECTION,
+        }
         missing = [c for c in ErrorCategory if c not in exempt and c not in _FALLBACKS]
         assert missing == []
+
+    def test_uncorrectable_categories_have_no_hint(self) -> None:
+        assert ErrorCategory.PERMISSION not in _FALLBACKS
+        assert ErrorCategory.CONNECTION not in _FALLBACKS
+        hinted = {category for category, _advice in _HINTS.values()}
+        assert ErrorCategory.PERMISSION not in hinted
 
 
 class TestRowFilterHint:

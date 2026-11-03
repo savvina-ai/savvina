@@ -15,10 +15,12 @@ Name matching (a sensitive pattern, or a bare name from ``excluded_columns``) ap
 well. The one thing classification takes away from it is an exempt output: ``COUNT(email)
 AS email`` is a statistic, not an address, and is not masked for its name.
 
-The classifier fails closed: when it cannot parse the statement and the SQL names a
-sensitive or excluded column, every column is masked (``MASK_ALL_COLUMNS``), and so is
-every column when a name it classified as masked is missing from the driver's column list and no
-per-position classification lines up with it.
+The classifier fails closed: when it cannot parse or resolve the statement and the SQL names
+a sensitive or excluded column (or a record function, a possible whole-row read), every
+column is masked (``MASK_ALL_COLUMNS``); so is every column when a name it classified as
+masked is missing from the driver's column list and no per-position classification lines up
+with it, and when its per-position classification has a different column count than the
+driver's on SQL that names a sensitive column.
 
 Entry points: ``_plan_result_mask`` builds one ``_ResultMaskPlan`` per executed statement
 (classification is the costly part); ``plan.redact(rows, columns)`` is applied to every
@@ -31,13 +33,17 @@ and the connection's current privacy settings.
 from __future__ import annotations
 
 from collections.abc import Iterable
+import contextlib
+import contextvars
 from dataclasses import dataclass, field
 import functools
 import logging
 import re
 from typing import Any
 
+from sqlglot.errors import TokenError
 import sqlparse
+from sqlparse.exceptions import SQLParseError
 from sqlparse.sql import Comment, Function, Identifier, IdentifierList, Parenthesis, Where
 import sqlparse.tokens as sql_tokens
 from sqlparse.utils import remove_quotes
@@ -154,6 +160,42 @@ def is_sensitive_name(privacy: PrivacySettings, value: str) -> bool:
 
     Shared with ``sensitive_guard``."""
     return privacy.is_column_sensitive(value) or value.lower() in _excluded_bare_names(privacy)
+
+
+# PostgreSQL built-ins and aggregates that can be called with a row as their single argument
+# (a record or an any-type parameter), each verified to return the row's content or, for
+# ``hash_record``, a hash of it (``json_agg`` and ``array_agg`` aggregate the rows). In
+# attribute notation ``u.f`` is ``f(u)``, so ``u.to_jsonb`` returns every column of ``u``
+# under the function's name: a whole-row read.
+# A built-in whose first parameter is text or that needs a second argument (``format``,
+# ``concat_ws``, ``json_populate_record``) is not listed: ``u.format`` is never ``format(u)``.
+# Shared with ``sensitive_guard``, which applies it on PostgreSQL only; result masking applies
+# it on every dialect (on MySQL ``u.concat`` is a plain column, and masking it is the
+# fail-closed direction), and only to attribute notation: a call such as
+# ``public.concat(id, ' ', status)`` is followed by ``(`` and is not a whole-row read. A
+# user-defined function with a composite argument is not covered (carry-forward: the robust
+# check compares ``f`` with the introspected columns of ``u``).
+RECORD_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        "to_json",
+        "to_jsonb",
+        "row_to_json",
+        "record_out",
+        "record_send",
+        "concat",
+        "quote_literal",
+        "quote_nullable",
+        "json_build_array",
+        "jsonb_build_array",
+        "hash_record",
+        "json_agg",
+        "jsonb_agg",
+        "array_agg",
+        "json_agg_strict",
+        "jsonb_agg_strict",
+        "any_value",
+    }
+)
 
 
 def _is_windowed(token: object) -> bool:
@@ -363,29 +405,6 @@ def _is_aggregate_expr(token: object) -> bool:
     return _statistic_end(leaves, 0) == len(leaves)
 
 
-def _token_references_sensitive(
-    token: object,
-    privacy: PrivacySettings,
-    *,
-    double_quote_is_string_literal: bool = False,
-) -> bool:
-    """True if any identifier token inside *token* names a sensitive or excluded column.
-
-    A bare ``salary`` is a ``Name``. A double-quoted ``"salary"`` is ``String.Symbol``:
-    sqlparse cannot know whether that is an identifier or a string literal, but the adapter
-    can (``double_quote_is_string_literal``). A backtick-quoted one is a ``Name`` carrying
-    its delimiters; every token is tested unquoted so an anchored pattern can match it.
-    """
-    flat = token.flatten() if hasattr(token, "flatten") else []
-    for tok in flat:
-        is_reference = tok.ttype is sql_tokens.Name or (
-            tok.ttype is sql_tokens.String.Symbol and not double_quote_is_string_literal
-        )
-        if is_reference and is_sensitive_name(privacy, unquote_ident(tok.value)):
-            return True
-    return False
-
-
 _OUTPUT_NAME_TTYPES = (sql_tokens.Name, sql_tokens.String.Symbol, sql_tokens.Keyword)
 
 
@@ -410,7 +429,7 @@ def _output_alias(token: object) -> str | None:
     sqlparse strips one surrounding quote pair and keeps the doubling inside, so
     ``"pay""rate"`` comes back as ``pay""rate`` while the driver names the column
     ``pay"rate``. Map back to the raw token and unquote that, the same call
-    ``_token_references_sensitive`` makes, so both halves agree.
+    ``_references_sensitive`` makes, so both halves agree.
     """
     if isinstance(token, _ComposedItem):
         return token.output_name
@@ -546,7 +565,24 @@ _JOIN_KEYWORD_PREFIXES = (
     "OUTER",
     "STRAIGHT_JOIN",
 )
-_FROM_NOISE_KEYWORDS: frozenset[str] = frozenset({"AS", "LATERAL"})
+_FROM_NOISE_KEYWORDS: frozenset[str] = frozenset({"AS", "LATERAL", "ONLY"})
+# Keywords that may follow a source and are not its alias (``FROM users data``: sqlparse reads
+# a few alias words as keywords).
+_NOT_A_SOURCE_ALIAS: frozenset[str] = frozenset(
+    {
+        "FOR",
+        "USE",
+        "FORCE",
+        "IGNORE",
+        "PARTITION",
+        "ORDINALITY",
+        "TABLESAMPLE",
+        "REPEATABLE",
+        "WINDOW",
+        "LOCK",
+        "INTO",
+    }
+)
 # Keywords that open a join condition; everything up to the next join or comma is skipped.
 _JOIN_CONDITION_KEYWORDS: frozenset[str] = frozenset({"ON", "USING"})
 
@@ -563,6 +599,19 @@ class _SelectItem:
 
 
 _OPAQUE = _SelectItem(None, "opaque")
+# A masked column without a name next to ``_OPAQUE``: the source's columns cannot be
+# enumerated, and any of them may carry a masked value (``_is_tainted``).
+_TAINT = _SelectItem(None, "masked")
+
+
+def _is_tainted(cols: Iterable[_SelectItem]) -> bool:
+    """A source of which any column, by whatever name, may be masked: it has a masked column
+    without a name among columns that cannot be enumerated."""
+    items = list(cols)
+    return any(i.kind == "opaque" for i in items) and any(
+        i.kind == "masked" and i.name is None for i in items
+    )
+
 
 # Lowercased CTE or derived-table alias -> that query's output columns, in order.
 _Scope = dict[str, list[_SelectItem]]
@@ -762,6 +811,77 @@ def _masked_names(sources: _Scope) -> set[str]:
     return {i.name for cols in sources.values() for i in cols if i.kind == "masked" and i.name}
 
 
+# Keywords that only ever structure a statement: never a column or source name.
+_GRAMMAR_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "FROM",
+        "WHERE",
+        "AS",
+        "ON",
+        "USING",
+        "JOIN",
+        "GROUP BY",
+        "ORDER BY",
+        "HAVING",
+        "LIMIT",
+        "OFFSET",
+        "UNION",
+        "UNION ALL",
+        "INTERSECT",
+        "EXCEPT",
+        "DISTINCT",
+        "CASE",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "END",
+        "AND",
+        "OR",
+        "NOT",
+        "NULL",
+        "IS",
+        "IN",
+        "BETWEEN",
+        "LIKE",
+        "ILIKE",
+        "OVER",
+        "FILTER",
+        "WITHIN",
+        "TRUE",
+        "FALSE",
+    }
+)
+
+
+def _is_keyword_token(tok: object) -> bool:
+    """A keyword, or a word sqlparse reads as an operator (``ilike``, ``div``)."""
+    ttype = tok.ttype  # type: ignore[attr-defined]
+    if ttype is None:
+        return False
+    return ttype in sql_tokens.Keyword or (
+        ttype in sql_tokens.Operator and _BARE_WORD.fullmatch(tok.value) is not None  # type: ignore[attr-defined]
+    )
+
+
+def _is_reference_token(tok: object, dq: bool) -> bool:
+    """A leaf token that may name a column or a source: a name (sqlparse reads a few column
+    names, ``date``, ``text``, as built-in names and others, ``comment``, ``data``, as
+    keywords, so both count), or a double-quoted identifier unless the dialect reads ``"…"``
+    as a string literal (*dq*). A statement keyword (``SELECT``, ``FROM``'s DML, DDL and
+    ``WITH``) is not. Over-reading another keyword can only mask more."""
+    ttype = tok.ttype  # type: ignore[attr-defined]
+    if ttype is None:
+        return False
+    if ttype in sql_tokens.Keyword:
+        return not (
+            ttype in sql_tokens.Keyword.DML
+            or ttype in sql_tokens.Keyword.DDL
+            or ttype in sql_tokens.Keyword.CTE
+            or tok.normalized.upper() in _GRAMMAR_KEYWORDS  # type: ignore[attr-defined]
+        )
+    return ttype in sql_tokens.Name or (ttype is sql_tokens.String.Symbol and not dq)
+
+
 def _mentions_masked(node: object, privacy: PrivacySettings, dq: bool, visible: _Scope) -> bool:
     """A name token in *node* matching a sensitive pattern or a masked column in *visible*.
 
@@ -770,8 +890,9 @@ def _mentions_masked(node: object, privacy: PrivacySettings, dq: bool, visible: 
     """
     masked = _masked_names(visible)
     for tok in node.flatten():  # type: ignore[attr-defined]
-        is_ref = tok.ttype is sql_tokens.Name or (tok.ttype is sql_tokens.String.Symbol and not dq)
-        if not is_ref:
+        if not _is_reference_token(tok, dq):
+            if _is_keyword_token(tok) and tok.value.lower() in masked:
+                return True
             continue
         value = unquote_ident(tok.value)
         if privacy.is_column_sensitive(value) or value.lower() in masked:
@@ -793,30 +914,171 @@ class _AllColumns(frozenset):
 
 
 # The masked-name half of ``_classify_select_columns``'s result when classification failed
-# (an exception, sqlparse's token or depth limit) on SQL that names a sensitive or excluded
-# column: every column is masked. ``name in MASK_ALL_COLUMNS`` is True for any name, so a
+# (an exception, sqlparse's token or depth limit, a shape the resolver does not understand)
+# on SQL that names a sensitive or excluded column or a record function: every column is
+# masked. ``name in MASK_ALL_COLUMNS`` is True for any name, so a
 # membership test fails closed on its own; compare by identity (``is``) to detect it, since
 # iterating it or combining it with another set yields nothing.
 MASK_ALL_COLUMNS: frozenset[str] = _AllColumns()
 
-_IDENTIFIER_WORD = re.compile(r'"((?:[^"]|"")+)"|`((?:[^`]|``)+)`|([A-Za-z_][A-Za-z0-9_$]*)')
+# A quoted identifier (its quote doubled inside), or a bare word: any run of Unicode word
+# characters (letters of any script, digits, underscore), dollar signs and non-ASCII
+# characters, so an unquoted Greek column name (in NFD form too, its accents combining
+# marks), ``mail€x`` or a MySQL name that starts with a digit is one word. PostgreSQL accepts
+# any byte from 0x80 in an unquoted name and MySQL U+0080 to U+FFFF, so this is at least as
+# wide as either engine's rule, which can only make the scan say "mentions" more often: it
+# decides fail-closed outcomes (mask every column, bypass the cache).
+# A PostgreSQL Unicode-escape identifier (``U&"em\0061il"``, optionally ``UESCAPE '!'``) is
+# decoded first (``_decode_unicode_escapes``).
+_IDENTIFIER_WORD = re.compile(
+    r'[Uu]&"((?:[^"]|"")+)"(?:\s*UESCAPE\s*\'([^\'])\')?'
+    r'|"((?:[^"]|"")+)"|`((?:[^`]|``)+)`|((?:[\w$]|[^\x00-\x7F])+)',
+    re.IGNORECASE,
+)
+
+
+def _decode_unicode_escapes(body: str, escape: str = "\\") -> str:
+    """The name a PostgreSQL ``U&"…"`` identifier spells: *escape* followed by four hex digits,
+    or by ``+`` and six, is that code point; a doubled *escape* is itself. ``ValueError`` on
+    anything else, as PostgreSQL refuses it."""
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch != escape:
+            out.append(ch)
+            i += 1
+            continue
+        if body[i + 1 : i + 2] == escape:
+            out.append(escape)
+            i += 2
+            continue
+        digits, start = (6, i + 2) if body[i + 1 : i + 2] == "+" else (4, i + 1)
+        code = body[start : start + digits]
+        if len(code) != digits or not all(c in "0123456789abcdefABCDEF" for c in code):
+            raise ValueError("invalid Unicode escape")
+        out.append(chr(int(code, 16)))
+        i = start + digits
+    return "".join(out)
+
+
+def _identifier_words(sql: str) -> Iterable[str]:
+    for match in _IDENTIFIER_WORD.finditer(sql):
+        unicode_quoted, uescape, double_quoted, backticked, bare = match.groups()
+        if unicode_quoted is not None:
+            raw = unicode_quoted.replace('""', '"')
+            yield raw
+            with contextlib.suppress(ValueError):
+                yield _decode_unicode_escapes(raw, uescape or "\\")
+        elif double_quoted is not None:
+            yield double_quoted.replace('""', '"')
+        elif backticked is not None:
+            yield backticked.replace("``", "`")
+        else:
+            yield bare
 
 
 def sql_mentions_sensitive(sql: str, privacy: PrivacySettings) -> bool:
     """Whether any identifier-like word in *sql* names a sensitive or excluded column.
 
     Shared with the pipeline's cache bypass."""
-    for match in _IDENTIFIER_WORD.finditer(sql):
-        double_quoted, backticked, bare = match.groups()
-        if double_quoted is not None:
-            word = double_quoted.replace('""', '"')
-        elif backticked is not None:
-            word = backticked.replace("``", "`")
-        else:
-            word = bare
-        if is_sensitive_name(privacy, word):
+    return any(is_sensitive_name(privacy, word) for word in _identifier_words(sql))
+
+
+def _may_read_whole_rows(sql: str, dq: bool) -> bool:
+    """Whether *sql* may read a whole row, or a column under a name the classifier cannot
+    follow, into its result. Read with sqlglot (MySQL's dialect when *dq*, PostgreSQL's
+    otherwise), which parses shapes the classifier does not follow; True when it cannot
+    parse *sql* either (fail closed). Any of:
+
+    - a column alias list (``t(a, b)``, ``WITH c(a, b) AS``): it renames by position;
+    - a ``TABLE x`` statement;
+    - a star anywhere but as a whole item of the outermost SELECT list, inside
+      ``COUNT(*)`` or in an ``EXISTS``/``IN`` subquery (``ROW(u.*)``, ``(u.*)::text``,
+      ``SELECT q FROM (SELECT * FROM users) s(q)``);
+    - on PostgreSQL, an unqualified column named like a table, table alias or derived-table
+      or CTE alias in a SELECT list (``SELECT u FROM users u``) or in the arguments of a
+      FROM item (``unnest(ARRAY[u::text])``).
+    """
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        trees = [t for t in sqlglot.parse(sql, read="mysql" if dq else "postgres") if t]
+    except Exception:
+        return True
+    names: set[str] = set()
+    for tree in trees:
+        if any(a.columns for a in tree.find_all(exp.TableAlias)):
             return True
+        if any(
+            i.this.upper() == "TABLE" and not i.quoted
+            for i in tree.find_all(exp.Identifier)
+            if isinstance(i.this, str)
+        ):
+            return True
+        names.update(t.name.lower() for t in tree.find_all(exp.Table) if t.name)
+        names.update(a.name.lower() for a in tree.find_all(exp.TableAlias) if a.name)
+
+    def outermost(node: exp.Expression) -> list[exp.Expression]:
+        if isinstance(node, exp.Select):
+            return [node]
+        if isinstance(node, exp.SetOperation):
+            return [*outermost(node.left), *outermost(node.right)]
+        if isinstance(node, exp.Subquery):
+            return outermost(node.this)
+        return []
+
+    for tree in trees:
+        top = {id(s) for s in outermost(tree)}
+        for star in tree.find_all(exp.Star):
+            item = star.parent if isinstance(star.parent, exp.Column) else star
+            parent = item.parent
+            if isinstance(parent, exp.Count):
+                continue
+            if (
+                isinstance(parent, exp.Select)
+                and item in parent.expressions
+                and (id(parent) in top or isinstance(parent.parent, (exp.Exists, exp.In)))
+            ):
+                continue
+            return True
+    if dq:
+        return False  # MySQL has no whole-row reference
+
+    def names_a_source(node: exp.Expression) -> bool:
+        return any(not c.table and c.name.lower() in names for c in node.find_all(exp.Column))
+
+    for tree in trees:
+        for select in tree.find_all(exp.Select):
+            if any(names_a_source(item) for item in select.expressions):
+                return True
+        for clause in (*tree.find_all(exp.From), *tree.find_all(exp.Join)):
+            source = clause.this
+            if isinstance(source, (exp.Subquery, exp.Table)) and not isinstance(
+                source.this, exp.Func
+            ):
+                continue  # a query is checked by its own SELECT lists; a table has no argument
+            if source is not None and names_a_source(source):
+                return True
     return False
+
+
+def _give_up_masks_all(sql: str, privacy: PrivacySettings, dq: bool) -> bool:
+    """When the classifier cannot tell which column carries what: whether *sql* names a
+    sensitive or excluded column, calls a record function, or may read a whole row or rename
+    columns by position (``_may_read_whole_rows``). If so, every column is masked."""
+    return (
+        sql_mentions_sensitive(sql, privacy)
+        or _mentions_record_function(sql)
+        or _may_read_whole_rows(sql, dq)
+    )
+
+
+def _mentions_record_function(sql: str) -> bool:
+    """Whether any identifier-like word in *sql* is a ``RECORD_FUNCTIONS`` name: a call such
+    as ``to_jsonb(u)`` or ``u.to_jsonb`` may read every column of a row."""
+    return any(word.lower() in RECORD_FUNCTIONS for word in _identifier_words(sql))
 
 
 _STRING_TOKEN_NAMES = (
@@ -845,6 +1107,48 @@ def _engine_lexing() -> tuple[object, object, frozenset[object], Any]:
     return MySQL(), Postgres(), strings, TokenType
 
 
+# The opener of a MySQL or MariaDB executable comment, with its optional version number: the
+# server runs the content, so for every check it is code, not a comment. Shared with
+# ``sensitive_guard``, which refuses it in strict mode. The MySQL validator keeps its own copy
+# (``mysql_validator._EXECUTABLE_OPENER``, which also eats the version digits): datasources
+# do not import from services, so keep the two in step.
+EXECUTABLE_COMMENT = re.compile(r"/\*M?!")
+
+
+def has_escape_string_continuation(sql: str) -> bool:
+    """Whether *sql*, lexed as PostgreSQL, has an ``E'…'`` continued by a ``'…'`` on a later
+    line, which the tokenizer reads otherwise than PostgreSQL (``_lex_like_the_engine``).
+    ``/*! … */`` is an ordinary comment on PostgreSQL, so it is read past rather than ending
+    the scan. Any other lexing error is False. Shared with ``sensitive_guard``."""
+    try:
+        _lex_like_the_engine(sql, False, refuse_executable_comments=False)
+    except _EscapeStringContinuationError:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+# Classification steps (a query or a SELECT resolved) one statement may take. A nested
+# ``WITH RECURSIVE`` re-classifies its body until it settles, and nesting multiplies the
+# passes; past the budget every column is masked.
+_CLASSIFICATION_BUDGET = 5000
+_BUDGET: contextvars.ContextVar[list[int]] = contextvars.ContextVar("_masking_budget")
+
+
+class _BudgetExhaustedError(Exception):
+    """The statement needs more classification steps than ``_CLASSIFICATION_BUDGET``."""
+
+
+def _spend_budget() -> None:
+    remaining = _BUDGET.get(None)
+    if remaining is None:
+        return
+    remaining[0] -= 1
+    if remaining[0] < 0:
+        raise _BudgetExhaustedError
+
+
 class _ExecutableCommentError(ValueError):
     """A MySQL ``/*! … */`` or ``/*M! … */`` comment: MySQL runs its content."""
 
@@ -861,7 +1165,148 @@ _COMMENT_JOINS: frozenset[str] = frozenset({"--", "/*", "*/"})
 _BACKSLASH_BEFORE_QUOTE = re.compile(r'\\(?=")')
 
 
-def _lex_like_the_engine(sql: str, dq: bool) -> str:
+# Calls whose ``AS`` names a type, not an alias.
+_CAST_CALLS: frozenset[str] = frozenset({"CAST", "TRY_CAST", "SAFE_CAST"})
+_BARE_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+
+# What may open a CTE body: ``AS [NOT] MATERIALIZED`` is dropped only before one, never
+# before a column alias list (``AS materialized (a, b)``).
+_QUERY_OPENERS: frozenset[str] = frozenset({"SELECT", "WITH", "VALUES", "TABLE", "("})
+
+
+def _column_neutral_tokens(
+    tokens: list, strings: frozenset[object], token_type: Any, dq: bool
+) -> dict[int, str]:
+    """Token index -> what to emit instead, for constructs that do not change which column
+    carries what but that sqlparse groups so that the resolver gives up or misreads:
+
+    - ``[NOT] MATERIALIZED`` after a CTE's ``AS``, a ``TABLESAMPLE method (…) [REPEATABLE
+      (…)]`` clause, PostgreSQL's ``WITH ORDINALITY`` after a call (it adds a numbered
+      column, which an alias list may name; a table function's columns are never all known
+      anyway), MySQL's index hints (``USE|FORCE|IGNORE INDEX|KEY [FOR …] (…)``) and
+      ``PARTITION (…)``: blanked;
+    - ``IS [NOT] DISTINCT FROM``: ``<>``, since sqlparse ends the SELECT list at its ``FROM``;
+    - a keyword used as a name, after ``AS`` (outside ``CAST``) or after ``.`` (``AS from``,
+      ``s.case``): quoted, so sqlparse reads a name (PostgreSQL folds it to lower case).
+    """
+
+    def word(i: int) -> str:
+        if not 0 <= i < len(tokens):
+            return ""
+        tok = tokens[i]
+        if tok.token_type in strings or tok.token_type is token_type.IDENTIFIER:
+            return ""
+        return tok.text.upper()
+
+    # Each ``(`` -> the index after its ``)``, matched once (a rescan per clause would be
+    # quadratic on a run of ``TABLESAMPLE x (``).
+    closing: dict[int, int] = {}
+    opened: list[int] = []
+    for j, tok in enumerate(tokens):
+        if tok.token_type is token_type.L_PAREN:
+            opened.append(j)
+        elif tok.token_type is token_type.R_PAREN and opened:
+            closing[opened.pop()] = j + 1
+
+    def after_parens(i: int) -> int | None:
+        return closing.get(i)
+
+    blank: set[int] = set()
+    out: dict[int, str] = {}
+    casts: list[bool] = []  # per open parenthesis: whether it is a CAST's
+    for i in range(len(tokens)):
+        if i in blank or i in out:
+            continue
+        w = word(i)
+        if w == "(":
+            casts.append(word(i - 1) in _CAST_CALLS)
+        elif w == ")" and casts:
+            casts.pop()
+        is_keyword_name = (
+            tokens[i].token_type is not token_type.VAR
+            and _BARE_WORD.fullmatch(w) is not None
+            and (
+                (word(i - 1) == "AS" and not (casts and casts[-1]))
+                or tokens[i - 1 if i else 0].token_type is token_type.DOT
+            )
+        )
+        if i and is_keyword_name:
+            name = tokens[i].text
+            out[i] = f"`{name}`" if dq else f'"{name.lower()}"'
+        elif w == "MATERIALIZED":
+            start = i - 1 if word(i - 1) == "NOT" else i
+            if word(start - 1) == "AS" and word(i + 1) == "(" and word(i + 2) in _QUERY_OPENERS:
+                blank.update(range(start, i + 1))
+        elif w == "IS":
+            j = i + 2 if word(i + 1) == "NOT" else i + 1
+            if word(j) == "DISTINCT" and word(j + 1) == "FROM":
+                out[i] = "<>"
+                blank.update(range(i + 1, j + 2))
+        elif w == "WITH" and not dq and word(i - 1) == ")" and word(i + 1) == "ORDINALITY":
+            blank.update((i, i + 1))
+        elif dq and w in ("USE", "FORCE", "IGNORE") and word(i + 1) in ("INDEX", "KEY"):
+            j = i + 2
+            if word(j) == "FOR":
+                j += 3 if word(j + 1) in ("ORDER", "GROUP") else 2
+            end = after_parens(j)
+            if end is not None:
+                blank.update(range(i, end))
+        elif dq and w == "PARTITION" and word(i + 1) == "(":
+            end = after_parens(i + 1)
+            if end is not None:
+                blank.update(range(i, end))
+        elif w == "TABLESAMPLE":
+            j = i + 1  # the method: a name, possibly qualified
+            while j < len(tokens) and tokens[j].token_type in (
+                token_type.VAR,
+                token_type.IDENTIFIER,
+                token_type.DOT,
+            ):
+                j += 1
+            end = after_parens(j) if j > i + 1 else None
+            if end is not None and word(end) == "REPEATABLE":
+                end = after_parens(end + 1)
+            if end is not None:
+                blank.update(range(i, end))
+    return {**dict.fromkeys(blank, " "), **{k: v for k, v in out.items() if k not in blank}}
+
+
+def _unicode_identifiers(
+    sql: str, tokens: list, token_type: Any
+) -> tuple[dict[int, str], set[int]]:
+    """PostgreSQL ``U&"…" [UESCAPE '…']`` identifiers among *tokens*, which sqlglot reads as
+    ``U``, ``&`` and a quoted name: the index of each ``U`` -> the decoded name, and the
+    indices of the rest of each one. ``ValueError`` on an escape PostgreSQL refuses."""
+    names: dict[int, str] = {}
+    parts: set[int] = set()
+    for k in range(len(tokens) - 2):
+        u, amp, ident = tokens[k : k + 3]
+        if not (
+            u.token_type is token_type.VAR
+            and u.text in ("U", "u")
+            and amp.token_type is token_type.AMP
+            and ident.token_type is token_type.IDENTIFIER
+            and amp.start == u.end + 1
+            and ident.start == amp.end + 1
+            and sql[ident.start] == '"'
+        ):
+            continue
+        escape = "\\"
+        end = k + 2
+        if (
+            k + 4 < len(tokens)
+            and tokens[k + 3].text.upper() == "UESCAPE"
+            and tokens[k + 4].token_type is token_type.STRING
+            and len(tokens[k + 4].text) == 1
+        ):
+            escape = tokens[k + 4].text
+            end = k + 4
+        names[k] = _decode_unicode_escapes(ident.text, escape)
+        parts.update(range(k + 1, end + 1))
+    return names, parts
+
+
+def _lex_like_the_engine(sql: str, dq: bool, *, refuse_executable_comments: bool = True) -> str:
     """*sql* rebuilt from the engine's own tokens, so sqlparse sees every boundary where the
     engine has it.
 
@@ -874,7 +1319,8 @@ def _lex_like_the_engine(sql: str, dq: bool) -> str:
 
     - the text between tokens is whitespace or a comment: whitespace is kept, a comment
       becomes spaces (newlines kept). A MySQL executable comment (``/*!``, ``/*M!``) raises,
-      since MySQL runs its content;
+      since MySQL runs its content, unless *refuse_executable_comments* is False (a caller
+      that only lexes as PostgreSQL, where it is an ordinary comment);
     - a string literal of any kind becomes ``'<decoded text>'`` with every ``'`` and ``\\``
       replaced by a space (its end is what matters; a string alias keeps its name);
     - a double-quoted identifier becomes ``"<name>"`` with ``"`` doubled and a ``\\`` that
@@ -884,6 +1330,10 @@ def _lex_like_the_engine(sql: str, dq: bool) -> str:
     - a PostgreSQL operator spelled with ``#`` (``#``, ``#>>``, ``#-``) has it replaced by
       ``^``, an operator sqlparse does not read as a comment (on MySQL ``#`` only ever starts
       a comment, which is a gap);
+    - a few constructs sqlparse misgroups are rewritten (``_column_neutral_tokens``):
+      ``[NOT] MATERIALIZED``, ``TABLESAMPLE``, ``WITH ORDINALITY``, MySQL index hints and
+      ``PARTITION (…)`` become spaces, ``IS [NOT] DISTINCT FROM`` becomes ``<>``, and a
+      keyword used as a name after ``AS`` or ``.`` is quoted;
     - everything else is kept as written, with a space between two tokens that would
       otherwise join into ``--``, ``/*``, ``*/`` or ``#``.
 
@@ -894,6 +1344,8 @@ def _lex_like_the_engine(sql: str, dq: bool) -> str:
     """
     mysql, postgres, strings, token_type = _engine_lexing()
     tokens = (mysql if dq else postgres).tokenize(sql)  # type: ignore[attr-defined]
+    neutral = _column_neutral_tokens(tokens, strings, token_type, dq)
+    unicode_names, unicode_parts = _unicode_identifiers(sql, tokens, token_type)
     out: list[str] = []
     last = 0
     prev = None
@@ -904,11 +1356,11 @@ def _lex_like_the_engine(sql: str, dq: bool) -> str:
         if text.isspace():
             out.append(text)
             return
-        if "/*!" in text or "/*M!" in text:
+        if refuse_executable_comments and EXECUTABLE_COMMENT.search(text):
             raise _ExecutableCommentError("MySQL executable comment")
         out.append(_NON_SPACE.sub(" ", text))
 
-    for tok in tokens:
+    for k, tok in enumerate(tokens):
         if tok.start < last or tok.end < tok.start:
             raise ValueError("tokens out of order")
         between = sql[last : tok.start]
@@ -922,7 +1374,14 @@ def _lex_like_the_engine(sql: str, dq: bool) -> str:
             raise _EscapeStringContinuationError("escape string continued on a later line")
         gap(between)
         raw = sql[tok.start : tok.end + 1]
-        if tok.token_type in strings:
+        if k in neutral:
+            piece = neutral[k]
+        elif k in unicode_parts:
+            piece = " "
+        elif k in unicode_names:
+            name = unicode_names[k].replace('"', '""')
+            piece = '"' + _BACKSLASH_BEFORE_QUOTE.sub("_", name + '"')
+        elif tok.token_type in strings:
             piece = "'" + tok.text.replace("'", " ").replace("\\", " ") + "'"
         elif tok.token_type is token_type.IDENTIFIER:
             if raw.startswith('"'):
@@ -943,9 +1402,11 @@ def _lex_like_the_engine(sql: str, dq: bool) -> str:
 
 
 def _classification_failed(
-    sql: str, privacy: PrivacySettings, exc: BaseException
+    sql: str, privacy: PrivacySettings, exc: BaseException, dq: bool
 ) -> tuple[frozenset[str], set[str]] | None:
-    mask_all = sql_mentions_sensitive(sql, privacy)
+    """A statement the tokenizers could not read: every column masked when the give-up test
+    fires (``_give_up_masks_all``), name matching otherwise."""
+    mask_all = _give_up_masks_all(sql, privacy, dq)
     logger.warning(
         "Result-column classification failed (%s) on SQL of length %d; %s",
         type(exc).__name__,
@@ -980,17 +1441,18 @@ def _classify_select_columns(
     enumerated (a wildcard over a real table) the result is the known masked names with no
     exemptions, or ``None`` if there are none.
 
-    If classification fails outright (an exception, or sqlparse's token/depth limit) and the
-    SQL names a sensitive or excluded column, masked is ``MASK_ALL_COLUMNS``: mask every
-    column. A caller that *iterates* the masked names must test ``masked is
-    MASK_ALL_COLUMNS`` first: the sentinel contains every name but iterates as empty.
+    If classification fails (an exception, sqlparse's token/depth limit, or a shape the
+    scoped resolver does not understand) and the SQL names a sensitive or excluded column or
+    a record function, masked is ``MASK_ALL_COLUMNS``: mask every column. A caller that
+    *iterates* the masked names must test ``masked is MASK_ALL_COLUMNS`` first: the sentinel
+    contains every name but iterates as empty.
 
     Scope-aware: a column renamed inside a CTE, a derived table or a scalar subquery keeps
     its sensitivity through the rename (column alias lists included), a nested query anywhere
     in a SELECT item masks the item, a whole-row reference (``row_to_json(u)``) masks the
     item, and a set operation masks a position when any branch does. A shape the resolver
-    does not understand falls back to the outermost SELECT list alone, then to ``None`` —
-    never a wrong "nothing sensitive".
+    does not understand is ``MASK_ALL_COLUMNS`` (above) or ``None`` — never a wrong "nothing
+    sensitive".
     """
     masked, exempt, _ = _classify_result(sql, privacy, double_quote_is_string_literal)
     return None if masked is None else (masked, exempt)
@@ -1009,6 +1471,7 @@ def _classify_result(
     *masked* is ``None`` where ``_classify_select_columns`` returns ``None``. Positions are
     given only for a fully classified outer list, so their count is the query's column count.
     """
+    budget = _BUDGET.set([_CLASSIFICATION_BUDGET])
     try:
         parsed = sqlparse.parse(_lex_like_the_engine(sql, dq).strip())
         if not parsed:
@@ -1016,14 +1479,33 @@ def _classify_result(
         stmt = parsed[0]
         items = _classify_output_items(stmt, privacy, dq)
         if items is None:
-            # The scoped resolver gave up (a FROM shape it does not parse …). Do not discard
-            # what the outermost SELECT list alone shows: a sensitive reference there is
-            # masked whatever the rest of the query looks like.
-            outer = _outer_select_list_masked(stmt, privacy, dq)
-            return (outer or None), set(), None
-    except Exception as exc:
-        failed = _classification_failed(sql, privacy, exc)
+            # The scoped resolver gave up (a FROM shape it does not parse …): which column
+            # carries what is unknown.
+            if _give_up_masks_all(sql, privacy, dq):
+                return MASK_ALL_COLUMNS, set(), None
+            return None, set(), None
+    except (_ExecutableCommentError, _BudgetExhaustedError) as exc:
+        # MySQL runs the comment's content; a statement too costly to classify. Either way
+        # nothing about the columns is known.
+        logger.warning(
+            "Result-column classification stopped (%s) on SQL of length %d; masking every column",
+            type(exc).__name__,
+            len(sql),
+        )
+        return MASK_ALL_COLUMNS, set(), None
+    except (SQLParseError, TokenError, ValueError) as exc:  # the tokenizers could not read it
+        failed = _classification_failed(sql, privacy, exc, dq)
         return (failed[0] if failed else None), set(), None
+    except Exception as exc:  # anything else is a fault, not a reading: fail closed
+        logger.warning(
+            "Result-column classification failed unexpectedly (%s) on SQL of length %d; "
+            "masking every column",
+            type(exc).__name__,
+            len(sql),
+        )
+        return MASK_ALL_COLUMNS, set(), None
+    finally:
+        _BUDGET.reset(budget)
     masked = {i.name for i in items if i.kind == "masked" and i.name}
     if any(i.kind == "opaque" for i in items):
         if any(i.kind == "masked" and not i.name for i in items):
@@ -1033,31 +1515,6 @@ def _classify_result(
         return (masked or None), set(), None
     exempt = {i.name for i in items if i.kind == "exempt" and i.name}
     return masked, exempt, tuple(i.kind for i in items)
-
-
-def _outer_select_list_masked(stmt: object, privacy: PrivacySettings, dq: bool) -> set[str] | None:
-    """Output names of the outermost SELECT list that reference a sensitive name token directly.
-
-    The scope-blind fallback for shapes ``_classify_query`` does not resolve. ``None`` when
-    a sensitive item has no determinable output name or the list cannot be read.
-    """
-    toks = _significant(stmt.tokens)  # type: ignore[attr-defined]
-    for idx, t in enumerate(toks):
-        if t.ttype is sql_tokens.Keyword and t.normalized.upper() in _SET_OPERATORS:
-            toks = toks[:idx]
-            break
-    collected = _collect_select(toks)
-    if collected is None:
-        return None
-    masked: set[str] = set()
-    for item in collected[0]:
-        if _ends_in_wildcard(item):
-            continue  # its columns are left to name matching
-        if _is_aggregate_expr(item) or _is_ranking_window_expr(item):
-            continue
-        if _token_references_sensitive(item, privacy, double_quote_is_string_literal=dq):
-            masked.add(_output_alias(item) or _default_output_name(item))
-    return masked
 
 
 def _classify_query(
@@ -1075,6 +1532,7 @@ def _classify_query(
     correlated references. With *allow_unnamed* a masked column may have no name (a column
     alias list or a scalar-subquery position names it); otherwise that is ``None``.
     """
+    _spend_budget()
     toks = _strip_parens(tokens)
     if not toks:
         return None
@@ -1363,6 +1821,14 @@ def _group_item(group: list) -> object | None:
         return _composed(group, explicit)  # type: ignore[arg-type]
     if _is_alias_word(last) and _ends_expression(prev):
         return _composed(group, _alias_token_name(last))  # ``email result``, ``email 'c'``
+    if (
+        len(group) == 2
+        and _is_reference_token(prev, False)
+        and _is_alias_word(last)
+        and not (last.ttype is not None and last.ttype in sql_tokens.String)
+    ):
+        # ``data x``: a column sqlparse reads as a keyword, then its alias
+        return _composed(group, _alias_token_name(last))
     return _composed(group, None)
 
 
@@ -1487,6 +1953,26 @@ class _FromScope:
     real: dict[str, bool] = field(default_factory=dict)
 
 
+class _RealTable(list):
+    """A real table of an enclosing FROM, as a nested query sees it (``_as_outer``): its
+    columns are unknown (``_OPAQUE``, after the columns of a scoped source of the same key,
+    if any), and ``aliased`` tells whether its key is an alias (see ``_whole_row_masked``)."""
+
+    def __init__(self, items: Iterable[_SelectItem], aliased: bool) -> None:
+        super().__init__(items)
+        self.aliased = aliased
+
+
+def _as_outer(fs: _FromScope) -> _Scope:
+    """*fs*'s sources as a nested (correlated or ``LATERAL``) query sees them: the scoped
+    ones with their columns, a real table as a ``_RealTable``, so a whole-row reference to
+    it (``to_jsonb(u)``, ``u.to_jsonb``) from inside the nested query is masked too."""
+    visible: _Scope = dict(fs.scoped)
+    for key, aliased in fs.real.items():
+        visible[key] = _RealTable([*fs.scoped.get(key, []), _OPAQUE], aliased)
+    return visible
+
+
 def _default_output_name(item: object) -> str:
     """The name PostgreSQL gives an unaliased expression: the function name for a call,
     ``?column?`` otherwise. Only a guess for a sensitive item. When the outer SELECT list is
@@ -1532,6 +2018,7 @@ def _classify_simple_select(
     columns: the rest of the list is still classified, and the caller treats the result as
     "these masked names plus name matching".
     """
+    _spend_budget()
     collected = _collect_select(toks)
     if collected is None:
         return None
@@ -1543,7 +2030,7 @@ def _classify_simple_select(
     # A nested query resolves FROM names against CTEs only; this FROM's derived tables are
     # visible to it as correlated column qualifiers (*outer*), not as table sources.
     nested_scope = scope
-    nested_outer = {**outer, **fs.scoped}
+    nested_outer = {**outer, **_as_outer(fs)}
 
     items: list[_SelectItem] = []
     for item in select_items:
@@ -1557,6 +2044,8 @@ def _classify_simple_select(
             continue
         name = _output_alias(item)
         sub = _subquery_parens(item) if isinstance(item, Identifier) else None
+        if sub is None and not _nested_queries(item) and _unknown_reference(item, fs, outer, dq):
+            return None
         if sub is not None:
             # A scalar subquery: its value is the subquery's column, so only that counts
             # (a sensitive name in its WHERE does not reach the output).
@@ -1581,27 +2070,114 @@ def _classify_simple_select(
     return items
 
 
+# Marks the end of a parenthesised join group spliced into ``_from_sources``' token stream.
+_JOIN_GROUP_END = object()
+
+
+def _source_tokens(tokens: Iterable[object]) -> list:
+    """*tokens*' significant tokens, a comma-separated list sqlparse grouped read in order:
+    an alias word it reads as a keyword is grouped with it (``users data, orders o``)."""
+    stream: list = []
+    for t in _significant(tokens):
+        stream.extend(_significant(t.tokens) if isinstance(t, IdentifierList) else [t])
+    return stream
+
+
+def _is_join_group(paren: Parenthesis) -> bool:
+    """A parenthesis holding a join (``(a JOIN b ON …)``), not a query or a value list."""
+    for t in _strip_parens(paren.tokens):
+        if t.ttype is sql_tokens.Keyword and t.normalized.upper().startswith(
+            _JOIN_KEYWORD_PREFIXES
+        ):
+            return True
+        if isinstance(t, Parenthesis) and not _is_query_parens(t) and _is_join_group(t):
+            return True
+    return False
+
+
+def _is_values_parens(paren: object) -> bool:
+    """A parenthesis holding a ``VALUES`` list."""
+    if not isinstance(paren, Parenthesis):
+        return False
+    body = _strip_parens(paren.tokens)
+    return bool(body) and body[0].ttype is sql_tokens.Keyword and body[0].normalized == "VALUES"
+
+
+def _computed_source_columns(names: list[str], masked: bool) -> list[_SelectItem]:
+    """The columns of a table function or a ``VALUES`` list: *names* (its column alias list or
+    its own name), then columns that cannot be enumerated. When it is *masked*, every one
+    is: the listed names and, through ``_TAINT``, any other name read from it (a function may
+    declare its columns itself, ``JSON_TABLE(… COLUMNS (e …))``, or return several)."""
+    if masked:
+        return [*(_SelectItem(n, "masked") for n in names), _TAINT, _OPAQUE]
+    return [*(_SelectItem(n, "plain") for n in names), _OPAQUE]
+
+
+def _is_bare_source(node: object) -> bool:
+    """*node* is a source without an alias of its own: a (dotted) name, a call or a query in
+    parentheses."""
+    if isinstance(node, (Function, Parenthesis)):
+        return True
+    if not isinstance(node, Identifier):
+        return False
+    leaves = [t for t in node.flatten() if not t.is_whitespace and not _is_comment(t)]
+    return _dotted_name_end(leaves, 0) == len(leaves)
+
+
+def _table_name(node: object) -> tuple[str | None, bool]:
+    """The table a FROM item names, unquoted and lowercased, keyed by its last name part
+    (``public.users`` is referenced as ``users``), and whether it is schema-qualified.
+    ``(None, False)`` when *node* does not start with a name."""
+    leaves = [t for t in node.flatten() if not t.is_whitespace and not _is_comment(t)]  # type: ignore[attr-defined]
+    end = _dotted_name_end(leaves, 0)
+    if end is None:
+        return None, False
+    return unquote_ident(leaves[end - 1].value).lower(), end > 1
+
+
 def _from_sources(
     from_tokens: list, privacy: PrivacySettings, dq: bool, scope: _Scope, outer: _Scope
 ) -> _FromScope | None:
     """Resolve the FROM clause into the sources it makes visible.
 
     Join conditions (``ON …``, ``USING (…)``) are skipped. A source renamed by a column alias
-    list (``s(a, b)``) is renamed by position. ``None`` when the clause has a shape this does
-    not understand (a derived table with no alias, a parenthesised join group).
+    list (``s(a, b)``) is renamed by position. A word sqlparse reads as a keyword directly
+    after a source with no alias (``FROM users data``) is its alias. A real table is keyed by
+    its last name part (``public.users`` is ``users``), an unaliased table function by its
+    name (``unnest(emails)`` is ``unnest``), as PostgreSQL names them. ``None`` when the
+    clause has a shape this does not understand (a derived table with no alias, a
+    parenthesised join group under an alias). A join group without one is read as its
+    sources, in place.
     """
     refs: list[list] = []  # [node, alias, column list] per source
     in_condition = False
     attachable = False  # the last source may still take a following ``alias(a, b)``
-    for t in _significant(from_tokens):
+    stream = _source_tokens(from_tokens)
+    after_group = False  # the token before was the end of a parenthesised join group
+    i = 0
+    while i < len(stream):
+        t = stream[i]
+        i += 1
+        if t is _JOIN_GROUP_END:
+            in_condition = attachable = False
+            after_group = True
+            continue
         is_keyword = t.ttype is sql_tokens.Keyword
         upper = t.normalized.upper() if is_keyword else ""
+        if after_group:
+            after_group = False
+            if not (
+                (t.ttype is sql_tokens.Punctuation and t.value == ",")
+                or (is_keyword and upper.startswith(_JOIN_KEYWORD_PREFIXES))
+                or upper in _JOIN_CONDITION_KEYWORDS
+            ):
+                return None  # an alias on a join group hides its sources
         if in_condition:
             if (is_keyword and upper.startswith(_JOIN_KEYWORD_PREFIXES)) or (
                 t.ttype is sql_tokens.Punctuation and t.value == ","
             ):
                 in_condition = False
-            elif isinstance(t, IdentifierList) or _has_top_level_comma(t):
+            elif _has_top_level_comma(t):
                 return None  # a source may be grouped into the condition
             continue
         if isinstance(t, Function) and attachable:
@@ -1611,25 +2187,35 @@ def _from_sources(
             refs[-1][1], refs[-1][2] = named
             attachable = False
             continue
+        can_take_alias = attachable and refs[-1][1] is None and _is_bare_source(refs[-1][0])
         attachable = False
-        if isinstance(t, IdentifierList):
-            refs.extend(
-                [e, None, None]
-                for e in t.get_identifiers()
-                if not (
-                    e.ttype is sql_tokens.Keyword and e.normalized.upper() in _FROM_NOISE_KEYWORDS
-                )
-            )
+        if isinstance(t, (Identifier, Function)) or _is_query_parens(t):
+            head = _significant(t.tokens)[0] if isinstance(t, Identifier) else None
+            if (
+                isinstance(head, Parenthesis)
+                and not _is_query_parens(head)
+                and _is_join_group(head)
+            ):
+                return None  # ``(a JOIN b ON …) AS j``: the alias hides a and b
+            refs.append([t, None, None, False])
             attachable = True
-        elif isinstance(t, (Identifier, Function)) or _is_query_parens(t):
-            refs.append([t, None, None])
+        elif isinstance(t, Parenthesis) and _is_values_parens(t):
+            refs.append([t, None, None, False])  # ``LATERAL (VALUES …) v(r)``
             attachable = True
+        elif isinstance(t, Parenthesis) and _is_join_group(t):
+            # ``a JOIN (b JOIN c ON …) ON …``: the group's sources, read in place
+            stream[i:i] = [*_source_tokens(_strip_parens(t.tokens)), _JOIN_GROUP_END]
         elif isinstance(t, Parenthesis):
-            return None  # a parenthesised join group
+            return None
         elif is_keyword:
             if upper in _JOIN_CONDITION_KEYWORDS:
                 in_condition = True
-            elif not (upper.startswith(_JOIN_KEYWORD_PREFIXES) or upper in _FROM_NOISE_KEYWORDS):
+            elif upper.startswith(_JOIN_KEYWORD_PREFIXES) or upper in _FROM_NOISE_KEYWORDS:
+                pass
+            elif can_take_alias and upper not in _NOT_A_SOURCE_ALIAS:
+                refs[-1][1] = unquote_ident(t.value).lower()  # ``FROM users data``
+                refs[-1][3] = True
+            else:
                 return None
         elif not (
             t.ttype is sql_tokens.Punctuation
@@ -1639,7 +2225,7 @@ def _from_sources(
             return None
 
     fs = _FromScope()
-    for node, attached_alias, attached_cols in refs:
+    for node, attached_alias, attached_cols, keyword_alias in refs:
         alias: str | None = attached_alias
         cols: list[str] | None = attached_cols
         parts = _significant(node.tokens) if node.is_group else []
@@ -1659,37 +2245,56 @@ def _from_sources(
                 alias = unquote_ident(raw).lower() if raw else None
         elif not isinstance(node, (Function, Parenthesis)):
             return None
+        values = node if isinstance(node, Parenthesis) and _is_values_parens(node) else None
+        if isinstance(node, Identifier) and parts and isinstance(parts[0], Parenthesis):
+            values = parts[0] if _is_values_parens(parts[0]) else None
+        if values is not None:
+            # A VALUES list yields what its rows hold, which may be a whole row (``u::text``).
+            if not alias:
+                return None
+            masked = _mentions_masked(
+                values, privacy, dq, {**scope, **outer, **fs.scoped}
+            ) or _references_sensitive(values, privacy, dq, fs, outer)
+            _store_source(fs.scoped, alias, _computed_source_columns(cols or [], masked))
+            fs.order.append(alias)
+            continue
         body = node if isinstance(node, Parenthesis) else _subquery_parens(node)
         if body is not None:
             if not alias:
                 return None
-            inner = _source_columns(body, cols, privacy, dq, scope, {**outer, **fs.scoped})
+            # Earlier sources are visible to a LATERAL body (and an error anywhere else).
+            inner = _source_columns(body, cols, privacy, dq, scope, {**outer, **_as_outer(fs)})
             if inner is None:
                 return None
             _store_source(fs.scoped, alias, inner)
             fs.order.append(alias)
             continue
         is_function = isinstance(node, Function) or bool(parts and isinstance(parts[0], Function))
-        real = None if is_function else _first_name(node)
-        key = alias or real
-        if real is not None and real in scope and key:
+        real, qualified = (None, False) if is_function else _table_name(node)
+        key = alias or (_outermost_call_name(node) if is_function else real)
+        if real is not None and not qualified and real in scope and key:
             src_cols = scope[real]
             if _spelling(node, dq) not in getattr(src_cols, "spellings", frozenset()):
                 # Spelled unlike the CTE (``"U"`` for ``u``): a real table of the same folded
                 # name may be meant, whose columns are unknown. Fail closed: both.
                 src_cols = _merge_sources(src_cols, [_OPAQUE])
-            _store_source(
-                fs.scoped, key, _rename_columns(src_cols, cols) if cols is not None else src_cols
-            )
+            renamed_cols = _rename_columns(src_cols, cols) if cols is not None else src_cols
+            _store_source(fs.scoped, key, renamed_cols)
+            if keyword_alias and real != key:
+                _store_source(fs.scoped, real, renamed_cols)  # the alias may be misread
             fs.order.append(key)
             continue
         if is_function:
-            # A table function (``unnest(emails) AS z``) yields whatever its arguments hold.
-            if _mentions_masked(node, privacy, dq, {**scope, **outer, **fs.scoped}):
+            # A table function (``unnest(emails) AS z``, ``unnest(emails)``) yields whatever
+            # its arguments hold: a sensitive or masked column, or a whole row of an earlier
+            # or enclosing source (``jsonb_each_text(to_jsonb(u))``).
+            if _mentions_masked(
+                node, privacy, dq, {**scope, **outer, **fs.scoped}
+            ) or _references_sensitive(node, privacy, dq, fs, outer):
                 if not key:
                     return None
                 names = cols if cols is not None else [key]
-                _store_source(fs.scoped, key, [_SelectItem(n, "masked") for n in names] + [_OPAQUE])
+                _store_source(fs.scoped, key, _computed_source_columns(names, True))
                 fs.order.append(key)
                 continue
             fs.order.append(None)
@@ -1705,6 +2310,8 @@ def _from_sources(
         fs.order.append(None)
         if key:
             fs.real[key] = alias is not None
+        if keyword_alias and real and real != key:
+            fs.real.setdefault(real, False)  # the alias may be a misread clause keyword
     return fs
 
 
@@ -1719,7 +2326,8 @@ def _alias_leaf(item: object) -> object | None:
     if not has_alias:
         return None
     leaves = [t for t in item.flatten() if not t.is_whitespace]  # type: ignore[attr-defined]
-    return leaves[-1] if leaves else None
+    # A lone word (``SELECT data``, a keyword to sqlparse) is the expression, not an alias.
+    return leaves[-1] if len(leaves) > 1 else None
 
 
 def _inside_call(tok: object, item: object) -> bool:
@@ -1732,18 +2340,71 @@ def _inside_call(tok: object, item: object) -> bool:
     return False
 
 
-def _whole_row_masked(key: str, tok: object, item: object, fs: _FromScope) -> bool:
+def _whole_row_masked(
+    key: str, tok: object, item: object, fs: _FromScope, outer: _Scope, dq: bool
+) -> bool:
     """A bare source name (``row_to_json(u)``, ``SELECT u FROM users u``) or ``u.*`` inside an
-    expression references every column of that source."""
-    # A key may name both a scoped source and a real table (``users "U", (…) u``): masked
-    # if either is.
-    if key in fs.scoped and any(i.kind in ("masked", "opaque") for i in fs.scoped[key]):
+    expression references every column of that source: one of this FROM (*fs*) or, for a
+    correlated or ``LATERAL`` reference, of an enclosing one (*outer*)."""
+
+    def real_table(aliased: bool) -> bool:
+        # A real table's columns are unknown: fail closed. An unaliased table name may also
+        # be a column of that table (``SELECT country FROM country``), which PostgreSQL
+        # prefers to the whole row; the columns are unknown here, so on PostgreSQL it is
+        # masked anyway. MySQL has no whole-row reference: there the name is a column,
+        # except inside a call (the fail-closed reading of ``row_to_json(users)``).
+        return aliased or not dq or _inside_call(tok, item)
+
+    if key in fs.scoped or key in fs.real:
+        # A key may name both a scoped source and a real table (``users "U", (…) u``):
+        # masked if either is.
+        if key in fs.scoped and any(i.kind in ("masked", "opaque") for i in fs.scoped[key]):
+            return True
+        return key in fs.real and real_table(fs.real[key])
+    src = outer.get(key)
+    if src is None:
+        return False
+    if any(i.kind == "masked" for i in src):
         return True
-    if key in fs.real:
-        # A real table's columns are unknown: fail closed. An unaliased table name is read
-        # as a whole row only inside a call, since ``SELECT country FROM country`` is the
-        # column (a column name wins over a whole-row reference).
-        return fs.real[key] or _inside_call(tok, item)
+    if isinstance(src, _RealTable):
+        return real_table(src.aliased)
+    return any(i.kind == "opaque" for i in src)
+
+
+def _unknown_reference(item: object, fs: _FromScope, outer: _Scope, dq: bool) -> bool:
+    """A name in *item* that no visible source has, when every visible source's columns are
+    known (CTEs and derived tables only): the item was misread (``SELECT y FROM (SELECT id
+    AS x …) s``, or an alias sqlparse took for part of the expression), so the resolver
+    gives up rather than call it harmless. Only plain names count, not keywords or built-in
+    type names."""
+    sources = {**outer, **fs.scoped}
+    if fs.real or None in fs.order:
+        return False
+    if any(
+        isinstance(c, _RealTable) or any(i.kind == "opaque" for i in c) for c in sources.values()
+    ):
+        return False
+    known = {i.name for c in sources.values() for i in c if i.name}
+    alias_leaf = _alias_leaf(item)
+    toks = [t for t in item.flatten() if not t.is_whitespace]  # type: ignore[attr-defined]
+    for idx, tok in enumerate(toks):
+        if not (tok.ttype is sql_tokens.Name or (tok.ttype is sql_tokens.String.Symbol and not dq)):
+            continue
+        after = toks[idx + 1].value if idx + 1 < len(toks) else ""
+        if tok is alias_leaf or after in ("(", "."):
+            continue
+        low = unquote_ident(tok.value).lower()
+        if idx >= 2 and toks[idx - 1].value == ".":
+            cols = sources.get(unquote_ident(toks[idx - 2].value).lower())
+            if (
+                cols is not None
+                and low not in RECORD_FUNCTIONS
+                and all(i.name != low for i in cols)
+            ):
+                return True
+            continue
+        if low not in known and low not in sources:
+            return True
     return False
 
 
@@ -1760,17 +2421,24 @@ def _references_sensitive(
     source that can carry a sensitive column.
 
     A double-quoted token is a column reference unless the dialect reads ``"…"`` as a string
-    literal (*dq*). Every token is tested unquoted. A qualified reference ``x.c`` is looked
-    up in ``x`` alone; an unqualified ``c`` in every visible source, which over-masks on a
-    name collision — the safe direction.
+    literal (*dq*), and so is a word sqlparse reads as a keyword or a built-in name
+    (``comment``, ``data``, ``date``): a few column names are. Every token is tested
+    unquoted. A qualified reference ``x.c`` is looked up in ``x`` alone; a qualified ``x.f``
+    where ``x`` is a source and ``f`` a record-taking built-in (``RECORD_FUNCTIONS``) is a
+    whole-row read and masked; an unqualified ``c`` in every visible source, which
+    over-masks on a name collision — the safe direction.
     """
     scoped_sources = fs.scoped
     masked_any = _masked_names({**outer, **scoped_sources})
+    tainted = any(_is_tainted(c) for c in (*outer.values(), *scoped_sources.values()))
     alias_leaf = _alias_leaf(item)
     toks = [t for t in item.flatten() if not t.is_whitespace]  # type: ignore[attr-defined]
     for idx, tok in enumerate(toks):
-        is_ref = tok.ttype is sql_tokens.Name or (tok.ttype is sql_tokens.String.Symbol and not dq)
-        if not is_ref:
+        if not _is_reference_token(tok, dq):
+            # a grammar keyword spelling a masked column of a source (``SELECT over AS x
+            # FROM (SELECT email AS over …) s``)
+            if _is_keyword_token(tok) and tok.value.lower() in masked_any:
+                return True
             continue
         value = unquote_ident(tok.value)
         if is_sensitive_name(privacy, value):
@@ -1778,24 +2446,32 @@ def _references_sensitive(
         low = value.lower()
         after = toks[idx + 1].value if idx + 1 < len(toks) else ""
         qualified = (
-            idx >= 2
-            and toks[idx - 1].value == "."
-            and toks[idx - 2].ttype in (sql_tokens.Name, sql_tokens.String.Symbol)
+            idx >= 2 and toks[idx - 1].value == "." and _is_reference_token(toks[idx - 2], dq)
         )
         if qualified:
             qual = unquote_ident(toks[idx - 2].value).lower()
+            if (
+                low in RECORD_FUNCTIONS
+                and after != "("
+                and (qual in fs.real or qual in scoped_sources or qual in outer)
+            ):
+                return True  # u.to_jsonb is to_jsonb(u): every column of the source
             cols = scoped_sources.get(qual)
             if cols is None:
                 cols = outer.get(qual)
-            if cols is not None and any(i.kind == "masked" and i.name == low for i in cols):
+            if cols is not None and (
+                _is_tainted(cols) or any(i.kind == "masked" and i.name == low for i in cols)
+            ):
                 return True
             continue
         if low in masked_any:
             return True
         if tok is alias_leaf or after == "(":
             continue  # the item's own alias, or a function name
+        if tainted and after != ".":
+            return True  # an unqualified name may be any column of a tainted source
         star = after == "." and idx + 2 < len(toks) and toks[idx + 2].ttype is sql_tokens.Wildcard
-        if (after != "." or star) and _whole_row_masked(low, tok, item, fs):
+        if (after != "." or star) and _whole_row_masked(low, tok, item, fs, outer, dq):
             return True
     return False
 
@@ -1807,6 +2483,8 @@ def _resolve_mask_indices(
     privacy: PrivacySettings,
     exempt_names: frozenset[str] | set[str],
     positions: _Positions = None,
+    *,
+    mismatch_masks_all: bool = False,
 ) -> frozenset[int]:
     """Column indices to redact.
 
@@ -1824,6 +2502,12 @@ def _resolve_mask_indices(
     rewrite returns a function column under sqlglot's name (``strpos`` → ``position``,
     ``now`` → ``current_timestamp``) while PostgreSQL truncates a long alias. The position
     is the lineage, as engine-side dynamic data masking has it.
+    Positions whose count differs from the columns' are a misread of the query: with
+    *mismatch_masks_all* (a position is masked, or the give-up test fires: the SQL names a
+    sensitive or excluded column, a record function or a possible whole row; see
+    ``_ResultMaskPlan``) every column is masked, otherwise the name rules below
+    apply. The cost: ``SELECT *`` over a ``USING``/``NATURAL`` join of CTEs or derived tables
+    (the join column appears once) is fully masked when such a query names a sensitive column.
     Without positions, a column is masked when its name is a masked name, or when name
     matching hits it and its name is not an exempt alias; and a masked name the driver did
     not return masks every column, since the guess was wrong and nothing else lines up.
@@ -1836,12 +2520,16 @@ def _resolve_mask_indices(
     def name_hit(col: str, low: str) -> bool:
         return privacy.is_column_sensitive(col) or low in excluded_bare
 
-    if masked_names is not None and positions is not None and len(positions) == len(columns):
-        return frozenset(
-            i
-            for i, (col, low, kind) in enumerate(zip(columns, lowered, positions, strict=True))
-            if kind == "masked" or (kind != "exempt" and name_hit(col, low))
-        )
+    if masked_names is not None and positions is not None:
+        if len(positions) != len(columns):
+            if mismatch_masks_all:
+                return frozenset(range(len(columns)))
+        else:
+            return frozenset(
+                i
+                for i, (col, low, kind) in enumerate(zip(columns, lowered, positions, strict=True))
+                if kind == "masked" or (kind != "exempt" and name_hit(col, low))
+            )
     if masked_names is not None and not set(masked_names) <= set(lowered):
         return frozenset(range(len(columns)))
     masked = masked_names or set()
@@ -1881,7 +2569,23 @@ class _ResultMaskPlan:
     masked: set[str] | frozenset[str] | None
     exempt: set[str]
     positions: _Positions
+    # Every column is masked when the positions do not line up with the driver's columns
+    # and a position is masked, or the give-up test fires on *classified_sql* (computed only
+    # on such a mismatch).
+    mismatch_masks_all: bool = False
+    classified_sql: str | None = None
+    dq: bool = False
     _by_columns: dict[tuple[str, ...], frozenset[int]] = field(default_factory=dict)
+    _gives_up: list[bool] = field(default_factory=list)
+
+    def _mismatch_masks_all(self, columns: list[str]) -> bool:
+        if self.mismatch_masks_all:
+            return True
+        if self.positions is None or len(self.positions) == len(columns) or not self.classified_sql:
+            return False
+        if not self._gives_up:
+            self._gives_up.append(_give_up_masks_all(self.classified_sql, self.privacy, self.dq))
+        return self._gives_up[0]
 
     def redacted_indices(self, columns: list[str]) -> frozenset[int]:
         """Indices of *columns* whose values must be replaced by ``[REDACTED]``."""
@@ -1895,6 +2599,7 @@ class _ResultMaskPlan:
                 self.privacy,
                 self.exempt,
                 self.positions,
+                mismatch_masks_all=self._mismatch_masks_all(columns),
             )
             self._by_columns[key] = hit
         return hit
@@ -1931,7 +2636,15 @@ def _plan_result_mask(
     masked, exempt, positions = _classify_result(
         classify_from, privacy, double_quote_is_string_literal
     )
-    return _ResultMaskPlan(privacy, masked, exempt, positions)
+    return _ResultMaskPlan(
+        privacy,
+        masked,
+        exempt,
+        positions,
+        mismatch_masks_all=positions is not None and "masked" in positions,
+        classified_sql=classify_from,
+        dq=double_quote_is_string_literal,
+    )
 
 
 def _mask_sensitive_result_columns(

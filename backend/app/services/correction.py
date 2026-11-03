@@ -198,13 +198,6 @@ async def _attempt_complexity_correction(
     return None, ""
 
 
-_PERMISSION_ADVICE = (
-    "The database has denied access to one or more objects or columns in your query. "
-    "Do NOT attempt to rewrite the query to retrieve that data via a workaround. "
-    "Instead, respond with an EXPLANATION only (no QUERY block) telling the user "
-    "which object is restricted and that it cannot be accessed with their current credentials."
-)
-
 _UNKNOWN_NAME_ADVICE = (
     "A column or relation name was not found. Check for typos and confirm the exact names "
     "from the schema. Qualify ambiguous column names with the table name. If a function "
@@ -217,6 +210,14 @@ _AMBIGUOUS_ADVICE = (
     "For ORDER BY: use column ordinal positions (e.g. ORDER BY 3 DESC) instead of alias names. "
     "For SELECT/WHERE/JOIN: qualify the column with its table or CTE name "
     "(e.g. cte_name.column_name or table_alias.column_name)."
+)
+
+# PostgreSQL 42725 (ambiguous_function), also AMBIGUOUS_NAME: a call that matches several
+# overloads, usually because an argument is an untyped literal.
+_AMBIGUOUS_FUNCTION_ADVICE = (
+    "A function or operator call matches more than one definition, usually because an "
+    "argument is an untyped literal. Cast the arguments explicitly to the types the intended "
+    "definition takes, e.g. round(CAST(x AS numeric), 2) or '1'::integer + 2."
 )
 
 _DIVISION_ADVICE = (
@@ -235,8 +236,6 @@ _EXEC_ERROR_HINTS: dict[str, tuple[ErrorCategory, str]] = {
         "Aggregate functions (SUM, AVG, COUNT, MIN, MAX) cannot appear in a WHERE clause. "
         "Move aggregate conditions to a HAVING clause.",
     ),
-    "select permission was denied on the column": (ErrorCategory.PERMISSION, _PERMISSION_ADVICE),
-    "the select permission was denied": (ErrorCategory.PERMISSION, _PERMISSION_ADVICE),
     "must appear in the group by clause": (
         ErrorCategory.GROUPING,
         "Every non-aggregated column in SELECT must appear in GROUP BY. "
@@ -251,11 +250,6 @@ _EXEC_ERROR_HINTS: dict[str, tuple[ErrorCategory, str]] = {
         "Example: COUNT(*) FILTER (WHERE status = 'x') → COUNT(CASE WHEN status = 'x' THEN 1 END).",
     ),
     "does not exist": (ErrorCategory.UNKNOWN_NAME, _UNKNOWN_NAME_ADVICE),
-    "ambiguous column": (
-        ErrorCategory.AMBIGUOUS_NAME,
-        "A column name appears in multiple joined tables. Qualify it with its table name, "
-        "e.g. table_name.column_name.",
-    ),
     "invalid input syntax for type": (
         ErrorCategory.DATA,
         "A value cannot be cast to the expected column type. Use an explicit CAST or :: operator "
@@ -277,12 +271,15 @@ _EXEC_ERROR_HINTS: dict[str, tuple[ErrorCategory, str]] = {
         "Check for typos, incorrect keywords, unclosed parentheses, missing commas, "
         "or incorrect clause ordering.",
     ),
+    "is not unique": (ErrorCategory.AMBIGUOUS_NAME, _AMBIGUOUS_FUNCTION_ADVICE),
     "is ambiguous": (ErrorCategory.AMBIGUOUS_NAME, _AMBIGUOUS_ADVICE),
 }
 
 # Used when no text hint both matched and agreed with the category (a non-English server,
 # or the only textual match was refused). Dialect-neutral by construction: these fire for
 # PostgreSQL and MySQL alike. REJECTED has none: the rejection's own ``llm_hint`` is the advice.
+# PERMISSION and CONNECTION have none: no correction is attempted for them
+# (``execution._correctable``), since a rewrite cannot lift a denial or restore a connection.
 _CATEGORY_FALLBACK_HINTS: dict[ErrorCategory, str] = {
     ErrorCategory.UNKNOWN_NAME: _UNKNOWN_NAME_ADVICE,
     ErrorCategory.AMBIGUOUS_NAME: _AMBIGUOUS_ADVICE,
@@ -291,7 +288,6 @@ _CATEGORY_FALLBACK_HINTS: dict[ErrorCategory, str] = {
         "aggregate such as MAX() or MIN(). Aggregate conditions belong in HAVING, not WHERE."
     ),
     ErrorCategory.DIVISION_BY_ZERO: _DIVISION_ADVICE,
-    ErrorCategory.PERMISSION: _PERMISSION_ADVICE,
     ErrorCategory.DATA: (
         "Guard the conversion: filter out the rows whose values cannot be converted before "
         "casting, cast with a CASE that checks the value's shape first, or select a different "

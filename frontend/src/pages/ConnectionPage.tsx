@@ -28,7 +28,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '../components/ui/dialog';
-import { connectionsApi } from '../api/connections';
+import { connectionsApi, type PrivacySaveRequest } from '../api/connections';
 import apiClient from '../api/client';
 import {
   useConnections,
@@ -46,10 +46,19 @@ import { useAppStore } from '../store/appStore';
 import { cn } from '@/lib/utils';
 import { getDatasourceIcon } from '@/lib/datasourceIcons';
 import { apiErrorMessage } from '@/lib/apiError';
-import type { DataSourceInfo, PrivacySettings, Connection } from '../types';
+import type { DataSourceInfo, PrivacySettings, PrivacySettingsUpdate, Connection } from '../types';
+
+/** Shown when a privacy save finds that the settings were saved elsewhere since the form
+ *  was loaded (409); the form is reloaded with the stored settings. */
+const STALE_PRIVACY =
+  'The privacy settings changed since this form was loaded. They have been reloaded: apply ' +
+  'your changes again.';
+/** The same 409 when reloading the stored settings failed: the form keeps what it holds. */
+const STALE_RELOAD_FAILED =
+  'The privacy settings changed since this form was loaded, and reloading them failed:';
 
 function EditPanel({ connId, onClose }: { connId: string; onClose: () => void }) {
-  const { data: detail, isLoading } = useConnection(connId);
+  const { data: detail, isLoading, refetch } = useConnection(connId);
   const updatePrivacy = useUpdatePrivacySettings();
   const updateMode = useUpdateExecutionMode();
   const recheck = useTestConnection();
@@ -66,6 +75,9 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
   const [execMode, setExecMode] = useState<Connection['execution_mode']>('auto_execute');
   const [privacyOpen, setPrivacyOpen] = useState(false);
   const [initialized, setInitialized] = useState(false);
+  // The privacy_version of the settings the form holds; every privacy save sends it so a
+  // save from a stale form is refused (409) instead of overwriting a newer one.
+  const [loadedVersion, setLoadedVersion] = useState<string | undefined>(undefined);
   const [formValid, setFormValid] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -74,20 +86,25 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
     // keys are held in the form's displayed form, which depends on the dialect. On an error
     // the dialect falls back to the connection's source_type.
     if (detail && !sourcesPending && !initialized) {
-      if (detail.privacy_settings) {
-        // A stored legacy row (row_filter_sql, no map) starts with an empty list, and the
-        // map is sent on every save so the server can refuse to drop the old filter
-        // silently. The legacy value is never part of the form state (the banner reads
-        // it from `detail`), so a save never sends row_filter_sql. The keys are held as the
-        // form shows them (quoted where the dialect needs it), so a save that touches only
-        // another setting sends each key back unchanged instead of letting the server fold it.
-        setPrivacy({
-          ...PRIVACY_DEFAULTS,
-          ...detail.privacy_settings,
-          row_filters: displayRowFilterMap(detail.privacy_settings.row_filters ?? {}, dialect),
-          row_filter_sql: undefined,
-        });
-      }
+      // A stored legacy row (row_filter_sql, no map) starts with an empty list, and the
+      // map is sent on every save so the server can refuse to drop the old filter
+      // silently. The legacy value is never part of the form state (the banner reads
+      // it from `detail`), so a save never sends row_filter_sql. The keys are held as the
+      // form shows them (quoted where the dialect needs it), so a save that touches only
+      // another setting sends each key back unchanged instead of letting the server fold it.
+      // Also runs again after a 409, so a connection without stored settings resets the
+      // form to the defaults rather than keeping the refused edits.
+      setPrivacy(
+        detail.privacy_settings
+          ? {
+              ...PRIVACY_DEFAULTS,
+              ...detail.privacy_settings,
+              row_filters: displayRowFilterMap(detail.privacy_settings.row_filters ?? {}, dialect),
+              row_filter_sql: undefined,
+            }
+          : PRIVACY_DEFAULTS,
+      );
+      setLoadedVersion(detail.privacy_version);
       setExecMode(detail.execution_mode);
       // A legacy connection needs its row filters redefined: show the form with the banner.
       if (detail.row_filter_needs_migration) setPrivacyOpen(true);
@@ -101,15 +118,38 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
     if (!formValid && !privacyOpen) setPrivacyOpen(true);
   }, [formValid, privacyOpen]);
 
+  /** Save *settings* as an update of the version the form was loaded with, and hold the
+   *  version the save stored, for a later save from this panel. */
+  const savePrivacy = async (settings: PrivacySettingsUpdate) => {
+    const request: PrivacySaveRequest = { ...settings, base_privacy_version: loadedVersion };
+    const saved = await updatePrivacy.mutateAsync({ id: connId, settings: request });
+    setLoadedVersion(saved.privacy_version);
+  };
+
+  /** A 409 from the privacy save: another save landed since the form was loaded. Reload the
+   *  stored settings into the form (the refused edits are dropped) and say so. When the
+   *  reload fails, say that instead: re-initialising would restore the old detail. */
+  const handleStale = async (e: unknown): Promise<boolean> => {
+    if ((e as { response?: { status?: number } })?.response?.status !== 409) return false;
+    const reloaded = await refetch();
+    if (reloaded.isError) {
+      setError(`${STALE_RELOAD_FAILED} ${apiErrorMessage(reloaded.error, 'unknown error')}`);
+      return true;
+    }
+    setError(STALE_PRIVACY);
+    setInitialized(false);
+    return true;
+  };
+
   const handleSave = async () => {
     setError(null);
     try {
       // Privacy first: a rejected row filter (422) stops before the execution mode changes.
-      await updatePrivacy.mutateAsync({ id: connId, settings: privacy });
+      await savePrivacy(privacy);
       await updateMode.mutateAsync({ id: connId, mode: execMode });
       onClose();
     } catch (e: unknown) {
-      setError(apiErrorMessage(e, 'Failed to save'));
+      if (!(await handleStale(e))) setError(apiErrorMessage(e, 'Failed to save'));
     }
   };
 
@@ -120,12 +160,9 @@ function EditPanel({ connId, onClose }: { connId: string; onClose: () => void })
     if (!ok) return;
     setError(null);
     try {
-      await updatePrivacy.mutateAsync({
-        id: connId,
-        settings: { row_filters: privacy.row_filters ?? {}, clear_legacy_row_filter: true },
-      });
+      await savePrivacy({ row_filters: privacy.row_filters ?? {}, clear_legacy_row_filter: true });
     } catch (e: unknown) {
-      setError(apiErrorMessage(e, 'Failed to remove the old filter'));
+      if (!(await handleStale(e))) setError(apiErrorMessage(e, 'Failed to remove the old filter'));
     }
   };
 

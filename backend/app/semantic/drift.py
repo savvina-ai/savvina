@@ -21,7 +21,7 @@ from ..datasources.models import table_key
 
 if TYPE_CHECKING:
     from ..datasources.models import DataSourceSchema, PrivacySettings
-    from .models import RelationshipEdge, SemanticModel
+    from .models import RelationshipEdge, SemanticModel, TableSemantic
 
 
 def policy_hides_table(key: str, privacy: PrivacySettings | None, *, bare_ok: bool = False) -> bool:
@@ -160,6 +160,49 @@ def _column_renames(
     return renames
 
 
+def table_renames(
+    stored_keys: Collection[str],
+    schema: DataSourceSchema,
+    privacy: PrivacySettings | None,
+    known: Mapping[str, Collection[str]] | None = None,
+) -> dict[str, str]:
+    """The stored table keys that are renamed to the live table they spell, each mapped
+    to that table's key.
+
+    A stored key absent from the live *schema* (and neither hidden by *privacy* nor in
+    ``unreadable_tables``: those exist under that key) is renamed when
+    ``resolve_real_key`` (against every live key, with ``bare_ok``: quote stripping, then
+    letter case, then a bare name, never an ambiguous match) maps it to a live table the
+    model does not store; if it does, the key is a duplicate the prune drops. These are
+    blob-era spellings such as ``public.Orders`` of a live ``public.orders``. Of several
+    keys spelling one table, the first in sort order is renamed; the others stay
+    removals.
+
+    A stored key with an entry of its own in *known*, the baseline, is never renamed:
+    the baseline is written only for stored live tables, so such a key was a real table
+    (a quoted ``public."Orders"``) the database dropped, and a live ``public.orders``
+    beside it is another table, which must not inherit its annotation and marks. A
+    blob-era misspelling was never live and never gets an entry, as a column key the
+    baseline knows is never renamed (``_column_renames``). Without *known* nothing is
+    gated. The one rule behind ``compute_drift``'s ``renamed_tables``, the baseline
+    reads (``services/drift_check._completed_known_columns``) and the routes' prompt-side
+    reads, each passing the stored baseline.
+    """
+    live_keys = {table_key(t) for t in schema.tables}
+    stored = set(stored_keys)
+    unreadable = set(schema.unreadable_tables)
+    live_sorted = sorted(live_keys)
+    renames: dict[str, str] = {}
+    seen = known or {}
+    for key in sorted(stored - live_keys):
+        if policy_hides_table(key, privacy) or key in unreadable or key in seen:
+            continue
+        target = resolve_real_key(key, live_sorted, bare_ok=True)
+        if target is not None and target not in stored and target not in renames.values():
+            renames[key] = target
+    return renames
+
+
 @dataclass
 class SchemaDrift:
     """What the live schema has that the stored model lacks, and vice versa.
@@ -209,10 +252,19 @@ class SchemaDrift:
     ``unreadable_tables``: they exist, but the connection's role cannot read them.
     They are reported, never removed, and do not count as drift to apply —
     the fix is a grant, not a model edit.
+
+    ``renamed_tables`` maps a stored table key to the live key the apply renames it to
+    (``table_renames`` has the rule): the model holds the table under a near-miss
+    spelling, so the apply rekeys it with its columns, marks and relationship endpoints
+    (``generator.rename_tables``), with no LLM call. A renamed key is not in
+    ``removed_table_keys``, nor its live key in ``new_table_keys``, and every column map
+    above names a renamed table by its live key (its columns are diffed against that
+    table and read that key's baseline).
     """
 
     new_table_keys: set[str] = field(default_factory=set)
     removed_table_keys: set[str] = field(default_factory=set)
+    renamed_tables: dict[str, str] = field(default_factory=dict)
     removed_columns: dict[str, set[str]] = field(default_factory=dict)
     renamed_columns: dict[str, dict[str, str]] = field(default_factory=dict)
     added_columns: dict[str, set[str]] = field(default_factory=dict)
@@ -225,6 +277,7 @@ class SchemaDrift:
         return not (
             self.new_table_keys
             or self.removed_table_keys
+            or self.renamed_tables
             or self.removed_columns
             or self.renamed_columns
             or self.added_columns
@@ -263,9 +316,10 @@ def compute_drift(
     unreadable = set(schema.unreadable_tables)
     known = known_columns or {}
 
+    renamed_tables = table_renames(stored_keys, schema, privacy, known)
     removed_table_keys: set[str] = set()
     unreadable_table_keys: set[str] = set()
-    for key in stored_keys - live_keys:
+    for key in stored_keys - live_keys - set(renamed_tables):
         if policy_hides_table(key, privacy):
             continue
         if key in unreadable:
@@ -277,9 +331,13 @@ def compute_drift(
     renamed_columns: dict[str, dict[str, str]] = {}
     added_columns: dict[str, set[str]] = {}
     dropped_columns: dict[str, set[str]] = {}
-    for key in stored_keys & live_keys:
+    # Each held live table, by its live key, with the stored key it is held under (a
+    # renamed table's is its near-miss spelling).
+    held = {key: key for key in stored_keys & live_keys}
+    held.update({live: stored for stored, live in renamed_tables.items()})
+    for key, stored_key in held.items():
         live_cols = {c.name for c in live_tables[key].columns}
-        stored_cols = set(stored_model.tables[key].columns)
+        stored_cols = set(stored_model.tables[stored_key].columns)
         gone = {
             col
             for col in stored_cols
@@ -314,8 +372,9 @@ def compute_drift(
             removed_columns[key] = gone
 
     return SchemaDrift(
-        new_table_keys=live_keys - stored_keys,
+        new_table_keys=live_keys - stored_keys - set(renamed_tables.values()),
         removed_table_keys=removed_table_keys,
+        renamed_tables=renamed_tables,
         removed_columns=removed_columns,
         renamed_columns=renamed_columns,
         added_columns=added_columns,
@@ -330,9 +389,11 @@ def compute_drift(
 _STRUCTURAL_FIELDS = (
     "tables_added",
     "tables_removed",
+    "tables_renamed",
     "columns_added",
     "columns_removed",
     "columns_renamed",
+    "references_cleared",
     "metrics_added",
     "metrics_removed",
     "joins_added",
@@ -363,9 +424,16 @@ class DriftApplySummary(BaseModel):
     which are in neither of those lists. Only when the baseline never saw ``status`` is
     the key dropped beside a newly annotated ``status`` column, and then it is listed in
     both, as the stored spelling and the live one.
+    ``tables_renamed`` lists the table keys renamed to their live key
+    (``SchemaDrift.renamed_tables``), which are in neither ``tables_added`` nor
+    ``tables_removed``; a renamed table's column lists are keyed by its live key.
+    ``references_cleared`` names, per surviving table, the reference fields
+    (``TABLE_REFERENCE_FIELDS``: the primary timestamp and date columns, the partition
+    and cluster columns, the hierarchy levels) that lost a column name, whether the
+    column was annotated or not; a name renamed with its column is not lost.
     Relationships are labelled ``from_table.from_column → to_table.to_column``; one whose
-    endpoint was renamed is labelled by its new endpoint on both sides, so it is the same
-    relationship, neither removed nor added.
+    endpoint was renamed (its column or its table) is labelled by its new endpoint on
+    both sides, so it is the same relationship, neither removed nor added.
     ``tables_not_annotated`` are new tables the LLM returned nothing for: they are
     still missing from the model, and the next drift check reports them again.
     ``column_tables_failed`` is to ``columns_added`` what ``tables_not_annotated`` is to
@@ -388,6 +456,9 @@ class DriftApplySummary(BaseModel):
     dry_run: bool = False
     tables_added: list[str] = Field(default_factory=list)
     tables_removed: list[str] = Field(default_factory=list)
+    # Stored table key → the live key the apply renamed it to, its columns, user edits
+    # and relationship endpoints carried (no LLM call).
+    tables_renamed: dict[str, str] = Field(default_factory=dict)
     # Surviving table key → the columns the apply added to it (a new table is named in
     # ``tables_added`` instead; its columns are not listed).
     columns_added: dict[str, list[str]] = Field(default_factory=dict)
@@ -395,6 +466,9 @@ class DriftApplySummary(BaseModel):
     # Surviving table key → stored column key → the live column name the apply renamed it
     # to, its annotation, user edits and references carried (no LLM call).
     columns_renamed: dict[str, dict[str, str]] = Field(default_factory=dict)
+    # Surviving table key → the reference fields that lost a column name (a cleared
+    # primary timestamp or date column, a partition or cluster column, a hierarchy level).
+    references_cleared: dict[str, list[str]] = Field(default_factory=dict)
     metrics_added: list[str] = Field(default_factory=list)
     metrics_removed: list[str] = Field(default_factory=list)
     joins_added: list[str] = Field(default_factory=list)
@@ -434,15 +508,55 @@ def _added_removed(
 
 
 def _edge_label(
-    edge: RelationshipEdge, renamed: Mapping[str, Mapping[str, str]] | None = None
+    edge: RelationshipEdge,
+    renamed: Mapping[str, Mapping[str, str]] | None = None,
+    tables: Mapping[str, str] | None = None,
 ) -> str:
-    """``from_table.from_column → to_table.to_column``, an endpoint column in *renamed*
-    (table key → old key → new name) under its new name."""
+    """``from_table.from_column → to_table.to_column``, an endpoint table in *tables* (old
+    key → new key) and an endpoint column in *renamed* (new table key → old key → new
+    name) under their new names."""
 
     def end(table: str, column: str) -> str:
+        table = (tables or {}).get(table, table)
         return f"{table}.{(renamed or {}).get(table, {}).get(column, column)}"
 
     return f"{end(edge.from_table, edge.from_column)} → {end(edge.to_table, edge.to_column)}"
+
+
+# A table's fields that name its columns. The prune, the dangling-edit trim and the
+# renames (``generator``) rewrite them; ``summarize_model_change`` lists the ones that
+# lost a name.
+TABLE_REFERENCE_FIELDS = (
+    "primary_timestamp_column",
+    "primary_date_column",
+    "partition_columns",
+    "cluster_columns",
+    "hierarchies",
+)
+
+
+def _reference_column_names(table: TableSemantic, field_name: str) -> set[str]:
+    """The column names *table*'s reference field holds: each hierarchy's levels, a
+    list's entries, or the one name."""
+    value = getattr(table, field_name)
+    if field_name == "hierarchies":
+        return {level for h in value for level in h.levels}
+    if isinstance(value, list):
+        return set(value)
+    return {value} if value else set()
+
+
+def _cleared_references(
+    before: TableSemantic, after: TableSemantic, renamed: Mapping[str, str]
+) -> list[str]:
+    """The reference fields of *before* that hold a column name *after* lacks, a name in
+    *renamed* (old key → new name) read under its new name, sorted."""
+    return sorted(
+        name
+        for name in TABLE_REFERENCE_FIELDS
+        if {renamed.get(c, c) for c in _reference_column_names(before, name)}
+        - _reference_column_names(after, name)
+    )
 
 
 def summarize_model_change(
@@ -454,6 +568,7 @@ def summarize_model_change(
     warnings: Sequence[str] = (),
     removed_items: Mapping[str, Iterable[str]] | None = None,
     columns_renamed: Mapping[str, Mapping[str, str]] | None = None,
+    tables_renamed: Mapping[str, str] | None = None,
 ) -> DriftApplySummary:
     """Name everything that left or arrived between *before* and *after*.
 
@@ -469,18 +584,34 @@ def summarize_model_change(
     name arrived) is listed in ``columns_renamed`` instead, and the relationships on it
     are compared under the new name.
 
+    ``tables_renamed`` (old key → new key, ``SchemaDrift.renamed_tables``) does the same
+    for table keys: a rename *after* shows is listed in ``tables_renamed``, the table's
+    columns are compared under its new key (where ``columns_renamed`` keys them) and its
+    relationships under the new key.
+
     ``removed_items`` (keyed by the store's kinds: ``metric``, ``common_join``,
     ``derived_column``, ``segment``) names the items the caller took out of
     *before*. A diff by name alone would read a removed item and a new one under the
     same name as "unchanged"; with it, such a pair is reported as removed and added.
     """
     taken_out = removed_items or {}
-    tables_added, tables_removed = _added_removed(before.tables, after.tables)
+    moved = {
+        old: new
+        for old, new in (tables_renamed or {}).items()
+        if old in before.tables
+        and old not in after.tables
+        and new in after.tables
+        and new not in before.tables
+    }
+    # *before* under the new table keys, so a renamed table is compared with itself.
+    before_tables = {moved.get(key, key): table for key, table in before.tables.items()}
+    tables_added, tables_removed = _added_removed(before_tables, after.tables)
     columns_added: dict[str, list[str]] = {}
     columns_removed: dict[str, list[str]] = {}
+    references_cleared: dict[str, list[str]] = {}
     renamed: dict[str, dict[str, str]] = {}
-    for key in sorted(set(before.tables) & set(after.tables)):
-        stored = set(before.tables[key].columns)
+    for key in sorted(set(before_tables) & set(after.tables)):
+        stored = set(before_tables[key].columns)
         live = set(after.tables[key].columns)
         if pairs := {
             old: new
@@ -489,6 +620,8 @@ def summarize_model_change(
         }:
             renamed[key] = dict(sorted(pairs.items()))
             stored = (stored - set(pairs)) | set(pairs.values())
+        if cleared := _cleared_references(before_tables[key], after.tables[key], pairs):
+            references_cleared[key] = cleared
         fresh = live - stored
         if fresh:
             columns_added[key] = sorted(fresh)
@@ -522,15 +655,17 @@ def summarize_model_change(
         taken_out.get("segment", ()),
     )
     rels_added, rels_removed = _added_removed(
-        (_edge_label(e, renamed) for e in before.relationships),
+        (_edge_label(e, renamed, moved) for e in before.relationships),
         map(_edge_label, after.relationships),
     )
     summary = DriftApplySummary(
         tables_added=tables_added,
         tables_removed=tables_removed,
+        tables_renamed=dict(sorted(moved.items())),
         columns_added=columns_added,
         columns_removed=columns_removed,
         columns_renamed=renamed,
+        references_cleared=references_cleared,
         metrics_added=metrics_added,
         metrics_removed=metrics_removed,
         joins_added=joins_added,

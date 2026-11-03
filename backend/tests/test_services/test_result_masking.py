@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import ClassVar
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -26,9 +26,16 @@ from app.services.result_masking import (
 _PRIVACY = PrivacySettings()  # default patterns include salary, email, phone …
 
 
-def _masked(sql: str, privacy: PrivacySettings = _PRIVACY, **kw) -> set[str] | None:
+# What ``_masked`` returns for ``MASK_ALL_COLUMNS``: the sentinel iterates as empty, so it
+# compares equal to ``set()``, and an expected ``set()`` must not pass on it.
+_ALL = "MASK_ALL_COLUMNS"
+
+
+def _masked(sql: str, privacy: PrivacySettings = _PRIVACY, **kw) -> set[str] | str | None:
     result = _classify_select_columns(sql, privacy, **kw)
-    return None if result is None else result[0]
+    if result is None:
+        return None
+    return _ALL if result[0] is MASK_ALL_COLUMNS else result[0]
 
 
 def _response(columns: list[str], rows: list[list]) -> QueryResultsResponse:
@@ -113,8 +120,10 @@ class TestClassifySelectColumns:
         assert _masked("SELECT * FROM employees") is None
         assert _masked("SELECT e.* FROM employees e") is None
 
-    def test_unparseable_is_uncertain(self) -> None:
-        assert _masked("not sql at all") is None
+    def test_unparseable_fails_closed(self) -> None:
+        # whether it projects a whole row cannot be told (the database would refuse it anyway)
+        assert _masked("not sql at all") == _ALL
+        assert _masked("not sql at all", double_quote_is_string_literal=True) == _ALL
 
     def test_cte_classifies_the_outer_select(self) -> None:
         sql = "WITH x AS (SELECT id, salary FROM employees) SELECT salary AS pay FROM x"
@@ -213,7 +222,8 @@ class TestScopedClassification:
                 "WITH x AS (SELECT id, COUNT(email) AS n FROM users GROUP BY id) SELECT n FROM x",
                 set(),
             ),
-            ("WITH x AS (SELECT id FROM users) SELECT c FROM x", set()),
+            # ``c`` is no column of ``x``: misread, not understood
+            ("WITH x AS (SELECT id FROM users) SELECT c FROM x", None),
             (
                 "WITH x AS (SELECT email AS c, id FROM users) "
                 "SELECT x.c, COUNT(*) AS n FROM x GROUP BY x.c",
@@ -255,6 +265,11 @@ class TestScopedClassification:
             ("SELECT id FROM a UNION SELECT id FROM b", set()),
             (
                 "WITH x AS (SELECT id FROM users) SELECT c FROM x union all select email from y",
+                _ALL,
+            ),
+            (
+                "WITH x AS (SELECT id AS c FROM users) "
+                "SELECT c FROM x union all select email from y",
                 {"c"},
             ),
             # scalar subqueries
@@ -270,7 +285,10 @@ class TestScopedClassification:
             ("WITH x AS (SELECT * FROM users) SELECT c FROM x", set()),
             # `*` over a scoped and a real source: the scoped column is still known
             ("SELECT * FROM (SELECT email AS x FROM u) s JOIN t ON 1=1", {"x"}),
-            ("SELECT id FROM a UNION SELECT id, email FROM b", None),
+            # branches of different widths: not understood, and the SQL names a sensitive
+            # column
+            ("SELECT id FROM a UNION SELECT id, email FROM b", _ALL),
+            ("SELECT id FROM a UNION SELECT id, name FROM b", None),
             # unaffected
             ("SELECT x.c FROM x", set()),
             ("SELECT id FROM t WHERE email = 'a'", set()),
@@ -301,39 +319,82 @@ class TestScopedClassification:
         assert out.rows == [["[REDACTED]"], ["[REDACTED]"]]
 
 
-class TestFallbackKeepsOuterSelectListMasking:
-    """A FROM shape the scoped resolver does not parse must not drop what the outermost
-    SELECT list alone shows: ``email AS contact`` is masked whatever follows it."""
+class TestFallbackFailsClosed:
+    """A FROM shape the scoped resolver does not parse masks every column when the SQL names
+    a sensitive column: which column carries the value is unknown. A shape it does parse
+    keeps the precise answer."""
 
     @pytest.mark.parametrize(
-        "sql",
+        ("sql", "expected"),
         [
-            "SELECT email AS contact FROM users JOIN t USING (id)",
-            "SELECT email AS contact FROM users u JOIN t ON (u.id = t.id)",
-            "SELECT email AS contact FROM users u JOIN t ON u.id = t.id AND (t.a = 1 OR t.b = 2)",
-            "SELECT email AS contact FROM users u JOIN t ON u.id = t.id AND t.k IN (1, 2)",
-            "SELECT email AS contact FROM users u JOIN t ON u.id = t.id AND t.k IS NOT NULL",
-            "SELECT email AS contact FROM users u JOIN t ON u.id = t.id "
-            "JOIN v ON v.id BETWEEN 1 AND 2",
-            "SELECT email AS contact FROM users u JOIN t ON NOT t.flag",
-            "SELECT email AS contact FROM users u JOIN (t JOIN v ON v.id = t.id) ON u.id = t.id",
-            "SELECT email AS contact FROM users TABLESAMPLE SYSTEM (10)",
-            "SELECT email AS contact FROM users STRAIGHT_JOIN t ON t.id = users.id",
-            "SELECT email AS contact FROM users u USE INDEX (ix) JOIN t ON t.id = u.id",
-            "SELECT email AS contact FROM users PARTITION (p0)",
-            "SELECT email AS contact FROM ONLY users",
-            "SELECT email AS contact FROM users FOR UPDATE",
-            "WITH RECURSIVE r AS (SELECT 1) SELECT email AS contact FROM users",
-            "WITH x AS MATERIALIZED (SELECT 1) SELECT email AS contact FROM users",
-            "WITH x AS (SELECT * FROM users) SELECT email AS contact FROM x",
-            "SELECT email AS contact FROM (SELECT * FROM users) s",
-            "SELECT s.email AS contact FROM (SELECT * FROM users) s",
-            "SELECT email AS contact FROM users UNION SELECT a, b FROM v",
-            "SELECT email AS contact FROM users UNION SELECT * FROM v",
+            ("SELECT email AS contact FROM users JOIN t USING (id)", {"contact"}),
+            ("SELECT email AS contact FROM users u JOIN t ON (u.id = t.id)", {"contact"}),
+            (
+                "SELECT email AS contact FROM users u JOIN t ON u.id = t.id "
+                "AND (t.a = 1 OR t.b = 2)",
+                {"contact"},
+            ),
+            (
+                "SELECT email AS contact FROM users u JOIN t ON u.id = t.id AND t.k IN (1, 2)",
+                {"contact"},
+            ),
+            (
+                "SELECT email AS contact FROM users u JOIN t ON u.id = t.id AND t.k IS NOT NULL",
+                {"contact"},
+            ),
+            (
+                "SELECT email AS contact FROM users u JOIN t ON u.id = t.id "
+                "JOIN v ON v.id BETWEEN 1 AND 2",
+                {"contact"},
+            ),
+            ("SELECT email AS contact FROM users u JOIN t ON NOT t.flag", {"contact"}),
+            ("SELECT email AS contact FROM users TABLESAMPLE SYSTEM (10)", {"contact"}),
+            (
+                "SELECT email AS contact FROM users STRAIGHT_JOIN t ON t.id = users.id",
+                {"contact"},
+            ),
+            ("SELECT email AS contact FROM ONLY users", {"contact"}),
+            ("WITH RECURSIVE r AS (SELECT 1) SELECT email AS contact FROM users", {"contact"}),
+            ("WITH x AS MATERIALIZED (SELECT 1) SELECT email AS contact FROM users", {"contact"}),
+            ("WITH x AS (SELECT * FROM users) SELECT email AS contact FROM x", {"contact"}),
+            ("SELECT email AS contact FROM (SELECT * FROM users) s", {"contact"}),
+            ("SELECT s.email AS contact FROM (SELECT * FROM users) s", {"contact"}),
+            ("SELECT email AS contact FROM users UNION SELECT * FROM v", {"contact"}),
+            # a parenthesised join group is read as its sources
+            (
+                "SELECT email AS contact FROM users u JOIN (t JOIN v ON v.id = t.id) "
+                "ON u.id = t.id",
+                {"contact"},
+            ),
+            ("SELECT id FROM users u JOIN (t JOIN v ON v.id = t.id) ON u.email = t.e", set()),
+            ("SELECT to_jsonb(u) AS j FROM users u JOIN (t JOIN v ON true) ON true", {"j"}),
+            ("SELECT id FROM users u JOIN (t JOIN v ON v.id = t.id) ON u.id = t.id", set()),
+            # not understood: every column
+            ("SELECT email AS contact FROM users u USE INDEX (ix) JOIN t ON t.id = u.id", _ALL),
+            ("SELECT email AS contact FROM users PARTITION (p0)", _ALL),
+            ("SELECT email AS contact FROM users FOR UPDATE", _ALL),
+            ("SELECT email AS contact FROM users UNION SELECT a, b FROM v", _ALL),
+            # a join group under an alias hides its sources: not understood
+            ("SELECT j.id FROM (users u JOIN t ON true) AS j WHERE j.email = 'x'", _ALL),
+            # a sensitive name anywhere is enough, and so is a record function
+            ("SELECT g.id FROM (users u JOIN z ON true) AS g WHERE u.email IS NULL", _ALL),
+            ("SELECT to_json(g) AS j FROM (users u JOIN z ON true) AS g", _ALL),
+            ("SELECT g.v FROM (users u JOIN z ON true) AS g", None),
+            # WITH ORDINALITY is followed
+            (
+                "SELECT id FROM users u, unnest(u.tags) WITH ORDINALITY AS z(v, n) "
+                "WHERE u.email IS NULL",
+                set(),
+            ),
+            (
+                "SELECT to_json(z) AS j FROM users u, unnest(u.tags) WITH ORDINALITY AS z(v, n)",
+                set(),  # a function over harmless arguments yields harmless rows
+            ),
+            ("SELECT z.v FROM users u, unnest(u.tags) WITH ORDINALITY AS z(v, n)", set()),
         ],
     )
-    def test_outer_sensitive_reference_stays_masked(self, sql: str) -> None:
-        assert _masked(sql) == {"contact"}
+    def test_fallback(self, sql: str, expected: set[str] | str | None) -> None:
+        assert _masked(sql) == expected
 
     @pytest.mark.parametrize(
         "sql",
@@ -539,7 +600,7 @@ class TestAggregateExemption:
 
     def test_value_aggregate_masked_in_the_fallback_scan(self) -> None:
         assert _masked("SELECT MAX(email) AS m FROM users TABLESAMPLE SYSTEM (10)") == {"m"}
-        assert _masked("SELECT COUNT(email) AS n FROM users TABLESAMPLE SYSTEM (10)") is None
+        assert _masked("SELECT COUNT(email) AS n FROM users TABLESAMPLE SYSTEM (10)") == set()
 
     def test_unaliased_value_aggregate_in_a_later_set_operation_branch(self) -> None:
         # Later branches take their names from the first, so an unnamed item there is fine.
@@ -645,7 +706,12 @@ class TestMaskEndToEnd:
             ("SELECT row_to_json(s) AS j FROM (SELECT id FROM users) s", ["j"], False, set()),
             ("SELECT row_to_json(s) AS j FROM (SELECT email FROM users) s", ["j"], False, {0}),
             ("SELECT g FROM generate_series(1, 3) g", ["g"], False, set()),
-            ("SELECT country FROM country", ["country"], False, set()),
+            # an unaliased table name may be its column or the whole row on PostgreSQL;
+            # the columns are unknown, so it is masked (fail closed). MySQL has no
+            # whole-row reference.
+            ("SELECT country FROM country", ["country"], False, {0}),
+            ("SELECT country FROM country", ["country"], True, set()),
+            ("SELECT c.country FROM country c", ["country"], False, set()),
             # DISTINCT ON
             (
                 "SELECT DISTINCT ON (id) id, email AS contact FROM users",
@@ -797,7 +863,9 @@ class TestClassifierHardening:
             result = _classify_select_columns(sql, _PRIVACY)
         assert result is not None and result[0] is MASK_ALL_COLUMNS
         assert "users" not in caplog.text and str(len(sql)) in caplog.text
-        assert _classify_select_columns("SELECT id FROM t", _PRIVACY) is None
+        # an unexpected error is not a parse failure: every column, whatever the SQL names
+        result = _classify_select_columns("SELECT id FROM t", _PRIVACY)
+        assert result is not None and result[0] is MASK_ALL_COLUMNS
 
     def test_exception_fails_closed_on_excluded_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def boom(*_a: object, **_k: object) -> None:
@@ -1389,3 +1457,834 @@ class TestBackslashIsEscapeReader:
 
     def test_a_literal_true_reads_true(self) -> None:
         assert _backslash_is_escape(SimpleNamespace(backslash_is_escape=True)) is True
+
+
+class TestSqlMentionsSensitive:
+    """``sql_mentions_sensitive`` decides fail-closed outcomes (mask every column, bypass
+    the cache), so its word scan must see every spelling an engine accepts as a name."""
+
+    _GREEK = PrivacySettings(sensitive_column_patterns=["ηλεκτρονικό"], sensitive_columns=["όνομα"])
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT όνομα FROM πελάτες",
+            "SELECT ΌΝΟΜΑ FROM πελάτες",
+            'SELECT "όνομα" FROM πελάτες',
+            "SELECT `όνομα` FROM πελάτες",
+            "SELECT ηλεκτρονικό_ταχυδρομείο FROM πελάτες",
+        ],
+    )
+    def test_a_non_ascii_name_is_a_word(self, sql: str) -> None:
+        assert result_masking.sql_mentions_sensitive(sql, self._GREEK)
+
+    def test_a_name_that_starts_with_a_digit_is_a_word(self) -> None:
+        privacy = PrivacySettings(sensitive_column_patterns=[], sensitive_columns=["1email"])
+        assert result_masking.sql_mentions_sensitive("SELECT 1email FROM t", privacy)
+
+    def test_an_unrelated_query_does_not_mention(self) -> None:
+        assert not result_masking.sql_mentions_sensitive("SELECT id FROM πελάτες", self._GREEK)
+
+    def test_a_failed_classification_on_a_non_ascii_name_masks_every_column(self) -> None:
+        with patch.object(result_masking, "_lex_like_the_engine", side_effect=ValueError("x")):
+            result = _classify_select_columns("SELECT όνομα FROM πελάτες", self._GREEK)
+        assert result is not None and result[0] is MASK_ALL_COLUMNS
+
+
+class TestRecordFunctionsOnARow:
+    """PostgreSQL attribute notation: ``u.to_jsonb`` is ``to_jsonb(u)``, every column of
+    ``u``. The item is masked under its output name whatever the source holds."""
+
+    @pytest.mark.parametrize(
+        ("sql", "name"),
+        [
+            ("SELECT u.to_jsonb FROM users u", "to_jsonb"),
+            ("SELECT u.to_jsonb AS j FROM users u", "j"),
+            ("SELECT users.row_to_json FROM users", "row_to_json"),
+            ("SELECT u.concat FROM users u", "concat"),
+            ("SELECT id, u.quote_literal AS f FROM users u", "f"),
+            ("SELECT d.to_json FROM (SELECT id FROM users) d", "to_json"),
+            (
+                "WITH c AS (SELECT id FROM users) SELECT c.jsonb_build_array FROM c",
+                "jsonb_build_array",
+            ),
+            ("SELECT u.json_agg FROM users u", "json_agg"),
+            ("SELECT u.array_agg AS a FROM users u", "a"),
+            ("SELECT u.any_value FROM users u GROUP BY u.id", "any_value"),
+        ],
+    )
+    def test_a_record_function_in_attribute_notation_is_masked(self, sql: str, name: str) -> None:
+        assert _masked(sql, _PRIVACY) == {name}
+
+    def test_a_qualifier_that_is_no_source_is_left_to_the_name_rules(self) -> None:
+        assert _masked("SELECT x.concat FROM users u", _PRIVACY) == set()
+
+    def test_a_call_is_not_attribute_notation(self) -> None:
+        assert _masked("SELECT concat(id, status) AS c FROM users u", _PRIVACY) == set()
+
+    def test_a_schema_qualified_call_is_not_attribute_notation(self) -> None:
+        sql = "SELECT public.concat(id, ' ', status) AS c FROM public.users"
+        assert _masked(sql, _PRIVACY) == set()
+
+    def test_a_dropped_name_is_a_plain_column(self) -> None:
+        assert _masked("SELECT u.num_nulls FROM users u", _PRIVACY) == set()
+
+    def test_the_rows_are_redacted(self) -> None:
+        response = _response(["to_jsonb"], [['{"id": 1, "email": "a@x.io"}']])
+        masked = _mask_sensitive_result_columns(
+            response, _PRIVACY, sql="SELECT u.to_jsonb FROM users u"
+        )
+        assert masked.rows == [["[REDACTED]"]]
+
+
+class TestCteAndFromClauseShapes:
+    """``[NOT] MATERIALIZED``, ``TABLESAMPLE`` and an unaliased table function are read, so a
+    sensitive value they carry stays masked; a shape still not understood masks every column
+    when the SQL names a sensitive column."""
+
+    @pytest.mark.parametrize(
+        ("sql", "columns", "redacted"),
+        [
+            (
+                "WITH x AS MATERIALIZED (SELECT email AS c FROM users) SELECT c FROM x",
+                ["c"],
+                {0},
+            ),
+            (
+                "WITH x AS NOT MATERIALIZED (SELECT email AS c FROM users) SELECT c FROM x",
+                ["c"],
+                {0},
+            ),
+            ("WITH x(c) AS MATERIALIZED (SELECT email FROM users) SELECT c FROM x", ["c"], {0}),
+            (
+                "WITH y AS (SELECT 1 AS k), x (c, k) AS NOT MATERIALIZED "
+                "(SELECT email, 1 FROM users) SELECT c, k FROM x",
+                ["c", "k"],
+                {0},
+            ),
+            ("SELECT a FROM users TABLESAMPLE SYSTEM (10) AS u(a, b)", ["a"], {0}),
+            ("SELECT a FROM users AS u(a, b) TABLESAMPLE SYSTEM (10)", ["a"], {0}),
+            (
+                "SELECT a FROM users AS u(a, b) TABLESAMPLE BERNOULLI (5) REPEATABLE (1) "
+                "WHERE a IS NOT NULL",
+                ["a"],
+                {0},
+            ),
+            ("SELECT unnest FROM users, unnest(emails)", ["unnest"], {0}),
+            # any unqualified name may be a column of a masked table function
+            ("SELECT id, unnest FROM users, unnest(emails)", ["id", "unnest"], {0, 1}),
+            ("SELECT users.id, unnest FROM users, unnest(emails)", ["id", "unnest"], {1}),
+            # a parenthesised join group is read as its sources
+            (
+                "WITH x AS (SELECT id, email AS c FROM users) "
+                "SELECT c, t.id FROM x JOIN (t JOIN v ON v.id = t.id) ON x.id = t.id",
+                ["c", "id"],
+                {0},
+            ),
+            (
+                "WITH x AS (SELECT id, email AS c FROM users) "
+                "SELECT t.id, c FROM t JOIN ((v JOIN x ON x.id = v.id) JOIN w ON true) ON true",
+                ["id", "c"],
+                {1},
+            ),
+            ("SELECT u FROM (users u JOIN t ON t.id = u.id)", ["u"], {0}),
+            # under an alias the group hides its sources: not understood, every column
+            (
+                "WITH x AS (SELECT id, email AS c FROM users) "
+                "SELECT j.c, j.id FROM (x JOIN t ON true) AS j",
+                ["c", "id"],
+                {0, 1},
+            ),
+        ],
+    )
+    def test_a_sensitive_value_is_masked(
+        self, sql: str, columns: list[str], redacted: set[int]
+    ) -> None:
+        assert _redacted(sql, columns) == redacted
+
+    @pytest.mark.parametrize(
+        ("sql", "columns"),
+        [
+            ("WITH x AS MATERIALIZED (SELECT id AS c FROM users) SELECT c FROM x", ["c"]),
+            ("WITH x(c) AS NOT MATERIALIZED (SELECT id FROM users) SELECT c FROM x", ["c"]),
+            ("SELECT id, name FROM users TABLESAMPLE SYSTEM (10)", ["id", "name"]),
+            ("SELECT u.id FROM users u TABLESAMPLE SYSTEM (10) REPEATABLE (7)", ["id"]),
+            (
+                "SELECT generate_series FROM users, generate_series(1, 3)",
+                ["generate_series"],
+            ),
+            (
+                "SELECT t.id FROM users u JOIN (t JOIN v ON v.id = t.id) ON u.id = t.id",
+                ["id"],
+            ),
+        ],
+    )
+    def test_a_harmless_query_of_the_same_shape_is_not_masked(
+        self, sql: str, columns: list[str]
+    ) -> None:
+        assert _redacted(sql, columns) == set()
+
+    def test_materialized_keeps_the_classification_precise(self) -> None:
+        sql = "WITH x AS MATERIALIZED (SELECT id, email AS c FROM users) SELECT id, c FROM x"
+        assert _masked(sql) == {"c"}
+
+
+class TestPositionCountMismatchFailsClosed:
+    """Positions that do not line up with the driver's columns are a misread: every column is
+    masked when the SQL names a sensitive column or a position is masked."""
+
+    @staticmethod
+    def _plan_with(
+        monkeypatch: pytest.MonkeyPatch, sql: str, positions: tuple[str, ...]
+    ) -> result_masking._ResultMaskPlan:
+        monkeypatch.setattr(
+            result_masking, "_classify_result", lambda *_a: (set(), set(), positions)
+        )
+        plan = _plan_result_mask(_PRIVACY, sql)
+        assert plan is not None
+        return plan
+
+    def test_a_misread_that_names_a_sensitive_column_masks_every_column(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        plan = self._plan_with(monkeypatch, "SELECT email AS c, id FROM users", ("plain",))
+        assert plan.redacted_indices(["c", "id"]) == {0, 1}
+
+    def test_a_misread_without_a_sensitive_name_keeps_name_matching(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        plan = self._plan_with(monkeypatch, "SELECT name AS c, id FROM users", ("plain",))
+        assert plan.redacted_indices(["c", "id"]) == set()
+
+    def test_a_masked_position_masks_every_column_on_a_mismatch(self) -> None:
+        got = _resolve_mask_indices(
+            ["a", "b"], set(), frozenset(), _PRIVACY, set(), ("masked",), mismatch_masks_all=True
+        )
+        assert got == {0, 1}
+
+    def test_a_using_join_over_ctes_that_carry_a_sensitive_column_is_fully_masked(self) -> None:
+        # the documented cost: USING merges the join column, so the counts differ
+        sql = (
+            "WITH a AS (SELECT 1 AS id, email AS e FROM users), b AS (SELECT 1 AS id, 2 AS n) "
+            "SELECT * FROM a JOIN b USING (id)"
+        )
+        assert _redacted(sql, ["id", "e", "n"]) == {0, 1, 2}
+
+    def test_a_harmless_using_join_over_ctes_is_not_masked(self) -> None:
+        sql = (
+            "WITH a AS (SELECT 1 AS id, 2 AS m), b AS (SELECT 1 AS id, 2 AS n) "
+            "SELECT * FROM a JOIN b USING (id)"
+        )
+        assert _redacted(sql, ["id", "m", "n"]) == set()
+
+
+class TestWholeRowReads:
+    """A whole-row reference returns every column of a source, sensitive ones included."""
+
+    @pytest.mark.parametrize(
+        ("sql", "dq"),
+        [
+            # an unaliased table read as a whole row on PostgreSQL
+            ("SELECT u FROM u", False),
+            ("SELECT (SELECT u FROM orders o LIMIT 1) AS x FROM u", False),
+            # a correlated reference to an outer real table
+            ("SELECT (SELECT u.to_jsonb FROM orders o LIMIT 1) AS x FROM users u", False),
+            ("SELECT (SELECT to_jsonb(u) FROM orders o LIMIT 1) AS x FROM users u", False),
+            ("SELECT (SELECT u FROM orders o LIMIT 1) AS x FROM users u", False),
+            # LATERAL
+            ("SELECT l.x FROM users u, LATERAL (SELECT u.to_jsonb AS x) l", False),
+            ("SELECT l.x FROM users u CROSS JOIN LATERAL (SELECT to_jsonb(u) AS x) l", False),
+            # a schema-qualified table without an alias
+            ("SELECT to_jsonb(users) AS x FROM public.users", False),
+            ("SELECT users.to_jsonb AS x FROM public.users", False),
+            # a keyword alias
+            ("SELECT data.to_jsonb AS x FROM users data", False),
+            ("SELECT to_jsonb(data) AS x FROM users data", False),
+            ("SELECT data AS x FROM users AS data", False),
+            # a correlated reference to an outer derived table
+            (
+                "SELECT (SELECT to_jsonb(d) FROM orders o LIMIT 1) AS x "
+                "FROM (SELECT email FROM users) d",
+                False,
+            ),
+        ],
+    )
+    def test_the_row_is_masked(self, sql: str, dq: bool) -> None:
+        cols = ["x"] if " AS x" in sql else ["u"]
+        assert _redacted(sql, cols, double_quote_is_string_literal=dq) == {0}
+
+    @pytest.mark.parametrize(
+        ("sql", "dq"),
+        [
+            # MySQL has no whole-row reference: the bare name is the column
+            ("SELECT country AS x FROM country", True),
+            ("SELECT id AS x FROM u", False),
+            (
+                "SELECT (SELECT max(o.total) FROM orders o WHERE o.user_id = u.id) AS x "
+                "FROM users u",
+                False,
+            ),
+            ("SELECT l.x FROM users u, LATERAL (SELECT u.id AS x) l", False),
+            ("SELECT id AS x FROM public.users", False),
+            ("SELECT users.id AS x FROM public.users", False),
+            ("SELECT data.id AS x FROM users data", False),
+            ("SELECT data.id AS x FROM users AS data JOIN orders o ON o.uid = data.id", False),
+        ],
+    )
+    def test_a_harmless_query_of_the_same_shape_is_not_masked(self, sql: str, dq: bool) -> None:
+        assert _redacted(sql, ["x"], double_quote_is_string_literal=dq) == set()
+
+
+class TestKeywordSpelledNames:
+    """A name sqlparse reads as a keyword (``comment``, ``data``, ``date``) is still a column
+    reference."""
+
+    _COMMENT = PrivacySettings(sensitive_columns=["comment"])
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT comment AS c FROM t",
+            "SELECT lower(comment) AS c FROM t",
+            "SELECT c FROM (SELECT comment AS c FROM t) s",
+        ],
+    )
+    def test_a_sensitive_keyword_spelled_column_is_masked(self, sql: str) -> None:
+        assert _redacted(sql, ["c"], self._COMMENT) == {0}
+
+    def test_a_masked_column_renamed_to_a_keyword_is_masked(self) -> None:
+        sql = "SELECT data FROM (SELECT email AS data FROM users) s"
+        assert _redacted(sql, ["data"]) == {0}
+
+    def test_a_harmless_column_renamed_to_a_keyword_is_not_masked(self) -> None:
+        sql = "SELECT date FROM (SELECT created_at AS date FROM users) s"
+        assert _redacted(sql, ["date"]) == set()
+
+
+class TestIdentifierWordIsWiderThanTheEngines:
+    @pytest.mark.parametrize(
+        "name", ["mail\u20acx", "e\u0301mail", "\u03c4\u03b1\u03c7\u03c5\u0301"]
+    )
+    def test_a_non_word_non_ascii_character_does_not_split_a_name(self, name: str) -> None:
+        privacy = PrivacySettings(sensitive_column_patterns=[], sensitive_columns=[name])
+        sql = f"SELECT {name} FROM t"  # noqa: S608 — test input, never executed
+        assert result_masking.sql_mentions_sensitive(sql, privacy)
+
+    def test_a_harmless_non_ascii_name_does_not_mention(self) -> None:
+        privacy = PrivacySettings(sensitive_column_patterns=[], sensitive_columns=["mail€x"])
+        assert not result_masking.sql_mentions_sensitive("SELECT mail€y FROM t", privacy)
+
+
+class TestFallbackWholeRowCandidates:
+    """In a shape the resolver cannot follow, a bare name equal to a source's name or alias
+    may be the whole row on PostgreSQL: every column is masked."""
+
+    _GIVE_UP = "FROM (users u JOIN z ON true) AS g"
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            f"SELECT u {_GIVE_UP}",
+            f"SELECT u AS x, z.v {_GIVE_UP}",
+            f"SELECT coalesce(u::text, '') AS x {_GIVE_UP}",
+            "SELECT users AS x FROM (users JOIN z ON true) AS g",
+            "SELECT u FROM users u FOR UPDATE",
+            "SELECT (SELECT u FROM t FOR UPDATE) AS x FROM users u",
+        ],
+    )
+    def test_a_whole_row_candidate_masks_every_column(self, sql: str) -> None:
+        assert _masked(sql) == _ALL
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            f"SELECT g.v, g.id {_GIVE_UP}",
+            f"SELECT v, n {_GIVE_UP}",
+            "SELECT u.id FROM users u FOR UPDATE",
+            f"SELECT id {_GIVE_UP} WHERE u IS NOT NULL",
+        ],
+    )
+    def test_a_harmless_query_of_the_same_shape_is_left_to_name_matching(self, sql: str) -> None:
+        assert _masked(sql) is None
+
+    def test_mysql_has_no_whole_row_reference(self) -> None:
+        sql = "SELECT u FROM users u FOR UPDATE"
+        assert _masked(sql, double_quote_is_string_literal=True) is None
+
+
+class TestHasEscapeStringContinuation:
+    @pytest.mark.parametrize(
+        "sql",
+        ["SELECT E'a'\n'b' AS x", "SELECT e'a' \n  'b'", "SELECT 1 WHERE x = E'\\''\n'z'"],
+    )
+    def test_an_escape_string_continued_on_a_later_line(self, sql: str) -> None:
+        assert result_masking.has_escape_string_continuation(sql)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "/*!*/ SELECT E'a'\n'b' FROM u",
+            "SELECT /*M! x */ E'a'\n'b' FROM u",
+            "SELECT 1 /*!50000 2 */, E'a'\n'b'",
+        ],
+    )
+    def test_a_mysql_executable_comment_is_a_plain_comment_on_postgresql(self, sql: str) -> None:
+        assert result_masking.has_escape_string_continuation(sql)
+
+    @pytest.mark.parametrize("dq", [True, False])
+    def test_masking_still_refuses_an_executable_comment(self, dq: bool) -> None:
+        with pytest.raises(result_masking._ExecutableCommentError):
+            result_masking._lex_like_the_engine("SELECT /*! email */ 1", dq)
+        result = _classify_select_columns(
+            "SELECT 1 AS a, /*! email AS e, */ 2 AS b FROM users",
+            _PRIVACY,
+            double_quote_is_string_literal=dq,
+        )
+        assert result is not None and result[0] is MASK_ALL_COLUMNS
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT E'a' 'b'",
+            "SELECT 'a'\n'b'",
+            "SELECT E'a', 'b'",
+            "SELECT /*! 1 */ 2",
+            "SELECT 'unterminated",
+            "",
+        ],
+    )
+    def test_anything_else_is_not(self, sql: str) -> None:
+        assert not result_masking.has_escape_string_continuation(sql)
+
+
+_EMAIL_ONLY = PrivacySettings(sensitive_column_patterns=["email"])
+
+
+def _leaks(
+    sql: str, columns: list[str], leaked: list[int], privacy: PrivacySettings, dq: bool = False
+) -> list[str]:
+    """The columns of *leaked* that come back in plaintext."""
+    got = _redacted(sql, columns, privacy, double_quote_is_string_literal=dq)
+    return [columns[i] for i in leaked if i not in got]
+
+
+class TestReviewLeaks:
+    """Leaks an adversarial review found with strict mode off: each value is masked, and a
+    harmless query of the same shape is not."""
+
+    @pytest.mark.parametrize(
+        ("sql", "columns", "leaked"),
+        [
+            # 1. a join group under an alias, read through a qualified star
+            ("SELECT ROW(j.*) AS t FROM (users u CROSS JOIN orders o) AS j", ["t"], [0]),
+            ("SELECT j.*::text AS t FROM (users u CROSS JOIN orders o) AS j", ["t"], [0]),
+            ("SELECT (j.*)::text AS t FROM (users u JOIN orders o ON true) j", ["t"], [0]),
+            ("SELECT ROW(x.*) AS t FROM users x, (users u JOIN orders o ON true) j", ["t"], [0]),
+            (
+                "WITH x AS (SELECT email AS c FROM users) SELECT j.c FROM (x JOIN t ON true) AS j",
+                ["c"],
+                [0],
+            ),
+            # 2. a qualified star in an expression, in a shape the resolver cannot follow
+            (
+                "SELECT ROW(u.*) AS x FROM users u, unnest(u.tags) WITH ORDINALITY AS z(v, n)",
+                ["x"],
+                [0],
+            ),
+            (
+                "SELECT (u.*)::text AS x FROM users u, "
+                "generate_series(1,1) WITH ORDINALITY AS z(v,n)",
+                ["x"],
+                [0],
+            ),
+            ("SELECT q FROM (SELECT ROW(u.*) AS q FROM users u)", ["q"], [0]),
+            ("SELECT q FROM (SELECT xmlforest(u.*) AS q FROM users u)", ["q"], [0]),
+            (
+                "SELECT x FROM (SELECT u.e AS x FROM (SELECT ROW(z.*) AS e FROM users z) u)",
+                ["x"],
+                [0],
+            ),
+            ("SELECT q FROM (SELECT * FROM users) s(q) FOR UPDATE", ["q"], [0]),
+            # keyword alias misread: the table name still counts
+            ("SELECT users AS x FROM users RETURNING 1", ["x"], [0]),
+            ("SELECT to_jsonb(users) AS x FROM users AT", ["x"], [0]),
+            # 3. a whole row as the argument of a table function or a LATERAL VALUES
+            ("SELECT value FROM users u, jsonb_each_text(to_jsonb(u))", ["value"], [0]),
+            (
+                "SELECT * FROM users u, jsonb_each_text(to_jsonb(u))",
+                ["id", "email", "key", "value"],
+                [1, 3],
+            ),
+            ("SELECT t.* FROM users u, jsonb_each_text(to_jsonb(u)) t", ["key", "value"], [1]),
+            ("SELECT value FROM users, jsonb_each_text(to_jsonb(users))", ["value"], [0]),
+            ("SELECT r FROM users u, regexp_split_to_table(u::text, ',') r", ["r"], [0]),
+            ("SELECT r FROM users u, unnest(ARRAY[u.*]) r", ["r"], [0]),
+            ("SELECT x FROM users u, LATERAL unnest(ARRAY[u]) x", ["x"], [0]),
+            ("SELECT unnest FROM users u, unnest(ARRAY[u])", ["unnest"], [0]),
+            (
+                "SELECT x.e FROM users u, jsonb_populate_record(null::users, to_jsonb(u)) "
+                "AS x(i, e)",
+                ["e"],
+                [0],
+            ),
+            ("SELECT r FROM users u, LATERAL (VALUES (u::text)) v(r)", ["r"], [0]),
+            ("SELECT r FROM users u, LATERAL (VALUES (ROW(u.*))) v(r)", ["r"], [0]),
+            (
+                "SELECT r FROM (SELECT email FROM users) s, regexp_split_to_table(s::text, ',') r",
+                ["r"],
+                [0],
+            ),
+            (
+                "WITH s AS (SELECT * FROM users) "
+                "SELECT r FROM s, regexp_split_to_table(s::text, ',') r",
+                ["r"],
+                [0],
+            ),
+            (
+                "SELECT (SELECT value FROM jsonb_each_text(to_jsonb(u)) LIMIT 1) AS x FROM users u",
+                ["x"],
+                [0],
+            ),
+            (
+                "SELECT j.v FROM users u, "
+                "LATERAL (SELECT value AS v FROM jsonb_each_text(to_jsonb(u))) j",
+                ["v"],
+                [0],
+            ),
+            (
+                "SELECT j.value FROM users u, "
+                "LATERAL (SELECT * FROM jsonb_each_text(to_jsonb(u))) j",
+                ["value"],
+                [0],
+            ),
+            # 4. a table function declaring its own columns
+            (
+                "SELECT e FROM users u, XMLTABLE('/r' PASSING xmlelement(name r, u.email) "
+                "COLUMNS e text PATH '.') x",
+                ["e"],
+                [0],
+            ),
+            (
+                "SELECT e FROM users u, JSON_TABLE(to_jsonb(u.email), '$' "
+                "COLUMNS (e text PATH '$')) x",
+                ["e"],
+                [0],
+            ),
+            # 6. a Unicode-escape identifier
+            ('SELECT U&"em\\0061il" AS x FROM users', ["x"], [0]),
+            ("SELECT U&\"em!0061il\" UESCAPE '!' AS x FROM users", ["x"], [0]),
+            ('SELECT x FROM (SELECT u&"\\+000065mail" AS x FROM users) s', ["x"], [0]),
+        ],
+    )
+    def test_the_value_is_masked(self, sql: str, columns: list[str], leaked: list[int]) -> None:
+        assert _leaks(sql, columns, leaked, _EMAIL_ONLY) == []
+
+    def test_mysql_json_table_columns_are_masked(self) -> None:
+        sql = "SELECT e FROM t, JSON_TABLE(JSON_ARRAY(t.email), '$[*]' COLUMNS (e TEXT PATH '$')) j"
+        assert _leaks(sql, ["e"], [0], _EMAIL_ONLY, dq=True) == []
+
+    @pytest.mark.parametrize(
+        ("sql", "columns"),
+        [
+            ("SELECT j.id AS t FROM (users u CROSS JOIN orders o) AS j", ["t"]),
+            ("SELECT j.n FROM (users u JOIN orders o ON true) AS j", ["n"]),
+            ("SELECT u.* FROM users u, unnest(u.tags) WITH ORDINALITY AS z(v, n)", ["id"]),
+            ("SELECT count(*) AS n FROM users u, unnest(u.tags) WITH ORDINALITY AS z(v, n)", ["n"]),
+            ("SELECT value FROM users u, jsonb_each_text(u.prefs)", ["value"]),
+            ("SELECT r FROM users u, regexp_split_to_table(u.tags_csv, ',') r", ["r"]),
+            ("SELECT r FROM users u, LATERAL (VALUES (u.id)) v(r)", ["r"]),
+            ("SELECT c FROM (VALUES (1)) v(c), users u", ["c"]),
+            (
+                "SELECT e FROM users u, XMLTABLE('/r' PASSING u.doc COLUMNS e text PATH '.') x",
+                ["e"],
+            ),
+            ('SELECT U&"n\\0061me" AS x FROM users', ["x"]),
+        ],
+    )
+    def test_a_harmless_query_of_the_same_shape_is_not_masked(
+        self, sql: str, columns: list[str]
+    ) -> None:
+        assert _redacted(sql, columns, _EMAIL_ONLY) == set()
+
+    def test_a_unicode_escape_identifier_is_a_sensitive_mention(self) -> None:
+        assert result_masking.sql_mentions_sensitive('SELECT U&"em\\0061il" FROM t', _EMAIL_ONLY)
+        assert result_masking.sql_mentions_sensitive(
+            "SELECT U&\"em!0061il\" UESCAPE '!' FROM t", _EMAIL_ONLY
+        )
+        assert not result_masking.sql_mentions_sensitive('SELECT U&"n\\0061me" FROM t', _EMAIL_ONLY)
+
+
+class TestKeywordColumnWithABareAlias:
+    """5. ``SELECT data x``: a keyword-spelled column followed by a bare alias."""
+
+    @pytest.mark.parametrize(
+        "name",
+        ["data", "comment", "key", "role", "level", "type", "owner", "year", "source", "position"],
+    )
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "SELECT x FROM (SELECT {n} x FROM t) s",
+            "WITH s AS (SELECT {n} x FROM t) SELECT x FROM s",
+            "SELECT x FROM (SELECT t.id, {n} x FROM t) s",
+        ],
+    )
+    @pytest.mark.parametrize("dq", [False, True])
+    def test_the_value_is_masked(self, name: str, template: str, dq: bool) -> None:
+        privacy = PrivacySettings(sensitive_column_patterns=[], sensitive_columns=[name])
+        assert _leaks(template.format(n=name), ["x"], [0], privacy, dq) == []
+
+    def test_a_harmless_keyword_column_is_not_masked(self) -> None:
+        privacy = PrivacySettings(sensitive_column_patterns=[], sensitive_columns=["data"])
+        assert _redacted("SELECT x FROM (SELECT type x FROM t) s", ["x"], privacy) == set()
+
+    def test_a_reference_a_known_source_does_not_have_is_not_understood(self) -> None:
+        assert _masked("SELECT y FROM (SELECT id AS x FROM t) s") is None
+        assert _masked("SELECT s.y FROM (SELECT id AS x FROM t) s") is None
+        assert _masked("SELECT x FROM (SELECT id AS x FROM t) s") == set()
+
+
+class TestReferenceTokens:
+    """8. A DML, DDL or CTE keyword is never a column reference."""
+
+    def test_statement_keywords_are_not_references(self) -> None:
+        import sqlparse
+
+        stmt = sqlparse.parse("WITH a AS (SELECT data FROM t WHERE x IS NULL) SELECT 1")[0]
+        leaves = {t.value.upper(): t for t in stmt.flatten() if not t.is_whitespace}
+        for word in ("SELECT", "FROM", "WHERE", "IS", "NULL", "AS"):
+            assert not result_masking._is_reference_token(leaves[word], False), word
+        assert not result_masking._is_reference_token(leaves["WITH"], False)
+        assert result_masking._is_reference_token(leaves["DATA"], False)
+        assert result_masking._is_reference_token(leaves["T"], False)
+
+
+class TestTablesampleScanIsLinear:
+    """7. ``_column_neutral_tokens`` matches each parenthesis once."""
+
+    def test_repeated_tablesample_openers(self) -> None:
+        import time
+
+        sql = "SELECT email FROM t " + "TABLESAMPLE x (" * 16000  # about 256 KB
+        start = time.perf_counter()
+        _masked(sql)
+        assert time.perf_counter() - start < 5.0
+
+
+class TestSecondReviewLeaks:
+    """Leaks a second adversarial review found: each value is masked, and a harmless query
+    of the same shape is not."""
+
+    @pytest.mark.parametrize(
+        ("sql", "columns", "leaked", "dq"),
+        [
+            # A. a column alias spelled as a grammar keyword
+            ("SELECT over AS x FROM (SELECT email AS over FROM users) s", ["x"], [0], False),
+            (
+                "WITH c AS (SELECT email AS between FROM users) SELECT between AS x FROM c",
+                ["x"],
+                [0],
+                False,
+            ),
+            (
+                "WITH a AS (SELECT email AS over FROM users), b AS (SELECT over AS p FROM a), "
+                "c AS (SELECT p AS q FROM b) SELECT q AS r FROM c",
+                ["r"],
+                [0],
+                False,
+            ),
+            ("SELECT s.from AS x FROM (SELECT email AS from FROM users) s", ["x"], [0], False),
+            ("SELECT s.using AS x FROM (SELECT email AS using FROM users) s", ["x"], [0], False),
+            ("SELECT s.case AS x FROM (SELECT email AS case FROM users) s", ["x"], [0], False),
+            ("SELECT s.in AS x FROM (SELECT email AS in FROM users) s", ["x"], [0], False),
+            ("SELECT end AS x FROM (SELECT email AS end FROM users) s", ["x"], [0], True),
+            ("SELECT offset AS x FROM (SELECT email AS offset FROM users) s", ["x"], [0], True),
+            ("SELECT ilike AS x FROM (SELECT email AS ilike FROM users) s", ["x"], [0], True),
+            ("SELECT s.from AS x FROM (SELECT email AS `from` FROM users) s", ["x"], [0], True),
+            # B. IS [NOT] DISTINCT FROM in the SELECT list
+            (
+                "SELECT 1 IS DISTINCT FROM 2 AS d, (SELECT u::text FROM users u LIMIT 1) AS x",
+                ["d", "x"],
+                [1],
+                False,
+            ),
+            (
+                "SELECT 1 IS NOT DISTINCT FROM 2 AS d, "
+                "(SELECT to_jsonb(u) FROM users u LIMIT 1) AS x",
+                ["d", "x"],
+                [1],
+                False,
+            ),
+            (
+                "SELECT 1 IS DISTINCT FROM 2 AS d, t.x FROM (SELECT u::text AS x FROM users u) t",
+                ["d", "x"],
+                [1],
+                False,
+            ),
+            (
+                "SELECT 1 IS DISTINCT FROM 2 AS d, x FROM users u, LATERAL (SELECT u::text AS x) t",
+                ["d", "x"],
+                [1],
+                False,
+            ),
+            # C1. TABLE
+            ("SELECT x FROM (TABLE users) t(a, x)", ["x"], [0], False),
+            ("WITH c(a, b) AS (TABLE users) SELECT b FROM c", ["b"], [0], False),
+            ("SELECT b FROM (TABLE users) t(a, b)", ["b"], [0], True),
+            # C2. a real table renamed by a column list
+            ("SELECT j.b FROM (users AS t(a, b) JOIN orders o ON true) AS j", ["b"], [0], False),
+            (
+                "SELECT b FROM unnest(ARRAY[1]) WITH ORDINALITY AS z(q, r), users t(a, b)",
+                ["b"],
+                [0],
+                False,
+            ),
+            # C3. a whole row in a FROM function argument
+            (
+                "SELECT r.x FROM users u, LATERAL unnest(ARRAY[u::text]) WITH ORDINALITY r(x, n)",
+                ["x"],
+                [0],
+                False,
+            ),
+            (
+                "SELECT r.x FROM users u, "
+                "LATERAL regexp_split_to_table(u::text, ',') WITH ORDINALITY AS r(x, n)",
+                ["x"],
+                [0],
+                False,
+            ),
+            (
+                "SELECT j.x FROM (users u CROSS JOIN LATERAL "
+                "unnest(ARRAY[concat_ws(',', u)]) r(x)) AS j",
+                ["x"],
+                [0],
+                False,
+            ),
+            # C4. MySQL ``*`` under a column list
+            (
+                "SELECT t.b FROM (SELECT * FROM users) t(a, b) "
+                "JOIN orders o USE INDEX (PRIMARY) ON true",
+                ["b"],
+                [0],
+                True,
+            ),
+            (
+                "WITH c(a, b) AS (SELECT * FROM users) "
+                "SELECT b FROM c JOIN orders o USE INDEX (PRIMARY) ON true",
+                ["b"],
+                [0],
+                True,
+            ),
+            (
+                "SELECT t.b FROM (SELECT * FROM users) t(a, b), orders PARTITION (p0)",
+                ["b"],
+                [0],
+                True,
+            ),
+        ],
+    )
+    def test_the_value_is_masked(
+        self, sql: str, columns: list[str], leaked: list[int], dq: bool
+    ) -> None:
+        assert _leaks(sql, columns, leaked, _EMAIL_ONLY, dq) == []
+
+    @pytest.mark.parametrize(
+        ("sql", "columns", "dq"),
+        [
+            (
+                "WITH c AS (SELECT id AS between FROM users) SELECT between AS x FROM c",
+                ["x"],
+                False,
+            ),
+            ("SELECT s.from AS x FROM (SELECT id AS from FROM users) s", ["x"], False),
+            ("SELECT CAST(total AS int) AS c, CAST(n AS text) AS t FROM orders", ["c", "t"], False),
+            (
+                "WITH m AS (SELECT 1 AS n) SELECT CAST(n AS double precision) AS c FROM m",
+                ["c"],
+                False,
+            ),
+            ("SELECT 1 IS DISTINCT FROM 2 AS d, o.total FROM orders o", ["d", "total"], False),
+            (
+                "SELECT r.x FROM users u, LATERAL unnest(u.tags) WITH ORDINALITY r(x, n)",
+                ["x"],
+                False,
+            ),
+            (
+                "SELECT c.name, o.total FROM customers c JOIN orders o USE INDEX (PRIMARY) "
+                "ON o.customer_id = c.id WHERE c.email <> ''",
+                ["name", "total"],
+                True,
+            ),
+            ("SELECT o.id FROM orders o FORCE INDEX FOR JOIN (ix) PARTITION (p0)", ["id"], True),
+            (
+                "SELECT o.id, sum(o.total) OVER (PARTITION BY o.cid) AS s FROM orders o",
+                ["id", "s"],
+                False,
+            ),
+        ],
+    )
+    def test_a_harmless_query_of_the_same_shape_is_not_masked(
+        self, sql: str, columns: list[str], dq: bool
+    ) -> None:
+        assert _redacted(sql, columns, _EMAIL_ONLY, double_quote_is_string_literal=dq) == set()
+
+
+class TestFailureModes:
+    """D and E: what a failed or too costly classification masks."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        ["SELECT to_jsonb(u) AS x FROM users u", "SELECT u FROM users u", "SELECT q FROM t s(q)"],
+    )
+    def test_a_parse_failure_on_a_possible_whole_row_masks_every_column(self, sql: str) -> None:
+        with patch.object(result_masking, "_lex_like_the_engine", side_effect=ValueError("x")):
+            result = _classify_select_columns(sql, _EMAIL_ONLY)
+        assert result is not None and result[0] is MASK_ALL_COLUMNS
+
+    def test_a_harmless_parse_failure_keeps_name_matching(self) -> None:
+        with patch.object(result_masking, "_lex_like_the_engine", side_effect=ValueError("x")):
+            assert _classify_select_columns("SELECT id FROM t", _EMAIL_ONLY) is None
+
+    def test_an_unexpected_exception_masks_every_column(self) -> None:
+        with patch.object(result_masking, "_classify_output_items", side_effect=KeyError("x")):
+            result = _classify_select_columns("SELECT id FROM t", _EMAIL_ONLY)
+        assert result is not None and result[0] is MASK_ALL_COLUMNS
+
+    def test_an_executable_comment_masks_every_column(self) -> None:
+        result = _classify_select_columns(
+            "SELECT 1 AS a /*!, id AS b */ FROM t", _EMAIL_ONLY, double_quote_is_string_literal=True
+        )
+        assert result is not None and result[0] is MASK_ALL_COLUMNS
+
+    def test_an_exhausted_work_budget_masks_every_column(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(result_masking, "_CLASSIFICATION_BUDGET", 3)
+        sql = "SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT 1 AS a) x) y) z"
+        assert _masked(sql, _EMAIL_ONLY) == _ALL
+
+    def test_nested_recursive_ctes_are_bounded(self) -> None:
+        import time
+
+        sql = "SELECT 1 AS n, 'a' AS v"
+        for i in range(20):
+            sql = (
+                f"WITH RECURSIVE r{i}(n, v) AS (({sql}) UNION ALL "  # noqa: S608
+                f"SELECT n+1, v FROM r{i} WHERE n<2) SELECT n, v FROM r{i}"
+            )
+        start = time.perf_counter()
+        masked = _masked(sql, _EMAIL_ONLY)
+        assert time.perf_counter() - start < 2.0
+        assert masked in (set(), _ALL)
+
+    def test_a_mismatch_on_a_possible_whole_row_masks_every_column(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            result_masking, "_classify_result", lambda *_a: (set(), set(), ("plain",))
+        )
+        for sql in ("SELECT to_jsonb(u) AS c, id FROM users u", "SELECT u, id FROM users u"):
+            plan = _plan_result_mask(_EMAIL_ONLY, sql)
+            assert plan is not None and plan.redacted_indices(["c", "id"]) == {0, 1}
+        plan = _plan_result_mask(_EMAIL_ONLY, "SELECT name AS c, id FROM users u")
+        assert plan is not None and plan.redacted_indices(["c", "id"]) == set()

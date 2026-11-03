@@ -809,6 +809,7 @@ class TestSummarizeModelChange:
             "tables_not_annotated",
             "column_tables_failed",
         }
+        assert {"references_cleared", "tables_renamed"} <= set(drift._STRUCTURAL_FIELDS)
 
     def test_changed_is_the_structural_diff_not_the_notes(self) -> None:
         """An apply that annotated nothing changed nothing: ``changed`` is false even with
@@ -924,3 +925,212 @@ class TestResolveRealKey:
         assert matching_real_keys("missing", keys, bare_ok=True) == []
         # A case-insensitive match decides: the bare rule is not tried as well.
         assert matching_real_keys("Orders", ["orders", "public.orders"], bare_ok=True) == ["orders"]
+
+
+class TestTableRenames:
+    """A stored table key that is a near-miss spelling of a live one (a blob-era
+    ``public.Orders`` for ``public.orders``) is renamed to it, not removed beside a new
+    table: ``SchemaDrift.renamed_tables``."""
+
+    def test_a_near_miss_table_key_is_renamed_neither_removed_nor_new(self) -> None:
+        drift = compute_drift(
+            _schema(("public", "orders", ["id", "status"])), _model(public_Orders=["id"])
+        )
+        assert drift.renamed_tables == {"public.Orders": "public.orders"}
+        assert drift.removed_table_keys == set()
+        assert drift.new_table_keys == set()
+        assert not drift.is_empty
+        assert not SchemaDrift(renamed_tables={"public.Orders": "public.orders"}).is_empty
+
+    def test_a_quoted_key_is_renamed_too(self) -> None:
+        stored = SemanticModel(tables={'"public"."orders"': TableSemantic(display_name="Orders")})
+        drift = compute_drift(_schema(("public", "orders", ["id"])), stored)
+        assert drift.renamed_tables == {'"public"."orders"': "public.orders"}
+
+    def test_the_columns_of_a_renamed_table_are_diffed_under_its_live_key(self) -> None:
+        """Its baseline is the live key's, so a near-miss column key is renamed and an
+        unseen live column is new, as for any held table."""
+        drift = compute_drift(
+            _schema(("public", "orders", ["id", "status", "region"])),
+            _model(public_Orders=["id", '"status"', "gone"]),
+            known_columns={"public.orders": {"id", "status"}},
+        )
+        assert drift.renamed_tables == {"public.Orders": "public.orders"}
+        assert drift.renamed_columns == {"public.orders": {'"status"': "status"}}
+        assert drift.removed_columns == {"public.orders": {"gone"}}
+        assert drift.added_columns == {"public.orders": {"region"}}
+
+    def test_a_key_whose_live_table_is_stored_is_a_duplicate_removed(self) -> None:
+        drift = compute_drift(
+            _schema(("public", "orders", ["id"])),
+            _model(public_Orders=["id"], public_orders=["id"]),
+        )
+        assert drift.renamed_tables == {}
+        assert drift.removed_table_keys == {"public.Orders"}
+
+    def test_two_keys_for_one_table_rename_the_first_in_sort_order(self) -> None:
+        stored = SemanticModel(
+            tables={
+                "public.ORDERS": TableSemantic(display_name="A"),
+                "public.Orders": TableSemantic(display_name="B"),
+            }
+        )
+        drift = compute_drift(_schema(("public", "orders", ["id"])), stored)
+        assert drift.renamed_tables == {"public.ORDERS": "public.orders"}
+        assert drift.removed_table_keys == {"public.Orders"}
+        assert drift.new_table_keys == set()
+
+    def test_an_ambiguous_spelling_is_removed(self) -> None:
+        drift = compute_drift(
+            _schema(("public", "events", ["id"]), ("sales", "events", ["id"])),
+            _model(public_EVENTS=["id"], sales_events=["id"]),
+        )
+        assert drift.renamed_tables == {"public.EVENTS": "public.events"}
+        bare = SemanticModel(tables={"Events": TableSemantic(display_name="Events")})
+        drift = compute_drift(
+            _schema(("public", "events", ["id"]), ("sales", "events", ["id"])), bare
+        )
+        assert drift.renamed_tables == {}
+        assert drift.removed_table_keys == {"Events"}
+
+    def test_a_key_with_its_own_baseline_entry_is_removed_not_renamed(self) -> None:
+        """A real ``public."Orders"`` the model saw live (so it has a baseline entry) was
+        dropped while an unannotated ``public.orders`` exists: that is a removal and a new
+        table, not a misspelling to carry onto the other table."""
+        drift = compute_drift(
+            _schema(("public", "orders", ["id", "region"])),
+            _model(public_Orders=["id"]),
+            known_columns={"public.Orders": {"id"}},
+        )
+        assert drift.renamed_tables == {}
+        assert drift.removed_table_keys == {"public.Orders"}
+        assert drift.new_table_keys == {"public.orders"}
+
+    def test_a_hidden_or_unreadable_key_is_not_renamed(self) -> None:
+        privacy = PrivacySettings(excluded_tables=["public.Orders"])
+        drift = compute_drift(
+            _schema(("public", "orders", ["id"])), _model(public_Orders=["id"]), privacy
+        )
+        assert drift.renamed_tables == {}
+        drift = compute_drift(
+            _schema(("public", "orders", ["id"]), unreadable=["public.Orders"]),
+            _model(public_Orders=["id"]),
+        )
+        assert drift.renamed_tables == {}
+        assert drift.unreadable_table_keys == {"public.Orders"}
+
+    def test_a_renamed_table_is_listed_as_renamed_only(self) -> None:
+        summary = summarize_model_change(
+            _model(public_Orders=["id", "gone"]),
+            _model(public_orders=["id", "region"]),
+            tables_renamed={"public.Orders": "public.orders"},
+        )
+        assert summary.tables_renamed == {"public.Orders": "public.orders"}
+        assert summary.tables_added == summary.tables_removed == []
+        assert summary.columns_added == {"public.orders": ["region"]}
+        assert summary.columns_removed == {"public.orders": ["gone"]}
+        assert summary.changed is True
+
+    def test_a_table_rename_the_after_model_does_not_show_is_not_listed(self) -> None:
+        model = _model(public_Orders=["id"])
+        summary = summarize_model_change(
+            model, model, tables_renamed={"public.Orders": "public.orders"}
+        )
+        assert summary.tables_renamed == {}
+        assert summary.changed is False
+
+    def test_an_edge_on_a_renamed_table_is_neither_removed_nor_added(self) -> None:
+        def with_edge(table: str) -> SemanticModel:
+            model = SemanticModel(
+                tables={
+                    table: TableSemantic(
+                        display_name="Orders",
+                        columns={"customer_id": ColumnSemantic(display_name="C")},
+                    ),
+                    "public.customers": TableSemantic(
+                        display_name="Customers", columns={"id": ColumnSemantic(display_name="I")}
+                    ),
+                }
+            )
+            edge = RelationshipEdge(
+                from_table=table,
+                from_column="customer_id",
+                to_table="public.customers",
+                to_column="id",
+                join_sql="x",
+            )
+            return model.model_copy(update={"relationships": [edge]})
+
+        summary = summarize_model_change(
+            with_edge("public.Orders"),
+            with_edge("public.orders"),
+            tables_renamed={"public.Orders": "public.orders"},
+        )
+        assert summary.relationships_added == summary.relationships_removed == []
+
+
+class TestReferencesCleared:
+    """A table reference field (primary timestamp or date column, partition or cluster
+    columns, hierarchy levels) that lost a name is listed, even when no annotated column
+    left with it."""
+
+    @staticmethod
+    def _orders(**fields) -> SemanticModel:
+        return SemanticModel(
+            tables={
+                "public.orders": TableSemantic(
+                    display_name="Orders",
+                    columns={"id": ColumnSemantic(display_name="Id")},
+                    **fields,
+                )
+            }
+        )
+
+    def test_each_reference_field_that_lost_a_name_is_listed(self) -> None:
+        before = self._orders(
+            primary_timestamp_column="created_at",
+            primary_date_column="day",
+            partition_columns=["day", "region"],
+            cluster_columns=["id"],
+            hierarchies=[{"name": "Geo", "levels": ["country", "city"]}],
+        )
+        after = self._orders(
+            primary_timestamp_column=None,
+            primary_date_column="day",
+            partition_columns=["day"],
+            cluster_columns=["id"],
+            hierarchies=[{"name": "Geo", "levels": ["country"]}],
+        )
+        summary = summarize_model_change(before, after)
+        assert summary.references_cleared == {
+            "public.orders": ["hierarchies", "partition_columns", "primary_timestamp_column"]
+        }
+        assert summary.columns_removed == {}
+        assert summary.changed is True
+
+    def test_a_dropped_hierarchy_is_a_cleared_reference(self) -> None:
+        before = self._orders(hierarchies=[{"name": "Geo", "levels": ["country"]}])
+        summary = summarize_model_change(before, self._orders())
+        assert summary.references_cleared == {"public.orders": ["hierarchies"]}
+
+    def test_a_reference_renamed_with_its_column_is_not_cleared(self) -> None:
+        before = self._orders(primary_timestamp_column='"created_at"')
+        before.tables["public.orders"].columns['"created_at"'] = ColumnSemantic(display_name="C")
+        after = self._orders(primary_timestamp_column="created_at")
+        after.tables["public.orders"].columns["created_at"] = ColumnSemantic(display_name="C")
+        summary = summarize_model_change(
+            before, after, columns_renamed={"public.orders": {'"created_at"': "created_at"}}
+        )
+        assert summary.references_cleared == {}
+
+    def test_a_removed_or_set_reference_is_not_listed(self) -> None:
+        """A removed table takes its fields with it, and a field that gained a name lost
+        nothing."""
+        summary = summarize_model_change(
+            self._orders(primary_timestamp_column="created_at"), SemanticModel()
+        )
+        assert summary.references_cleared == {}
+        summary = summarize_model_change(
+            self._orders(), self._orders(primary_timestamp_column="created_at")
+        )
+        assert summary.references_cleared == {}

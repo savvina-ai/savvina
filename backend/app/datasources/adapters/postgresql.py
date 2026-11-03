@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator
 import hashlib
 import json as _json
 import logging
+import re
 import time
 from typing import Any
 
@@ -115,20 +116,21 @@ _ROLE_FACTS_SQL = (
 )
 
 # $1/$2: the qualified pairs as two parallel arrays; $3: the bare names, matched in every
-# schema but the system ones. One policy applies to the role when its role list names
-# PUBLIC or a role whose privileges current_user inherits (pg_has_role ... 'USAGE', not
-# 'MEMBER': a NOINHERIT membership does not make a policy apply). A CASE, not an OR: the
-# planner does not promise the operands' order and pg_has_role raises for 'public', which
-# is not a role. is_owner is the engine's own rule (check_enable_rls: has_privs_of_role),
-# so a role that inherits the owner bypasses RLS like the owner and reads True. For a
-# superuser that rule is true of every role (its bypass is the SUPERUSER finding), so only
-# the tables it owns by oid read True; the CASE keeps that order. can_select
-# needs USAGE on the schema as well: the table privilege alone is true for a table the
-# role cannot reach; can_write stays the table privilege, a write grant is worth revoking
-# either way. select_grantees: the grantees of the SELECT entries of the table's ACL that
-# the role is or inherits (PUBLIC for grantee 0), the owner's own entry left out (a non-null
-# ACL lists the owner; ownership is is_owner); NULL for a NULL ACL (default privileges: only
-# the owner reads).
+# schema but the system ones. One policy applies to the role when it is permissive (a
+# restrictive policy only narrows what a permissive one grants: alone it lets no row
+# through) and its role list names PUBLIC or a role whose privileges current_user inherits
+# (pg_has_role ... 'USAGE', not 'MEMBER': a NOINHERIT membership does not make a policy
+# apply). A CASE, not an OR: the planner does not promise the operands' order and
+# pg_has_role raises for 'public', which is not a role. is_owner is the engine's own rule
+# (check_enable_rls: has_privs_of_role), so a role that inherits the owner bypasses RLS
+# like the owner and reads True. For a superuser that rule is true of every role (its
+# bypass is the SUPERUSER finding), so only the tables it owns by oid read True; the CASE
+# keeps that order. can_select needs USAGE on the schema as well: the table privilege
+# alone is true for a table the role cannot reach; can_write stays the table privilege, a
+# write grant is worth revoking either way. select_grantees: the grantees of the SELECT
+# entries of the table's ACL that the role is or inherits (PUBLIC for grantee 0), the
+# owner's own entry left out (a non-null ACL lists the owner; ownership is is_owner); NULL
+# for a NULL ACL (default privileges: only the owner reads).
 _TABLE_FACTS_SQL = """
 SELECT n.nspname AS schema_name,
        c.relname AS table_name,
@@ -146,6 +148,7 @@ SELECT n.nspname AS schema_name,
            WHERE p.schemaname = n.nspname
              AND p.tablename = c.relname
              AND p.cmd IN ('SELECT', 'ALL')
+             AND p.permissive = 'PERMISSIVE'
              AND EXISTS (
                  SELECT 1 FROM unnest(p.roles) AS r(name)
                  WHERE CASE WHEN r.name = 'public' THEN true
@@ -1040,11 +1043,22 @@ class PostgreSQLDataSource(BaseDataSource):
         return self._validator.validate(query)
 
     def classify_error(self, exc: BaseException) -> ErrorCategory:
-        """Map an asyncpg failure via its SQLSTATE (PostgreSQL docs, Appendix A "Error Codes")."""
+        """Map an asyncpg failure via its SQLSTATE (PostgreSQL docs, Appendix A "Error Codes");
+        a bare ``asyncpg.InterfaceError`` saying the connection is closed or released is
+        CONNECTION."""
         return classify_chain(exc, self._classify_one)
 
     @staticmethod
     def _classify_one(err: BaseException) -> ErrorCategory | None:
+        # asyncpg raises a bare InterfaceError for an operation on a connection that is
+        # already closed or released, but also for a placeholder the model wrote ("the
+        # server expects 1 argument") and for a concurrent operation: only the first is a
+        # lost connection. A link lost mid-query arrives as ConnectionDoesNotExistError
+        # (SQLSTATE class 08).
+        if type(err) is asyncpg.InterfaceError:
+            if _CLOSED_CONNECTION.search(str(err)):
+                return ErrorCategory.CONNECTION
+            return None
         # Restricted to asyncpg's own hierarchy: an unrelated exception can carry a
         # same-named `.sqlstate` attribute and must not be read as a database verdict.
         if not isinstance(err, asyncpg.PostgresError):
@@ -1180,6 +1194,11 @@ You are querying a PostgreSQL database. Use PostgreSQL-specific syntax:
 # query (the failing text came from a function or the data, not the model's SQL).
 # Residual: a permission error caused by a stored value that names an existing schema or a
 # superuser-only setting keeps PERMISSION; it can only echo such a name.
+# asyncpg's InterfaceError text for a connection that is closed ("connection is closed")
+# or was handed back to the pool ("connection has been released back to the pool").
+_CLOSED_CONNECTION = re.compile(r"\bconnection (?:is closed|has been released)\b")
+
+
 def _may_quote_a_value(err: BaseException, category: ErrorCategory) -> bool:
     """Whether a PostgreSQL error under a name-quoting *category* may quote a stored value."""
     if getattr(err, "context", None) or getattr(err, "internal_query", None):

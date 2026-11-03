@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
 import logging
@@ -123,6 +123,21 @@ class _PipelineContext:
 
 
 # ── Module-level helpers ───────────────────────────────────────────────────────
+
+_TOKEN_FIELDS = ("tokens_used", "input_tokens", "output_tokens")
+
+
+def _with_spent_tokens(gen: Any, failed: Any) -> Any:
+    """*gen* (a ``_GenerationResult``) with the token counts of the *failed* regeneration
+    added: the request spent them, so the stored message and the reply report them. A count
+    neither side has stays ``None``."""
+    if failed is None or all(getattr(failed, f) is None for f in _TOKEN_FIELDS):
+        return gen
+    totals = {}
+    for f in _TOKEN_FIELDS:
+        a, b = getattr(gen, f), getattr(failed, f)
+        totals[f] = None if a is None and b is None else (a or 0) + (b or 0)
+    return replace(gen, **totals)
 
 
 async def _get_or_create_session(
@@ -487,6 +502,71 @@ class ChatService:
         self.cache = query_cache
         self.examples = example_library
 
+    async def _regenerate_after_cached_failure(
+        self,
+        *,
+        gen: Any,
+        connection_id: str,
+        session_id: str | None,
+        message: str,
+        adapter: Any,
+        schema: DataSourceSchema,
+        privacy: PrivacySettings | None,
+        semantic_model: Any,
+        provider_name: str,
+        options: dict,
+        settings: Any,
+    ) -> tuple[Any, Any]:
+        """A cached query failed at execution through its own fault (``query_fault``): evict
+        its entry and run generation and validation again with the cache bypassed, in this
+        request. Returns ``(gen, val)`` for a fresh, valid query, ``(gen, None)`` when the
+        regeneration yields none (a generation or validation error, an empty query), with
+        ``gen`` ``None`` when the generation stage raised (no token counts are known then): the
+        caller then reports the cached failure, with the tokens the failed generation spent.
+        A cached query is never
+        self-corrected (the prompt the cache skipped is not there), so without this the
+        question failed on every repeat until the entry's TTL or a thumbs-down."""
+        logger.info("Cached query failed at execution; evicting it and regenerating")
+        if gen.cached_question:
+            try:
+                async with _create_session() as db:
+                    await self.cache.evict_question(connection_id, gen.cached_question, db)
+            except Exception as exc:  # the regeneration is still worth running
+                logger.warning("Could not evict the failed cached query: %s", exc)
+        fresh: Any = None
+        try:
+            fresh = await _stage_generate(
+                cache=self.cache,
+                examples=self.examples,
+                connection_id=connection_id,
+                message=message,
+                session_id=session_id,
+                adapter=adapter,
+                schema=schema,
+                privacy=privacy,
+                semantic_model=semantic_model,
+                provider_name=provider_name,
+                options={**options, "bypass_cache": True},
+                settings=settings,
+            )
+            if fresh.error or not fresh.generated_query:
+                logger.warning(
+                    "Regeneration after a cached failure produced no query: %s",
+                    "generation failed" if fresh.error else "generation returned no query",
+                )
+                return fresh, None
+            val = await _stage_validate(fresh, adapter, schema, message)
+        except _PipelineError as exc:
+            logger.warning("Regeneration after a cached failure produced no query: %s", exc)
+            return fresh, None
+        if val.error or not val.generated_query:
+            logger.warning(
+                "Regeneration after a cached failure produced no query: %s",
+                "validation failed" if val.error else "validation returned no query",
+            )
+            return fresh, None
+        return fresh, val
+
     async def stream_message(
         self,
         connection_id: str,
@@ -691,6 +771,7 @@ class ChatService:
             results_response: QueryResultsResponse | None = None
             execution_time_ms: float | None = None
             bytes_scanned_val: int | None = None
+            regenerated: tuple[Any, Any] | None = None  # set when a cached failure regenerated
 
             if not error:
                 if conn.execution_mode == "generate_only":
@@ -700,31 +781,83 @@ class ChatService:
                     status = "pending_approval"
 
                 elif conn.execution_mode == "auto_execute" and generated_query:
+
+                    def _stream_run(g: Any, query: str, expl: str, is_connected: bool, hit: bool):
+                        out = _StreamResult()
+                        events = _stream_execute_with_correction(
+                            generated_query=query,
+                            explanation=expl,
+                            adapter=adapter,
+                            config_dict=config_dict,
+                            connected=is_connected,
+                            cache_hit=hit,
+                            provider=g.provider,
+                            configured_model=g.configured_model,
+                            configured_max_tokens=g.configured_max_tokens,
+                            system_prompt=g.system_prompt,
+                            history=g.history,
+                            message=message,
+                            schema=schema,
+                            options=options,
+                            settings=settings,
+                            result_out=out,
+                            privacy=privacy,
+                            intent=_intent_classifier.classify(message),
+                        )
+                        return out, events
+
                     yield StatusEvent(type="status", message="Executing query…")
-                    result_out = _StreamResult()
-                    async for event in _stream_execute_with_correction(
-                        generated_query=generated_query,
-                        explanation=explanation,
-                        adapter=adapter,
-                        config_dict=config_dict,
-                        connected=connected,
-                        cache_hit=gen.cache_hit,
-                        provider=gen.provider,
-                        configured_model=gen.configured_model,
-                        configured_max_tokens=gen.configured_max_tokens,
-                        system_prompt=gen.system_prompt,
-                        history=gen.history,
-                        message=message,
-                        schema=schema,
-                        options=options,
-                        settings=settings,
-                        result_out=result_out,
-                        privacy=privacy,
-                        intent=_intent_classifier.classify(message),
-                    ):
+                    result_out, run = _stream_run(
+                        gen, generated_query, explanation, connected, gen.cache_hit
+                    )
+                    async for event in run:
                         yield event
 
                     exe = result_out.result
+                    if exe is not None:
+                        # Before the regeneration's LLM call, so a client disconnect during
+                        # it still reaches the disconnect.
+                        connected = exe.connected
+                    if exe is not None and exe.error and exe.query_fault and gen.cache_hit:
+                        # A cached query is never self-corrected: drop it and generate afresh.
+                        yield StatusEvent(
+                            type="status", message="The cached query failed; generating a new one…"
+                        )
+                        fresh, fresh_val = await self._regenerate_after_cached_failure(
+                            gen=gen,
+                            connection_id=connection_id,
+                            session_id=session_id,
+                            message=message,
+                            adapter=adapter,
+                            schema=schema,
+                            privacy=privacy,
+                            semantic_model=semantic_model,
+                            provider_name=provider_name,
+                            options=options,
+                            settings=settings,
+                        )
+                        if fresh_val is None:
+                            # No valid fresh query: the cached run's exe stands.
+                            gen = _with_spent_tokens(gen, fresh)
+                        else:
+                            gen, val = fresh, fresh_val
+                            regenerated = gen, val
+                            # A new statement: the client starts its rows over on it.
+                            yield SqlEvent(
+                                type="sql", query=val.generated_query, dialect=adapter.query_dialect
+                            )
+                            yield StatusEvent(type="status", message="Executing query…")
+                            result_out, run = _stream_run(
+                                gen, val.generated_query, val.explanation, connected, False
+                            )
+                            # The run connects first when the first run ended disconnected; it
+                            # reports that only at its end, so until then count the adapter as
+                            # connected: a client disconnect mid-stream still reaches the
+                            # disconnect (a no-op on an adapter that is not connected).
+                            connected = True
+                            async for event in run:
+                                yield event
+                            exe = result_out.result
                     if exe is not None:
                         results_response = exe.results_response
                         execution_time_ms = exe.execution_time_ms
@@ -750,7 +883,12 @@ class ChatService:
                         query_dialect=adapter.query_dialect,
                         embedding=gen.cache_embedding,
                         db=db_post,
-                        force=bool(options.get("force_refresh", False)),
+                        # A regenerated answer, or one replacing an entry the strict check
+                        # refused, overwrites the entry stored for this question, so on an
+                        # exact hit no stale entry is left.
+                        force=regenerated is not None
+                        or gen.replaces_cached_entry
+                        or bool(options.get("force_refresh", False)),
                     )
 
                 # ── Stage 12: Emit explanation ────────────────────────────────────
@@ -890,6 +1028,7 @@ class ChatService:
         results_response: QueryResultsResponse | None = None
         execution_time_ms: float | None = None
         bytes_scanned_val: int | None = None
+        regenerated: tuple[Any, Any] | None = None  # set when a cached failure regenerated
 
         try:
             # ── Execution (no app DB session held) ───────────────────────────────
@@ -899,25 +1038,55 @@ class ChatService:
                 elif ctx.conn.execution_mode == "review_first":
                     status = "pending_approval"
                 elif ctx.conn.execution_mode == "auto_execute" and generated_query:
-                    exe = await _execute_auto_query(
-                        generated_query=generated_query,
-                        explanation=explanation,
-                        adapter=adapter,
-                        config_dict=ctx.config_dict,
-                        connected=connected,
-                        cache_hit=gen.cache_hit,
-                        provider=gen.provider,
-                        configured_model=gen.configured_model,
-                        configured_max_tokens=gen.configured_max_tokens,
-                        system_prompt=gen.system_prompt,
-                        history=gen.history,
-                        message=message,
-                        schema=ctx.schema,
-                        options=options,
-                        settings=settings,
-                        privacy=ctx.privacy,
-                        intent=_intent_classifier.classify(message),
-                    )
+
+                    async def _run(g: Any, query: str, expl: str, is_connected: bool, hit: bool):
+                        return await _execute_auto_query(
+                            generated_query=query,
+                            explanation=expl,
+                            adapter=adapter,
+                            config_dict=ctx.config_dict,
+                            connected=is_connected,
+                            cache_hit=hit,
+                            provider=g.provider,
+                            configured_model=g.configured_model,
+                            configured_max_tokens=g.configured_max_tokens,
+                            system_prompt=g.system_prompt,
+                            history=g.history,
+                            message=message,
+                            schema=ctx.schema,
+                            options=options,
+                            settings=settings,
+                            privacy=ctx.privacy,
+                            intent=_intent_classifier.classify(message),
+                        )
+
+                    exe = await _run(gen, generated_query, explanation, connected, gen.cache_hit)
+                    # Before a second run, so an exception in it still reaches the disconnect.
+                    connected = exe.connected
+                    if exe.error and exe.query_fault and gen.cache_hit:
+                        # A cached query is never self-corrected: drop it and generate afresh.
+                        fresh, fresh_val = await self._regenerate_after_cached_failure(
+                            gen=gen,
+                            connection_id=connection_id,
+                            session_id=session_id,
+                            message=message,
+                            adapter=adapter,
+                            schema=ctx.schema,
+                            privacy=ctx.privacy,
+                            semantic_model=ctx.semantic_model,
+                            provider_name=provider_name,
+                            options=options,
+                            settings=settings,
+                        )
+                        if fresh_val is None:
+                            # No valid fresh query: the cached run's exe stands.
+                            gen = _with_spent_tokens(gen, fresh)
+                        else:
+                            gen, val = fresh, fresh_val
+                            regenerated = gen, val
+                            exe = await _run(
+                                gen, val.generated_query, val.explanation, exe.connected, False
+                            )
                     results_response = exe.results_response
                     execution_time_ms = exe.execution_time_ms
                     bytes_scanned_val = exe.bytes_scanned
@@ -937,7 +1106,12 @@ class ChatService:
                         query_dialect=adapter.query_dialect,
                         embedding=gen.cache_embedding,
                         db=db_post,
-                        force=bool(options.get("force_refresh", False)),
+                        # A regenerated answer, or one replacing an entry the strict check
+                        # refused, overwrites the entry stored for this question, so on an
+                        # exact hit no stale entry is left.
+                        force=regenerated is not None
+                        or gen.replaces_cached_entry
+                        or bool(options.get("force_refresh", False)),
                     )
 
                 await _save_user_message(ctx.session.id, message, db_post)
@@ -1071,7 +1245,9 @@ class ChatService:
 
         if exec_error:
             await db.execute(
-                update(ChatMessage).where(ChatMessage.id == message_id).values(status="error")
+                update(ChatMessage)
+                .where(ChatMessage.id == message_id)
+                .values(status="error", error=exec_error)
             )
             session.updated_at = datetime.now(UTC)
             await db.commit()
@@ -1215,20 +1391,24 @@ class ChatService:
         try:
             # Connect first: the adapter reads @@sql_mode at connect, and both flags below
             # come from it (a fresh adapter holds the class defaults). A refusal raised after
-            # connect still reaches the disconnect in finally.
-            await adapter.connect(config_dict)
-            run_query = _executable(
-                run_query,
-                privacy,
-                adapter.query_dialect,
-                double_quote_is_string_literal=_double_quote_is_literal(adapter),
-                backslash_is_escape=_backslash_is_escape(adapter),
-            )
-            query_result = await adapter.execute_query(
-                run_query,
-                timeout=settings.default_query_timeout,
-                max_rows=settings.default_row_limit,
-            )
+            # connect still reaches the disconnect in finally. A failed connect is reported
+            # by the result, not raised: nothing runs, as in _execute_auto_query.
+            conn_result = await adapter.connect(config_dict)
+            if not getattr(conn_result, "success", True):
+                exec_error = f"Connection failed: {getattr(conn_result, 'message', '')}"
+            else:
+                run_query = _executable(
+                    run_query,
+                    privacy,
+                    adapter.query_dialect,
+                    double_quote_is_string_literal=_double_quote_is_literal(adapter),
+                    backslash_is_escape=_backslash_is_escape(adapter),
+                )
+                query_result = await adapter.execute_query(
+                    run_query,
+                    timeout=settings.default_query_timeout,
+                    max_rows=settings.default_row_limit,
+                )
         except Exception as e:
             exec_error = _user_error_text(adapter, e)
         finally:
@@ -1325,9 +1505,12 @@ class ChatService:
             raise ResourceNotFoundError(f"Message '{message_id}' not found")
 
         # 3. Validate sort_column against stored columns (SQL injection guard)
-        if not msg.results_json:
+        # A stored value that is not a result (not a dict, columns not a list) has nothing
+        # to sort: the same 400 as no result, not an AttributeError.
+        stored = msg.results_json
+        stored_columns = stored.get("columns") if isinstance(stored, dict) else None
+        if not isinstance(stored_columns, list):
             raise ValueError("Message has no stored results")
-        stored_columns: list[str] = msg.results_json.get("columns", [])
         if sort_column not in stored_columns:
             raise ValueError(f"Column '{sort_column}' is not in the result set")
 
@@ -1337,11 +1520,7 @@ class ChatService:
         # sort the query, then rewrite it once.
         original_query = unwrap_row_filter(msg.query_generated)
 
-        # 4. Inject ORDER BY
-        dialect = msg.query_dialect or "sql"
-        sorted_query = _inject_order_by(original_query, sort_column, sort_order, dialect)
-
-        # 5. Use the already-loaded connection
+        # 4. Use the already-loaded connection
         if conn is None:
             raise ResourceNotFoundError("Connection not found")
 
@@ -1354,6 +1533,12 @@ class ChatService:
             else PrivacySettings()
         )
         adapter = create_datasource(conn.source_type)
+
+        # 5. Inject ORDER BY in the connection's dialect, not the message's: a row stored
+        # without a dialect would otherwise get a double-quoted column, a string on MySQL.
+        sorted_query = _inject_order_by(
+            original_query, sort_column, sort_order, adapter.query_dialect
+        )
 
         # 6. Safety-validate the modified query (read-only check)
         validation = adapter.validate_query(sorted_query)
@@ -1373,20 +1558,24 @@ class ChatService:
         try:
             # Connect first: the adapter reads @@sql_mode at connect, and both flags below
             # come from it (a fresh adapter holds the class defaults). A refusal raised after
-            # connect still reaches the disconnect in finally.
-            await adapter.connect(config_dict)
-            run_query = _executable(
-                run_query,
-                privacy,
-                adapter.query_dialect,
-                double_quote_is_string_literal=_double_quote_is_literal(adapter),
-                backslash_is_escape=_backslash_is_escape(adapter),
-            )
-            query_result = await adapter.execute_query(
-                run_query,
-                timeout=settings.default_query_timeout,
-                max_rows=settings.default_row_limit,
-            )
+            # connect still reaches the disconnect in finally. A failed connect is reported
+            # by the result, not raised: nothing runs, as in _execute_auto_query.
+            conn_result = await adapter.connect(config_dict)
+            if not getattr(conn_result, "success", True):
+                exec_error = f"Connection failed: {getattr(conn_result, 'message', '')}"
+            else:
+                run_query = _executable(
+                    run_query,
+                    privacy,
+                    adapter.query_dialect,
+                    double_quote_is_string_literal=_double_quote_is_literal(adapter),
+                    backslash_is_escape=_backslash_is_escape(adapter),
+                )
+                query_result = await adapter.execute_query(
+                    run_query,
+                    timeout=settings.default_query_timeout,
+                    max_rows=settings.default_row_limit,
+                )
         except Exception as e:
             exec_error = _user_error_text(adapter, e)
         finally:
@@ -1412,7 +1601,8 @@ class ChatService:
     ) -> str:
         """Process user feedback on a generated query.
 
-        thumbs_up  → add to example library for future few-shot prompting.
+        thumbs_up  → add to example library for future few-shot prompting, when the
+                     message's status is ``executed``, ``cached`` or ``query_only``.
         thumbs_down → remove from query cache; do NOT add to examples.
 
         Returns the connection_id of the message's session so callers can use
@@ -1449,7 +1639,15 @@ class ChatService:
         user_msg = user_msg_result.scalar_one_or_none()
         question = user_msg.content if user_msg else ""
 
-        if feedback == "thumbs_up" and msg.query_generated and question:
+        # A failed query, or one still awaiting approval, never becomes an example; a
+        # generate-only answer the user reviewed is their endorsement. The rating is
+        # still recorded.
+        if (
+            feedback == "thumbs_up"
+            and msg.status in ("executed", "cached", "query_only")
+            and msg.query_generated
+            and question
+        ):
             # Compute embedding and add to example library for future few-shot use
             embedding = await self.cache.compute_embedding_async(question)
             await self.examples.add_example(

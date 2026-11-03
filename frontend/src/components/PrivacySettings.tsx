@@ -29,6 +29,7 @@ function TagList({
   onChange,
   description,
   caseInsensitive = false,
+  columnNamesOnly = false,
 }: {
   label: string;
   items: string[];
@@ -37,11 +38,15 @@ function TagList({
   /** Two spellings of one name are one entry (the backend matches and de-duplicates the
    *  sensitive column names that way). */
   caseInsensitive?: boolean;
+  /** Bare column names only: an entry with a dot (table.column) is refused, as the backend
+   *  refuses it (such an entry would never match). */
+  columnNamesOnly?: boolean;
 }) {
   const [draft, setDraft] = useState('');
   const hintId = useId();
-  // The existing entry a refused draft collides with; cleared as soon as the draft changes.
-  const [duplicateOf, setDuplicateOf] = useState<string | null>(null);
+  // Why the draft was refused (a duplicate, a qualified name); cleared as soon as the
+  // draft changes.
+  const [hint, setHint] = useState<string | null>(null);
   const listed = (value: string) =>
     items.find((item) =>
       caseInsensitive ? item.toLowerCase() === value.toLowerCase() : item === value,
@@ -50,14 +55,19 @@ function TagList({
   const add = () => {
     const trimmed = draft.trim();
     if (!trimmed) return;
+    if (columnNamesOnly && trimmed.includes('.')) {
+      const column = trimmed.slice(trimmed.lastIndexOf('.') + 1) || 'the column';
+      setHint(`Column names only: enter ${column} instead of ${trimmed}.`);
+      return;
+    }
     const existing = listed(trimmed);
     if (existing !== undefined) {
-      setDuplicateOf(existing);
+      setHint(`Already listed as ${existing}.`);
       return;
     }
     onChange([...items, trimmed]);
     setDraft('');
-    setDuplicateOf(null);
+    setHint(null);
   };
 
   return (
@@ -68,11 +78,11 @@ function TagList({
         <input
           type="text"
           aria-label={label}
-          aria-describedby={duplicateOf !== null ? hintId : undefined}
+          aria-describedby={hint !== null ? hintId : undefined}
           value={draft}
           onChange={(e) => {
             setDraft(e.target.value);
-            setDuplicateOf(null);
+            setHint(null);
           }}
           onKeyDown={(e) => e.key === 'Enter' && (e.preventDefault(), add())}
           placeholder="Add and press Enter"
@@ -81,6 +91,7 @@ function TagList({
         <button
           type="button"
           onClick={add}
+          aria-label={`Add ${label}`}
           className="px-3 py-1.5 bg-muted hover:bg-muted/80 rounded text-sm"
         >
           Add
@@ -89,9 +100,9 @@ function TagList({
       <p
         id={hintId}
         aria-live="polite"
-        className={duplicateOf !== null ? 'text-xs text-muted-foreground mb-2' : undefined}
+        className={hint !== null ? 'text-xs text-muted-foreground mb-2' : undefined}
       >
-        {duplicateOf !== null && `Already listed as ${duplicateOf}.`}
+        {hint}
       </p>
       <div className="flex flex-wrap gap-2">
         {items.map((item) => (
@@ -102,9 +113,10 @@ function TagList({
             {item}
             <button
               type="button"
+              aria-label={`Remove ${item}`}
               onClick={() => {
                 onChange(items.filter((i) => i !== item));
-                setDuplicateOf(null);
+                setHint(null);
               }}
               className="hover:text-destructive ml-1"
             >
@@ -128,6 +140,10 @@ function Toggle({
   checked: boolean;
   onChange: (v: boolean) => void;
 }) {
+  // The whole row stays clickable (the label), but the checkbox is named by the title alone
+  // and the description is its accessible description, not part of its name.
+  const titleId = useId();
+  const descriptionId = useId();
   return (
     <label className="flex items-start gap-3 cursor-pointer">
       <div className="relative mt-0.5 flex-shrink-0">
@@ -135,6 +151,8 @@ function Toggle({
           type="checkbox"
           checked={checked}
           onChange={(e) => onChange(e.target.checked)}
+          aria-labelledby={titleId}
+          aria-describedby={descriptionId}
           className="sr-only"
         />
         <div
@@ -145,8 +163,12 @@ function Toggle({
         />
       </div>
       <div>
-        <p className="text-sm font-medium text-foreground">{label}</p>
-        <p className="text-xs text-muted-foreground">{description}</p>
+        <p id={titleId} className="text-sm font-medium text-foreground">
+          {label}
+        </p>
+        <p id={descriptionId} className="text-xs text-muted-foreground">
+          {description}
+        </p>
       </div>
     </label>
   );
@@ -388,10 +410,11 @@ export default function PrivacySettingsForm({
         description="Column names matched exactly (case-insensitive), in every table that has
           them. Use this for names too common for a pattern, such as name, notes or comment.
           Same effect as a pattern match. Column names only: an entry such as table.column is
-          ignored."
+          refused."
         items={settings.sensitive_columns ?? []}
         onChange={(v) => set('sensitive_columns', v)}
         caseInsensitive
+        columnNamesOnly
       />
       <Toggle
         label="Strict sensitive columns"
