@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v3.0.3 (2026-11-04)
+
+### Bug Fixes
+
+- **ci**: Install Trivy from its pinned GitHub release and override every minimatch to ^11.0.1
+  ([#30](https://github.com/savvina-ai/savvina/pull/30),
+  [`abfdd85`](https://github.com/savvina-ai/savvina/commit/abfdd8583282e166cc2228040ddb1c3d922ccab3))
+
+
 ## v3.0.2 (2026-11-04)
 
 ### Bug Fixes
