@@ -12,9 +12,11 @@ from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlparse.exceptions import SQLParseError
 
 from app.datasources.errors import ErrorCategory
 from app.datasources.models import DataSourceSchema, PrivacySettings, QueryResult, ValidationResult
+from app.datasources.validators.postgresql_validator import PostgreSQLValidator
 from app.providers.base import LLMResponse
 from app.services.error_feedback import redact_error_for_user
 from app.services.execution import (
@@ -27,6 +29,7 @@ from app.services.row_filter import (
     _MIGRATION_MESSAGE,
     RowFilterRejectedError,
     _executable,
+    backslash_risk_keys,
     row_filter_fingerprint,
 )
 from app.services.row_filter_errors import QueryRejectedError, SensitiveColumnRejectedError
@@ -162,6 +165,26 @@ class TestNoBackslashEscapes:
         with pytest.raises(RowFilterRejectedError):
             _executable("SELECT id FROM shop.orders", privacy, "MySQL", **_NO_BACKSLASH)
 
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            "org_id = 7\nAND active = 1",
+            "org_id = 7\tAND active = 1",
+            "org_id = 7\r\nAND active = 1",
+        ],
+    )
+    def test_whitespace_between_the_tokens_of_a_condition_is_not_an_escape(
+        self, condition: str
+    ) -> None:
+        # The rewrite writes it as a space: no backslash reaches the server.
+        privacy = PrivacySettings(row_filters={"shop.users": condition})
+        out = _executable("SELECT id FROM shop.users", privacy, "MySQL", **_NO_BACKSLASH)
+        assert "org_id = 7 AND active = 1" in out
+        assert "\\" not in out
+        # A query on another table of the same map runs too.
+        out = _executable("SELECT id FROM shop.orders", privacy, "MySQL", **_NO_BACKSLASH)
+        assert "\\" not in out
+
     def test_mysql_refuses_a_rewrite_that_writes_a_backslash(self) -> None:
         # A line break inside a string of the query is written back as \n, two characters
         # for the server under NO_BACKSLASH_ESCAPES.
@@ -188,6 +211,44 @@ class TestNoBackslashEscapes:
         privacy = PrivacySettings(row_filters={"public.users": "name NOT LIKE 'a\\_%'"})
         out = _executable("SELECT id FROM public.users", privacy, "postgresql", **_NO_BACKSLASH)
         assert "a\\_%" in out
+
+
+class TestBackslashRiskKeys:
+    """``backslash_risk_keys``: the conditions the rewriter would write with a backslash
+    escape under NO_BACKSLASH_ESCAPES, read off sqlglot's token spans."""
+
+    @pytest.mark.parametrize(
+        ("condition", "risky"),
+        [
+            ("owner <> 'dom\\user'", True),
+            ("owner <> 'dom\\\\user'", True),
+            ("name NOT LIKE 'a\\_%'", True),
+            ("note <> 'a\tb'", True),
+            ("x = 'a\nb'", True),
+            ("x = 'a\rb'", True),
+            ("`a\tb` = 1", True),
+            ("x = 'a' -- a\tb", True),  # inside a comment: fails closed
+            ("x = 'unterminated", True),  # the tokenizer refuses it: fails closed
+            ("org_id = 7\nAND active = 1", False),
+            ("org_id = 7\tAND\r\nactive = 1", False),
+            ("city = 'Αθήνα'", False),
+            ("tenant_id = 7", False),
+        ],
+    )
+    def test_only_a_character_inside_a_token_counts(self, condition: str, risky: bool) -> None:
+        keys = backslash_risk_keys({"shop.users": condition}, "MySQL")
+        assert keys == (["shop.users"] if risky else [])
+
+    def test_keys_are_sorted(self) -> None:
+        filters = {
+            "shop.users": "x = 'a\tb'",
+            "shop.orders": "y = 'a\nb'",
+            "shop.items": "z = 1",
+        }
+        assert backslash_risk_keys(filters, "MySQL") == ["shop.orders", "shop.users"]
+
+    def test_an_empty_map_has_no_keys(self) -> None:
+        assert backslash_risk_keys({}, "MySQL") == []
 
 
 @pytest.mark.usefixtures("no_row_limit")
@@ -585,12 +646,26 @@ class TestRowLimit:
             out = _executable("SELECT id FROM users", None, "MySQL", **_MODES)
         assert out == "SELECT id FROM users\nLIMIT 51"
 
-    def test_an_unknown_dialect_or_a_refused_query_is_left_alone(self) -> None:
+    def test_an_unknown_dialect_is_left_alone(self) -> None:
         assert _executable("SELECT id FROM users", None, "sql", **_MODES) == (
             "SELECT id FROM users"
         )
-        refused = "SELECT pg_read_file('x')"
-        assert _executable(refused, None, "PostgreSQL", **_MODES) == refused
+
+    def test_a_query_sqlparse_refuses_is_left_alone(self) -> None:
+        with patch(
+            "app.datasources.validators.base_sql_validator.sqlparse.parse",
+            side_effect=SQLParseError("too deep"),
+        ):
+            out = _executable("SELECT id FROM users", None, "PostgreSQL", **_MODES)
+        assert out == "SELECT id FROM users"
+
+    def test_the_validator_does_not_run_again(self) -> None:
+        # The callers validated the clean query already; only the LIMIT placement is wanted.
+        with patch.object(
+            PostgreSQLValidator, "validate", side_effect=AssertionError("validated twice")
+        ):
+            out = _executable("SELECT id FROM users; -- note", None, "PostgreSQL", **_MODES)
+        assert out == _limited("SELECT id FROM users")
 
     @pytest.mark.parametrize(
         ("dialect", "key"), [("PostgreSQL", "public.users"), ("MySQL", "shop.users")]

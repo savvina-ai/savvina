@@ -14,6 +14,7 @@ from .base_sql_validator import (
     LOCKING_READ_ERROR,
     SET_STATEMENT_ERROR,
     BaseSQLValidator,
+    code_words,
     has_second_statement,
     not_a_read_error,
     strip_query,
@@ -52,12 +53,15 @@ _EXECUTABLE_OPENER = re.compile(r"/\*M?!\d*")
 # the server does not read as a comment (sqlparse takes both for comments while the server
 # runs them), or a # (sqlparse reads INTO#x as one name, the server ends the word at the #).
 # Where one is present, sqlparse's tokens do not show all the code, so the INTO check falls
-# back to the scan text.
+# back to the words of the scan text the server reads as code (code_words).
 _HIDDEN_FROM_SQLPARSE = re.compile(rf"/\*M?!|{_DASHES_AS_CODE}|#")
 
 
 class MySQLValidator(BaseSQLValidator):
     """MySQL/MariaDB-specific query validator extending the shared base."""
+
+    # MySQL quotes a name with a backtick as well; the lock and INTO scans skip that region.
+    QUOTE_CHARS: ClassVar[str] = "'\"`"
 
     MYSQL_DANGEROUS_FUNCTIONS: ClassVar[list[str]] = [
         "SLEEP",
@@ -119,8 +123,10 @@ class MySQLValidator(BaseSQLValidator):
                 is_valid=False,
                 error_message="Multiple statements are not allowed",
             )
-        # A share-locking read inside an executable comment or after a # comment.
-        if takes_row_locks(scan, mysql_comments=True):
+        # A share-locking read inside an executable comment, after a # comment or after
+        # dashes the server does not read as a comment (--1 FOR SHARE), which the base
+        # scan reads as gaps or a comment.
+        if takes_row_locks(scan, mysql_comments=True, quotes=self.QUOTE_CHARS):
             return ValidationResult(is_valid=False, error_message=LOCKING_READ_ERROR)
 
         # INTO writes the selected value into a user variable (or a file). The base check
@@ -129,10 +135,14 @@ class MySQLValidator(BaseSQLValidator):
         # variable on the pooled connection that a later SELECT @x returns past result
         # masking; INTO#x then @v on the next line likewise reads as one name. When the text
         # holds an executable comment, dashes the server does not read as a comment or a #,
-        # INTO is refused anywhere in the scan text, a literal or comment included. Executable
+        # INTO is refused wherever the server reads it as code (code_words: a # inside a
+        # string literal does not make the INTO in another literal a clause). Executable
         # comments themselves stay allowed (/*! STRAIGHT_JOIN */), as for every other pattern
         # here; the strict sensitive-column mode refuses them outright.
-        if _HIDDEN_FROM_SQLPARSE.search(query) and re.search(r"\bINTO\b", scan):
+        if _HIDDEN_FROM_SQLPARSE.search(query) and any(
+            word == "INTO"
+            for word, _ in code_words(scan, mysql_comments=True, quotes=self.QUOTE_CHARS)
+        ):
             return ValidationResult(
                 is_valid=False,
                 error_message="SELECT … INTO is not allowed: it writes to the database",

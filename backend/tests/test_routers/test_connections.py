@@ -1920,8 +1920,9 @@ class TestRowFilterVerification:
         assert resp.status_code == 422
         assert resp.json()["detail"] == (
             'row_filters["shop.orders"]: the condition contains a backslash, tab, carriage'
-            " return or line break, which this MySQL server (NO_BACKSLASH_ESCAPES) reads"
-            " differently from the way the filter is applied; remove it"
+            " return or line break inside a string literal, a quoted name or a comment, which"
+            " this MySQL server (NO_BACKSLASH_ESCAPES) reads differently from the way the"
+            " filter is applied; remove it"
         )
         adapter.explain.assert_not_awaited()
 
@@ -1934,6 +1935,21 @@ class TestRowFilterVerification:
             resp = await http_client.put(
                 "/api/v1/connections/conn-123/privacy",
                 json={"row_filters": {"shop.orders": "name NOT LIKE 'a\\_%'"}},
+            )
+        assert resp.status_code == 200
+        adapter.explain.assert_awaited_once()
+
+    async def test_mysql_no_backslash_escapes_plans_a_condition_with_a_line_break_between_tokens(
+        self, http_client
+    ):
+        conn = _make_conn(source_type="mysql", privacy_settings={})
+        adapter = _verifying_adapter()
+        adapter.backslash_is_escape = False
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"shop.orders": "tenant_id = 42\nAND active = 1"}},
             )
         assert resp.status_code == 200
         adapter.explain.assert_awaited_once()

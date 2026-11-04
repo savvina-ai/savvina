@@ -33,3 +33,12 @@ def _clear_semantic_filter_caches() -> None:
 
     clear_semantic_filter_caches()
     clear_hidden_identifier_cache()
+
+
+@pytest.fixture(autouse=True)
+def _clear_strict_verdicts() -> None:
+    """``pipeline._strict_allowed`` memoises strict-mode verdicts per process; clear the
+    memo so no test sees another's verdicts (a patched check would otherwise never run)."""
+    from app.services.pipeline import _STRICT_VERDICTS
+
+    _STRICT_VERDICTS.clear()

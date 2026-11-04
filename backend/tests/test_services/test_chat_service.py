@@ -2135,6 +2135,46 @@ class TestRegenerateAfterCachedFailure:
         assert out == (None, None)
         service.cache.evict_question.assert_awaited_once()
 
+    async def test_a_provider_exception_during_regeneration_yields_no_query(self):
+        # The real _stage_generate wraps every exception of the generation in
+        # _PipelineError, so a provider failure (network, rate limit) ends the
+        # regeneration, not the request: the caller reports the cached failure.
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.evict_question = AsyncMock(return_value=1)
+        gen = MagicMock(cached_question="How many users?")
+        db = _make_null_db()
+        with (
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, db)),
+            patch(
+                f"{_MODULE}._generate_query",
+                new=AsyncMock(side_effect=ConnectionError("rate limited")),
+            ),
+        ):
+            out = await service._regenerate_after_cached_failure(**self._args(gen))
+
+        assert out == (None, None)
+        service.cache.evict_question.assert_awaited_once()
+
+    async def test_a_crash_in_validation_keeps_the_fresh_generation_and_no_query(self):
+        # The real _stage_validate wraps the crash too; the fresh generation's tokens are
+        # still reported with the cached failure.
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.evict_question = AsyncMock(return_value=1)
+        gen = MagicMock(cached_question="How many users?")
+        fresh = self._ok()
+        db = _make_null_db()
+        with (
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, db)),
+            patch(f"{_MODULE}._stage_generate", new=AsyncMock(return_value=fresh)),
+            patch(
+                f"{_MODULE}._validate_and_correct_query",
+                new=AsyncMock(side_effect=RuntimeError("boom")),
+            ),
+        ):
+            out = await service._regenerate_after_cached_failure(**self._args(gen))
+
+        assert out == (fresh, None)
+
     async def test_an_eviction_error_does_not_stop_the_regeneration(self):
         service = ChatService(MagicMock(), MagicMock())
         service.cache.evict_question = AsyncMock(side_effect=RuntimeError("db down"))

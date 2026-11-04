@@ -55,9 +55,9 @@ from ..services.privilege_audit import to_dict as audit_to_dict
 from ..services.privilege_audit import unavailable as audit_unavailable
 from ..services.result_masking import _backslash_is_escape
 from ..services.row_filter import (
-    _NO_BACKSLASH_CHARS,
     RowFilterInvalidError,
     RowFilterRejectedError,
+    backslash_risk_keys,
     validate_row_filters,
 )
 from ..services.row_filter_rewrite import apply_row_filters, sqlglot_dialect
@@ -237,9 +237,10 @@ async def _verify_row_filters(
     adapter shared with the privilege audit and closed by the handler; the callers pass only
     new or changed pairs and call only when there is one, so an unchanged map opens nothing.
     On a MySQL server under NO_BACKSLASH_ESCAPES (read off the opened adapter), a pair whose
-    condition holds a backslash, tab, carriage return or line break is 422 naming the key
-    before anything is planned, since ``_executable`` would refuse every query of such a
-    map.
+    condition the rewriter would write with a backslash escape (``backslash_risk_keys``: a
+    backslash, tab, carriage return or line break inside a string literal, a quoted name or
+    a comment) is 422 naming the key before anything is planned, since ``_executable`` would
+    refuse every query of such a map.
     """
     # Built before the connection is opened: a pair the rewriter refuses opens nothing.
     statements = {key: _check_statement(key, cond, source_type) for key, cond in pairs.items()}
@@ -258,17 +259,17 @@ async def _verify_row_filters(
             # run-time check in row_filter._executable refuses every query of such a map, so
             # the admin learns here, where they can fix it. Gated on the dialect as well:
             # _backslash_is_escape reads a missing attribute as False.
-            for key, cond in pairs.items():
-                if any(ch in cond for ch in _NO_BACKSLASH_CHARS):
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            f'row_filters["{key}"]: the condition contains a backslash, tab,'
-                            " carriage return or line break, which this MySQL server"
-                            " (NO_BACKSLASH_ESCAPES) reads differently from the way the filter"
-                            " is applied; remove it"
-                        ),
-                    )
+            keys = backslash_risk_keys(pairs, _query_dialect(source_type))
+            if keys:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f'row_filters["{keys[0]}"]: the condition contains a backslash, tab,'
+                        " carriage return or line break inside a string literal, a quoted"
+                        " name or a comment, which this MySQL server (NO_BACKSLASH_ESCAPES)"
+                        " reads differently from the way the filter is applied; remove it"
+                    ),
+                )
         for key, sql in statements.items():
             try:
                 await asyncio.wait_for(

@@ -3,6 +3,8 @@
 
 """Tests for SQL query validation logic (base + PostgreSQL-specific)."""
 
+from unittest.mock import patch
+
 import pytest
 
 from app.datasources.validators.base_sql_validator import BaseSQLValidator
@@ -563,6 +565,8 @@ class TestMySQLHashCommentInto:
             "SELECT 1 FROM u INTO#x\nDUMPFILE '/tmp/x'",
             "SELECT 1 FROM u into#x\n@v",
             "SELECT 1 FROM u #c\nINTO#x\n@v",
+            "SELECT 1 FROM u WHERE a = '#' INTO @v",
+            "SELECT 1 FROM u WHERE a = 'x' #c\nINTO @v",
         ],
     )
     def test_into_with_a_hash_comment_is_refused(self, query):
@@ -576,6 +580,10 @@ class TestMySQLHashCommentInto:
             "SELECT a FROM t #note\nWHERE b = 1",
             "SELECT 1 FROM notes WHERE body LIKE '%#tag%'",
             "SELECT 1 FROM notes WHERE body LIKE '%logged into%'",
+            "SELECT * FROM notes WHERE body = 'walked into room #3'",
+            "SELECT 1 FROM t WHERE a = 'into' #c\n",
+            "SELECT 1 FROM t /*! STRAIGHT_JOIN */ WHERE a = 'into'",
+            "SELECT 1 FROM t WHERE a = 'x' -- fold into #1\n",
         ],
     )
     def test_a_hash_without_into_or_into_without_a_hash_pass(self, query):
@@ -621,9 +629,29 @@ class TestMultiStatementAfterAComment:
     @pytest.mark.parametrize(
         "query",
         [
+            # Under MySQL's rule --1 is two minus signs, code and not a comment: the
+            # server rejects these as syntax errors, but a run of dashes before a word or a
+            # parenthesis after a semicolon may start a statement, so the scan refuses.
+            "SELECT 1 FROM t;#x\n--1\nSET @x=1",
+            "SELECT 1 FROM t /*! ; */ --1\nSET @x=1",
+            "SELECT 1 FROM t;--1 SET @x=1",
+            "SELECT 1 FROM t;---1\nSET @x=1",
+            "SELECT 1 FROM t;--(1)\nSET @x=1",
+        ],
+    )
+    def test_mysql_dashes_that_are_code_after_a_semicolon_are_refused(self, query):
+        result = MySQLValidator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == "Multiple statements are not allowed"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
             "SELECT 1;",
             "SELECT 1;;",
             "SELECT 1; -- c",
+            "SELECT 1;--\n",
+            "SELECT a--1 FROM t",
             "SELECT 1; /* c */",
             "SELECT 1 ; \n -- x\n",
             "SELECT ';' AS x",
@@ -829,6 +857,12 @@ class TestLockingReads:
             "SELECT shared_for, for_share FROM t",
             "SELECT id FROM t /* for review */ WHERE lock_mode = 'in share'",
             "SELECT id FROM t WHERE x = 1 -- for key lookups\n",
+            "SELECT id FROM posts WHERE title = 'Up for share'",
+            "SELECT id FROM t WHERE note = 'lock in share mode'",
+            "SELECT id FROM t WHERE x = 'it''s' AND y = 'for key share'",
+            "SELECT id FROM t -- lock in share mode?\n",
+            "SELECT id FROM t /* for share */ WHERE x = 1",
+            'SELECT id FROM t WHERE "for share" = 1',
         ],
     )
     @pytest.mark.parametrize("validator", [PostgreSQLValidator, MySQLValidator])
@@ -843,3 +877,101 @@ class TestLockingReads:
         start = time.monotonic()
         validator().validate("SELECT 1 FROM t WHERE a = 1 " + piece * 3000)
         assert time.monotonic() - start < 2.0
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT * FROM t WHERE x = 'a' FOR SHARE",
+            "SELECT * FROM t WHERE x = 'it''s' FOR SHARE",
+            "SELECT * FROM t WHERE x = 'for' /* 'share' */ FOR SHARE",
+            "SELECT * FROM t WHERE x = 1 -- c\nLOCK IN SHARE MODE",
+        ],
+    )
+    @pytest.mark.parametrize("validator", [PostgreSQLValidator, MySQLValidator])
+    def test_a_literal_before_the_clause_does_not_hide_it(self, validator, query):
+        result = validator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == self.LOCK_ERROR
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # A backslash may escape a quote, a dollar sign may open a dollar-quoted string
+            # that holds one: the scan then reads every word, as before (refuses more).
+            "SELECT 'for share\\' FROM t",
+            "SELECT $$for share$$ FROM t",
+            "SELECT 'a\\' FROM t FOR SHARE -- '",
+        ],
+    )
+    @pytest.mark.parametrize("validator", [PostgreSQLValidator, MySQLValidator])
+    def test_quotes_are_not_followed_next_to_a_backslash_or_a_dollar_sign(self, validator, query):
+        result = validator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == self.LOCK_ERROR
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # PostgreSQL has no backtick quoting: a backtick is an operator character, so
+            # it opens no region and the words after it are code.
+            "SELECT id FROM t WHERE a ` 1 FOR SHARE",
+            "SELECT `for share` FROM t",
+        ],
+    )
+    def test_postgresql_reads_a_backtick_as_an_operator_character(self, query):
+        result = PostgreSQLValidator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == self.LOCK_ERROR
+
+    def test_mysql_reads_a_backtick_as_a_quoted_name(self):
+        assert MySQLValidator().validate("SELECT `for share` FROM t").is_valid
+
+    def test_mysql_unclosed_backtick_verdict_is_pinned(self):
+        # MySQL follows the backtick, so the unclosed region hides FOR SHARE from the
+        # lock scan; the server rejects an unclosed backtick as a syntax error, so
+        # accepting is safe.
+        query = "SELECT id FROM t WHERE a ` 1 FOR SHARE"
+        assert MySQLValidator().validate(query).is_valid
+
+    def test_mysql_dashes_without_whitespace_do_not_hide_the_clause(self):
+        # MySQL reads --1 as two minus signs: 1 - -1 FOR SHARE is a locking read there,
+        # and a comment on PostgreSQL.
+        query = "SELECT 1 FROM t WHERE x = 1 --1 FOR SHARE"
+        result = MySQLValidator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == self.LOCK_ERROR
+        assert PostgreSQLValidator().validate(query).is_valid
+
+
+class TestWithoutTrailingGaps:
+    """``without_trailing_gaps``: the query up to its last code token, from one sqlparse
+    parse and no checks, for a query ``validate`` has already accepted."""
+
+    @pytest.mark.parametrize(
+        ("query", "expected"),
+        [
+            ("SELECT 1", "SELECT 1"),
+            ("SELECT 1;", "SELECT 1"),
+            ("SELECT 1; -- c", "SELECT 1"),
+            ("SELECT ';--' AS x; -- c", "SELECT ';--' AS x"),
+            ("\ufeff  SELECT 1 /* c */ ;\n", "SELECT 1"),
+            ("SELECTday FROM t", "SELECT day FROM t"),
+        ],
+    )
+    @pytest.mark.parametrize("validator", [PostgreSQLValidator, MySQLValidator])
+    def test_a_trailing_semicolon_and_comments_go(self, validator, query, expected):
+        assert validator().without_trailing_gaps(query) == expected
+
+    def test_a_hash_comment_is_a_gap_on_mysql_and_code_on_postgresql(self):
+        assert MySQLValidator().without_trailing_gaps("SELECT 1 #c") == "SELECT 1"
+        assert PostgreSQLValidator().without_trailing_gaps("SELECT 1 #c") == "SELECT 1 #c"
+
+    def test_an_empty_or_unparseable_query_is_none(self):
+        from sqlparse.exceptions import SQLParseError
+
+        assert PostgreSQLValidator().without_trailing_gaps("  ;  ") is None
+        with patch(
+            "app.datasources.validators.base_sql_validator.sqlparse.parse",
+            side_effect=SQLParseError("too deep"),
+        ):
+            assert PostgreSQLValidator().without_trailing_gaps("SELECT 1") is None

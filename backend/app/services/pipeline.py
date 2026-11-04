@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+import json
 import logging
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -293,27 +294,64 @@ def _without_row_filter_wrap(found: list[ExampleEntry] | None) -> list[ExampleEn
     ]
 
 
+# Strict-mode verdicts on few-shot examples, by (query, privacy settings, dialect): the
+# rejection message, or None for a pass. A verdict changes only when the settings change,
+# and every field of the settings is in the key, so a change never serves a stale verdict.
+# Bounded: cleared when it would grow past _STRICT_VERDICTS_MAX.
+_STRICT_VERDICTS: dict[tuple[str, str, str], str | None] = {}
+_STRICT_VERDICTS_MAX = 2048
+
+
+def _privacy_key(privacy: PrivacySettings) -> str:
+    """The settings as one string for the memo key: every field, so a change to any of
+    them (not only the ones the strict check reads today) starts afresh."""
+    return json.dumps(asdict(privacy), sort_keys=True, default=str)
+
+
+def _strict_verdict(
+    query: str, privacy: PrivacySettings, privacy_key: str, dialect: str
+) -> str | None:
+    """``check_strict_sensitive``'s verdict on *query*, memoised: the rejection message, or
+    None for a pass. *privacy_key* is ``_privacy_key(privacy)``, computed once by the caller
+    for every example of a request. A crash in the check propagates and is not memoised."""
+    key = (query, privacy_key, dialect)
+    if key in _STRICT_VERDICTS:
+        return _STRICT_VERDICTS[key]
+    try:
+        check_strict_sensitive(query, privacy, dialect)
+    except QueryRejectedError as exc:
+        verdict: str | None = str(exc)
+    else:
+        verdict = None
+    if len(_STRICT_VERDICTS) >= _STRICT_VERDICTS_MAX:
+        _STRICT_VERDICTS.clear()
+    _STRICT_VERDICTS[key] = verdict
+    return verdict
+
+
 def _strict_allowed(
     found: list[ExampleEntry] | None, privacy: PrivacySettings | None, dialect: str
 ) -> list[ExampleEntry] | None:
     """Few-shot examples that pass the strict sensitive-column check, when strict mode is
     on. An example kept before the toggle (``WHERE email = …``) would contradict the prompt
     rule and teach the model a query the connection now refuses; it is left out, with its id
-    in the log. A crash in the check drops the example too (fails closed) without failing
-    the request."""
+    in the log. The verdict is memoised (``_strict_verdict``): the sqlglot parse and the
+    guard's walk run once per example and privacy settings, not on every cache miss. A
+    crash in the check drops the example too (fails closed) without failing the request."""
     if not found or privacy is None or not privacy.strict_sensitive_columns:
         return found
     kept: list[ExampleEntry] = []
+    privacy_key = _privacy_key(privacy)
     for ex in found:
         try:
-            check_strict_sensitive(ex.query, privacy, dialect)
-        except QueryRejectedError as exc:
-            logger.info("Few-shot example %s left out of the prompt: %s", ex.id, exc)
-            continue
+            verdict = _strict_verdict(ex.query, privacy, privacy_key, dialect)
         except Exception:
             logger.exception(
                 "Few-shot example %s left out of the prompt: the strict check failed", ex.id
             )
+            continue
+        if verdict is not None:
+            logger.info("Few-shot example %s left out of the prompt: %s", ex.id, verdict)
             continue
         kept.append(ex)
     return kept
