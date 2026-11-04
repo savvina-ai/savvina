@@ -86,21 +86,37 @@ export function useStreamChat() {
         updateState((prev) => ({ ...prev, statusText: event.message }))
         break
       case 'sql':
-        updateState((prev) => ({ ...prev, sql: event.query, dialect: event.dialect }))
+        // A new statement: the first one, a corrected retry, the re-run after an empty
+        // result, or the query generated afresh after a cached one failed. Rows shown so
+        // far belong to the previous statement.
+        updateState((prev) => ({
+          ...prev,
+          sql: event.query,
+          dialect: event.dialect,
+          columns: [],
+          columnTypes: [],
+          rows: [],
+          rowCount: 0,
+          truncated: false,
+        }))
         break
       case 'explanation':
         updateState((prev) => ({ ...prev, explanation: event.text }))
         break
-      case 'row_batch':
+      case 'row_batch': {
+        // batch_index 0 opens a statement's result; the backend restarts it on every retry.
+        const rows = event.rows as RowValue[][]
+        const fresh = event.batch_index === 0
         updateState((prev) => ({
           ...prev,
           columns: event.columns,
           columnTypes: event.column_types,
-          rows: [...prev.rows, ...(event.rows as RowValue[][])],
-          rowCount: prev.rowCount + event.rows.length,
+          rows: fresh ? rows : [...prev.rows, ...rows],
+          rowCount: fresh ? rows.length : prev.rowCount + rows.length,
           truncated: event.truncated,
         }))
         break
+      }
       case 'error':
         updateState((prev) => ({ ...prev, error: event.message }))
         break

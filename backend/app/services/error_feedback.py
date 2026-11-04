@@ -72,6 +72,9 @@ _CATEGORY_SENTENCE: dict[ErrorCategory, str] = {
         "support, or it is not a read-only SELECT."
     ),
     ErrorCategory.TIMEOUT: "The query exceeded the time limit.",
+    # Never sent in a correction prompt (execution._correctable rules CONNECTION out); the
+    # stand-in when the driver's text is empty.
+    ErrorCategory.CONNECTION: "The connection to the database was lost while the query ran.",
     ErrorCategory.OTHER: "The database rejected the query.",
     ErrorCategory.REJECTED: (
         "The query was refused by this application's own checks before it reached the database."

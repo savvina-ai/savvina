@@ -8,7 +8,7 @@
  * The table/chart can be expanded to a full-screen overlay via the Maximize button.
  */
 
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback, useEffect, useId, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { toPng } from 'html-to-image';
 import {
@@ -34,12 +34,15 @@ import { chatApi } from '@/api/chat';
 import { suggestChart } from '../lib/chartDetection';
 import { downloadCsv, triggerUrlDownload } from '../lib/exportUtils';
 import { exportApi } from '../api/export';
+import { useConnection } from '../hooks/useConnections';
+import { useAppStore } from '../store/appStore';
 import ChartView from './ChartView';
 import ChartEditor from './ChartEditor';
 import ColumnStatsView from './ColumnStatsView';
 import { STALE_ROW_FILTER_TEXT } from './ResultsTable';
 import { shareApi } from '../api/share';
 import { cn } from '@/lib/utils';
+import { apiErrorMessage } from '@/lib/apiError';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -78,6 +81,23 @@ function Cell({ value }: { value: unknown }) {
 
 const CELL_TRUNCATE_AT = 80;
 
+/** The value result masking puts in every cell of a masked column (services/result_masking.py). */
+const REDACTED = '[REDACTED]';
+
+const STRICT_MASKED_SORT_TITLE = 'Sorting is off for a masked column under Strict sensitive columns.';
+
+/** Indices of the columns whose every cell is `[REDACTED]`: masking replaces each value of a
+ *  masked column, NULL included, so this is exactly the masked set when there are rows. A
+ *  column whose real values all read `[REDACTED]` would match too; sorting it shows nothing. */
+function maskedColumnIndices(results: QueryResults): Set<number> {
+  const masked = new Set<number>();
+  if (results.rows.length === 0) return masked;
+  results.columns.forEach((_, j) => {
+    if (results.rows.every((row) => row[j] === REDACTED)) masked.add(j);
+  });
+  return masked;
+}
+
 export default function ResultsView({ results, messageId, isStreaming = false }: Props) {
   const chartCounterRef = useRef(0);
 
@@ -96,6 +116,19 @@ export default function ResultsView({ results, messageId, isStreaming = false }:
   const [sortError, setSortError] = useState<string | null>(null);
 
   const displayedResults = sortedResults ?? results;
+
+  // Strict sensitive columns refuses the ORDER BY a database sort adds on a masked column,
+  // and a client-side sort of `[REDACTED]` values changes nothing, so under strict mode the
+  // sort is turned off on those columns. The results are those of the active connection.
+  const activeConnectionId = useAppStore((s) => s.activeConnectionId);
+  // Prefix for the ids of the sr-only reasons the blocked sort buttons point at.
+  const blockedReasonId = useId();
+  const { data: connectionDetail } = useConnection(activeConnectionId);
+  const strictSensitive = connectionDetail?.privacy_settings?.strict_sensitive_columns === true;
+  const sortBlocked = useMemo(
+    () => (strictSensitive ? maskedColumnIndices(results) : new Set<number>()),
+    [strictSensitive, results],
+  );
 
   // Two refs: one for the inline chart, one for the expanded-overlay chart.
   // Export functions pick the active one based on isExpanded.
@@ -179,8 +212,9 @@ export default function ResultsView({ results, messageId, isStreaming = false }:
           const data = await chatApi.sortResults(messageId, col, newDir);
           setSortedResults(data);
           setSmartSortActive(true);
-        } catch {
-          setSortError('Sort failed — results may be unordered');
+        } catch (err) {
+          // The server's reason, such as a strict sensitive-column refusal, when it gave one.
+          setSortError(apiErrorMessage(err, 'Sort failed — results may be unordered'));
         } finally {
           setIsSorting(false);
         }
@@ -432,31 +466,52 @@ export default function ResultsView({ results, messageId, isStreaming = false }:
         <table className="w-full">
           <thead>
             <tr className="border-b border-border bg-table-header">
-              {displayedResults.columns.map((col) => (
-                <th
-                  key={col}
-                  onClick={() => handleSort(col)}
-                  className={cn(
-                    'group whitespace-nowrap px-3 py-2 text-left font-mono text-[10px] font-semibold uppercase tracking-wider text-muted-foreground',
-                    'cursor-pointer select-none hover:bg-table-header/80',
-                  )}
-                >
-                  <span className="flex items-center gap-1">
-                    {col}
-                    {isSorting && sortCol === col ? (
-                      <RefreshCw className="h-3 w-3 animate-spin text-primary" />
-                    ) : sortCol === col ? (
-                      sortDir === 'ASC' ? (
-                        <ChevronUp className="h-3 w-3 text-foreground" />
-                      ) : (
-                        <ChevronDown className="h-3 w-3 text-foreground" />
-                      )
-                    ) : (
-                      <ChevronsUpDown className="h-3 w-3 opacity-0 transition-opacity group-hover:opacity-50" />
+              {displayedResults.columns.map((col, j) => {
+                const blocked = sortBlocked.has(j);
+                const sorted = !blocked && sortCol === col;
+                const reasonId = `${blockedReasonId}-${j}`;
+                return (
+                  <th
+                    key={col}
+                    aria-sort={sorted ? (sortDir === 'ASC' ? 'ascending' : 'descending') : undefined}
+                    title={blocked ? STRICT_MASKED_SORT_TITLE : undefined}
+                    className={cn(
+                      'whitespace-nowrap text-left font-mono text-[10px] font-semibold uppercase tracking-wider text-muted-foreground',
+                      !blocked && 'hover:bg-table-header/80',
                     )}
-                  </span>
-                </th>
-              ))}
+                  >
+                    {/* A native button: focusable, and Enter or Space sorts. */}
+                    <button
+                      type="button"
+                      onClick={() => handleSort(col)}
+                      disabled={blocked}
+                      aria-describedby={blocked ? reasonId : undefined}
+                      className={cn(
+                        'group flex w-full items-center gap-1 px-3 py-2 uppercase select-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring',
+                        blocked ? 'cursor-not-allowed' : 'cursor-pointer',
+                      )}
+                    >
+                      {col}
+                      {blocked ? null : isSorting && sortCol === col ? (
+                        <RefreshCw className="h-3 w-3 animate-spin text-primary" />
+                      ) : sortCol === col ? (
+                        sortDir === 'ASC' ? (
+                          <ChevronUp className="h-3 w-3 text-foreground" />
+                        ) : (
+                          <ChevronDown className="h-3 w-3 text-foreground" />
+                        )
+                      ) : (
+                        <ChevronsUpDown className="h-3 w-3 opacity-0 transition-opacity group-hover:opacity-50 group-focus-visible:opacity-50" />
+                      )}
+                    </button>
+                    {blocked && (
+                      <span id={reasonId} className="sr-only">
+                        {STRICT_MASKED_SORT_TITLE}
+                      </span>
+                    )}
+                  </th>
+                );
+              })}
             </tr>
           </thead>
           <tbody>

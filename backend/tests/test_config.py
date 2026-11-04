@@ -215,6 +215,46 @@ class TestBehindTlsProxy:
         assert s.behind_tls_proxy is False
 
 
+class TestDriftCheckInterval:
+    _REQUIRED: ClassVar[dict] = TestLogLevelValidator._REQUIRED
+
+    def test_default_is_off(self):
+        assert Settings(**self._REQUIRED).drift_check_interval_minutes == 0
+
+    def test_reads_the_environment(self, monkeypatch):
+        monkeypatch.setenv("DRIFT_CHECK_INTERVAL_MINUTES", "15")
+        assert Settings(**self._REQUIRED).drift_check_interval_minutes == 15
+
+    def test_negative_is_rejected(self):
+        with pytest.raises(ValidationError, match="drift_check_interval_minutes"):
+            Settings(**self._REQUIRED, drift_check_interval_minutes=-1)
+
+    def test_is_not_a_ui_setting(self):
+        from app.config import SINGLETON_SETTING_PARSERS
+
+        assert "drift_check_interval_minutes" not in SINGLETON_SETTING_PARSERS
+
+
+class TestSemanticModelCacheSize:
+    _REQUIRED: ClassVar[dict] = TestLogLevelValidator._REQUIRED
+
+    def test_default_is_thirty_two(self):
+        assert Settings(**self._REQUIRED).semantic_model_cache_size == 32
+
+    def test_reads_the_environment(self, monkeypatch):
+        monkeypatch.setenv("SEMANTIC_MODEL_CACHE_SIZE", "0")
+        assert Settings(**self._REQUIRED).semantic_model_cache_size == 0
+
+    def test_negative_is_rejected(self):
+        with pytest.raises(ValidationError, match="semantic_model_cache_size"):
+            Settings(**self._REQUIRED, semantic_model_cache_size=-1)
+
+    def test_is_not_a_ui_setting(self):
+        from app.config import SINGLETON_SETTING_PARSERS
+
+        assert "semantic_model_cache_size" not in SINGLETON_SETTING_PARSERS
+
+
 class TestDbLockTimeout:
     _REQUIRED: ClassVar[dict] = TestLogLevelValidator._REQUIRED
 

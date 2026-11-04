@@ -22,7 +22,10 @@ from sqlglot.tokens import TokenType
 import sqlparse
 import sqlparse.tokens as sql_tokens
 
+from ..config import get_settings
 from ..datasources.models import PrivacySettings
+from ..datasources.validators.mysql_validator import MySQLValidator
+from ..datasources.validators.postgresql_validator import PostgreSQLValidator
 from .row_filter_errors import QueryRejectedError, RowFilterInvalidError, RowFilterRejectedError
 from .row_filter_rewrite import apply_row_filters, parse_condition, sqlglot_dialect
 from .sensitive_guard import check_strict_sensitive
@@ -67,6 +70,71 @@ _NO_BACKSLASH_ESCAPES_MESSAGE = (
     " (NO_BACKSLASH_ESCAPES), which the privacy checks cannot follow, so the query was not run."
 )
 _NO_BACKSLASH_ESCAPES_HINT = "Do not use a backslash anywhere in the query."
+
+# Characters in a row-filter condition that the rewriter writes back as a backslash escape
+# (a backslash itself is read as one: 'dom\user' is written 'domuser'). Under
+# NO_BACKSLASH_ESCAPES the server reads the result differently from what the admin wrote.
+_NO_BACKSLASH_CHARS = ("\\", "\t", "\r", "\n")
+# The rewriter writes every control character in a string as a backslash escape (tab,
+# CR, LF, and also backspace, NUL and Ctrl-Z as \b, \0, \Z), so the hint names them all.
+_REWRITE_BACKSLASH_HINT = (
+    "Do not put a tab, carriage return, line break or any other control character inside a"
+    " string literal."
+)
+
+
+def _rewritten_with_escape(condition: str, read: str | None) -> bool:
+    """Whether *condition* holds a character of ``_NO_BACKSLASH_CHARS`` inside one of its
+    tokens or comments, as sqlglot's tokenizer, which the rewriter parses with, spans them.
+    Inside a string literal the rewriter writes it as a backslash escape, which a server
+    under NO_BACKSLASH_ESCAPES reads literally. Inside a quoted name or a comment it does
+    not (the name is written verbatim, the comment dropped); those two are refused as a
+    precaution, not as an escape risk. The same character between two tokens is whitespace
+    the rewrite writes as a space. A condition the tokenizer refuses counts (fails closed)."""
+    try:
+        tokens = sqlglot.tokenize(condition, read=read)
+    except TokenError:
+        return True
+    for token in tokens:
+        span = condition[token.start : token.end + 1]
+        if any(ch in span for ch in _NO_BACKSLASH_CHARS):
+            return True
+        if any(ch in comment for comment in token.comments for ch in _NO_BACKSLASH_CHARS):
+            return True
+    return False
+
+
+def backslash_risk_keys(row_filters: dict[str, str], dialect: str) -> list[str]:
+    """Sorted keys of the conditions ``_rewritten_with_escape`` refuses: the ones the
+    rewriter would write with a backslash escape, which a MySQL server under
+    NO_BACKSLASH_ESCAPES reads differently from what the admin wrote, plus the precautionary
+    quoted-name and comment cases. The one scan behind the save-time 422
+    (``routers.connections._verify_row_filters``) and the run-time refusal
+    (``_filtered_executable``, ``_reject_backslash_in_rewrite``)."""
+    read = sqlglot_dialect(dialect)
+    return sorted(key for key, cond in row_filters.items() if _rewritten_with_escape(cond, read))
+
+
+def _reject_backslash_in_rewrite(keys: list[str]) -> QueryRejectedError:
+    """The refusal when, under NO_BACKSLASH_ESCAPES, the rewrite would send a backslash the
+    server reads literally. *keys* are the conditions that would be written with one
+    (``backslash_risk_keys``): a ``RowFilterRejectedError`` with no hint naming them (a
+    setting the model cannot change, so the correction loop ends). With none, the backslash
+    comes from a control character inside a string of the query: a ``QueryRejectedError``
+    with a hint for the model."""
+    if keys:
+        return RowFilterRejectedError(
+            f"The row filter for {', '.join(keys)} contains a backslash, tab, carriage return"
+            " or line break inside a string literal, a quoted name or a comment, which the"
+            " database reads differently (NO_BACKSLASH_ESCAPES) from the way the filter is"
+            " applied, so the query was not run. Change the condition."
+        )
+    return QueryRejectedError(
+        "The database reads a backslash in a string as an ordinary character"
+        " (NO_BACKSLASH_ESCAPES), and the row filter writes a tab, line break or other"
+        " control character inside a string as one, so the query was not run.",
+        llm_hint=_REWRITE_BACKSLASH_HINT,
+    )
 
 
 def _reads_double_quotes_as_names(dialect: str, double_quote_is_string_literal: bool) -> bool:
@@ -369,12 +437,37 @@ def _executable(
     and a query that contains a backslash is refused whatever the settings
     (``_NO_BACKSLASH_ESCAPES_MESSAGE``): result masking parses every executed statement. The
     check comes first, before the ``privacy is None`` return, so it does not depend on the
-    caller loading the settings.
+    caller loading the settings. With row filters on, the same mode also refuses, before the
+    rewrite, a map in which any condition would be written with a backslash
+    (``backslash_risk_keys``: such a character inside a string literal, a quoted name or a
+    comment; between two tokens it is whitespace the rewrite writes as a space): a
+    ``RowFilterRejectedError`` with no hint, naming the keys (the whole map is checked, since
+    the rewrite does not report which filters it applied and the map is the admin's to fix).
+    After the rewrite it refuses a rewritten statement that holds a backslash (a tab, carriage
+    return or line break inside a string of the query, written as an escape: a
+    ``QueryRejectedError`` with a hint).
 
     Both mode keywords are required: each caller reads them off the connected adapter.
+
+    Last, the executed form gets the read-only validator's row limit (``_with_row_limit``):
+    after the strict check and the rewrite, both of which read the clean query.
     """
     if (dialect or "").lower() == "mysql" and not backslash_is_escape and "\\" in sql:
         raise QueryRejectedError(_NO_BACKSLASH_ESCAPES_MESSAGE, llm_hint=_NO_BACKSLASH_ESCAPES_HINT)
+    executed = _filtered_executable(
+        sql, privacy, dialect, double_quote_is_string_literal, backslash_is_escape
+    )
+    return _with_row_limit(sql, executed, dialect)
+
+
+def _filtered_executable(
+    sql: str,
+    privacy: PrivacySettings | None,
+    dialect: str,
+    double_quote_is_string_literal: bool,
+    backslash_is_escape: bool,
+) -> str:
+    """``_executable`` before the row limit: the strict check and the row-filter rewrite."""
     if privacy is None:
         return sql
     if privacy.row_filter_needs_migration:
@@ -386,9 +479,55 @@ def _executable(
     ):
         raise QueryRejectedError(_ANSI_QUOTES_MESSAGE, llm_hint=_ANSI_QUOTES_HINT)
     tree = check_strict_sensitive(sql, privacy, dialect)
-    if privacy.row_filters:
-        return apply_row_filters(sql, privacy.row_filters, dialect, tree=tree)
-    return sql
+    if not privacy.row_filters:
+        return sql
+    literal_backslash = (dialect or "").lower() == "mysql" and not backslash_is_escape
+    if literal_backslash:
+        keys = backslash_risk_keys(privacy.row_filters, dialect)
+        if keys:
+            raise _reject_backslash_in_rewrite(keys)
+    rewritten = apply_row_filters(sql, privacy.row_filters, dialect, tree=tree)
+    if literal_backslash and "\\" in rewritten:
+        # The map is clean (checked above) and the query holds no backslash (_executable):
+        # the escape stands for a control character inside a string of the query.
+        raise _reject_backslash_in_rewrite([])
+    return rewritten
+
+
+_VALIDATORS = {"postgresql": PostgreSQLValidator(), "mysql": MySQLValidator()}
+# A FETCH FIRST clause is a row limit the validator's LIMIT check does not see; a LIMIT
+# after it is a syntax error.
+_FETCH = re.compile(r"\bFETCH\b", re.IGNORECASE)
+_LIMIT = re.compile(r"\bLIMIT\b", re.IGNORECASE)
+
+
+def _with_row_limit(clean: str, executed: str, dialect: str) -> str:
+    """*executed* with the read-only validator's row limit when *clean* has none.
+
+    The read-only validator (``BaseSQLValidator.validate``) appends ``LIMIT n`` to a query
+    without the word LIMIT, after its last code token (a trailing semicolon or comment goes
+    first). The executed form carries the same limit so the server stops early;
+    ``max_rows`` stays the fetch-time cap. ``n`` is ``default_row_limit`` plus one: the
+    adapters tell a truncated result by one row more than they keep. Decided on the clean
+    query, which every display, cache and prompt carries: the rewrite's own fences (a MySQL
+    ``LIMIT 18446744073709551615`` inside a derived table) must not count as the query's
+    limit. Unchanged when the dialect has no validator, the query already has a LIMIT
+    anywhere or a FETCH clause, or sqlparse cannot parse it (the callers' validation is the
+    gate; this never validates again).
+
+    The rewritten form (sqlglot output: no comments, no trailing semicolon, the outer query
+    unchanged) takes ``\nLIMIT n`` at its end; the unrewritten one is the validator's text
+    (``without_trailing_gaps``, one parse). Masking classifies the clean query by
+    result-column position, which a trailing LIMIT does not change.
+    """
+    validator = _VALIDATORS.get((dialect or "").lower())
+    if validator is None or _FETCH.search(clean) or _LIMIT.search(clean):
+        return executed
+    suffix = f"\nLIMIT {get_settings().default_row_limit + 1}"
+    if executed != clean:
+        return executed + suffix
+    trimmed = validator.without_trailing_gaps(clean)
+    return executed if trimmed is None else trimmed + suffix
 
 
 # Domain separation for the fingerprint MAC: the encryption key is the app's one secret, so

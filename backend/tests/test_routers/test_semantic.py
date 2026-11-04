@@ -30,6 +30,7 @@ from app.datasources.models import (
 )
 from app.main import app
 from app.semantic import store as semantic_store
+from app.semantic.drift import DriftApplySummary
 from app.semantic.generator import SemanticModelGenerator as _RealGenerator
 from app.semantic.models import (
     GENERATION_BATCH_SIZE,
@@ -80,7 +81,9 @@ class TestGetSemanticModel:
     async def test_returns_200_when_model_exists(self, http_client):
         db = _mock_db(MockResult(single=_make_conn()))
         app.dependency_overrides[get_db] = lambda: db
-        with patch(f"{_STORE}.load_model", new=AsyncMock(return_value=_populated())):
+        with patch(
+            f"{_STORE}.load_model_with_version", new=AsyncMock(return_value=(_populated(), 1))
+        ):
             resp = await http_client.get("/api/v1/connections/conn-123/semantic")
         assert resp.status_code == 200
         assert "public.orders" in resp.json()["tables"]
@@ -88,9 +91,26 @@ class TestGetSemanticModel:
     async def test_returns_404_when_no_model(self, http_client):
         db = _mock_db(MockResult(single=_make_conn()))
         app.dependency_overrides[get_db] = lambda: db
-        with patch(f"{_STORE}.load_model", new=AsyncMock(return_value=None)):
+        with patch(f"{_STORE}.load_model_with_version", new=AsyncMock(return_value=None)):
             resp = await http_client.get("/api/v1/connections/conn-123/semantic")
         assert resp.status_code == 404
+
+    async def test_serves_the_version_the_content_was_read_at(self, http_client):
+        """One read gives both, so the version is exactly the content's: no separate
+        ``load_version`` that a write could land after or before."""
+        db = _mock_db(MockResult(single=_make_conn()))
+        app.dependency_overrides[get_db] = lambda: db
+        load_version = AsyncMock(return_value=99)
+        with (
+            patch(
+                f"{_STORE}.load_model_with_version", new=AsyncMock(return_value=(_populated(), 7))
+            ),
+            patch(f"{_STORE}.load_version", new=load_version),
+        ):
+            resp = await http_client.get("/api/v1/connections/conn-123/semantic")
+        assert resp.status_code == 200
+        assert resp.json()["version"] == 7
+        load_version.assert_not_awaited()
 
     async def test_returns_404_when_connection_missing(self, http_client):
         db = _mock_db(MockResult(single=None))
@@ -171,6 +191,155 @@ class TestUpdateSemanticModel:
         resp = await http_client.put("/api/v1/connections/missing/semantic", json={})
         assert resp.status_code == 404
 
+    async def test_a_stale_base_version_is_409_and_writes_nothing(self, http_client):
+        db = _mock_db(MockResult(single=_make_conn()))  # lock_and_reread_connection
+        app.dependency_overrides[get_db] = lambda: db
+        apply = AsyncMock(return_value=_populated())
+        with (
+            patch(f"{_STORE}.apply_user_patch", new=apply),
+            patch(f"{_STORE}.load_version", new=AsyncMock(return_value=7)),
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/semantic",
+                json={"notes": ["x"], "base_version": 6},
+            )
+        assert resp.status_code == 409
+        assert "version 6, now 7" in resp.json()["detail"]
+        # The page recognises this 409 by its opening (frontend semanticMerge.STALE_DRAFT).
+        assert resp.json()["detail"].startswith(
+            "The semantic model changed since this draft was loaded"
+        )
+        apply.assert_not_awaited()
+        db.commit.assert_not_awaited()
+        db.rollback.assert_awaited()
+
+    async def test_a_base_version_of_a_deleted_model_is_409(self, http_client):
+        db = _mock_db(MockResult(single=_make_conn()))
+        app.dependency_overrides[get_db] = lambda: db
+        apply = AsyncMock(return_value=_populated())
+        with (
+            patch(f"{_STORE}.apply_user_patch", new=apply),
+            patch(f"{_STORE}.load_version", new=AsyncMock(return_value=None)),
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/semantic",
+                json={"notes": ["x"], "base_version": 6},
+            )
+        assert resp.status_code == 409
+        assert "now deleted" in resp.json()["detail"]
+        apply.assert_not_awaited()
+
+    async def test_a_matching_base_version_writes_and_returns_the_new_version(self, http_client):
+        db = _mock_db(
+            MockResult(single=_make_conn()),  # lock_and_reread_connection
+            MockResult(),  # delete QueryCacheEntry
+            MockResult(),  # delete UserSchemaCache
+            MockResult(),  # delete TableEmbeddingCache
+        )
+        app.dependency_overrides[get_db] = lambda: db
+        apply = AsyncMock(return_value=_populated())
+        # Read twice: under the lock before the write, and after the commit for the response.
+        versions = AsyncMock(side_effect=[7, 8])
+        with (
+            patch(f"{_STORE}.apply_user_patch", new=apply),
+            patch(f"{_STORE}.load_version", new=versions),
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/semantic",
+                json={"notes": ["x"], "base_version": 7},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["version"] == 8
+        apply.assert_awaited_once()
+        # ``base_version`` is the route's to read; the store never sees it as a section.
+        assert apply.await_args.args[2].base_version == 7
+        db.commit.assert_awaited_once()
+
+    async def test_without_a_base_version_the_put_is_unconditional(self, http_client):
+        # API clients and "save anyway": no 409 whatever the stored version.
+        db = _mock_db(
+            MockResult(single=_make_conn()),
+            MockResult(),
+            MockResult(),
+            MockResult(),
+        )
+        app.dependency_overrides[get_db] = lambda: db
+        with (
+            patch(f"{_STORE}.apply_user_patch", new=AsyncMock(return_value=_populated())),
+            patch(f"{_STORE}.load_version", new=AsyncMock(return_value=42)),
+        ):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/semantic", json={"notes": ["x"]}
+            )
+        assert resp.status_code == 200
+        assert resp.json()["version"] == 42
+        db.commit.assert_awaited_once()
+
+
+# ── GET/POST /api/v1/connections/{id}/semantic/tombstones ───────────────────────
+
+
+class TestTombstones:
+    _URL = "/api/v1/connections/conn-123/semantic/tombstones"
+
+    @staticmethod
+    def _row(kind: str, key: str) -> MagicMock:
+        row = MagicMock()
+        row.kind, row.key = kind, key
+        row.created_at = datetime(2026, 11, 3, 12, 0, tzinfo=UTC)
+        return row
+
+    async def test_lists_the_deleted_items_newest_first(self, http_client):
+        db = _mock_db(MockResult(single=_make_conn()))
+        app.dependency_overrides[get_db] = lambda: db
+        rows = [self._row("metric", "Revenue"), self._row("relationship", "a.b->c.d")]
+        with (
+            patch(f"{_STORE}.load_version", new=AsyncMock(return_value=3)),
+            patch(f"{_STORE}.list_tombstones", new=AsyncMock(return_value=rows)),
+        ):
+            resp = await http_client.get(self._URL)
+        assert resp.status_code == 200
+        assert resp.json() == [
+            {"kind": "metric", "key": "Revenue", "created_at": "2026-11-03T12:00:00Z"},
+            {"kind": "relationship", "key": "a.b->c.d", "created_at": "2026-11-03T12:00:00Z"},
+        ]
+
+    async def test_list_is_404_without_a_model(self, http_client):
+        db = _mock_db(MockResult(single=_make_conn()))
+        app.dependency_overrides[get_db] = lambda: db
+        with patch(f"{_STORE}.load_version", new=AsyncMock(return_value=None)):
+            resp = await http_client.get(self._URL)
+        assert resp.status_code == 404
+
+    async def test_restore_lifts_the_tombstone_and_commits(self, http_client):
+        db = _mock_db(MockResult(single=_make_conn()))
+        app.dependency_overrides[get_db] = lambda: db
+        lift = AsyncMock(return_value=True)
+        with patch(f"{_STORE}.delete_tombstone", new=lift):
+            resp = await http_client.post(
+                self._URL + "/restore", json={"kind": "common_join", "key": "a JOIN b"}
+            )
+        assert resp.status_code == 204
+        lift.assert_awaited_once_with(db, "conn-123", "common_join", "a JOIN b")
+        db.commit.assert_awaited_once()
+
+    async def test_restore_of_a_missing_tombstone_is_404(self, http_client):
+        db = _mock_db(MockResult(single=_make_conn()))
+        app.dependency_overrides[get_db] = lambda: db
+        with patch(f"{_STORE}.delete_tombstone", new=AsyncMock(return_value=False)):
+            resp = await http_client.post(
+                self._URL + "/restore", json={"kind": "metric", "key": "Gone"}
+            )
+        assert resp.status_code == 404
+        db.commit.assert_not_awaited()
+
+    async def test_restore_rejects_an_unknown_kind_or_empty_key(self, http_client):
+        db = _mock_db(MockResult(single=_make_conn()))
+        app.dependency_overrides[get_db] = lambda: db
+        for body in ({"kind": "table", "key": "x"}, {"kind": "metric", "key": ""}):
+            resp = await http_client.post(self._URL + "/restore", json=body)
+            assert resp.status_code == 422
+
 
 # ── DELETE /api/v1/connections/{id}/semantic ────────────────────────────────────
 
@@ -236,8 +405,10 @@ class TestCheckDrift:
         with (
             patch(f"{_STORE}.load_known_columns", new=AsyncMock(return_value={})),
             patch(f"{_STORE}.load_header", new=AsyncMock(return_value=_locked_header())),
+            patch(f"{_STORE}.load_column_names", new=AsyncMock(return_value={})),
             patch(f"{_STORE}.update_known_columns", new=AsyncMock()),
             patch("app.routers.semantic._lock_generation", new=AsyncMock()),
+            patch(f"{_STORE}.record_drift_report", new=AsyncMock()),
         ):
             yield
 
@@ -413,6 +584,93 @@ class TestCheckDrift:
         refresh.assert_not_awaited()
 
 
+class TestLastDrift:
+    _URL = "/api/v1/connections/conn-123/semantic/drift/last"
+    _REPORT: ClassVar[dict] = {
+        "connection_id": "conn-123",
+        "warnings": ["Table public.coupons was removed"],
+        "warning_count": 1,
+        "checked_at": "2026-11-03T12:00:00+00:00",
+        "schema_source": "live",
+        "schema_cached_at": None,
+        "refresh_error": None,
+        "has_actionable_changes": True,
+    }
+
+    async def _get(self, http_client, stored, *, version=7, interval=15):
+        db = _mock_db(MockResult(single=_make_conn()))
+        app.dependency_overrides[get_db] = lambda: db
+        settings = MagicMock(drift_check_interval_minutes=interval)
+        with (
+            patch(f"{_STORE}.load_last_drift_report", new=AsyncMock(return_value=stored)),
+            patch(f"{_STORE}.load_version", new=AsyncMock(return_value=version)),
+            patch("app.routers.semantic.get_settings", return_value=settings),
+        ):
+            resp = await http_client.get(self._URL)
+        assert resp.status_code == 200
+        return resp.json()
+
+    async def test_serves_a_monitor_report_about_the_current_model(self, http_client):
+        stored = {**self._REPORT, "source": "monitor", "model_version": 7}
+        body = await self._get(http_client, stored)
+        assert body == {"report": self._REPORT, "monitor_interval_minutes": 15}
+
+    @pytest.mark.parametrize(
+        "stored",
+        [
+            None,
+            # A Check Drift wrote it: the page shows its own report.
+            {"warning_count": 1, "source": "manual", "model_version": 7},
+            # The model changed since (an apply, a regenerate, a save).
+            {"warning_count": 1, "source": "monitor", "model_version": 6},
+            # An older shape that no longer validates.
+            {"source": "monitor", "model_version": 7, "warnings": "not a list"},
+        ],
+        ids=["none", "manual", "superseded", "invalid"],
+    )
+    async def test_withholds_a_report_that_does_not_describe_the_model(self, http_client, stored):
+        if stored and stored.get("source") == "manual":
+            stored = {**self._REPORT, **stored}
+        if stored and stored.get("model_version") == 6:
+            stored = {**self._REPORT, **stored}
+        body = await self._get(http_client, stored)
+        assert body == {"report": None, "monitor_interval_minutes": 15}
+
+    async def test_says_when_the_monitor_is_off(self, http_client):
+        body = await self._get(http_client, None, interval=0)
+        assert body == {"report": None, "monitor_interval_minutes": 0}
+
+    async def test_check_drift_stores_its_report_as_manual_in_its_own_commit(self, http_client):
+        _reset_limiter()
+        db = _mock_db(MockResult(single=_make_conn()))
+        app.dependency_overrides[get_db] = lambda: db
+        order: list[str] = []
+        db.commit = AsyncMock(side_effect=lambda: order.append("commit"))
+        record = AsyncMock(side_effect=lambda *_a, **_k: order.append("record"))
+        stored = SemanticModel(tables={"public.coupons": TableSemantic(display_name="Coupons")})
+        with (
+            patch(f"{_STORE}.load_version", new=AsyncMock(return_value=4)),
+            patch(f"{_STORE}.load_model", new=AsyncMock(return_value=stored)),
+            patch(f"{_STORE}.load_known_columns", new=AsyncMock(return_value={})),
+            patch(f"{_STORE}.load_header", new=AsyncMock(return_value=_locked_header())),
+            patch(f"{_STORE}.update_known_columns", new=AsyncMock()),
+            patch("app.routers.semantic._lock_generation", new=AsyncMock()),
+            patch(f"{_STORE}.record_drift_report", new=record),
+            patch(
+                "app.routers.semantic.refresh_user_schema_cache",
+                new=AsyncMock(return_value=_schema(["orders"])),
+            ),
+        ):
+            resp = await http_client.get("/api/v1/connections/conn-123/semantic/drift")
+        assert resp.status_code == 200
+        _db, cid, report, checked_at = record.await_args.args
+        assert cid == "conn-123"
+        assert report == {**resp.json(), "source": "manual", "model_version": 4}
+        assert checked_at.isoformat() == report["checked_at"]
+        # The cache transaction commits first; the report is written after it, alone.
+        assert order[-3:] == ["commit", "record", "commit"]
+
+
 class TestCheckDriftNewColumns:
     """The check reads the baseline; a table with none is baselined at first sight, and a
     baselined entry lacking names the read can complete (the real name of a hidden stored
@@ -427,11 +685,16 @@ class TestCheckDriftNewColumns:
         self.header = AsyncMock(return_value=_locked_header())
         self.known_update = AsyncMock()
         self.lock = AsyncMock()
+        # The stored column keys re-read under the lock; ``_get`` defaults them to the
+        # stored model's.
+        self.names = AsyncMock()
         with (
             patch(f"{_STORE}.load_known_columns", new=self.known),
             patch(f"{_STORE}.load_header", new=self.header),
             patch(f"{_STORE}.update_known_columns", new=self.known_update),
+            patch(f"{_STORE}.load_column_names", new=self.names),
             patch("app.routers.semantic._lock_generation", new=self.lock),
+            patch(f"{_STORE}.record_drift_report", new=AsyncMock()),
         ):
             yield
 
@@ -459,6 +722,11 @@ class TestCheckDriftNewColumns:
             },
         )
         live = schema or _schema(["orders"], {"orders": ["id", "loyalty_tier"]})
+        if self.names.side_effect is None:
+            held = {key: list(table.columns) for key, table in stored.tables.items()}
+            self.names.side_effect = lambda _db, _cid, keys: {
+                key: held[key] for key in keys if key in held
+            }
         with (
             patch(f"{_STORE}.load_model", new=AsyncMock(return_value=stored)),
             patch(
@@ -600,6 +868,33 @@ class TestCheckDriftNewColumns:
         assert self.known.await_count == 2
         assert self.known_update.await_args.args[2] == {"public.orders": {"id", "ssn"}}
 
+    async def test_the_write_completes_the_stored_columns_re_read_under_the_lock(
+        self, http_client
+    ) -> None:
+        """The model was read before the introspection, holding the hidden ``"ssn"`` key;
+        a PUT from another tab deleted it before the lock. The write is computed from the
+        column keys stored under the lock, so ``ssn`` is not recorded as seen, and once
+        un-hidden it is reported new rather than silently counted as seen."""
+        conn = _make_conn(privacy_settings={"excluded_columns": ["public.orders.ssn"]})
+        stored = SemanticModel(
+            tables={
+                "public.orders": TableSemantic(
+                    display_name="Orders",
+                    columns={
+                        "id": ColumnSemantic(display_name="Id"),
+                        '"ssn"': ColumnSemantic(display_name="SSN"),
+                    },
+                )
+            }
+        )
+        self.names.side_effect = lambda _db, _cid, _keys: {"public.orders": ["id"]}
+        await self._get(
+            http_client, stored=stored, conn=conn, schema=_schema(["orders"], {"orders": ["id"]})
+        )
+        assert self.names.await_args.args[1] == "conn-123"
+        assert set(self.names.await_args.args[2]) == {"public.orders"}
+        assert self.known_update.await_args.args[2] == {"public.orders": {"id"}}
+
     async def test_the_write_is_computed_against_the_baseline_re_read_under_the_lock(
         self, http_client
     ) -> None:
@@ -647,7 +942,8 @@ class TestCheckDriftNewColumns:
         await self._get(http_client, status=GenerationStatus.TABLES_PARTIAL, db=db)
         self.known_update.assert_not_awaited()
         self.lock.assert_not_awaited()
-        db.commit.assert_awaited_once()
+        # The cache commit, then the report's own.
+        assert db.commit.await_count == 2
 
     async def test_a_cached_schema_is_not_baselined(self, http_client) -> None:
         """The cache is not what the model has *seen*: a column it lacks must stay new."""
@@ -706,7 +1002,8 @@ class TestCheckDriftNewColumns:
         await self._get(http_client, db=db, refresh=refresh)
         # The baseline is read once before the lock for the report and once after the lock
         # and the header re-read, which is what the write is computed against. The baseline
-        # commit releases the lock; the last commit finds nothing to write.
+        # commit releases the lock; the next commit finds nothing to write, and the last
+        # commits the stored report on its own (``drift_check.drift_report``).
         assert order == [
             "refresh",
             "known",
@@ -715,6 +1012,7 @@ class TestCheckDriftNewColumns:
             "header",
             "known",
             "write",
+            "commit",
             "commit",
             "commit",
         ]
@@ -729,8 +1027,9 @@ class TestCheckDriftNewColumns:
         body = await self._get(http_client, db=db)
         self.lock.assert_awaited_once()
         self.known_update.assert_not_awaited()
-        # The lock is still released, and the report is the one the check computed.
-        assert db.commit.await_count == 3
+        # The lock is still released, and the report is the one the check computed
+        # (the fourth commit is the stored report's own).
+        assert db.commit.await_count == 4
         assert body["warnings"] == []
 
     async def test_a_model_deleted_while_the_check_waited_for_the_lock_is_not_baselined(
@@ -913,6 +1212,10 @@ def _no_provenance() -> dict:
         "global_item": {},
         "relationship": {},
     }
+
+
+def _no_tombstones() -> dict[str, set[str]]:
+    return {kind: set() for kind in semantic_store.TOMBSTONE_KINDS}
 
 
 def _snapshot(
@@ -1848,6 +2151,7 @@ class TestGenerateGlobals:
             patch(f"{_STORE}.save_model", new=save),
             patch(f"{_STORE}.load_known_columns", new=AsyncMock(return_value=known or {})),
             patch(f"{_STORE}.update_known_columns", new=self.known_update),
+            patch(f"{_STORE}.load_tombstones", new=AsyncMock(return_value=_no_tombstones())),
             ExitStack() as stack,
         ):
             # Entered last, so an extra patch overrides a default one above.
@@ -1914,6 +2218,66 @@ class TestGenerateGlobals:
         assert save.await_args.kwargs["provenance"] == provenance
         assert save.await_args.kwargs["protected"] == protected
         db.commit.assert_awaited_once()
+
+    async def test_a_tombstoned_generated_item_stays_out_and_a_marked_one_survives(
+        self, http_client
+    ) -> None:
+        """A metric the user deleted (tombstone) is left out of the generator's set; a
+        same-named hand-authored metric is carried through regardless, and so is a
+        generated metric with no tombstone."""
+        partial = self._partial(
+            business_metrics=[
+                {
+                    "name": "Hand",
+                    "metric_type": "simple",
+                    "definition": "1",
+                    "description": "kept",
+                    "aggregation": "sum",
+                }
+            ],
+            segments=[
+                {"name": "Vip", "sql_expression": "1", "description": "", "applicable_tables": []}
+            ],
+        )
+        llm_metrics = [
+            SimpleMetric(name=n, definition="2", description="llm", aggregation=AggregationType.SUM)
+            # "Buri\x00ed": the LLM's NUL is stripped by the store, so it is still "Buried".
+            for n in ("Hand", "Fresh", "Buri\x00ed")
+        ]
+        llm_segments = [
+            Segment(name="Vip", sql_expression="2", description="llm", applicable_tables=[]),
+            Segment(name="Gone", sql_expression="3", description="llm", applicable_tables=[]),
+        ]
+        tombstones = {
+            **_no_tombstones(),
+            "metric": {"Buried", "Hand"},
+            "segment": {"Gone", "Vip"},
+        }
+        resp, save, _ = await self._run(
+            http_client,
+            model=partial,
+            schema=_schema(["orders"]),
+            llm=(llm_metrics, [], llm_segments),
+            provenance={
+                **_no_provenance(),
+                "metric": {"Hand": ["payload"]},
+                "global_item": {"segment:Vip": ["payload"]},
+            },
+            protected={"table": {}, "column": {}},
+            extra_patches=(
+                patch(f"{_STORE}.load_tombstones", new=AsyncMock(return_value=tombstones)),
+            ),
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert {m["name"]: m["description"] for m in body["business_metrics"]} == {
+            "Hand": "kept",
+            "Fresh": "llm",
+        }
+        assert {s["name"]: s["description"] for s in body["segments"]} == {"Vip": ""}
+        saved = save.await_args.args[2]
+        assert {m.name for m in saved.business_metrics} == {"Hand", "Fresh"}
 
     async def test_without_a_partial_model_is_400(self, http_client) -> None:
         with (
@@ -2707,7 +3071,7 @@ class TestGenerateGlobals:
 
 class TestBaselineChanges:
     def test_only_new_and_different_entries_are_returned(self) -> None:
-        from app.routers.semantic import _baseline_changes
+        from app.services.drift_check import _baseline_changes
 
         known = {"a": frozenset({"x"}), "b": frozenset({"x", "y"})}
         wanted = {"a": ["x"], "b": ["x"], "c": ["z"]}
@@ -2721,7 +3085,7 @@ class TestHeldColumnNames:
 
     @staticmethod
     def _held(stored: list[str], privacy: PrivacySettings | None) -> set[str]:
-        from app.routers.semantic import _held_column_names
+        from app.services.drift_check import _held_column_names
 
         return _held_column_names("public.orders", ["id", "status"], stored, privacy)
 
@@ -2758,7 +3122,7 @@ class TestBaselineEntries:
         stored: dict[str, list[str]],
         privacy: PrivacySettings | None = None,
     ) -> dict[str, set[str]]:
-        from app.routers.semantic import _baseline_entries
+        from app.services.drift_check import _baseline_entries
 
         # ``ssn`` is hidden, so it is not a live column of ``orders``.
         schema = _schema(["orders", "customers"], columns={"orders": ["id", "status"]})
@@ -2802,7 +3166,7 @@ class TestEffectiveKnownColumns:
     def test_a_stored_key_the_policy_hides_is_seeded_under_its_real_name(self) -> None:
         """A table with no entry is baselined with what a baseline write would record:
         its live columns and the real name of each stored key the policy hides."""
-        from app.routers.semantic import _effective_known_columns
+        from app.services.drift_check import _effective_known_columns
 
         schema = _schema(["orders"], columns={"orders": ["id"]})  # ``ssn`` is hidden
         stored = {
@@ -2816,7 +3180,7 @@ class TestEffectiveKnownColumns:
         }
 
     def test_a_stored_table_with_no_entry_gets_its_live_columns(self) -> None:
-        from app.routers.semantic import _effective_known_columns
+        from app.services.drift_check import _effective_known_columns
 
         schema = _schema(["orders"], columns={"orders": ["id", "status"]})
         stored = {"public.orders": TableSemantic(display_name="Orders")}
@@ -2825,7 +3189,7 @@ class TestEffectiveKnownColumns:
         }
 
     def test_an_existing_entry_is_kept_even_when_empty(self) -> None:
-        from app.routers.semantic import _effective_known_columns
+        from app.services.drift_check import _effective_known_columns
 
         schema = _schema(["orders"], columns={"orders": ["id", "status"]})
         stored = {"public.orders": TableSemantic(display_name="Orders")}
@@ -2833,18 +3197,18 @@ class TestEffectiveKnownColumns:
         assert _effective_known_columns(known, stored, schema, None) == known
 
     def test_a_stored_table_missing_from_the_live_schema_gets_no_entry(self) -> None:
-        from app.routers.semantic import _effective_known_columns
+        from app.services.drift_check import _effective_known_columns
 
         stored = {"public.ghosts": TableSemantic(display_name="Ghosts")}
         assert _effective_known_columns({}, stored, _schema(["orders"]), None) == {}
 
     def test_a_live_table_the_model_does_not_hold_gets_no_entry(self) -> None:
-        from app.routers.semantic import _effective_known_columns
+        from app.services.drift_check import _effective_known_columns
 
         assert _effective_known_columns({}, {}, _schema(["orders"]), None) == {}
 
     def test_entries_of_tables_that_are_not_stored_pass_through(self) -> None:
-        from app.routers.semantic import _effective_known_columns
+        from app.services.drift_check import _effective_known_columns
 
         known = {"public.legacy": frozenset({"id"})}
         assert _effective_known_columns(known, {}, _schema(["orders"]), None) == known
@@ -2855,7 +3219,7 @@ class TestEffectiveKnownColumns:
         """An entry written before hidden names were recorded lacks ``ssn``. The read
         completes it (and Check Drift persists it), so once un-hidden the quoted key is
         renamed to ``ssn`` instead of ``ssn`` being reported new."""
-        from app.routers.semantic import _effective_known_columns
+        from app.services.drift_check import _effective_known_columns
 
         schema = _schema(["orders"], columns={"orders": ["id"]})  # ``ssn`` is hidden
         stored = {
@@ -2872,7 +3236,7 @@ class TestEffectiveKnownColumns:
     def test_a_baselined_table_gains_a_stored_live_column_its_entry_lacks(self) -> None:
         """A column annotated by hand (``PUT``) is seen: the baseline is a superset of
         what the model stores, on read as on write."""
-        from app.routers.semantic import _effective_known_columns
+        from app.services.drift_check import _effective_known_columns
 
         schema = _schema(["orders"], columns={"orders": ["id", "status"]})
         stored = {
@@ -2888,7 +3252,7 @@ class TestEffectiveKnownColumns:
 
 class TestLiveColumns:
     def test_names_the_live_columns_of_every_table(self) -> None:
-        from app.routers.semantic import _live_columns
+        from app.services.drift_check import _live_columns
 
         schema = _schema(["orders", "customers"], columns={"orders": ["id", "status"]})
         assert _live_columns(schema) == {
@@ -2897,7 +3261,7 @@ class TestLiveColumns:
         }
 
     def test_keys_limit_it_to_the_tables_named(self) -> None:
-        from app.routers.semantic import _live_columns
+        from app.services.drift_check import _live_columns
 
         schema = _schema(["orders", "customers"])
         assert _live_columns(schema, {"public.customers", "public.ghost"}) == {
@@ -3050,6 +3414,120 @@ class TestPlanColumnBatches:
         )
         assert [list(b) for b in batches] == [["a"], ["b"], ["c"]]
         assert deferred == []
+
+
+class TestWithoutRemovedTables:
+    def test_an_item_naming_a_removed_duplicate_key_of_a_live_table_is_kept(self) -> None:
+        """``public.Orders`` is removed as a duplicate of the stored, live
+        ``public.orders``: an item naming it names the table that survives, so it stays,
+        while one naming a table that is gone leaves."""
+        from app.routers.semantic import _without_removed_tables
+
+        model = SemanticModel.model_validate(
+            {
+                **_EMPTY_MODEL,
+                "business_metrics": [
+                    {
+                        "name": "Orders",
+                        "metric_type": "simple",
+                        "definition": "COUNT(*)",
+                        "aggregation": "count",
+                        "related_tables": ["public.Orders"],
+                    },
+                    {
+                        "name": "Coupons",
+                        "metric_type": "simple",
+                        "definition": "COUNT(*)",
+                        "aggregation": "count",
+                        "related_tables": ["public.coupons"],
+                    },
+                ],
+                "derived_columns": [
+                    {"name": "d", "sql_expression": "1", "base_tables": ["public.Orders"]}
+                ],
+                "segments": [
+                    {
+                        "name": "s",
+                        "sql_expression": "1 = 1",
+                        "applicable_tables": ["public.Orders", "public.coupons"],
+                    }
+                ],
+            }
+        )
+        metrics, _joins, derived, segments = _without_removed_tables(
+            model, {"public.Orders", "public.coupons"}, ["public.orders"]
+        )
+        assert [m.name for m in metrics] == ["Orders"]
+        assert [d.name for d in derived] == ["d"]
+        assert segments[0].applicable_tables == ["public.Orders"]
+
+
+class TestRenamedRelationshipTombstones:
+    """A tombstone written under a stale table or column key still names the edge once the
+    apply or the finalisation renames those keys."""
+
+    def test_a_tombstone_under_old_keys_covers_the_renamed_catalog_edge(self) -> None:
+        from app.routers.semantic import _renamed_relationship_tombstones
+
+        edge = TestApplyDrift._edge
+        catalog = [
+            edge("public.orders", "customer_id", "public.customers"),
+            edge("public.orders", "region_id", "public.customers"),
+        ]
+        dead = {'public.Orders."customer_id"->public.customers.id'}
+        out = _renamed_relationship_tombstones(
+            dead,
+            catalog,
+            {"public.Orders": "public.orders"},
+            {"public.orders": {'"customer_id"': "customer_id"}},
+        )
+        assert out == dead | {"public.orders.customer_id->public.customers.id"}
+        assert _renamed_relationship_tombstones(dead, catalog, {}, {}) == dead
+
+
+class TestRebuildRelationshipsTombstones:
+    """A catalog edge the user deleted (its ``relationship_key`` tombstoned) is not rebuilt,
+    for globals (``new_tables=None``) and for the apply alike."""
+
+    @staticmethod
+    def _rebuild(tombstoned: set[str], *, new_tables: set[str] | None) -> set[str]:
+        from app.routers.semantic import _rebuild_relationships
+
+        edge = TestApplyDrift._edge
+        catalog = [
+            edge("public.orders", "customer_id", "public.customers"),
+            edge("public.orders", "region_id", "public.customers"),
+        ]
+        rebuilt = _rebuild_relationships(
+            [],
+            catalog,
+            _snapshot().marks,
+            _schema(
+                ["orders", "customers"],
+                {"orders": ["id", "customer_id", "region_id"], "customers": ["id"]},
+            ),
+            None,
+            render_tables={"public.orders", "public.customers"},
+            keep_hidden_endpoints=False,
+            new_tables=new_tables,
+            tombstoned=tombstoned,
+        )
+        return {semantic_store.relationship_key(e) for e in rebuilt}
+
+    def test_globals_leaves_a_tombstoned_edge_out(self) -> None:
+        dead = "public.orders.customer_id->public.customers.id"
+        assert self._rebuild({dead}, new_tables=None) == {
+            "public.orders.region_id->public.customers.id"
+        }
+
+    def test_an_apply_on_a_new_table_leaves_a_tombstoned_edge_out(self) -> None:
+        dead = "public.orders.region_id->public.customers.id"
+        assert self._rebuild({dead}, new_tables={"public.orders"}) == {
+            "public.orders.customer_id->public.customers.id"
+        }
+
+    def test_without_tombstones_every_edge_is_rebuilt(self) -> None:
+        assert len(self._rebuild(set(), new_tables=None)) == 2
 
 
 class TestRebuildRelationshipsNewColumns:
@@ -3323,6 +3801,7 @@ class TestApplyDrift:
         on_record: Callable | None = None,
         last_apply: object = None,
         known: dict | None = None,
+        tombstoned: dict[str, set[str]] | None = None,
         known_after_lock: dict | object = _SAME,
         provider_error: BaseException | None = None,
     ):
@@ -3403,6 +3882,10 @@ class TestApplyDrift:
             patch(f"{_STORE}.list_drift_applies", new=lister),
             patch(f"{_STORE}.load_known_columns", new=load_known),
             patch(f"{_STORE}.update_known_columns", new=update_known),
+            patch(
+                f"{_STORE}.load_tombstones",
+                new=AsyncMock(return_value={**_no_tombstones(), **(tombstoned or {})}),
+            ),
         ):
             gen = mock_gen.return_value
             gen._build_relationship_graph.return_value = fresh_edges or []
@@ -3653,6 +4136,91 @@ class TestApplyDrift:
         assert save.await_args.kwargs["protected"]["table"].get("public.orders", {}) == {}
         assert any("dropped_at" in w for w in resp.json()["semantic_model"]["generation_warnings"])
         assert any("dropped_at" in w for w in resp.json()["summary"]["warnings"])
+
+    async def test_an_apply_whose_only_effect_is_a_trimmed_hand_edit_still_saves(
+        self, http_client
+    ) -> None:
+        """The drift is a new column the LLM returns nothing for, so no column, table or
+        item changes; the one effect is ``drop_dangling_edits`` clearing a hand-set
+        ``primary_timestamp_column`` on a column (never annotated) that left the database.
+        That is saved, its note reported, and the summary lists the cleared reference."""
+        model = self._complete(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "primary_timestamp_column": "dropped_at",
+                    "columns": {"id": {"display_name": "Id"}},
+                }
+            }
+        )
+        provenance = {
+            **_no_provenance(),
+            "table": {"public.orders": ["primary_timestamp_column"]},
+        }
+        protected = {
+            "table": {"public.orders": {"primary_timestamp_column": "dropped_at"}},
+            "column": {},
+        }
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=model,
+            schema=_schema(["orders"], {"orders": ["id", "region"]}),
+            provenance=provenance,
+            protected=protected,
+            known={"public.orders": ["id", "dropped_at"]},
+        )
+        assert resp.status_code == 200
+        summary = resp.json()["summary"]
+        assert summary["columns_added"] == {} and summary["columns_removed"] == {}
+        assert summary["column_tables_failed"] == ["public.orders"]
+        assert summary["references_cleared"] == {"public.orders": ["primary_timestamp_column"]}
+        assert summary["changed"] is True
+        assert any("dropped_at" in w for w in summary["warnings"])
+        save.assert_awaited_once()
+        assert save.await_args.kwargs["provenance"]["table"].get("public.orders", []) == []
+        assert save.await_args.args[2].tables["public.orders"].primary_timestamp_column is None
+        self.record.assert_awaited_once()
+
+    async def test_a_trim_note_saves_even_when_the_summary_names_no_change(
+        self, http_client
+    ) -> None:
+        """The save branch's ``or assembly.notes`` arm: with ``summarize_model_change``
+        reporting nothing, a hand edit ``drop_dangling_edits`` trimmed is still saved, so
+        the stale mark cannot outlive the apply."""
+        model = self._complete(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "primary_timestamp_column": "dropped_at",
+                    "columns": {"id": {"display_name": "Id"}},
+                }
+            }
+        )
+        provenance = {
+            **_no_provenance(),
+            "table": {"public.orders": ["primary_timestamp_column"]},
+        }
+        protected = {
+            "table": {"public.orders": {"primary_timestamp_column": "dropped_at"}},
+            "column": {},
+        }
+        with patch(
+            "app.routers.semantic.summarize_model_change",
+            new=MagicMock(return_value=DriftApplySummary()),
+        ):
+            resp, save, _, _ = await self._run(
+                http_client,
+                model=model,
+                schema=_schema(["orders"], {"orders": ["id", "region"]}),
+                provenance=provenance,
+                protected=protected,
+                known={"public.orders": ["id", "dropped_at"]},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["summary"]["changed"] is False
+        save.assert_awaited_once()
+        assert save.await_args.kwargs["provenance"]["table"].get("public.orders", []) == []
+        assert any("dropped_at" in w for w in save.await_args.args[2].generation_warnings)
 
     async def test_what_the_policy_hides_is_not_removed(self, http_client) -> None:
         conn = _make_conn(privacy_settings={"excluded_tables": ["public.coupons"]})
@@ -3994,6 +4562,66 @@ class TestApplyDrift:
             "public.payroll"
         ]
         assert body["summary"]["relationships_removed"] == []
+
+    async def test_tombstoned_items_and_edges_stay_out_of_an_apply(self, http_client) -> None:
+        """An item or catalog edge the user deleted (tombstone) is not brought back by an
+        apply over a new table, while an untombstoned one is. (The preview annotates no
+        new table, so it adds neither kind of edge; nothing to compare there.)"""
+        model = self._complete(
+            tables={
+                "public.orders": {
+                    "display_name": "Orders",
+                    "columns": {"id": {"display_name": "I"}},
+                }
+            }
+        )
+        schema = _schema(
+            ["orders", "events"],
+            {"orders": ["id", "event_id"], "events": ["id", "order_id"]},
+        )
+        dead_edge = self._edge("public.orders", "event_id", "public.events")
+        live_edge = self._edge("public.events", "order_id", "public.orders")
+        llm_metrics = [
+            SimpleMetric(
+                name=name,
+                definition="COUNT(*)",
+                description="llm",
+                aggregation=AggregationType.COUNT,
+                related_tables=["public.events"],
+            )
+            for name in ("Buried", "Fresh")
+        ]
+        llm_segments = [
+            Segment(
+                name=name,
+                sql_expression="1 = 1",
+                description="",
+                applicable_tables=["public.events"],
+            )
+            for name in ("gone", "kept")
+        ]
+        resp, save, _, _ = await self._run(
+            http_client,
+            model=model,
+            schema=schema,
+            generated=self._annotate_all,
+            llm=(llm_metrics, [], llm_segments),
+            fresh_edges=[dead_edge, live_edge],
+            tombstoned={
+                "metric": {"Buried"},
+                "segment": {"gone"},
+                "relationship": {semantic_store.relationship_key(dead_edge)},
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        summary = resp.json()["summary"]
+        assert summary["relationships_added"] == ["public.events.order_id → public.orders.id"]
+        saved = save.await_args.args[2]
+        assert [m.name for m in saved.business_metrics] == ["Fresh"]
+        assert [s.name for s in saved.segments] == ["kept"]
+        assert [semantic_store.relationship_key(e) for e in saved.relationships] == [
+            semantic_store.relationship_key(live_edge)
+        ]
 
     async def test_live_catalog_edges_are_kept_and_new_ones_added(self, http_client) -> None:
         """Relationships are rebuilt from the catalog: an unchanged edge neither leaves

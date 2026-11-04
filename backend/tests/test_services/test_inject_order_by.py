@@ -191,3 +191,135 @@ class TestDirectionValidation:
     def test_rejects_arbitrary_string_direction(self):
         with pytest.raises(ValueError, match="Invalid sort direction"):
             _inject_order_by(BASE_PG, "id", "NULLS FIRST", "PostgreSQL")
+
+
+# ── the order goes on the outermost query ───────────────────────────────────
+
+
+class TestOutermostQuery:
+    """The sort is set on the outermost query of the statement (its clauses outside every
+    parenthesis), keeping its LIMIT and OFFSET; nothing inside a CTE, a subquery, a window or
+    a string literal is touched, and the rest of the text is kept as written."""
+
+    def test_offset_before_limit_keeps_both_after_the_order(self):
+        result = _inject_order_by("SELECT * FROM t OFFSET 5 LIMIT 10", "a", "ASC", "PostgreSQL")
+        assert result == 'SELECT * FROM t\nORDER BY "a" ASC\nOFFSET 5 LIMIT 10'
+
+    def test_a_limit_inside_a_cte_is_left_alone(self):
+        sql = "WITH x AS (SELECT * FROM t ORDER BY a LIMIT 5) SELECT * FROM x LIMIT 100"
+        result = _inject_order_by(sql, "a", "DESC", "PostgreSQL")
+        assert result == (
+            "WITH x AS (SELECT * FROM t ORDER BY a LIMIT 5) SELECT * FROM x"
+            '\nORDER BY "a" DESC\nLIMIT 100'
+        )
+
+    def test_a_limit_inside_a_subquery_is_left_alone(self):
+        sql = (
+            "SELECT a FROM t WHERE id IN (SELECT id FROM u ORDER BY z LIMIT 3) ORDER BY a LIMIT 10"
+        )
+        result = _inject_order_by(sql, "a", "DESC", "PostgreSQL")
+        assert result == (
+            "SELECT a FROM t WHERE id IN (SELECT id FROM u ORDER BY z LIMIT 3)"
+            '\nORDER BY "a" DESC\nLIMIT 10'
+        )
+
+    def test_the_word_limit_in_a_string_literal_is_left_alone(self):
+        sql = "SELECT * FROM t WHERE note = 'no limit' LIMIT 10"
+        result = _inject_order_by(sql, "a", "ASC", "PostgreSQL")
+        assert result == "SELECT * FROM t WHERE note = 'no limit'\nORDER BY \"a\" ASC\nLIMIT 10"
+
+    def test_a_window_order_by_keeps_the_from_clause(self):
+        sql = "SELECT a, sum(x) OVER (PARTITION BY c ORDER BY b) s FROM t LIMIT 10"
+        result = _inject_order_by(sql, "a", "DESC", "PostgreSQL")
+        assert result == (
+            'SELECT a, sum(x) OVER (PARTITION BY c ORDER BY b) s FROM t\nORDER BY "a" DESC'
+            "\nLIMIT 10"
+        )
+
+    def test_a_set_operation_is_sorted_as_a_whole(self):
+        sql = "SELECT a FROM t UNION SELECT b FROM u ORDER BY 1 LIMIT 5"
+        result = _inject_order_by(sql, "a", "ASC", "PostgreSQL")
+        assert result == 'SELECT a FROM t UNION SELECT b FROM u\nORDER BY "a" ASC\nLIMIT 5'
+
+    def test_a_multi_column_order_by_is_replaced_whole(self):
+        sql = "SELECT a, b FROM t ORDER BY a DESC, b LIMIT 5 OFFSET 2"
+        result = _inject_order_by(sql, "b", "ASC", "PostgreSQL")
+        assert result == 'SELECT a, b FROM t\nORDER BY "b" ASC\nLIMIT 5 OFFSET 2'
+
+    def test_an_order_by_at_the_end_is_replaced(self):
+        result = _inject_order_by("SELECT a FROM t ORDER BY a", "a", "DESC", "PostgreSQL")
+        assert result == 'SELECT a FROM t\nORDER BY "a" DESC'
+
+    def test_mysql_offset_comma_limit(self):
+        result = _inject_order_by("SELECT `a` FROM `t` LIMIT 5, 10", "a", "ASC", "MySQL")
+        assert result == "SELECT `a` FROM `t`\nORDER BY `a` ASC\nLIMIT 5, 10"
+
+    def test_a_trailing_semicolon_is_dropped(self):
+        result = _inject_order_by("SELECT id FROM users;", "id", "ASC", "PostgreSQL")
+        assert result == 'SELECT id FROM users\nORDER BY "id" ASC'
+
+    def test_a_trailing_line_comment_does_not_swallow_the_order(self):
+        result = _inject_order_by("SELECT id FROM users -- note", "id", "ASC", "PostgreSQL")
+        assert result == 'SELECT id FROM users -- note\nORDER BY "id" ASC'
+
+    def test_the_text_is_not_regenerated(self):
+        # The server's sql_mode is known only after connect: a double quote (an identifier
+        # under ANSI_QUOTES) and a backslash (a literal under NO_BACKSLASH_ESCAPES) must
+        # reach the mode checks in row_filter._executable as written.
+        sql = "SELECT id FROM users WHERE \"email\" = 'a\\'' LIMIT 3"
+        result = _inject_order_by(sql, "id", "ASC", "MySQL")
+        assert result == "SELECT id FROM users WHERE \"email\" = 'a\\''\nORDER BY `id` ASC\nLIMIT 3"
+
+
+class TestEdgeShapes:
+    @pytest.mark.parametrize(
+        ("sql", "dialect"),
+        [
+            ("SELECT a, offset FROM t", "MySQL"),
+            ("SELECT count(*) AS limit FROM t", "PostgreSQL"),
+        ],
+    )
+    def test_a_column_named_like_a_clause_is_refused_not_misplaced(self, sql, dialect):
+        # The token scan reads the identifier as a clause; the round-trip check catches it.
+        with pytest.raises(ValueError, match="cannot be sorted"):
+            _inject_order_by(sql, "a", "ASC", dialect)
+
+    @pytest.mark.parametrize(
+        ("sql", "dialect"),
+        [
+            ("SELECT a FROM t ORDER BY a FOR UPDATE", "PostgreSQL"),
+            ("SELECT a FROM t FOR SHARE SKIP LOCKED", "PostgreSQL"),
+            ("SELECT a FROM t LOCK IN SHARE MODE", "MySQL"),
+            ("SELECT a FROM (SELECT a FROM t FOR UPDATE) x", "PostgreSQL"),
+        ],
+    )
+    def test_a_locking_query_is_refused(self, sql, dialect):
+        with pytest.raises(ValueError, match="cannot be sorted"):
+            _inject_order_by(sql, "a", "ASC", dialect)
+
+    def test_several_trailing_semicolons_are_dropped(self):
+        result = _inject_order_by("SELECT a FROM t;;", "a", "ASC", "PostgreSQL")
+        assert result == 'SELECT a FROM t\nORDER BY "a" ASC'
+
+    def test_a_comment_after_the_semicolon_is_accepted(self):
+        result = _inject_order_by("SELECT a FROM t LIMIT 5; -- tail", "a", "ASC", "PostgreSQL")
+        assert result == 'SELECT a FROM t\nORDER BY "a" ASC\nLIMIT 5'
+
+    def test_a_lowercase_dialect_name_is_read(self):
+        result = _inject_order_by("SELECT a FROM t", "a", "ASC", "mysql")
+        assert result == "SELECT a FROM t\nORDER BY `a` ASC"
+
+
+class TestUnparseableQueryIsRefused:
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT FROM WHERE (",
+            "SELECT 'unterminated FROM t",
+            "SELECT 1; SELECT 2",
+            "INSERT INTO t VALUES (1)",
+        ],
+    )
+    def test_the_sort_is_refused(self, sql):
+        with pytest.raises(ValueError, match="cannot be sorted"):
+            _inject_order_by(sql, "a", "ASC", "PostgreSQL")

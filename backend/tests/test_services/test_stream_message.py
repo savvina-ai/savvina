@@ -11,8 +11,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.config import get_settings
 from app.datasources.models import QueryResult, ValidationResult
 from app.providers.base import LLMResponse
+from app.schemas.sse import StatusEvent
 from app.services.chat_service import ChatService
 from app.services.pipeline import _GenerationResult
 from app.services.row_filter_rewrite import apply_row_filters
@@ -604,7 +606,10 @@ class TestStreamMessageRowFilterAndMasking:
                 )
             )
 
-        assert executed == [apply_row_filters(clean, filters, "postgresql")]
+        assert executed == [
+            f"{apply_row_filters(clean, filters, 'postgresql')}"
+            f"\nLIMIT {get_settings().default_row_limit + 1}"
+        ]
         assert "WHERE (tenant_id = 7)" in executed[0]
         assert [e["query"] for e in events if e["type"] == "sql"] == [clean]
         assert [e["rows"] for e in events if e["type"] == "row_batch"] == [[["[REDACTED]"]]]
@@ -695,3 +700,371 @@ class TestStreamMessageRowFilterAndMasking:
         stored = [c.kwargs["generated_query"] for c in svc.cache.store.await_args_list]
         assert refined not in stored
         assert stored == [original]
+
+
+def _gen(*, query: str, cache_hit: bool, provider, cached_question=None, cache_embedding=None):
+    g = MagicMock()
+    g.generated_query = query
+    g.explanation = "Count users"
+    g.error = None
+    g.status = "executed"
+    g.cache_hit = cache_hit
+    g.cached_question = cached_question
+    g.cache_embedding = cache_embedding
+    g.provider = provider
+    g.configured_model = "m"
+    g.configured_max_tokens = 4096
+    g.system_prompt = "sys"
+    g.history = []
+    g.tokens_used = None
+    g.input_tokens = None
+    g.output_tokens = None
+    g.user_warning = None
+    g.replaces_cached_entry = False
+    return g
+
+
+def _val(g):
+    v = MagicMock()
+    v.generated_query = g.generated_query
+    v.explanation = g.explanation
+    v.error = None
+    v.status = g.status
+    return v
+
+
+class TestStreamMessageCachedFailure:
+    async def test_a_failed_cached_query_is_evicted_and_regenerated_in_the_stream(self):
+        conn = _make_connection()
+        db = _make_db_with_conn(conn)
+        adapter = _make_adapter()
+        calls = {"n": 0}
+
+        async def _stream(query, timeout=30, batch_size=50, max_rows=1000):  # noqa: ASYNC109
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("relation archived_users does not exist")
+            yield QueryResult(
+                columns=["count"],
+                column_types=["integer"],
+                rows=[[1]],
+                row_count=1,
+                truncated=False,
+                execution_time_ms=10.0,
+            )
+
+        adapter.execute_query_stream = _stream
+        provider = _make_provider()
+        svc = ChatService(MagicMock(), MagicMock())
+        svc.cache.evict_question = AsyncMock(return_value=1)
+        svc.cache.store = AsyncMock()
+        cached = _gen(
+            query="SELECT count(*) FROM archived_users",
+            cache_hit=True,
+            provider=None,
+            cached_question="How many users?",
+        )
+        fresh = _gen(
+            query="SELECT count(*) FROM users",
+            cache_hit=False,
+            provider=provider,
+            cache_embedding=[0.1],
+        )
+
+        with (
+            patch(f"{_MODULE}.get_settings", return_value=_make_settings()),
+            patch(f"{_MODULE}.decrypt_value", return_value=json.dumps({"host": "db"})),
+            patch(f"{_MODULE}.create_datasource", return_value=adapter),
+            patch(f"{_MODULE}._create_session", _mock_session_factory(db)),
+            patch(f"{_MODULE}._resolve_schema") as mock_schema,
+            patch(f"{_MODULE}._generate_query", new=AsyncMock(side_effect=[cached, fresh])) as gen,
+            patch(
+                f"{_MODULE}._validate_and_correct_query",
+                new=AsyncMock(side_effect=[_val(cached), _val(fresh)]),
+            ),
+            patch(
+                f"{_MODULE}._get_or_create_session", new=AsyncMock(return_value=MagicMock(id="s"))
+            ),
+            patch(f"{_MODULE}._save_user_message", new=AsyncMock()),
+            patch(
+                f"{_MODULE}._save_assistant_message", new=AsyncMock(return_value=MagicMock(id="m"))
+            ),
+        ):
+            mock_schema.return_value = MagicMock(
+                schema=MagicMock(), connected=False, embeddings_available=False
+            )
+            events = await _collect(
+                svc.stream_message(
+                    connection_id="conn-1",
+                    session_id=None,
+                    message="How many users?",
+                    provider_name="claude",
+                    options={"max_rows": 100},
+                )
+            )
+
+        sql_events = [e["query"] for e in events if e["type"] == "sql"]
+        assert sql_events == ["SELECT count(*) FROM archived_users", "SELECT count(*) FROM users"]
+        last_sql = max(i for i, e in enumerate(events) if e["type"] == "sql")
+        assert not any(e["type"] == "row_batch" for e in events[:last_sql])
+        assert any(e["type"] == "row_batch" for e in events[last_sql:])
+        assert not any(e["type"] == "error" for e in events)
+        done = events[-1]
+        assert done["type"] == "done"
+        assert done["status"] == "executed"
+        assert done["cache_hit"] is False
+        svc.cache.evict_question.assert_awaited_once_with("conn-1", "How many users?", db)
+        assert gen.await_count == 2
+        assert gen.await_args.kwargs["bypass_cache"] is True
+        svc.cache.store.assert_awaited_once()
+        assert svc.cache.store.await_args.kwargs["force"] is True
+
+    @staticmethod
+    async def _stream_cached(svc: ChatService, adapter, cached, save=None) -> list[dict]:
+        """Stream a turn whose generation is the cache hit *cached*; the real execution.
+        *save* stands in for ``_save_assistant_message`` when given."""
+        db = _make_db_with_conn(_make_connection())
+        save = save or AsyncMock(return_value=MagicMock(id="m"))
+        with (
+            patch(f"{_MODULE}.get_settings", return_value=_make_settings()),
+            patch(f"{_MODULE}.decrypt_value", return_value=json.dumps({"host": "db"})),
+            patch(f"{_MODULE}.create_datasource", return_value=adapter),
+            patch(f"{_MODULE}._create_session", _mock_session_factory(db)),
+            patch(f"{_MODULE}._resolve_schema") as mock_schema,
+            patch(f"{_MODULE}._generate_query", new=AsyncMock(return_value=cached)),
+            patch(
+                f"{_MODULE}._validate_and_correct_query", new=AsyncMock(return_value=_val(cached))
+            ),
+            patch(
+                f"{_MODULE}._get_or_create_session", new=AsyncMock(return_value=MagicMock(id="s"))
+            ),
+            patch(f"{_MODULE}._save_user_message", new=AsyncMock()),
+            patch(f"{_MODULE}._save_assistant_message", new=save),
+        ):
+            mock_schema.return_value = MagicMock(
+                schema=MagicMock(), connected=False, embeddings_available=False
+            )
+            return await _collect(
+                svc.stream_message(
+                    connection_id="conn-1",
+                    session_id=None,
+                    message="How many users?",
+                    provider_name="claude",
+                    options={"max_rows": 100},
+                )
+            )
+
+    @staticmethod
+    def _failing_adapter(exc: BaseException):
+        adapter = _make_adapter()
+
+        async def _stream(query, timeout=30, batch_size=50, max_rows=1000):  # noqa: ASYNC109
+            raise exc
+            yield  # pragma: no cover — makes this an async generator
+
+        adapter.execute_query_stream = _stream
+        return adapter
+
+    async def test_when_regeneration_yields_no_query_the_cached_failure_is_reported(self):
+        adapter = self._failing_adapter(RuntimeError("relation archived_users does not exist"))
+        svc = ChatService(MagicMock(), MagicMock())
+        svc.cache.store = AsyncMock()
+        cached = _gen(
+            query="SELECT count(*) FROM archived_users",
+            cache_hit=True,
+            provider=None,
+            cached_question="How many users?",
+        )
+
+        with patch.object(
+            ChatService,
+            "_regenerate_after_cached_failure",
+            new=AsyncMock(return_value=(None, None)),
+        ) as regen:
+            events = await self._stream_cached(svc, adapter, cached)
+
+        regen.assert_awaited_once()
+        sql_events = [e["query"] for e in events if e["type"] == "sql"]
+        assert sql_events == ["SELECT count(*) FROM archived_users"]
+        errors = [e["message"] for e in events if e["type"] == "error"]
+        assert errors == ["relation archived_users does not exist"]
+        done = events[-1]
+        assert done["type"] == "done"
+        assert done["status"] == "error"
+        assert done["cache_hit"] is True
+        svc.cache.store.assert_not_awaited()
+
+    async def test_a_cached_query_that_times_out_is_kept_and_not_regenerated(self):
+        adapter = self._failing_adapter(TimeoutError())
+        svc = ChatService(MagicMock(), MagicMock())
+        svc.cache.evict_question = AsyncMock(return_value=1)
+        svc.cache.store = AsyncMock()
+        cached = _gen(
+            query="SELECT count(*) FROM users",
+            cache_hit=True,
+            provider=None,
+            cached_question="How many users?",
+        )
+
+        with patch.object(ChatService, "_regenerate_after_cached_failure") as regen:
+            events = await self._stream_cached(svc, adapter, cached)
+
+        regen.assert_not_called()
+        svc.cache.evict_question.assert_not_awaited()
+        assert [e["query"] for e in events if e["type"] == "sql"] == ["SELECT count(*) FROM users"]
+        assert [e["message"] for e in events if e["type"] == "error"] == ["Query timed out"]
+        assert events[-1]["cache_hit"] is True
+        svc.cache.store.assert_not_awaited()
+
+    async def test_a_failure_during_the_regeneration_still_disconnects(self):
+        # The first run connected the adapter; the regeneration (its LLM call) raises, as a
+        # client disconnect would: the adapter connected by that run is still closed.
+        adapter = self._failing_adapter(RuntimeError("relation archived_users does not exist"))
+        svc = ChatService(MagicMock(), MagicMock())
+        svc.cache.store = AsyncMock()
+        cached = _gen(
+            query="SELECT count(*) FROM archived_users",
+            cache_hit=True,
+            provider=None,
+            cached_question="How many users?",
+        )
+
+        with patch.object(
+            ChatService,
+            "_regenerate_after_cached_failure",
+            new=AsyncMock(side_effect=RuntimeError("llm call interrupted")),
+        ):
+            events = await self._stream_cached(svc, adapter, cached)
+
+        assert events[-1]["type"] == "done"
+        assert events[-1]["status"] == "error"
+        adapter.disconnect.assert_awaited_once()
+
+    async def test_the_tokens_of_a_failed_regeneration_are_reported(self):
+        adapter = self._failing_adapter(RuntimeError("relation archived_users does not exist"))
+        svc = ChatService(MagicMock(), MagicMock())
+        svc.cache.store = AsyncMock()
+        cached = _GenerationResult(
+            generated_query="SELECT count(*) FROM archived_users",
+            explanation="Count users",
+            error=None,
+            status="executed",
+            cache_hit=True,
+            provider=None,
+            configured_model="",
+            configured_max_tokens=4096,
+            system_prompt="",
+            history=[],
+            cached_question="How many users?",
+        )
+        failed = MagicMock(tokens_used=120, input_tokens=100, output_tokens=20)
+        save = AsyncMock(return_value=MagicMock(id="m"))
+
+        with patch.object(
+            ChatService,
+            "_regenerate_after_cached_failure",
+            new=AsyncMock(return_value=(failed, None)),
+        ):
+            events = await self._stream_cached(svc, adapter, cached, save=save)
+
+        done = events[-1]
+        assert done["type"] == "done"
+        assert done["status"] == "error"
+        assert done["cache_hit"] is True
+        assert (done["token_count"], done["input_tokens"], done["output_tokens"]) == (120, 100, 20)
+        stored = save.await_args.kwargs
+        assert (stored["token_count"], stored["input_tokens"], stored["output_tokens"]) == (
+            120,
+            100,
+            20,
+        )
+
+    async def test_a_fresh_query_replacing_a_strict_refused_entry_is_stored_with_force(self):
+        # The cache served an entry the strict check refused (a miss in the pipeline); the
+        # entry is still stored, so the fresh answer overwrites it.
+        svc = ChatService(MagicMock(), MagicMock())
+        svc.cache.store = AsyncMock()
+        fresh = _gen(
+            query="SELECT count(*) FROM users",
+            cache_hit=False,
+            provider=_make_provider(),
+            cache_embedding=[0.1],
+        )
+        fresh.replaces_cached_entry = True
+
+        events = await self._stream_cached(svc, _make_adapter(), fresh)
+
+        assert events[-1]["status"] == "executed"
+        svc.cache.store.assert_awaited_once()
+        assert svc.cache.store.await_args.kwargs["force"] is True
+
+    async def test_a_client_disconnect_during_the_second_run_still_disconnects(self):
+        # The first run lost its connection (a query fault, connected=False); the second run
+        # reconnects, and the client goes away while it streams: the adapter is closed.
+        svc = ChatService(MagicMock(), MagicMock())
+        svc.cache.store = AsyncMock()
+        adapter = _make_adapter()
+        cached = _gen(
+            query="SELECT count(*) FROM archived_users",
+            cache_hit=True,
+            provider=None,
+            cached_question="How many users?",
+        )
+        fresh = _gen(query="SELECT count(*) FROM users", cache_hit=False, provider=None)
+        runs: list[bool] = []
+
+        async def _fake_run(*, connected, result_out, **_kwargs):
+            runs.append(connected)
+            if len(runs) == 1:
+                result_out.result = MagicMock(
+                    error="server closed the connection", query_fault=True, connected=False
+                )
+                return
+            await adapter.connect({})  # the second run connects, then streams
+            yield StatusEvent(type="status", message="second run streaming")
+            yield StatusEvent(type="status", message="never reached")
+
+        db = _make_db_with_conn(_make_connection())
+        with (
+            patch(f"{_MODULE}.get_settings", return_value=_make_settings()),
+            patch(f"{_MODULE}.decrypt_value", return_value=json.dumps({"host": "db"})),
+            patch(f"{_MODULE}.create_datasource", return_value=adapter),
+            patch(f"{_MODULE}._create_session", _mock_session_factory(db)),
+            patch(f"{_MODULE}._resolve_schema") as mock_schema,
+            patch(f"{_MODULE}._generate_query", new=AsyncMock(return_value=cached)),
+            patch(
+                f"{_MODULE}._validate_and_correct_query", new=AsyncMock(return_value=_val(cached))
+            ),
+            patch(
+                f"{_MODULE}._get_or_create_session", new=AsyncMock(return_value=MagicMock(id="s"))
+            ),
+            patch(f"{_MODULE}._stream_execute_with_correction", new=_fake_run),
+            patch.object(
+                ChatService,
+                "_regenerate_after_cached_failure",
+                new=AsyncMock(return_value=(fresh, _val(fresh))),
+            ),
+        ):
+            mock_schema.return_value = MagicMock(
+                schema=MagicMock(), connected=False, embeddings_available=False
+            )
+            stream = svc.stream_message(
+                connection_id="conn-1",
+                session_id=None,
+                message="How many users?",
+                provider_name="claude",
+                options={"max_rows": 100},
+            )
+            seen = []
+            async for event in stream:
+                seen.append(event["message"] if event["type"] == "status" else event["type"])
+                if seen[-1] == "second run streaming":
+                    break
+            await stream.aclose()  # the client disconnects mid-stream
+
+        assert seen[-1] == "second run streaming"
+        assert "never reached" not in seen
+
+        assert runs == [False, False]  # the second run was told to connect
+        adapter.connect.assert_awaited_once()
+        adapter.disconnect.assert_awaited_once()

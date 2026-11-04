@@ -30,6 +30,7 @@ from app.semantic.generator import (
     policy_hides_table,
     prune_to_schema,
     rename_columns,
+    rename_tables,
 )
 from app.semantic.models import (
     AggregationType,
@@ -937,6 +938,79 @@ class TestEdgesInSchema:
         assert edges_in_schema(edges, schema) == []
 
 
+class TestDetectDriftMetricTables:
+    """A metric's ``related_tables`` entry is matched against the live tables as
+    ``matching_real_keys`` does: quotes stripped, case-insensitive, bare allowed."""
+
+    @staticmethod
+    def _metric(name: str, *tables: str) -> SimpleMetric:
+        return SimpleMetric(
+            name=name,
+            definition="COUNT(*)",
+            aggregation=AggregationType.COUNT,
+            related_tables=list(tables),
+        )
+
+    def test_a_case_or_quote_variant_of_a_live_table_is_not_gone(self) -> None:
+        schema = _schema_with_tables(["orders"])
+        stored = SemanticModel(
+            tables={"public.orders": _tbl("id", name="Orders")},
+            business_metrics=[
+                self._metric("Qualified", "public.Orders"),
+                self._metric("Bare", "ORDERS"),
+                self._metric("Quoted", '"public"."Orders"'),
+                self._metric("Gone", "public.ghosts"),
+                self._metric("Gone bare", "Ghosts"),
+            ],
+        )
+        warnings = SemanticModelGenerator().detect_drift(schema, stored)
+        flagged = {w.split('"')[1] for w in warnings if w.startswith("Business metric")}
+        assert flagged == {"Gone", "Gone bare"}
+
+    def test_a_case_variant_of_an_unreadable_or_hidden_table_is_not_gone(self) -> None:
+        schema = _schema_with_tables(["orders"])
+        schema.unreadable_tables = ["public.audit"]
+        privacy = PrivacySettings(excluded_schemas=["hr"])
+        stored = SemanticModel(
+            tables={
+                "public.orders": _tbl("id", name="Orders"),
+                "hr.payroll": _tbl("id", name="Payroll"),
+            },
+            business_metrics=[
+                self._metric("Audit", "Audit"),
+                self._metric("Payroll", "PAYROLL"),
+            ],
+        )
+        warnings = SemanticModelGenerator().detect_drift(schema, stored, privacy)
+        assert not any(w.startswith("Business metric") for w in warnings)
+
+
+class TestDetectDriftTableRenames:
+    def test_a_near_miss_table_key_is_worded_as_the_rename_apply_makes(self) -> None:
+        schema = _schema_with_tables(["orders"], extra_columns=["status"])
+        stored = SemanticModel(
+            tables={"public.Orders": _tbl("id", '"status"', "gone", name="Orders")}
+        )
+        drift = compute_drift(schema, stored, known_columns={"public.orders": {"id", "status"}})
+        warnings = SemanticModelGenerator().detect_drift(schema, stored, drift=drift)
+        assert (
+            'Table key "public.Orders" in the semantic model is a near-miss spelling of '
+            '"public.orders"; Apply Drift renames it to "public.orders", keeping its '
+            "annotation" in warnings
+        )
+        assert not any("no longer exists in the database" in w for w in warnings)
+        assert not any("new table(s)" in w for w in warnings)
+        # Its columns are worded under the live key.
+        assert 'Column "public.orders.gone" referenced in semantic model no longer exists' in (
+            warnings
+        )
+        assert any(
+            'Column key "public.orders."status"" in the semantic model is a near-miss' in w
+            and 'renames it to "status"' in w
+            for w in warnings
+        )
+
+
 class TestDetectDriftPrivacy:
     """The store keeps what the policy hides; Check Drift must not call it removed."""
 
@@ -1347,6 +1421,110 @@ class TestDropDanglingEdits:
             "public.orders.hierarchies",
         ]
         assert "gone_a, gone_b are no longer in the table" in notes[2]
+
+
+class TestRenameTables:
+    """The drift's table renames, applied: a near-miss table key becomes its live key,
+    with its columns, marks, protected values and relationship endpoints."""
+
+    _RENAMES: ClassVar[dict[str, str]] = {"public.Orders": "public.orders"}
+
+    @staticmethod
+    def _tables() -> dict[str, TableSemantic]:
+        return {
+            "public.customers": TableSemantic(display_name="Customers"),
+            "public.Orders": TableSemantic(
+                display_name="Hand-written",
+                columns={"status": ColumnSemantic(display_name="Status", description="kept")},
+                primary_timestamp_column="status",
+            ),
+        }
+
+    @staticmethod
+    def _snapshot() -> tuple[dict[str, dict[str, list[str]]], dict[str, dict[str, Any]]]:
+        marks = {
+            "model": {},
+            "table": {"public.Orders": ["display_name"]},
+            "column": {"public.Orders.status": ["description"], "public.customers.id": ["x"]},
+            "metric": {},
+            "global_item": {},
+            "relationship": {"public.Orders.customer_id->public.customers.id": ["description"]},
+        }
+        protected = {
+            "table": {"public.Orders": {"display_name": "Hand-written"}},
+            "column": {"public.Orders.status": {"description": "kept"}},
+        }
+        return marks, protected
+
+    @staticmethod
+    def _edge(from_table: str) -> RelationshipEdge:
+        return RelationshipEdge(
+            from_table=from_table,
+            from_column="customer_id",
+            to_table="public.customers",
+            to_column="id",
+            join_sql="orders.customer_id = customers.id",
+        )
+
+    def test_the_table_is_rekeyed_in_place_with_its_columns(self) -> None:
+        marks, protected = self._snapshot()
+        tables, _, _, _ = rename_tables(self._tables(), [], marks, protected, self._RENAMES)
+        assert list(tables) == ["public.customers", "public.orders"]
+        assert tables["public.orders"] == self._tables()["public.Orders"]
+
+    def test_marks_and_protected_values_follow_the_table(self) -> None:
+        marks, protected = self._snapshot()
+        _, _, out_marks, out_protected = rename_tables(
+            self._tables(), [], marks, protected, self._RENAMES
+        )
+        assert out_marks["table"] == {"public.orders": ["display_name"]}
+        assert out_marks["column"] == {
+            "public.orders.status": ["description"],
+            "public.customers.id": ["x"],
+        }
+        assert out_protected == {
+            "table": {"public.orders": {"display_name": "Hand-written"}},
+            "column": {"public.orders.status": {"description": "kept"}},
+        }
+        # The inputs are untouched.
+        assert marks == self._snapshot()[0] and protected == self._snapshot()[1]
+
+    def test_an_edge_follows_the_table_with_its_marks(self) -> None:
+        marks, protected = self._snapshot()
+        untouched = RelationshipEdge(
+            from_table="public.customers",
+            from_column="id",
+            to_table="public.customers",
+            to_column="id",
+            join_sql="x",
+        )
+        _, edges, out_marks, _ = rename_tables(
+            self._tables(),
+            [self._edge("public.Orders"), untouched],
+            marks,
+            protected,
+            self._RENAMES,
+        )
+        assert [e.from_table for e in edges] == ["public.orders", "public.customers"]
+        assert edges[0].join_sql == "orders.customer_id = customers.id"
+        assert edges[1] is untouched
+        assert out_marks["relationship"] == {
+            "public.orders.customer_id->public.customers.id": ["description"]
+        }
+
+    def test_an_edge_the_live_key_already_has_is_a_duplicate_dropped_with_its_marks(
+        self,
+    ) -> None:
+        marks, protected = self._snapshot()
+        _, edges, out_marks, _ = rename_tables(
+            self._tables(),
+            [self._edge("public.orders"), self._edge("public.Orders")],
+            marks,
+            protected,
+            self._RENAMES,
+        )
+        assert [e.from_table for e in edges] == ["public.orders"]
+        assert out_marks["relationship"] == {}
 
 
 class TestRenameColumns:

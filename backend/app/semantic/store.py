@@ -24,6 +24,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import hashlib
 import json
 import logging
 from typing import TYPE_CHECKING, Any, Literal
@@ -32,6 +33,7 @@ import uuid
 from pydantic import TypeAdapter
 from sqlalchemy import String, delete, event, exists, func, null, select, update
 
+from ..config import get_settings
 from ..models.connection import Connection
 from ..models.semantic_store import (
     SemanticColumnRow,
@@ -42,6 +44,7 @@ from ..models.semantic_store import (
     SemanticModelRow,
     SemanticRelationshipRow,
     SemanticTableRow,
+    SemanticTombstoneRow,
 )
 from .models import (
     BusinessMetric,
@@ -692,6 +695,7 @@ async def save_model(
             metrics=metric_rows,
             relationships=rel_rows,
             global_items=global_rows,
+            key=(header.id, int(header.version)),
         )
     )
 
@@ -749,19 +753,70 @@ class _ModelRows:
     metrics: list[SemanticMetricRow]
     relationships: list[SemanticRelationshipRow]
     global_items: list[SemanticGlobalItemRow]
+    # The header's ``(id, version)`` as the read found it, and whether it still held
+    # when the read ended (``_fetch_rows``): only then do all the rows describe one
+    # committed state.
+    key: tuple[str, int]
+    consistent: bool = True
+
+
+# How many times ``_fetch_rows`` reads the rows before it gives up on a read that
+# no write interleaved with.
+_READ_ATTEMPTS = 3
+
+
+async def _content_key(db: AsyncSession, connection_id: str) -> tuple[str, int] | None:
+    row = (
+        await db.execute(
+            select(SemanticModelRow.id, SemanticModelRow.version).where(
+                SemanticModelRow.connection_id == connection_id
+            )
+        )
+    ).first()
+    return None if row is None else (row[0], int(row[1]))
 
 
 async def _fetch_rows(db: AsyncSession, connection_id: str) -> _ModelRows | None:
-    """Every row of a connection's model. Metrics, relationships and global items
-    come as ordinal-ordered lists; tables and columns in no particular order, as
-    ``_assemble_model`` orders them.
+    """Every row of a connection's model, read from one committed state.
 
-    ``populate_existing`` on every select: a re-read under a row lock must see
-    other transactions' committed state, not an identity-mapped instance. This is
-    the one pass ``load_model``, ``provenance_snapshot`` and
+    The rows take several statements and, outside the connection row lock, a
+    writer can commit between them (on PostgreSQL each statement of a READ
+    COMMITTED transaction sees the latest commit): ``save_model`` deletes and
+    reinserts every table row, so the column read would find none of the table
+    ids the table read returned. Every write that changes content bumps the
+    header's version in the same transaction, under the lock, so a header
+    ``(id, version)`` that is the same after the statements as before them means
+    no such commit landed in between and the rows describe one state. When it
+    moved the rows are read again, up to ``_READ_ATTEMPTS`` times; the last read
+    is then returned with ``consistent=False`` and a warning, and
+    ``load_model_cached`` does not cache it. The check costs one indexed SELECT.
+
+    Metrics, relationships and global items come as ordinal-ordered lists;
+    tables and columns in no particular order, as ``_assemble_model`` orders
+    them. ``populate_existing`` on every select: a re-read under a row lock must
+    see other transactions' committed state, not an identity-mapped instance.
+    This is the one pass ``load_model``, ``provenance_snapshot`` and
     ``load_model_with_provenance`` share, so a caller that needs both the model
     and its marks under the connection row lock scans the rows once.
     """
+    attempt = 0
+    while True:
+        attempt += 1
+        rows = await _fetch_rows_once(db, connection_id)
+        if rows is None or await _content_key(db, connection_id) == rows.key:
+            return rows
+        if attempt == _READ_ATTEMPTS:
+            logger.warning(
+                "semantic model of connection %s changed during every read (%d attempts); "
+                "serving the last read uncached",
+                connection_id,
+                attempt,
+            )
+            rows.consistent = False
+            return rows
+
+
+async def _fetch_rows_once(db: AsyncSession, connection_id: str) -> _ModelRows | None:
     header = await db.scalar(
         select(SemanticModelRow)
         .where(SemanticModelRow.connection_id == connection_id)
@@ -769,6 +824,7 @@ async def _fetch_rows(db: AsyncSession, connection_id: str) -> _ModelRows | None
     )
     if header is None:
         return None
+    key = (header.id, int(header.version))
     tables = list(
         (
             await db.scalars(
@@ -817,7 +873,15 @@ async def _fetch_rows(db: AsyncSession, connection_id: str) -> _ModelRows | None
             )
         ).all()
     )
-    return _ModelRows(header, tables, columns_by_table, metrics, relationships, global_items)
+    return _ModelRows(
+        header,
+        tables,
+        columns_by_table,
+        metrics,
+        relationships,
+        global_items,
+        key=key,
+    )
 
 
 def _assemble_model(rows: _ModelRows) -> SemanticModel:
@@ -862,6 +926,19 @@ async def load_model(db: AsyncSession, connection_id: str) -> SemanticModel | No
     return None if rows is None else _assemble_model(rows)
 
 
+async def load_model_with_version(
+    db: AsyncSession, connection_id: str
+) -> tuple[SemanticModel, int] | None:
+    """``load_model`` and the header ``version`` its rows were read at (``_ModelRows.key``),
+    or None if unset. For an unlocked read that serves both, such as ``GET /semantic``: the
+    version is the content's own, not one read in a separate statement a write could land
+    beside. A read that never settled (``consistent=False``) carries the version its header
+    showed, which is never newer than its content, so a draft seeded from it can only get a
+    spurious 409, never overwrite a later change."""
+    rows = await _fetch_rows(db, connection_id)
+    return None if rows is None else (_assemble_model(rows), rows.key[1])
+
+
 async def load_model_with_provenance(
     db: AsyncSession, connection_id: str
 ) -> tuple[SemanticModel | None, ProvenanceSnapshot]:
@@ -893,12 +970,15 @@ async def load_model_with_provenance(
 # (and each names one committed state) because every writer holds the
 # connection row lock (``lock_and_reread_connection``) and re-reads the header
 # under it; ``save_model``, ``begin_generation``, ``reconcile_tables`` and
-# ``apply_user_patch`` all require that of their caller. Given that, a commit
-# landing between the key read and the model read can only leave the cache
-# holding content *newer* than its key, which the next call sees as a version
-# mismatch and rebuilds. Content older than its key cannot be cached.
+# ``apply_user_patch`` all require that of their caller. Given that, the rebuild
+# is cached under the ``(id, version)`` its own rows were read at
+# (``_ModelRows.key``), not the key read before it, and only when ``_fetch_rows``
+# found that key unchanged at the end of its read: a commit landing mid-read
+# makes it read again, and a read that never settles is served but not cached.
+#
+# The cache holds at most ``SEMANTIC_MODEL_CACHE_SIZE`` connections per process
+# (``_model_cache_size``); 0 disables it.
 
-_MODEL_CACHE_SIZE = 32
 _model_cache: OrderedDict[str, tuple[str, int, SemanticModel]] = OrderedDict()
 
 # ``Session.info`` key: the connections this session has written semantic rows
@@ -937,7 +1017,7 @@ class SemanticModelUnavailable(Exception):  # noqa: N818 — names the state, no
 async def load_model_cached(db: AsyncSession, connection_id: str) -> SemanticModel | None:
     """``load_model``, served from a per-process cache while the header's version holds.
 
-    One SELECT of two header columns per call in place of the six statements and
+    One SELECT of two header columns per call in place of the statements and
     the row validation ``load_model`` costs; the model is rebuilt only when the
     version moved. For the chat path, which reads the model on every turn and
     never writes it. The returned instance is shared, so callers must not mutate
@@ -952,25 +1032,20 @@ async def load_model_cached(db: AsyncSession, connection_id: str) -> SemanticMod
     reuse with different content. Other pending ORM changes in the session are
     irrelevant to the model and do not bypass it.
 
-    A cache miss rebuilds the model inside a SAVEPOINT; a hit opens none. A failed
+    A cache miss rebuilds the model inside a SAVEPOINT; a hit opens none. The
+    rebuild is cached under the ``(id, version)`` its rows were read at, and not at
+    all when ``_fetch_rows`` could not get a read no write interleaved with. A failed
     rebuild raises ``SemanticModelUnavailable`` from the original error, with the
     caller's transaction intact; a failed key read raises the original error.
     """
     if connection_id in db.info.get(_WROTE_KEY, ()):
         return await load_model(db, connection_id)
-    row = (
-        await db.execute(
-            select(SemanticModelRow.id, SemanticModelRow.version).where(
-                SemanticModelRow.connection_id == connection_id
-            )
-        )
-    ).first()
-    if row is None:
+    key = await _content_key(db, connection_id)
+    if key is None:
         _model_cache.pop(connection_id, None)
         return None
-    header_id, version = row
     cached = _model_cache.get(connection_id)
-    if cached is not None and cached[0] == header_id and cached[1] == version:
+    if cached is not None and (cached[0], cached[1]) == key:
         _model_cache.move_to_end(connection_id)
         return cached[2]
     # The rebuild runs in a SAVEPOINT: on PostgreSQL a failed statement aborts the
@@ -982,19 +1057,28 @@ async def load_model_cached(db: AsyncSession, connection_id: str) -> SemanticMod
     # it has already aborted the caller's transaction.
     try:
         async with db.begin_nested():
-            model = await load_model(db, connection_id)
+            rows = await _fetch_rows(db, connection_id)
+            model = None if rows is None else _assemble_model(rows)
     except Exception as exc:
         raise SemanticModelUnavailable(
             f"could not rebuild the semantic model for connection {connection_id}"
         ) from exc
-    if model is None:
+    if rows is None or model is None:
         _model_cache.pop(connection_id, None)
         return None
-    _model_cache[connection_id] = (header_id, version, model)
+    if not rows.consistent:
+        _model_cache.pop(connection_id, None)
+        return model
+    _model_cache[connection_id] = (*rows.key, model)
     _model_cache.move_to_end(connection_id)
-    while len(_model_cache) > _MODEL_CACHE_SIZE:
+    while len(_model_cache) > _model_cache_size():
         _model_cache.popitem(last=False)
     return model
+
+
+def _model_cache_size() -> int:
+    """``SEMANTIC_MODEL_CACHE_SIZE``: connections cached per process; 0 disables."""
+    return get_settings().semantic_model_cache_size
 
 
 def clear_model_cache() -> None:
@@ -1114,6 +1198,16 @@ async def load_header(db: AsyncSession, connection_id: str) -> SemanticHeader | 
     )
 
 
+async def load_version(db: AsyncSession, connection_id: str) -> int | None:
+    """The header's content ``version`` (bumped by every content write), or ``None`` when
+    the connection has no model. One column, read fresh: the PUT route compares it with
+    the draft's ``base_version`` under the connection lock, and every model-serving route
+    returns it after its commit (``SemanticModelResponse``)."""
+    return await db.scalar(
+        select(SemanticModelRow.version).where(SemanticModelRow.connection_id == connection_id)
+    )
+
+
 async def load_known_columns(db: AsyncSession, connection_id: str) -> dict[str, frozenset[str]]:
     """Table key → known live column names, for the tables that have a baseline; ``{}``
     when the connection has no model or no baseline yet. A column-only SELECT, one row
@@ -1134,25 +1228,138 @@ async def load_known_columns(db: AsyncSession, connection_id: str) -> dict[str, 
     }
 
 
+# The ``kind`` values a tombstone can carry: the store's section kinds plus metrics and
+# relationships. ``load_tombstones`` returns every kind, possibly empty.
+TOMBSTONE_KINDS: tuple[str, ...] = (
+    "metric",
+    "segment",
+    "derived_column",
+    "common_join",
+    "relationship",
+)
+
+
+def tombstone_key(key: str) -> str:
+    """*key* as a tombstone stores it, and as every comparison against a tombstone must
+    read it: NULs stripped, as the store fits names, so a generated name that carries a NUL
+    still matches the tombstone of the stored, NUL-free item; and a key over the indexed
+    text bound (``_MAX_INDEXED_TEXT_BYTES``, reachable only by a relationship of four long
+    endpoints) replaced by its SHA-256, so the primary key stays inside PostgreSQL's btree
+    limit."""
+    fitted = _strip_nul(key)
+    if len(fitted.encode()) <= _MAX_INDEXED_TEXT_BYTES:
+        return fitted
+    return "sha256:" + hashlib.sha256(fitted.encode()).hexdigest()
+
+
+async def load_tombstones(db: AsyncSession, connection_id: str) -> dict[str, set[str]]:
+    """Kind → the keys of the items the user deleted (``SemanticTombstoneRow``), every kind
+    of ``TOMBSTONE_KINDS`` present. Read by the globals finalisation and Apply Drift under
+    the lock, beside the provenance, to leave a generated item the user deleted out."""
+    out: dict[str, set[str]] = {kind: set() for kind in TOMBSTONE_KINDS}
+    result = await db.execute(
+        select(SemanticTombstoneRow.kind, SemanticTombstoneRow.key).where(
+            SemanticTombstoneRow.connection_id == connection_id
+        )
+    )
+    for kind, key in result:
+        out.setdefault(kind, set()).add(key)
+    return out
+
+
+async def list_tombstones(db: AsyncSession, connection_id: str) -> list[SemanticTombstoneRow]:
+    """Every tombstone of the connection, newest first, for the page's list."""
+    return list(
+        (
+            await db.scalars(
+                select(SemanticTombstoneRow)
+                .where(SemanticTombstoneRow.connection_id == connection_id)
+                .order_by(SemanticTombstoneRow.created_at.desc(), SemanticTombstoneRow.key)
+            )
+        ).all()
+    )
+
+
+async def delete_tombstone(db: AsyncSession, connection_id: str, kind: str, key: str) -> bool:
+    """Lift one tombstone (the page's **Restore**): the next Regenerate, or Apply Drift for
+    a relationship, may bring the generator's item back. ``False`` when there was none.
+    Bookkeeping: no lock, no version bump, no history."""
+    result = await db.execute(
+        delete(SemanticTombstoneRow).where(
+            SemanticTombstoneRow.connection_id == connection_id,
+            SemanticTombstoneRow.kind == kind,
+            SemanticTombstoneRow.key == key,
+        )
+    )
+    return bool(result.rowcount)
+
+
+async def _record_tombstones(
+    db: AsyncSession,
+    header: SemanticModelRow,
+    connection_id: str,
+    kind: str,
+    stored_keys: Iterable[str],
+    incoming_keys: Collection[str],
+    *,
+    changed_by: str | None,
+) -> None:
+    """The tombstone bookkeeping of one rewritten list section in ``apply_user_patch``:
+    every stored key absent from *incoming_keys* gets a tombstone (whatever the item's
+    marks: a generated item the user had edited carries marks too, and its deletion must
+    hold), and every incoming key loses its tombstone, so re-adding an item lifts it.
+    Called before the section's rows are replaced, with the stored keys in hand."""
+    incoming = {tombstone_key(key) for key in incoming_keys}
+    gone = sorted({tombstone_key(key) for key in stored_keys} - incoming)
+    # One delete for both: an incoming key loses its tombstone, and a gone key's older row
+    # (none is expected, the item was stored) makes way for the fresh one, so the insert
+    # below never conflicts on any dialect. Chunked like the store's other IN lists.
+    for chunk in _chunks([*gone, *sorted(incoming)]):
+        await db.execute(
+            delete(SemanticTombstoneRow).where(
+                SemanticTombstoneRow.connection_id == connection_id,
+                SemanticTombstoneRow.kind == kind,
+                SemanticTombstoneRow.key.in_(chunk),
+            )
+        )
+    now = _now()
+    for key in gone:
+        db.add(
+            SemanticTombstoneRow(
+                model_id=header.id,
+                connection_id=connection_id,
+                kind=kind,
+                key=key,
+                created_at=now,
+                created_by=changed_by,
+            )
+        )
+    if gone:
+        await db.flush()
+
+
 async def load_column_names(
     db: AsyncSession, connection_id: str, table_keys: Collection[str]
 ) -> dict[str, list[str]]:
-    """Table key → the column keys stored for it, for the tables of *table_keys* the
-    model holds with at least one column row; ``{}`` with no model. A column-only SELECT,
-    read once per generation batch for the tables it reconciled, so its baseline write
-    can keep the stored keys the privacy policy hides (``_held_column_names``)."""
+    """Table key → the column keys stored for it, for each table of *table_keys* the
+    model holds (``[]`` for one with no column row); ``{}`` with no model. A key-only
+    SELECT, read by a generation batch for the tables it reconciled and by a live Check
+    Drift under the connection lock, so their baseline writes keep the stored keys the
+    privacy policy hides (``_held_column_names``) as the lock sees them."""
     names: dict[str, list[str]] = {}
     for chunk in _chunks(sorted(table_keys)):
         result = await db.execute(
             select(SemanticTableRow.table_key, SemanticColumnRow.column_name)
-            .join(SemanticColumnRow, SemanticColumnRow.table_id == SemanticTableRow.id)
+            .outerjoin(SemanticColumnRow, SemanticColumnRow.table_id == SemanticTableRow.id)
             .where(
                 SemanticTableRow.connection_id == connection_id,
                 SemanticTableRow.table_key.in_(chunk),
             )
         )
         for key, column in result:
-            names.setdefault(key, []).append(column)
+            held = names.setdefault(key, [])
+            if column is not None:
+                held.append(column)
     return names
 
 
@@ -1955,6 +2162,10 @@ async def apply_user_patch(
     Any change bumps the header's ``version`` (the chat path's model cache is
     keyed on it); an echo bumps nothing.
 
+    Every rewritten list section also keeps the deletion bookkeeping
+    (``_record_tombstones``): an item that left the section gets a tombstone, an incoming
+    item loses its own, so the finalisation never brings a deleted item back.
+
     Raises ``ValueError`` (before touching the session) for an over-long table
     key, column name, metric name, global-item name or relationship endpoint, and
     for a table or column the model does not have unless the patch supplies its
@@ -1964,7 +2175,7 @@ async def apply_user_patch(
     fitted_tables = _fit_table_patches(patch)
     section_dump = {
         key: value
-        for key, value in _sent(patch, exclude=frozenset({"tables"})).items()
+        for key, value in _sent(patch, exclude=frozenset({"tables", "base_version"})).items()
         if value is not None
     }
 
@@ -2064,6 +2275,15 @@ async def apply_user_patch(
             (row.name, canonical, row.user_edited_fields)
             for row, canonical in zip(existing_rows, canonical_items, strict=True)
         )
+        await _record_tombstones(
+            db,
+            header,
+            connection_id,
+            kind,
+            (row.name for row in existing_rows),
+            {item["name"] for item in items},
+            changed_by=updated_by,
+        )
         _write_section_history(
             db,
             header,
@@ -2114,6 +2334,15 @@ async def apply_user_patch(
                 (row.name, canonical, row.user_edited_fields)
                 for row, canonical in zip(existing_metric_rows, canonical_metrics, strict=True)
             )
+            await _record_tombstones(
+                db,
+                header,
+                connection_id,
+                "metric",
+                (row.name for row in existing_metric_rows),
+                {metric["name"] for metric in fitted_metrics},
+                changed_by=updated_by,
+            )
             _write_section_history(
                 db,
                 header,
@@ -2156,6 +2385,15 @@ async def apply_user_patch(
             marks = _stored_marks(
                 (relationship_identity(edge), edge, row.user_edited_fields)
                 for row, edge in zip(existing_rel_rows, existing_rel, strict=True)
+            )
+            await _record_tombstones(
+                db,
+                header,
+                connection_id,
+                "relationship",
+                (relationship_key(edge) for edge in existing_rel),
+                {relationship_key(edge) for edge in fitted_rels},
+                changed_by=updated_by,
             )
             _write_section_history(
                 db,
@@ -2366,6 +2604,33 @@ class DriftApplyRecord:
     applied_at: datetime
     applied_by: str | None
     summary: dict[str, Any]
+
+
+async def record_drift_report(
+    db: AsyncSession, connection_id: str, report: Mapping[str, Any], checked_at: datetime
+) -> None:
+    """Store *report* (a ``DriftReport`` dump) as the connection's latest drift report, made
+    at *checked_at*: Check Drift and the background monitor both write it, so "last" is
+    the latest of either. Bookkeeping on the header: no version bump, no history, no model
+    cache invalidation. A connection with no header stores nothing. Only stages the
+    update: the caller commits."""
+    await db.execute(
+        update(SemanticModelRow)
+        .where(SemanticModelRow.connection_id == connection_id)
+        .values(last_drift_report=dict(report), last_drift_checked_at=checked_at)
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def load_last_drift_report(db: AsyncSession, connection_id: str) -> dict[str, Any] | None:
+    """The connection's latest stored drift report (``record_drift_report``), or ``None``
+    when there is no model or no check has run."""
+    report = await db.scalar(
+        select(SemanticModelRow.last_drift_report).where(
+            SemanticModelRow.connection_id == connection_id
+        )
+    )
+    return report if isinstance(report, dict) else None
 
 
 async def record_drift_apply(

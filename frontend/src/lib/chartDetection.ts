@@ -5,6 +5,7 @@
 
 import type { QueryResults } from '../types';
 import type { UserChart } from '../types/charts';
+import { uniqueColumnNames } from './columnNames';
 
 const NUMERIC_FRAGMENTS = [
   'int', 'bigint', 'smallint', 'tinyint', 'mediumint',
@@ -35,7 +36,8 @@ function isDateType(t: string): boolean {
  * categorical queries and the user can switch to pie via the chart type picker.
  */
 export function suggestChart(results: QueryResults): Omit<UserChart, 'id'> {
-  const { columns, column_types, rows } = results;
+  const { columns: rawColumns, column_types, rows } = results;
+  const columns = uniqueColumnNames(rawColumns);
 
   const dateCols = columns.filter((_, i) => isDateType(column_types[i] ?? ''));
   const numericCols = columns.filter((_, i) => isNumericType(column_types[i] ?? ''));

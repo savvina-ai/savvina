@@ -21,6 +21,7 @@ import ChartView from '@/components/ChartView';
 import type { ChatMessage, QueryResults } from '../types';
 import type { UserChart } from '../types/charts';
 import { CHART_TYPES, CHART_TYPE_ICONS, CHART_TYPE_LABELS } from '../types/charts';
+import { uniqueColumnNames } from '../lib/columnNames';
 
 /** Shown for a message whose stored result was computed under a different row filter. */
 const STALE_SECTION_TEXT = 'Results outdated (row filter changed); re-run the question';
@@ -146,11 +147,11 @@ function ChartConfig({
   const canConnectNulls = chart.type === 'line' || chart.type === 'area' || chart.type === 'combo';
   const showDataLabelsOpt = !isScalar && chart.type !== 'pie' && chart.type !== 'scatter';
 
-  // Detect numeric columns by sampling up to 5 non-null values per column
+  // Detect numeric columns by sampling up to 5 non-null values per column. By position:
+  // `columns` are the unique chart keys, so two result columns named alike stay apart.
   const numericCols = new Set<string>(
-    columns.filter((col) => {
+    columns.filter((_col, colIdx) => {
       if (!results || results.rows.length === 0) return true; // can't tell, show all
-      const colIdx = results.columns.indexOf(col);
       const samples = results.rows
         .slice(0, 20)
         .map((r) => r[colIdx])
@@ -602,7 +603,9 @@ export default function ReportBuilderPage() {
             )}
 
             {sections.map((sec, idx) => {
-              const columns = sec.results?.columns ?? [];
+              // The chart keys of the result: duplicate names made unique (`count`,
+              // `count_2`), as the chart's row objects are keyed (`transformChartData`).
+              const columns = uniqueColumnNames(sec.results?.columns ?? []);
               const stale = sec.results?.stale_row_filter === true;
               const hasChart = sec.chart !== null;
               const chartReady =

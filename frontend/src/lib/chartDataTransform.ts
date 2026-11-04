@@ -5,6 +5,7 @@
 
 import type { QueryResults } from '../types';
 import type { AggregationMethod, ChartFilter, UserChart } from '../types/charts';
+import { uniqueColumnNames } from './columnNames';
 
 function filterPasses(value: unknown, op: ChartFilter['operator'], target: string): boolean {
   if (value === null || value === undefined) return false;
@@ -61,12 +62,13 @@ export interface TransformedData {
  */
 export function transformChartData(results: QueryResults, chart: UserChart): TransformedData {
   const { columns, rows } = results;
+  const keys = uniqueColumnNames(columns);
 
   // Row → object
   const rawRecords: Record<string, unknown>[] = rows.map((row) => {
     const obj: Record<string, unknown> = {};
-    columns.forEach((col, i) => {
-      obj[col] = row[i];
+    keys.forEach((key, i) => {
+      obj[key] = row[i];
     });
     return obj;
   });

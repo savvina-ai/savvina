@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
+import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, computed_field, field_validator
@@ -15,6 +17,17 @@ from ..services.privilege_audit import from_dict as audit_from_dict
 from ..services.privilege_audit import to_dict as audit_to_dict
 
 # ── Privacy Settings ───────────────────────────────────────────────────────────
+
+
+def privacy_version(settings: dict | None) -> str:
+    """A short SHA-256 of the stored privacy settings as canonical JSON (sorted keys).
+
+    It moves only when the settings change, so a rename or a config save does not make a
+    loaded privacy form stale; ``None`` (never saved) reads as ``{}``. Not stored: derived
+    from the column on every read, so it needs no migration.
+    """
+    canonical = json.dumps(settings or {}, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
 class PrivacySettingsUpdate(BaseModel):
@@ -39,6 +52,10 @@ class PrivacySettingsUpdate(BaseModel):
     # A command, not a setting: remove the legacy whole-query filter (row_filter_sql) and
     # leave the connection unfiltered unless row_filters is sent as well. Never stored.
     clear_legacy_row_filter: bool = False
+    # A precondition, not a setting: the privacy_version the form was loaded with. When given
+    # and the stored settings' version differs (another privacy save landed since), the PUT
+    # answers 409 and writes nothing; without it the PUT is unconditional. Never stored.
+    base_privacy_version: str | None = Field(default=None, max_length=64)
 
 
 # ── Execution Mode ──────────────────────────────────────────────────────────────
@@ -135,6 +152,13 @@ class ConnectionDetail(ConnectionResponse):
         """True while the stored settings hold a legacy ``row_filter_sql`` and no
         ``row_filters`` map: every execution is refused until the admin acts."""
         return PrivacySettings.from_dict(self.privacy_settings or {}).row_filter_needs_migration
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def privacy_version(self) -> str:
+        """The version of the stored privacy settings, which the privacy form sends back as
+        ``PrivacySettingsUpdate.base_privacy_version`` (``privacy_version``)."""
+        return privacy_version(self.privacy_settings)
 
 
 class ConnectionConfigResponse(BaseModel):

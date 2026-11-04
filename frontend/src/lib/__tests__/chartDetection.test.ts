@@ -140,4 +140,16 @@ describe('suggestChart', () => {
       expect(s.movingAvgWindow).toBe(3);
     });
   });
+
+  it('suggests every duplicate-named numeric column under its unique key', () => {
+    const results = makeQueryResults({
+      columns: ['region', 'count', 'count'],
+      column_types: ['text', 'int', 'int'],
+      rows: [['north', 1, 2], ['south', 3, 4]],
+      row_count: 2,
+    });
+    const s = suggestChart(results);
+    expect(s.xKey).toBe('region');
+    expect(s.yKeys).toEqual(['count', 'count_2']);
+  });
 });

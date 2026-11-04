@@ -10,7 +10,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.config import get_settings
 from app.datasources.errors import ErrorCategory
-from app.datasources.models import DataSourceSchema, PrivacySettings, QueryResult, ValidationResult
+from app.datasources.models import (
+    ConnectionResult,
+    DataSourceSchema,
+    PrivacySettings,
+    QueryResult,
+    ValidationResult,
+)
 from app.providers.base import LLMResponse
 from app.services.execution import _execute_auto_query
 from app.services.intent_classifier import QueryIntent
@@ -23,10 +29,16 @@ _FILTER = "tenant_id = 7"
 _FILTERS = {f"public.{t}": _FILTER for t in ("t", "orders", "ordes", "ordrs", "users")}
 
 
+def _limited(sql: str) -> str:
+    """*sql* with the row limit ``row_filter._executable`` appends to a query without one."""
+    return f"{sql}\nLIMIT {get_settings().default_row_limit + 1}"
+
+
 def _filtered(sql: str) -> str:
+    """*sql* as executed: rewritten by the row filter, then given the row limit."""
     rewritten = apply_row_filters(sql, _FILTERS, "postgresql")
     assert "WHERE (tenant_id = 7)" in rewritten
-    return rewritten
+    return _limited(rewritten)
 
 
 def _result(columns: list[str], rows: list[list]) -> QueryResult:
@@ -400,7 +412,26 @@ class TestZeroResultLog:
         assert exe.results_response.rows == []
         assert exe.generated_query == "SELECT id FROM t WHERE id < 0"
         assert "secret-value" not in caplog.text
-        assert "Zero-result corrected query failed at execution (data): " in caplog.text
+        # The shared line (the streaming path writes the same), with the exception class.
+        assert (
+            "Zero-result refinement failed, keeping the original result (data, RuntimeError): "
+            in caplog.text
+        )
+
+    async def test_no_redaction_runs_when_debug_is_off(self, caplog) -> None:
+        adapter = _adapter(_result(["id"], []), RuntimeError('value "secret-value" out of range'))
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.DATA)
+        provider = _provider("SELECT id FROM t WHERE id > 0")
+        with (
+            caplog.at_level(logging.INFO, logger="app.services.execution"),
+            patch("app.services.execution.redact_error_for_user") as redact,
+        ):
+            exe = await _run(
+                adapter, generated_query="SELECT id FROM t WHERE id < 0", provider=provider
+            )
+        assert exe.generated_query == "SELECT id FROM t WHERE id < 0"
+        redact.assert_not_called()
+        adapter.classify_error.assert_not_called()
 
 
 class TestAdapterQuotingReachesTheExecutable:
@@ -463,7 +494,7 @@ class TestAdapterQuotingReachesTheExecutable:
         assert first.args[0] == bypass
         assert first.kwargs["backslash_is_escape"] is False
         # The refused query never reached the database; the model was told why.
-        assert _executed(adapter) == [fixed]
+        assert _executed(adapter) == [_limited(fixed)]
         assert "NO_BACKSLASH_ESCAPES" in _llm_text(provider)
         assert "Do not use a backslash anywhere in the query." in _llm_text(provider)
         assert exe.status == "executed"
@@ -541,3 +572,174 @@ class TestHintlessRejectionEndsTheCorrection:
         assert provider.generate_response.await_count == 1
         assert "Qualify it." in _llm_text(provider)
         assert exe.status == "executed"
+
+
+async def _run_cached(adapter, *, connected: bool = True, privacy=None):
+    """A cached query's run: no provider, no correction loop."""
+    return await _execute_auto_query(
+        generated_query="SELECT id FROM t",
+        explanation="e",
+        adapter=adapter,
+        config_dict={},
+        connected=connected,
+        cache_hit=True,
+        provider=None,
+        configured_model="m",
+        configured_max_tokens=1024,
+        system_prompt="",
+        history=[],
+        message="q",
+        schema=DataSourceSchema(source_type="postgresql"),
+        options={},
+        settings=_settings(),
+        privacy=privacy,
+        intent=QueryIntent.UNKNOWN,
+    )
+
+
+class TestQueryFault:
+    """``query_fault`` marks a failure a fresh query could fix: running the statement failed,
+    not for a timeout, a permission error or a rejection the model cannot change, and not
+    because the connection failed. Only such a cached failure is evicted and regenerated."""
+
+    async def test_an_unknown_name_is_a_query_fault(self) -> None:
+        adapter = _adapter(RuntimeError('relation "t" does not exist'))
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.UNKNOWN_NAME)
+
+        exe = await _run_cached(adapter)
+
+        assert exe.status == "error"
+        assert exe.query_fault is True
+
+    async def test_a_rejection_with_a_hint_is_a_query_fault(self) -> None:
+        adapter = _adapter(_result(["id"], [[1]]))
+
+        with patch(
+            "app.services.row_filter.apply_row_filters",
+            side_effect=RowFilterRejectedError("Table t is ambiguous.", llm_hint="Qualify it."),
+        ):
+            exe = await _run_cached(adapter, privacy=PrivacySettings(row_filters=_FILTERS))
+
+        assert exe.status == "error"
+        assert exe.query_fault is True
+
+    async def test_a_success_is_not_a_query_fault(self) -> None:
+        exe = await _run_cached(_adapter(_result(["id"], [[1]])))
+
+        assert exe.status == "cached"
+        assert exe.query_fault is False
+
+    async def test_a_timeout_is_not_a_query_fault(self) -> None:
+        exe = await _run_cached(_adapter(TimeoutError()))
+
+        assert exe.status == "error"
+        assert exe.query_fault is False
+
+    async def test_a_permission_error_is_not_a_query_fault(self) -> None:
+        adapter = _adapter(RuntimeError("permission denied for table t"))
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.PERMISSION)
+
+        exe = await _run_cached(adapter)
+
+        assert exe.status == "error"
+        assert exe.query_fault is False
+
+    async def test_a_hintless_rejection_is_not_a_query_fault(self) -> None:
+        adapter = _adapter(_result(["id"], [[1]]))
+
+        with patch(
+            "app.services.row_filter.apply_row_filters",
+            side_effect=RowFilterRejectedError("The row filter on public.t needs migration."),
+        ):
+            exe = await _run_cached(adapter, privacy=PrivacySettings(row_filters=_FILTERS))
+
+        assert exe.status == "error"
+        assert exe.query_fault is False
+
+    async def test_a_connection_failure_is_not_a_query_fault(self) -> None:
+        # The adapter reports the failed connect; the statement is not run.
+        adapter = _adapter(RuntimeError("Not connected. Call connect() first."))
+        adapter.connect = AsyncMock(return_value=ConnectionResult(success=False, message="refused"))
+
+        exe = await _run_cached(adapter, connected=False)
+
+        adapter.connect.assert_awaited_once()
+        assert exe.status == "error"
+        assert exe.query_fault is False
+
+    async def test_a_lost_connection_is_not_a_query_fault(self) -> None:
+        adapter = _adapter(RuntimeError("connection was closed in the middle of operation"))
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.CONNECTION)
+
+        exe = await _run_cached(adapter)
+
+        assert exe.status == "error"
+        assert exe.query_fault is False
+        assert exe.error == (
+            "The connection to the database was lost while the query ran. Try again."
+        )
+
+
+class TestFailedConnect:
+    """A failed connect ends the turn at once, as on the streaming path: the statement is
+    not run and no correction is attempted."""
+
+    async def test_the_statement_is_not_run_and_no_llm_call_is_made(self) -> None:
+        adapter = _adapter(RuntimeError("Not connected. Call connect() first."))
+        adapter.connect = AsyncMock(return_value=ConnectionResult(success=False, message="refused"))
+        provider = _provider("SELECT id FROM t")
+
+        exe = await _execute_auto_query(
+            generated_query="SELECT id FROM t",
+            explanation="e",
+            adapter=adapter,
+            config_dict={},
+            connected=False,
+            cache_hit=False,
+            provider=provider,
+            configured_model="m",
+            configured_max_tokens=1024,
+            system_prompt="",
+            history=[],
+            message="q",
+            schema=DataSourceSchema(source_type="postgresql"),
+            options={},
+            settings=_settings(),
+        )
+
+        adapter.execute_query.assert_not_awaited()
+        provider.generate_response.assert_not_awaited()
+        assert exe.status == "error"
+        assert exe.error == "Connection failed: refused"
+        assert exe.connected is False
+        assert exe.generated_query == "SELECT id FROM t"
+        assert exe.explanation == "e"
+        assert exe.query_fault is False
+
+
+class TestNoCorrectionForADenialOrALostConnection:
+    """A rewrite cannot lift a permission denial or restore a lost connection, so the
+    correction loop ends before its LLM call and the user sees the failure."""
+
+    async def test_a_permission_error_makes_no_llm_call(self) -> None:
+        adapter = _adapter(RuntimeError("permission denied for table t"))
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.PERMISSION)
+        provider = _provider("SELECT id FROM u")
+
+        exe = await _run(adapter, generated_query="SELECT id FROM t", provider=provider)
+
+        provider.generate_response.assert_not_awaited()
+        assert adapter.execute_query.await_count == 1
+        assert exe.status == "error"
+        assert exe.error == "permission denied for table t"
+
+    async def test_a_lost_connection_makes_no_llm_call(self) -> None:
+        adapter = _adapter(RuntimeError("Lost connection to MySQL server during query"))
+        adapter.classify_error = MagicMock(return_value=ErrorCategory.CONNECTION)
+        provider = _provider("SELECT id FROM u")
+
+        exe = await _run(adapter, generated_query="SELECT id FROM t", provider=provider)
+
+        provider.generate_response.assert_not_awaited()
+        assert exe.status == "error"
+        assert exe.query_fault is False

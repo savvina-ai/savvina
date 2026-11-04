@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+import json
 import logging
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -23,7 +24,9 @@ from ..semantic.models import SemanticModel
 from .prompt_builder import PromptBuilder
 from .result_masking import sql_mentions_sensitive
 from .row_filter import unwrap_row_filter
+from .row_filter_errors import QueryRejectedError
 from .schema_utils import _is_fallback_query, _validate_columns_against_schema
+from .sensitive_guard import check_strict_sensitive
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -69,10 +72,17 @@ class _GenerationResult:
     output_tokens: int | None = None
     # Embedding deferred so cache.store() can be called after successful execution.
     cache_embedding: list[float] | None = None
+    # The question the served cache entry was stored under (``CacheHit.cached_question``),
+    # set on a hit only: ``ChatService`` evicts that entry when the cached query fails.
+    cached_question: str | None = None
     tpm_warning: str | None = None
     # Set when the context-window or TPM compression left the semantic model out of the
     # prompt, or compacted it (``_semantic_context_warning``).
     semantic_warning: str | None = None
+    # Set when the cache served an entry the strict sensitive-column check refuses: the
+    # entry is still stored, so the store after a successful run overwrites it (``force``);
+    # without that every repeat of the question would skip the cache and call the LLM.
+    replaces_cached_entry: bool = False
 
     @property
     def user_warning(self) -> str | None:
@@ -284,6 +294,69 @@ def _without_row_filter_wrap(found: list[ExampleEntry] | None) -> list[ExampleEn
     ]
 
 
+# Strict-mode verdicts on few-shot examples, by (query, privacy settings, dialect): the
+# rejection message, or None for a pass. A verdict changes only when the settings change,
+# and every field of the settings is in the key, so a change never serves a stale verdict.
+# Bounded: cleared when it would grow past _STRICT_VERDICTS_MAX.
+_STRICT_VERDICTS: dict[tuple[str, str, str], str | None] = {}
+_STRICT_VERDICTS_MAX = 2048
+
+
+def _privacy_key(privacy: PrivacySettings) -> str:
+    """The settings as one string for the memo key: every field, so a change to any of
+    them (not only the ones the strict check reads today) starts afresh."""
+    return json.dumps(asdict(privacy), sort_keys=True, default=str)
+
+
+def _strict_verdict(
+    query: str, privacy: PrivacySettings, privacy_key: str, dialect: str
+) -> str | None:
+    """``check_strict_sensitive``'s verdict on *query*, memoised: the rejection message, or
+    None for a pass. *privacy_key* is ``_privacy_key(privacy)``, computed once by the caller
+    for every example of a request. A crash in the check propagates and is not memoised."""
+    key = (query, privacy_key, dialect)
+    if key in _STRICT_VERDICTS:
+        return _STRICT_VERDICTS[key]
+    try:
+        check_strict_sensitive(query, privacy, dialect)
+    except QueryRejectedError as exc:
+        verdict: str | None = str(exc)
+    else:
+        verdict = None
+    if len(_STRICT_VERDICTS) >= _STRICT_VERDICTS_MAX:
+        _STRICT_VERDICTS.clear()
+    _STRICT_VERDICTS[key] = verdict
+    return verdict
+
+
+def _strict_allowed(
+    found: list[ExampleEntry] | None, privacy: PrivacySettings | None, dialect: str
+) -> list[ExampleEntry] | None:
+    """Few-shot examples that pass the strict sensitive-column check, when strict mode is
+    on. An example kept before the toggle (``WHERE email = …``) would contradict the prompt
+    rule and teach the model a query the connection now refuses; it is left out, with its id
+    in the log. The verdict is memoised (``_strict_verdict``): the sqlglot parse and the
+    guard's walk run once per example and privacy settings, not on every cache miss. A
+    crash in the check drops the example too (fails closed) without failing the request."""
+    if not found or privacy is None or not privacy.strict_sensitive_columns:
+        return found
+    kept: list[ExampleEntry] = []
+    privacy_key = _privacy_key(privacy)
+    for ex in found:
+        try:
+            verdict = _strict_verdict(ex.query, privacy, privacy_key, dialect)
+        except Exception:
+            logger.exception(
+                "Few-shot example %s left out of the prompt: the strict check failed", ex.id
+            )
+            continue
+        if verdict is not None:
+            logger.info("Few-shot example %s left out of the prompt: %s", ex.id, verdict)
+            continue
+        kept.append(ex)
+    return kept
+
+
 async def _load_history(session_id: str, db: AsyncSession) -> list[dict]:
     """Load the most recent N chat turns as role/content dicts for the LLM history.
 
@@ -337,6 +410,7 @@ async def _generate_query(
     error: str | None = None
     status: str = "executed"
     cache_hit = False
+    cached_question: str | None = None
     tokens_used: int | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
@@ -348,6 +422,7 @@ async def _generate_query(
     embedding: list[float] | None = None
     similar_examples: list | None = None
     _eligible_for_cache: bool = False
+    replaces_cached_entry = False
 
     # ── DB reads: cache, examples, history, provider ──────────────────────────
     # Session is acquired here and released at the end of the block — before the
@@ -402,18 +477,47 @@ async def _generate_query(
             )
             cache_result = None
 
+        # With strict mode on, a cached query the strict check refuses (a shape it cannot
+        # follow, such as a natural join, names no sensitive column, so the bypass above
+        # misses it) is a miss: a cache hit is never self-corrected, so it would otherwise be
+        # served, and refused, on every repeat of the question. A crash in the check is a
+        # miss too (fails closed).
+        if cache_result is not None and privacy is not None and privacy.strict_sensitive_columns:
+            try:
+                check_strict_sensitive(cache_result.generated_query, privacy, adapter.query_dialect)
+            except QueryRejectedError as exc:
+                logger.info(
+                    "Cached query refused by the strict sensitive-column check — treating as "
+                    "cache miss: %s",
+                    exc,
+                )
+                cache_result = None
+                replaces_cached_entry = True
+            except Exception:
+                logger.exception(
+                    "Strict sensitive-column check failed on a cached query — treating as "
+                    "cache miss"
+                )
+                cache_result = None
+                replaces_cached_entry = True
+
         if cache_result is not None:
             generated_query = cache_result.generated_query
             explanation = (
                 f"(Retrieved from cache — original question: {cache_result.cached_question})"
             )
             cache_hit = True
+            cached_question = cache_result.cached_question
         else:
             embedding = await cache.compute_embedding_async(message)
-            similar_examples = _without_row_filter_wrap(
-                await examples.find_similar_examples(
-                    connection_id, message, embedding, db, query_dialect=adapter.query_dialect
-                )
+            similar_examples = _strict_allowed(
+                _without_row_filter_wrap(
+                    await examples.find_similar_examples(
+                        connection_id, message, embedding, db, query_dialect=adapter.query_dialect
+                    )
+                ),
+                privacy,
+                adapter.query_dialect,
             )
 
             system_prompt = PromptBuilder().build_system_prompt(
@@ -671,6 +775,8 @@ async def _generate_query(
         system_prompt=system_prompt,
         history=history,
         cache_embedding=embedding if _eligible_for_cache else None,
+        cached_question=cached_question,
         tpm_warning=tpm_warning,
         semantic_warning=semantic_warning,
+        replaces_cached_entry=replaces_cached_entry,
     )

@@ -86,17 +86,25 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA "public" GRANT SELECT ON TABLES TO savvina_re
 
 Savvina validates every statement as a read-only SELECT and also runs it inside a database-enforced read-only transaction, so a write cannot succeed even if the text check is fooled. A read-only role is a third layer: it also limits what the connection can *read*.
 
-Savvina checks the role when a connection is created or its details are saved, on **Check again** (a connection test), and on a privacy save that changes the row filters or the excluded tables, and shows the findings in the connection panel (see [Privacy Controls](../user-guide/04_privacy-controls.md#privilege-check)). It reads, from the catalog only:
+Savvina checks the role when a connection is created or its details are saved, on **Check again** (a connection test), and on a privacy save that changes the row filters, the excluded tables or the excluded schemas, and shows the findings in the connection panel (see [Privacy Controls](../user-guide/04_privacy-controls.md#privilege-check)). It reads, from the catalog only:
 
 - `pg_roles` (superuser, `BYPASSRLS`);
-- `pg_class` and `pg_policies` for the row-filtered and excluded tables (`relrowsecurity`, `relforcerowsecurity`; `pg_has_role` for whether the role is the owner or inherits the owner's privileges, and for whether a `SELECT`/`ALL` policy applies to the role directly, through `PUBLIC` or through inherited membership);
+- `pg_class` and `pg_policies` for the row-filtered and excluded tables (`relrowsecurity`, `relforcerowsecurity`; `pg_has_role` for whether the role is the owner or inherits the owner's privileges, and for whether a permissive `SELECT`/`ALL` policy applies to the role directly, through `PUBLIC` or through inherited membership; a restrictive policy only narrows what a permissive one allows, so on its own it does not count);
 - `has_schema_privilege` and `has_table_privilege` (a table counts as readable only with `USAGE` on its schema as well);
 - the relation and column ACLs (`aclexplode` over `relacl` and `attacl`) of every non-system table (`pg_catalog`, `information_schema`, `pg_toast*` and `pg_temp*` are left out; tables, partitioned tables, views and foreign tables, not materialized views), restricted to the grants the role holds directly, through a role it inherits or through `PUBLIC`: the `INSERT`, `UPDATE` and `DELETE` grants and the column-level `INSERT` and `UPDATE` grants for the write finding, and the grantees of `SELECT` on the excluded tables. A `REVOKE` therefore names the grantee that holds the privilege, and a table the role owns (or whose owner it inherits) is reported as owned, not as a grant. At most 500 write grants are read;
-- `pg_auth_members` for memberships in `pg_read_all_data` and `pg_write_all_data` (PostgreSQL 14+), which give access with no grant on any table. Only memberships whose privileges are inherited count: on PostgreSQL 16 the membership's `inherit_option`, on 14 and 15 the member's `rolinherit`. The grantor is read too, and the `REVOKE` adds `GRANTED BY <grantor>` when the grantor is not the bootstrap superuser;
+- `pg_auth_members` for memberships in `pg_read_all_data` and `pg_write_all_data` (PostgreSQL 14+), which give access with no grant on any table. Only memberships whose privileges are inherited count: on PostgreSQL 16 the membership's `inherit_option`, on 14 and 15 the member's `rolinherit`. The grantor is read too, and the `REVOKE` adds `GRANTED BY <grantor>` when the grantor is not the bootstrap superuser (verified on PostgreSQL 16 only);
 - `pg_namespace` for the schemas of the dedicated-role script;
 - outside `pg_catalog`, `pg_proc` with `has_function_privilege` for the functions that run SQL from a string: the `dblink` and `tablefunc` extensions, and any user function with one of those names.
 
 A superuser or `BYPASSRLS` role, or the owner of a table without `FORCE ROW LEVEL SECURITY` (or a role that inherits the owner's privileges), makes native row-level security inert for the connection: the policies exist, the engine does not apply them to this role. For a superuser the grant and membership scans are skipped, since every privilege follows from it; the finding is the script that creates a dedicated read-only role.
+
+The fix for an owned table is `ALTER TABLE ... FORCE ROW LEVEL SECURITY`. When no `SELECT` policy applies to the role, a comment before it says so: after `FORCE` the role reads no rows from that table, so create a policy first. The function fix revokes `EXECUTE` from `PUBLIC`, so every role loses it, and a comment before the `REVOKE`s says so.
+
+Known limits:
+
+- A role literally named `PUBLIC` is read and revoked as if it were the `PUBLIC` pseudo-role.
+- `pg_catalog`'s own functions that run SQL from a string (`query_to_xml*`, `ts_stat`, `ts_rewrite`) are executable by every role through `PUBLIC` and are not reported; on a connection with row filters, Savvina rejects them by name instead.
+- When the database stops answering during the row-filter check of a privacy save, the cancel and the rollback that follow the time limit have no timeout of their own, so the save can wait longer than the limit.
 
 ---
 

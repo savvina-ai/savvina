@@ -13,6 +13,8 @@ tightened since. So every read masks the stored rows again with the connection's
 under (``QueryResultsResponse.row_filter_fingerprint``); when it differs from the
 connection's current map, is not a string, or the connection is in the row-filter migration
 state, the result is served with no rows and ``stale_row_filter`` set, whatever the columns.
+A stored result that is not a dict ``QueryResultsResponse`` accepts (a tampered or corrupt
+row) is served as an empty stale result, so no route fails on it.
 
 A connection with no stored settings, or one that no longer exists, masks with
 ``PrivacySettings()`` and an unknown dialect (double quotes read as identifiers, the
@@ -34,6 +36,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from pydantic import ValidationError
 from sqlalchemy import select
 
 from ..config import get_settings
@@ -41,6 +44,7 @@ from ..datasources.models import PrivacySettings
 from ..datasources.registry import get_datasource_class
 from ..models.chat import ChatSession
 from ..models.connection import Connection
+from ..schemas.chat import QueryResultsResponse
 from .result_masking import (
     _REDACTED,
     MASK_ALL_COLUMNS,
@@ -77,7 +81,8 @@ class StoredResultPrivacy:
         """*results_json* with sensitive and excluded columns redacted; the same dict when
         nothing changes. *query* is the stored SQL (possibly row-filter wrapped). Every key
         other than ``rows`` is kept as stored. A result computed under another row-filter
-        map comes back with no rows and ``stale_row_filter`` set."""
+        map comes back with no rows and ``stale_row_filter`` set. An invalid result (not a
+        dict ``QueryResultsResponse`` accepts) is replaced whole by an empty stale one."""
         return _remask(
             results_json,
             lambda: self.plan(query, served_query(query)),
@@ -109,9 +114,21 @@ def _remask(
     no rows; the rule is "same map or nothing", so loosening a filter blanks older results
     too. *expected_fingerprint* ``None`` (the migration state) makes every result stale. A
     stored fingerprint that is neither a string nor null is stale too and is served as
-    ``None``."""
-    if not results_json:
-        return results_json
+    ``None``. A stored result that is not a dict, or a dict ``QueryResultsResponse`` rejects
+    (its rows and fingerprint aside, which are checked below), is a tampered or corrupt row:
+    it is served as an empty stale result."""
+    if results_json is None:
+        return None
+    if not _valid(results_json):
+        return QueryResultsResponse(
+            columns=[],
+            column_types=[],
+            rows=[],
+            row_count=0,
+            truncated=False,
+            execution_time_ms=0.0,
+            stale_row_filter=True,
+        ).model_dump()
     stored = results_json.get("row_filter_fingerprint")
     readable = isinstance(stored, str | None)
     if expected_fingerprint is None or not readable or (stored or "") != expected_fingerprint:
@@ -126,9 +143,7 @@ def _remask(
     rows = results_json.get("rows")
     if not isinstance(rows, list):
         return {**results_json, "rows": []}
-    columns = results_json.get("columns")
-    if not isinstance(columns, list) or not all(isinstance(c, str) for c in columns):
-        return {**results_json, "rows": [_redacted_row(row, 0) for row in rows]}
+    columns = results_json["columns"]  # a list of strings: _valid checked it
     if not all(isinstance(row, list) for row in rows):
         rows = [row if isinstance(row, list) else _redacted_row(row, len(columns)) for row in rows]
     plan = plan_for()
@@ -136,6 +151,21 @@ def _remask(
     if masked is results_json.get("rows"):
         return results_json
     return {**results_json, "rows": masked}
+
+
+def _valid(results_json: Any) -> bool:
+    """*results_json* is a dict ``QueryResultsResponse`` accepts, its ``rows`` and
+    ``row_filter_fingerprint`` aside: ``_remask`` handles both itself, and leaving the rows
+    out keeps the check cheap on a large result."""
+    if not isinstance(results_json, dict):
+        return False
+    try:
+        QueryResultsResponse.model_validate(
+            {**results_json, "rows": [], "row_filter_fingerprint": None}
+        )
+    except ValidationError:
+        return False
+    return True
 
 
 def _redacted_row(row: Any, width: int) -> list[str]:

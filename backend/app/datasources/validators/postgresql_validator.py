@@ -4,6 +4,9 @@
 import re
 from typing import ClassVar
 
+import sqlparse.sql as sql_nodes
+import sqlparse.tokens as sql_tokens
+
 from ..models import ValidationResult
 from .base_sql_validator import BaseSQLValidator
 
@@ -59,3 +62,22 @@ class PostgreSQLValidator(BaseSQLValidator):
                 )
 
         return result
+
+    def _token_error(self, statements: tuple[sql_nodes.Statement, ...]) -> str | None:
+        """Refuse a block comment nested in another.
+
+        PostgreSQL nests block comments and sqlparse does not, so from the inner */ on the
+        two disagree on what is code: the server reads /* a /* b */ SELECT 1 */ SET … as a
+        comment and a SET, sqlparse as a SELECT. Every token check (the first word, INTO)
+        relies on sqlparse's reading, so a query whose comments nest is refused: a block
+        comment, as sqlparse reads it, that holds a second /*. Inside a string literal or a
+        quoted name the characters are not a comment and pass.
+        """
+        nested = any(
+            token.ttype in sql_tokens.Comment.Multiline and "/*" in token.value[2:]
+            for statement in statements
+            for token in statement.flatten()
+        )
+        if nested:
+            return "Query nests a block comment inside another, which is not allowed"
+        return None

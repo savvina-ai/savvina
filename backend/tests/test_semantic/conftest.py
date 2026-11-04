@@ -28,6 +28,7 @@ from app.models.semantic_store import (
     SemanticModelRow,
     SemanticRelationshipRow,
     SemanticTableRow,
+    SemanticTombstoneRow,
 )
 from app.models.semantic_suggestion import SemanticSuggestion
 
@@ -41,6 +42,7 @@ _TABLES = (
     SemanticGlobalItemRow,
     SemanticHistoryRow,
     SemanticKnownColumnsRow,
+    SemanticTombstoneRow,
     SemanticSuggestion,
 )
 

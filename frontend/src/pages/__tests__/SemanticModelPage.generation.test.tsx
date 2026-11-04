@@ -21,6 +21,9 @@ vi.mock('../../api/semantic', () => ({
   semanticApi: {
     get: vi.fn(),
     getDrift: vi.fn(),
+    getLastDrift: vi.fn(),
+    getTombstones: vi.fn(),
+    restoreTombstone: vi.fn(),
     getDriftHistory: vi.fn(),
     getSuggestions: vi.fn(),
     applySuggestion: vi.fn(),
@@ -128,6 +131,8 @@ function deferred<T>() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(semanticApi.getLastDrift).mockResolvedValue({ report: null, monitor_interval_minutes: 0 } as never);
+  vi.mocked(semanticApi.getTombstones).mockResolvedValue([] as never);
   vi.mocked(semanticApi.get).mockResolvedValue(PARTIAL_MODEL as never);
   vi.mocked(semanticApi.getDriftHistory).mockResolvedValue([] as never);
   vi.mocked(semanticApi.getSuggestions).mockResolvedValue([] as never);

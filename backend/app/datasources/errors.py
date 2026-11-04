@@ -32,6 +32,10 @@ class ErrorCategory(StrEnum):
     PERMISSION = "permission"
     UNSUPPORTED = "unsupported"
     TIMEOUT = "timeout"
+    # The connection to the database was lost while the statement ran (the server closed
+    # it, restarted or became unreachable). Not the query's fault: no correction is
+    # attempted and a cached query that fails this way is kept.
+    CONNECTION = "connection"
     OTHER = "other"
     # Not the database: this application refused the statement before sending it (a row
     # filter that cannot be applied, the strict sensitive-column rule; QueryRejectedError).
@@ -90,8 +94,12 @@ _SQLSTATE_EXACT: dict[str, ErrorCategory] = {
     # must rewrite the statement as a read, not look for a workaround.
     "25006": ErrorCategory.UNSUPPORTED,
     "57014": ErrorCategory.TIMEOUT,  # query_canceled (statement_timeout)
+    "57P01": ErrorCategory.CONNECTION,  # admin_shutdown
+    "57P02": ErrorCategory.CONNECTION,  # crash_shutdown
+    "57P03": ErrorCategory.CONNECTION,  # cannot_connect_now
 }
 _SQLSTATE_CLASS: dict[str, ErrorCategory] = {
+    "08": ErrorCategory.CONNECTION,  # connection_exception
     "22": ErrorCategory.DATA,  # data_exception
     "28": ErrorCategory.PERMISSION,  # invalid_authorization_specification
 }

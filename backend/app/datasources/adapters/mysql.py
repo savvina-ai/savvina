@@ -520,6 +520,8 @@ _MYSQL_ERRNO_CODES: dict[int, ErrorCategory] = {
     1792: ErrorCategory.UNSUPPORTED,  # ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION (Task 11)
     3024: ErrorCategory.TIMEOUT,  # ER_QUERY_TIMEOUT
     1969: ErrorCategory.TIMEOUT,  # ER_STATEMENT_TIMEOUT (MariaDB)
+    2006: ErrorCategory.CONNECTION,  # CR_SERVER_GONE_ERROR (client error)
+    2013: ErrorCategory.CONNECTION,  # CR_SERVER_LOST (client error)
 }
 
 
@@ -909,17 +911,26 @@ class MySQLDataSource(BaseDataSource):
             # Enforced by the engine for every autocommitted statement until reset: a write
             # the text validator missed is refused with errno 1792.
             await cur.execute("SET SESSION TRANSACTION READ ONLY")
+            cancelled = False
             try:
                 await cur.execute(query)
                 records = await cur.fetchall()
                 description = cur.description or []
+            except asyncio.CancelledError:
+                # The turn was cancelled (a client disconnect), as in ``explain``: aiomysql
+                # closed the connection, so a reset would raise InterfaceError in place of
+                # the CancelledError. The pool discards the closed connection on release.
+                cancelled = True
+                conn.close()
+                raise
             finally:
-                await cur.execute("SET SESSION TRANSACTION READ WRITE")
-                # Reset so the pooled connection is clean for reuse
-                if self._is_mariadb:
-                    await cur.execute("SET SESSION max_statement_time = 0")
-                else:
-                    await cur.execute("SET SESSION MAX_EXECUTION_TIME = 0")
+                if not cancelled:
+                    await cur.execute("SET SESSION TRANSACTION READ WRITE")
+                    # Reset so the pooled connection is clean for reuse
+                    if self._is_mariadb:
+                        await cur.execute("SET SESSION max_statement_time = 0")
+                    else:
+                        await cur.execute("SET SESSION MAX_EXECUTION_TIME = 0")
 
         elapsed_ms = (time.monotonic() - start) * 1000
 
@@ -1157,7 +1168,13 @@ class MySQLDataSource(BaseDataSource):
 
         Timeout is applied via SET SESSION MAX_EXECUTION_TIME (MySQL) or
         max_statement_time (MariaDB) and reset in a finally block on the same
-        connection so the pooled connection is clean for reuse.
+        connection so the pooled connection is clean for reuse. A cancelled stream (a
+        client disconnect) closes the connection and skips the cursor close and the resets,
+        as ``explain`` does, so the CancelledError, not a driver error from the closed
+        connection, reaches the caller. A stream the consumer stops early (``aclose``), and
+        one cut at *max_rows* while the server still holds rows (a one-row probe), is dropped
+        the same way rather than drained: closing the unbuffered cursor would read every
+        remaining row from the server first. Only an exhausted result keeps the connection.
         """
         if self._pool is None:
             raise RuntimeError("Not connected.")
@@ -1181,8 +1198,13 @@ class MySQLDataSource(BaseDataSource):
                     )
                 await setup_cur.execute("SET SESSION TRANSACTION READ ONLY")
 
+            # True once the connection is closed and must not be reset or drained.
+            dropped = False
             try:
-                async with conn.cursor(_SSCursor) as cur:
+                # Not ``async with``: closing an unbuffered cursor drains its result from the
+                # connection, which a cancelled read has already closed.
+                cur = await conn.cursor(_SSCursor)
+                try:
                     await cur.execute(query)
                     description = cur.description or []
 
@@ -1221,14 +1243,35 @@ class MySQLDataSource(BaseDataSource):
                             truncated=(total >= max_rows),
                             execution_time_ms=elapsed,
                         )
-            finally:
-                # Reset timeout so the returned connection is clean for reuse.
-                async with conn.cursor() as reset_cur:
-                    if self._is_mariadb:
-                        await reset_cur.execute("SET SESSION max_statement_time = 0")
                     else:
-                        await reset_cur.execute("SET SESSION MAX_EXECUTION_TIME = 0")
-                    await reset_cur.execute("SET SESSION TRANSACTION READ WRITE")
+                        # Cut at max_rows: a one-row probe tells whether the server holds
+                        # more. If it does, there may be any number of them: drop the
+                        # connection rather than drain them. If not, the result is exhausted
+                        # and the cursor is closed and the session reset as usual.
+                        if await cur.fetchmany(1):
+                            dropped = True
+                            conn.close()
+                except (asyncio.CancelledError, GeneratorExit):
+                    # Cancelled: see ``explain``, aiomysql closed the connection when the
+                    # read was cancelled. Stopped early (the consumer closed the generator):
+                    # rows are still on the server, and closing the unbuffered cursor would
+                    # read all of them first. Either way the connection is dropped without a
+                    # reset; the pool discards it on release and opens a new one.
+                    dropped = True
+                    conn.close()
+                    raise
+                finally:
+                    if not dropped:
+                        await cur.close()
+            finally:
+                if not dropped:
+                    # Reset timeout so the returned connection is clean for reuse.
+                    async with conn.cursor() as reset_cur:
+                        if self._is_mariadb:
+                            await reset_cur.execute("SET SESSION max_statement_time = 0")
+                        else:
+                            await reset_cur.execute("SET SESSION MAX_EXECUTION_TIME = 0")
+                        await reset_cur.execute("SET SESSION TRANSACTION READ WRITE")
 
     # ── Validation ─────────────────────────────────────────────────────────────
 
@@ -1248,7 +1291,8 @@ class MySQLDataSource(BaseDataSource):
         return _CONNECTION_ERROR_SENTENCES.get(errno, f"MySQL error {errno}")
 
     def classify_error(self, exc: BaseException) -> ErrorCategory:
-        """Map a pymysql/aiomysql failure via its numeric errno (``exc.args[0]``)."""
+        """Map a pymysql/aiomysql failure via its numeric errno (``exc.args[0]``); the
+        driver's ``InterfaceError`` (a closed connection) is CONNECTION."""
         return classify_chain(exc, self._classify_one)
 
     @staticmethod
@@ -1257,6 +1301,10 @@ class MySQLDataSource(BaseDataSource):
         # unrelated exception whose first arg happens to be an int from being misread.
         if not isinstance(err, aiomysql.MySQLError):
             return None
+        # aiomysql raises InterfaceError, with a text first argument ("Cancelled during
+        # execution", "(0, 'Not connected')"), for a statement on a connection it closed.
+        if isinstance(err, aiomysql.InterfaceError):
+            return ErrorCategory.CONNECTION
         args = getattr(err, "args", ())
         if args and isinstance(args[0], int):
             return _MYSQL_ERRNO_CODES.get(args[0])

@@ -323,7 +323,7 @@ When `schema_pruning_enabled` is true (default), the full schema is narrowed:
 **Files:** `services/semantic_privacy.py` → `without_hidden_identifiers()`; `services/schema_pruning.py` → `_filter_semantic_to_schema()`, `_filter_semantic_by_relevance()`  
 **Model:** `semantic/models.py` → `SemanticModel`
 
-Three-pass filtering of the model read by `semantic/store.load_model_cached` (one SELECT of the header's id and `version` per turn; the model is reassembled by `load_model`, inside a SAVEPOINT, only when they moved). The cached instance is shared across turns, so no pass mutates it: each returns its input unchanged or a `model_copy`. The first two are memoised on the model instance and return shared instances, so callers must not mutate their results either:
+Three-pass filtering of the model read by `semantic/store.load_model_cached` (one SELECT of the header's id and `version` per turn; the model is reassembled from the rows, inside a SAVEPOINT, only when they moved, and cached only when no write interleaved with the read; `SEMANTIC_MODEL_CACHE_SIZE` bounds the cache, `0` disables it). The cached instance is shared across turns, so no pass mutates it: each returns its input unchanged or a `model_copy`. The first two are memoised on the model instance and return shared instances, so callers must not mutate their results either:
 
 1. `without_hidden_identifiers()` — against the privacy-filtered *full* schema (before relevance narrowing), drops business metrics, segments, derived columns, common joins, `notes` and per-table `default_filters` entries that mention a name the privacy settings hide (an excluded schema, table or column), and clears a `base_sql` that does. A table or column that is merely gone from the database, with no exclusion, is not hidden: an item still mentioning it is stale, not secret, and is kept. With no privacy settings the model passes through unchanged. Matching is by whole identifier, case-insensitive (a name with other characters, such as a space or hyphen, is matched as a substring). The descriptions of visible tables and columns are not scanned. See [Chat Path](semantic-model-generation.md#chat-path) for the rules
 2. `_filter_semantic_to_schema()` — narrows the model to the privacy-filtered schema: drops table keys not present in it (excluded tables/schemas) and, within each kept table, columns not present in it, with references to them (primary timestamp/date column, partition/cluster columns, hierarchy levels) and the relationships that use them (a dropped edge between two visible tables is logged once per edge per process). Common joins are filtered by table only: one is dropped only when it references a pruned table. The store keeps annotations for privacy-hidden columns, so this is what keeps them out of the prompt
@@ -341,7 +341,8 @@ The `QueryCache` singleton (loaded once at startup via `routers/chat.py: _get_sh
 2. Exact match: `connection_id` + `question.lower().strip()` within `cache_max_age_days` TTL
 3. Semantic match (non-temporal only): compute 384-dim embedding, load all cached embeddings for this connection from `query_cache`, compute cosine similarity, return best hit if ≥ `semantic_similarity_threshold` (default 0.87)
 4. On hit: server-side `hit_count` increment + `last_hit_at` update (race-safe)
-5. Post-hit guard: `_validate_columns_against_schema()` re-checks the cached query — if the cached query references tables/columns the current user cannot see, the hit is discarded and regeneration occurs
+5. Post-hit guard: `_validate_columns_against_schema()` re-checks the cached query — if the cached query references tables/columns the current user cannot see, the hit is discarded and regeneration occurs. The hit is also discarded when the cached query fails `adapter.validate_query()`, mentions a sensitive column (`sql_mentions_sensitive`), or, with strict sensitive-column mode on, is refused by `check_strict_sensitive` (or the check fails): a cache hit is never self-corrected, so a refused entry would otherwise be served on every repeat of the question. The refused entry is not deleted at lookup; the generation is marked (`_GenerationResult.replaces_cached_entry`) and the store after a successful run overwrites it (`QueryCache.store` with `force`), so the next repeat is served from the cache again The sensitive-mention check also fires on an excluded column's bare name, so a connection with excluded columns gets fewer cache hits (accepted: CE has one user, and the bypass costs only an LLM call).
+6. Execution failure of a cached query through a query fault (auto-execute; `_ExecutionResult.query_fault`: running the statement failed and a different query could fix it): the entry is deleted (`QueryCache.evict_question`, by the hit's `cached_question`) and `ChatService._regenerate_after_cached_failure` runs `_stage_generate` with `bypass_cache` and `_stage_validate` again in the same request; the fresh query executes with self-correction and is stored and cached as a fresh one (`cache_hit=False`; `QueryCache.store` with `force`, so on an exact hit an eviction that failed leaves no stale entry; on a semantic hit the failed entry is stored under another question and survives a failed eviction). A failed connect, a connection lost while the statement runs (`ErrorCategory.CONNECTION`), a timeout, a permission error or a Savvina refusal the model cannot fix (a `QueryRejectedError` with no `llm_hint`) is not a query fault: the entry is kept and the failure is reported. The stream emits a status event and a second `sql` event for the fresh query; the client resets its rows on a new `sql` event. If the regeneration produces no valid query, the cached failure is reported, with the token counts of the failed regeneration's LLM call in the stored message and the reply (`_with_spent_tokens`). Limit: when the hit was semantic (stored under another question) and the eviction fails, the stale entry survives; `force` on the regenerated store covers the exact-hit case only.
 
 ### Step 9: Few-Shot Examples
 
@@ -353,6 +354,8 @@ Uses the question embedding (reused from step 8) to find the most relevant thumb
 1. **Dialect match** — only examples whose `query_dialect` matches the current connection's dialect are considered (prevents MySQL syntax appearing in PostgreSQL prompts and vice versa)
 2. **Similarity threshold** — examples scoring below `min_similarity` (default 0.4 cosine) are discarded; a low-scoring example actively degrades generation accuracy
 3. **Top-k** — up to 3 highest-scoring examples are returned
+
+With strict sensitive-column mode on, `pipeline._strict_allowed` then drops every example that `check_strict_sensitive` refuses (after the row-filter wrap is removed), so the prompt never shows a query the connection would refuse.
 
 The resulting examples are injected into the prompt under `## Example Queries`.
 
@@ -425,7 +428,7 @@ On failure, `_attempt_sql_correction()` feeds the error back to the LLM (up to `
 `BaseSQLValidator` (via `sqlparse`):
 - Ensures single statement, type must be `SELECT` or CTE (`WITH`)
 - Blocks DML/DDL keywords, dangerous patterns
-- Auto-appends `LIMIT {default_row_limit}` if absent
+- Auto-appends `LIMIT {default_row_limit}` if absent (`ValidationResult.sanitized_query`). The stored and displayed query stays the clean one; the executed form carries the limit: `row_filter._executable` appends `LIMIT {default_row_limit + 1}` (`_with_row_limit`) after the strict check and the row-filter rewrite on every execution path, and `max_rows` remains the fetch-time cap
 
 `_check_query_complexity()` rejects CROSS JOIN and large-table full-scans (tables > 1M rows without WHERE). Failed complexity checks trigger `_attempt_complexity_correction()` (same retry loop pattern).
 
@@ -441,11 +444,11 @@ On failure, `_attempt_sql_correction()` feeds the error back to the LLM (up to `
 | Error (invalid) | Don't execute | `error` |
 
 For `auto_execute`:
-- `adapter.connect(config_dict)` — creates connection pool
+- `adapter.connect(config_dict)` — creates connection pool; when it fails, the turn ends at once with `Connection failed: …` on both paths: the statement is not run and nothing is corrected
 - `adapter.execute_query(query, timeout_ms, max_rows)` — runs query, returns `QueryResult`
 - `adapter.disconnect()` — always via `finally`
-- On runtime error: `_attempt_sql_execution_correction()` sends the failed SQL, Savvina's own description of the error (`error_feedback.describe_error_for_llm`: a category from `adapter.classify_error()` plus, for name-quoting categories, names the LLM already has) and a hint back to the LLM (single attempt). The database's message is never sent. Hints live in `_EXEC_ERROR_HINTS` (text match, used only when it agrees with the category) and `_CATEGORY_FALLBACK_HINTS`
-- **Zero-result detection** — if the query succeeds but returns 0 rows, `_attempt_zero_result_correction()` is called (skipped for `QueryIntent.EXISTENCE` queries and cache hits). It prompts the LLM to identify the most likely cause (wrong filter value, case mismatch, overly restrictive date range, faulty JOIN) and optionally return a corrected query. If a corrected query is returned and passes read-only validation, it is re-executed and replaces the original result. If the LLM confirms 0 rows is correct, its explanation is surfaced to the user.
+- On runtime error: `_attempt_sql_execution_correction()` sends the failed SQL, Savvina's own description of the error (`error_feedback.describe_error_for_llm`: a category from `adapter.classify_error()` plus, for name-quoting categories, names the LLM already has) and a hint back to the LLM (single attempt). The database's message is never sent. Hints live in `_EXEC_ERROR_HINTS` (text match, used only when it agrees with the category) and `_CATEGORY_FALLBACK_HINTS`. A permission error (`PERMISSION`) and a connection lost while the statement ran (`CONNECTION`: PostgreSQL SQLSTATE class `08` and `57P01`–`57P03`, an asyncpg `InterfaceError` saying the connection is closed or released, MySQL client errors 2006/2013 and the aiomysql `InterfaceError`) get no correction call (`execution._correctable`): a rewrite cannot lift a denial or restore a connection. A lost connection is shown as "The connection to the database was lost while the query ran. Try again."
+- **Zero-result detection** — if the query succeeds but returns 0 rows, `_attempt_zero_result_correction()` is called (skipped for `QueryIntent.EXISTENCE` queries and cache hits). It prompts the LLM to identify the most likely cause (wrong filter value, case mismatch, overly restrictive date range, faulty JOIN) and optionally return a corrected query. If a corrected query is returned and passes read-only validation, it is re-executed and replaces the original result. If the LLM confirms 0 rows is correct, its explanation is surfaced to the user. If the refined query is refused (`row_filter._executable`) or fails, the original 0-row result, query and explanation stand; on the stream the `sql` event for the refined query is sent only once it passed `_executable`, and after a failed run the original query is announced again with an empty first `row_batch` of the original columns, so the live message matches the stored one.
 - `result_masking._mask_sensitive_result_columns(response, privacy)` — redacts `[REDACTED]` over sensitive/excluded columns in the result; the streaming path applies the same plan (`result_masking._plan_result_mask`) to every `row_batch` event
 - `row_filter._executable(sql, privacy, dialect)` — when `strict_sensitive_columns` is on, first runs `sensitive_guard.check_strict_sensitive` on the clean query (after the migration check; a rejection is a `SensitiveColumnRejectedError`, shown verbatim and sent back to the model as a hint); then rewrites every executed statement (first run, corrections, zero-result re-run) with the connection's per-table row filters (`row_filter_rewrite.apply_row_filters`: each filtered table reference becomes a filtered derived table); prompts, events and the stored message carry the model's SQL; a connection in the row-filter migration state is refused before generation; each filtered derived table is fenced (`OFFSET 0` / MySQL `LIMIT 18446744073709551615`) so the condition runs before the model's predicates; the result carries `row_filter_fingerprint` and stored results are served only under the same map
 
@@ -480,9 +483,11 @@ POST /api/v1/chat/feedback/{message_id}
 ChatService.submit_feedback()
   1. Load assistant message
   2. Load preceding user message (the question)
-  3. Compute embedding for the question
+  3. Only if the message's status is executed, cached or query_only
+     (never error or pending_approval): compute embedding for the question
   4. Add to verified_examples table
      → used as few-shot example in future prompts
+  5. Record the rating on the message (in every status)
 ```
 
 ```

@@ -15,11 +15,16 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 import contextlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 import inspect
 import logging
-import re
 from typing import TYPE_CHECKING, Any
+
+import sqlglot
+from sqlglot import exp
+from sqlglot.dialects.dialect import Dialect
+from sqlglot.errors import ErrorLevel, ParseError, TokenError
+from sqlglot.tokens import TokenType
 
 from ..config import get_settings
 from ..datasources.errors import ErrorCategory, classify_builtin
@@ -46,6 +51,7 @@ from .row_filter import _executable, row_filter_fingerprint
 # The base is imported from its defining module: the row_filter facade re-exports only the
 # row-filter names.
 from .row_filter_errors import QueryRejectedError
+from .row_filter_rewrite import sqlglot_dialect
 
 if TYPE_CHECKING:
     from ..datasources.base import BaseDataSource
@@ -63,6 +69,12 @@ class _ExecutionResult:
     generated_query: str | None
     explanation: str
     connected: bool
+    # True when the error came from running the statement and a different query could fix
+    # it (``_is_query_fault``); a cached query that fails this way is evicted and regenerated
+    # (``ChatService._regenerate_after_cached_failure``). False for a success and for any
+    # other failure: a connection failure, a timeout, a permission error, a hint-less
+    # rejection.
+    query_fault: bool = False
 
 
 def _results_to_response(result: QueryResult) -> QueryResultsResponse:
@@ -100,6 +112,11 @@ def _exec_error_text(exc: BaseException) -> str:
     return f"Query failed ({type(exc).__name__})"
 
 
+# Shown for ``ErrorCategory.CONNECTION`` in place of the driver's text, which names the
+# driver's own state ("Cancelled during execution", "(0, 'Not connected')").
+_CONNECTION_LOST = "The connection to the database was lost while the query ran. Try again."
+
+
 def _user_facing_error(
     exec_error: str, category: ErrorCategory, note: str | None = None, *, verbatim: bool = False
 ) -> str:
@@ -110,10 +127,16 @@ def _user_facing_error(
     text is ours (a ``QueryRejectedError``) and is shown as it is. Rejections are classified
     ``REJECTED``, a name-echoing category that is not redacted; *verbatim* is the guard
     should that ever change, since a redacting category would cut the text at the first
-    apostrophe. The raw text is not logged: the log holds what the user sees. The
-    self-correction's note, when it gave one, follows the text.
+    apostrophe. A lost connection (``CONNECTION``) is shown as our own sentence. The raw
+    text is not logged: the log holds what the user sees. The self-correction's note, when
+    it gave one, follows the text.
     """
-    shown = exec_error if verbatim else redact_error_for_user(category, exec_error)
+    if verbatim:
+        shown = exec_error
+    elif category is ErrorCategory.CONNECTION:
+        shown = _CONNECTION_LOST
+    else:
+        shown = redact_error_for_user(category, exec_error)
     logger.debug("Execution failed (%s): %s", category, shown)
     return f"{shown}\n\nNote: {note}" if note else shown
 
@@ -134,16 +157,39 @@ def _llm_hint(exc: BaseException) -> str | None:
     return exc.llm_hint if isinstance(exc, QueryRejectedError) else None
 
 
-def _correctable(rejected: bool, hint: str | None) -> bool:
+# Failures no rewritten query can fix: a permission denial (a rewrite would be refused
+# the same way, or would reach the data by a workaround) and a lost connection.
+_UNCORRECTABLE = frozenset({ErrorCategory.PERMISSION, ErrorCategory.CONNECTION})
+
+
+def _correctable(
+    rejected: bool, hint: str | None, category: ErrorCategory = ErrorCategory.OTHER
+) -> bool:
     """Whether a correction attempt can help with the latest failure.
 
     *rejected* is True when the failure is a ``QueryRejectedError``. Such a rejection
     without an ``llm_hint`` (``None`` or empty, as ``describe_error_for_llm`` reads it) is
     nothing the model can change (a row filter that needs migration, a malformed key, a
-    missing fence): every correction loop ends at once, with no LLM call, and the user sees
-    the rejection text.
+    missing fence), and neither is a permission denial or a lost connection (*category*,
+    ``_UNCORRECTABLE``): every correction loop ends at once, with no LLM call, and the user
+    sees the failure.
     """
+    if category in _UNCORRECTABLE:
+        return False
     return not rejected or bool(hint)
+
+
+def _is_query_fault(category: ErrorCategory, rejected: bool, hint: str | None) -> bool:
+    """Whether a statement's failure is the query's fault: a different query could succeed.
+
+    A timeout, a permission error and a connection lost while the statement ran are the
+    database's state, not the query's text (the same SQL can succeed later, a rewrite would
+    be refused the same way), and a rejection that ``_correctable`` rules out is nothing a
+    model can change. A failed connect never runs the statement.
+    """
+    if category is ErrorCategory.TIMEOUT:
+        return False
+    return _correctable(rejected, hint, category)
 
 
 def _classify(adapter: object, exc: BaseException) -> ErrorCategory:
@@ -173,8 +219,58 @@ def _classify(adapter: object, exc: BaseException) -> ErrorCategory:
     return classify_builtin(exc) if category is ErrorCategory.OTHER else category
 
 
+def _connect_failed_result(
+    conn_result: object, generated_query: str, explanation: str
+) -> _ExecutionResult:
+    """The result of a turn whose connect failed: the statement never ran."""
+    return _ExecutionResult(
+        results_response=None,
+        execution_time_ms=None,
+        bytes_scanned=None,
+        status="error",
+        error=f"Connection failed: {getattr(conn_result, 'message', '')}",
+        generated_query=generated_query,
+        explanation=explanation,
+        connected=False,
+        query_fault=False,  # the statement never ran
+    )
+
+
+def _log_zero_result_failure(adapter: object, exc: BaseException) -> None:
+    """Log a refined zero-result query that failed or was refused; the original 0-row result
+    stands. Both paths write this line. The log holds the redacted text, as the user-facing
+    path does, and the redaction runs only when the line is written."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    category = _classify(adapter, exc)
+    logger.debug(
+        "Zero-result refinement failed, keeping the original result (%s, %s): %s",
+        category,
+        type(exc).__name__,
+        redact_error_for_user(category, _exec_error_text(exc)),
+    )
+
+
+_UNSORTABLE = "The query could not be parsed as a single SELECT, so it cannot be sorted."
+
+# The clauses of the outermost query that follow its ORDER BY.
+_ROW_LIMIT_TOKENS = frozenset({TokenType.LIMIT, TokenType.OFFSET, TokenType.FETCH})
+
+
 def _inject_order_by(sql: str, column: str, direction: str, dialect: str) -> str:
-    """Replace or inject an ORDER BY clause, keeping LIMIT at the end.
+    """*sql* sorted by the result column *column*: its outermost query's ORDER BY replaced.
+
+    The statement is tokenized and parsed with sqlglot in the connection's dialect and must
+    be exactly one query (a SELECT, a set operation or a parenthesised query), else the sort
+    is refused with a ``ValueError``. The outermost query's clauses are the ones outside
+    every parenthesis, so a CTE, a subquery, a window's or an aggregate's ORDER BY and every
+    string literal and comment are left alone. Its ORDER BY is removed and the new one is
+    placed before its first LIMIT, OFFSET or FETCH, which keep their order and text.
+
+    The rest of the statement is kept as written, not regenerated: the server's sql_mode
+    (ANSI_QUOTES, NO_BACKSLASH_ESCAPES) is only known after connect, and the checks that
+    ``row_filter._executable`` runs for it must see the original text. A regenerated
+    statement would also turn a double-quoted identifier under ANSI_QUOTES into a string.
 
     Quoting rules per dialect:
     - MySQL: backtick — embedded backticks doubled (`` ` `` → ` `` `)
@@ -188,34 +284,89 @@ def _inject_order_by(sql: str, column: str, direction: str, dialect: str) -> str
     ``column`` against the result-set column list returned by the database
     (see ``ChatService.sort_and_execute``) before calling here.
     """
-    if direction.upper() not in {"ASC", "DESC"}:
+    direction = direction.upper()
+    if direction not in {"ASC", "DESC"}:
         raise ValueError(f"Invalid sort direction: {direction!r}")
 
-    if dialect == "MySQL":
-        quote_char = "`"
-        escaped_column = column.replace("`", "``")
+    if (dialect or "").lower() == "mysql":
+        order_clause = "ORDER BY `" + column.replace("`", "``") + "` " + direction
     else:
-        quote_char = '"'
-        escaped_column = column.replace('"', '""')
+        order_clause = 'ORDER BY "' + column.replace('"', '""') + '" ' + direction
 
-    order_clause = f"ORDER BY {quote_char}{escaped_column}{quote_char} {direction.upper()}"
+    read = sqlglot_dialect(dialect)
+    original = _parse_one_query(sql, read)
+    # A locking clause (FOR UPDATE, FOR SHARE, LOCK IN SHARE MODE, SKIP LOCKED) follows the
+    # ORDER BY and is not a read: the sort is refused (the validator refuses it too).
+    if original.find(exp.Lock) is not None:
+        raise ValueError(_UNSORTABLE)
 
-    sql_work = sql.rstrip(";").rstrip()
+    tokens = Dialect.get_or_raise(read).tokenize(sql)
+    # The statement's text ends before its trailing semicolons; a comment after its last
+    # token stays with the last clause.
+    while tokens and tokens[-1].token_type is TokenType.SEMICOLON:
+        tokens.pop()
+    end = tokens[-1].end + 1 if tokens else 0
+    # Keep a comment after the last token unless a semicolon precedes it.
+    rest = sql[end:]
+    text = (sql[:end] if ";" in rest else sql).rstrip()
+    order_start: int | None = None
+    order_end: int | None = None
+    limit_start: int | None = None
+    depth = 0
+    for token in tokens:
+        if token.token_type is TokenType.L_PAREN:
+            depth += 1
+        elif token.token_type is TokenType.R_PAREN:
+            depth -= 1
+        elif depth == 0 and token.token_type is TokenType.ORDER_BY and order_start is None:
+            order_start = token.start
+        elif depth == 0 and token.token_type in _ROW_LIMIT_TOKENS:
+            if order_start is not None and order_end is None:
+                order_end = token.start
+            if limit_start is None:
+                limit_start = token.start
+    if order_start is not None:
+        # The ORDER BY runs to the next LIMIT, OFFSET or FETCH, or to the end.
+        removed_end = order_end if order_end is not None else len(text)
+        text = text[:order_start] + text[removed_end:]
+        if limit_start is not None and limit_start >= removed_end:
+            limit_start -= removed_end - order_start
+    if limit_start is None:
+        result = text.rstrip() + f"\n{order_clause}"
+    else:
+        result = text[:limit_start].rstrip() + f"\n{order_clause}\n" + text[limit_start:]
 
-    # Strip existing ORDER BY (handles multi-column; stops at LIMIT or end-of-string)
-    sql_no_order = re.sub(
-        r"\s+ORDER\s+BY\b.+?(?=\s+LIMIT\b|$)",
-        "",
-        sql_work,
-        flags=re.IGNORECASE | re.DOTALL,
-    ).rstrip()
+    # The scan reads tokens, not the grammar: an identifier spelled like a clause (a column
+    # named offset or limit) would be taken for one. The edited statement must parse to the
+    # original with only the outer ORDER BY replaced.
+    try:
+        edited = _parse_one_query(result, read)
+    except ValueError:
+        raise ValueError(_UNSORTABLE) from None
+    wanted_order = sqlglot.parse_one(f"SELECT 1 {order_clause}", read=read).args["order"]
+    edited_order = edited.args.get("order")
+    edited, original = edited.copy(), original.copy()
+    edited.set("order", None)
+    original.set("order", None)
+    if edited_order != wanted_order or edited != original:
+        raise ValueError(_UNSORTABLE)
+    return result
 
-    # Inject before LIMIT, or append at end
-    limit_match = re.search(r"\bLIMIT\b", sql_no_order, re.IGNORECASE)
-    if limit_match:
-        pos = limit_match.start()
-        return sql_no_order[:pos].rstrip() + f"\n{order_clause}\n" + sql_no_order[pos:]
-    return sql_no_order + f"\n{order_clause}"
+
+def _parse_one_query(sql: str, read: str | None) -> exp.Query:
+    """*sql* parsed as exactly one query, or ``ValueError(_UNSORTABLE)``."""
+    try:
+        parsed = sqlglot.parse(sql, read=read, error_level=ErrorLevel.IMMEDIATE)
+    except (ParseError, TokenError) as exc:
+        raise ValueError(_UNSORTABLE) from exc
+    statements = [
+        statement
+        for statement in parsed
+        if statement is not None and not isinstance(statement, exp.Semicolon)
+    ]
+    if len(statements) != 1 or not isinstance(statements[0], exp.Query):
+        raise ValueError(_UNSORTABLE)
+    return statements[0]
 
 
 async def _execute_auto_query(
@@ -244,8 +395,12 @@ async def _execute_auto_query(
     message and in the cache) and every correction prompt carry the clean SQL. Each result is
     masked by the plan of the statement that produced it.
     """
+    # A failed connect is reported by the adapter's result, not raised. The turn ends at
+    # once, as on the streaming path: the statement never runs, so nothing is corrected.
     if not connected:
-        await adapter.connect(config_dict)
+        conn_result = await adapter.connect(config_dict)
+        if not getattr(conn_result, "success", True):
+            return _connect_failed_result(conn_result, generated_query, explanation)
         connected = True
     max_rows = min(options.get("max_rows", settings.default_row_limit), settings.default_row_limit)
     dialect = adapter.query_dialect
@@ -308,7 +463,7 @@ async def _execute_auto_query(
             attempt < max_exec_attempts - 1
             and not cache_hit
             and provider is not None
-            and _correctable(exec_verbatim, exec_hint)
+            and _correctable(exec_verbatim, exec_hint, exec_category)
         ):
             corrected_query, corrected_explanation = await _attempt_sql_execution_correction(
                 original_question=message,
@@ -337,9 +492,11 @@ async def _execute_auto_query(
         else:
             break
 
+    query_fault = False
     if exec_error:
         error = _user_facing_error(exec_error, exec_category, error_note, verbatim=exec_verbatim)
         status = "error"
+        query_fault = _is_query_fault(exec_category, exec_verbatim, exec_hint)
 
     # ── Zero-result detection ──────────────────────────────────────────────────
     # When execution succeeded but returned 0 rows, ask the LLM to diagnose
@@ -385,14 +542,8 @@ async def _execute_auto_query(
                     query_result.row_count,
                 )
             except Exception as e:
-                # Keep the original 0-row result; the correction failed at DB level. The log
-                # holds the redacted text, as the user-facing path does.
-                category = _classify(adapter, e)
-                logger.debug(
-                    "Zero-result corrected query failed at execution (%s): %s",
-                    category,
-                    redact_error_for_user(category, _exec_error_text(e)),
-                )
+                # Keep the original 0-row result; the correction failed at DB level.
+                _log_zero_result_failure(adapter, e)
         elif zero_expl:
             explanation = zero_expl
 
@@ -405,6 +556,7 @@ async def _execute_auto_query(
         generated_query=clean_query,
         explanation=explanation,
         connected=connected,
+        query_fault=query_fault,
     )
 
 
@@ -436,6 +588,13 @@ class _BatchAccumulator:
         """Clear accumulated rows and batch counter before a retry execution."""
         self.rows = []
         self.batch_index = 0
+
+    def restore(self, saved: _BatchAccumulator) -> None:
+        """Put back the state of *saved*, a ``dataclasses.replace`` copy taken before a run.
+        The copy is shallow: safe because ``reset_rows`` gives the run a new row list and
+        the run assigns, never mutates, the column lists."""
+        for item in fields(self):
+            setattr(self, item.name, getattr(saved, item.name))
 
 
 @dataclass
@@ -482,6 +641,19 @@ async def _stream_cursor_batches(
         acc.batch_index += 1
 
 
+def _stream_executable(
+    adapter: BaseDataSource, clean_query: str, privacy: PrivacySettings | None, dq_literal: bool
+) -> str:
+    """*clean_query* as the database receives it on the streaming path (``_executable``)."""
+    return _executable(
+        clean_query,
+        privacy,
+        adapter.query_dialect,
+        double_quote_is_string_literal=dq_literal,
+        backslash_is_escape=_backslash_is_escape(adapter),
+    )
+
+
 async def _stream_statement(
     adapter: BaseDataSource,
     clean_query: str,
@@ -491,20 +663,17 @@ async def _stream_statement(
     timeout: int,  # noqa: ASYNC109
     max_rows: int,
     acc: _BatchAccumulator,
+    executed: str | None = None,
 ) -> AsyncGenerator[RowBatchEvent, None]:
     """Execute one statement on the streaming path and yield its masked ``row_batch`` events.
 
-    The database receives *clean_query* rewritten by the row filter; the result mask is
-    planned once for this statement (from the clean SQL) and stored on *acc*, so every
-    batch here and the final payload built from *acc* are redacted by the same plan.
+    The database receives *clean_query* rewritten by the row filter (*executed*, when the
+    caller already rewrote it); the result mask is planned once for this statement (from
+    the clean SQL) and stored on *acc*, so every batch here and the final payload built
+    from *acc* are redacted by the same plan.
     """
-    executed = _executable(
-        clean_query,
-        privacy,
-        adapter.query_dialect,
-        double_quote_is_string_literal=dq_literal,
-        backslash_is_escape=_backslash_is_escape(adapter),
-    )
+    if executed is None:
+        executed = _stream_executable(adapter, clean_query, privacy, dq_literal)
     plan = _plan_result_mask(
         privacy, executed, clean_query, double_quote_is_string_literal=dq_literal
     )
@@ -571,11 +740,11 @@ async def _stream_self_correction_phase(
     - ``out["exec_verbatim"]``  — True when the latest failure was a ``QueryRejectedError``
     - ``out["error_note"]``     — the correction's note when it gave up with one
 
-    A failure that ``_correctable`` rules out (a rejection without a hint) ends the loop
-    before its LLM call, leaving *out* as it is.
+    A failure that ``_correctable`` rules out (a rejection without a hint, a permission
+    denial, a lost connection) ends the loop before its LLM call, leaving *out* as it is.
     """
     for _attempt in range(1, _MAX_SELF_CORRECTION_ATTEMPTS + 1):
-        if not _correctable(out["exec_verbatim"], out["exec_hint"]):
+        if not _correctable(out["exec_verbatim"], out["exec_hint"], out["exec_category"]):
             return
         yield StatusEvent(type="status", message="Correcting query…")
         corrected_query, corrected_explanation = await _attempt_sql_execution_correction(
@@ -650,7 +819,10 @@ async def _stream_zero_result_phase(
     when those conditions are not all met.
 
     The refined query is executed through _stream_statement (row filter, its own mask
-    plan); the prompt and the ``sql`` event carry the clean query.
+    plan); the prompt and the ``sql`` event carry the clean query. The ``sql`` event, which
+    resets the client's result, is sent only once the row filter accepted the refined query;
+    when its run then fails, the original query is announced again with an empty first batch
+    of the original columns, so the client ends where the stored message does.
 
     Mutates *out* in-place:
     - ``out["clean_query"]``           — the refined query, only once it has run
@@ -675,6 +847,15 @@ async def _stream_zero_result_phase(
         adapter=adapter,
     )
     if zero_query:
+        # Keep the original 0-row result, query and explanation when the refined query is
+        # refused or fails, as _execute_auto_query does: it is adopted only once it has run.
+        try:
+            zero_executed = _stream_executable(adapter, zero_query, privacy, dq_literal)
+        except Exception as exc:
+            _log_zero_result_failure(adapter, exc)
+            out["zero_result_reexecuted"] = False
+            return
+        original = replace(acc)
         yield SqlEvent(type="sql", query=zero_query, dialect=adapter.query_dialect)
         acc.reset_rows()
         try:
@@ -686,19 +867,28 @@ async def _stream_zero_result_phase(
                 timeout=settings.default_query_timeout,
                 max_rows=max_rows,
                 acc=acc,
+                executed=zero_executed,
             ):
                 yield event
         except Exception as exc:
-            # Keep the original 0-row result, query and explanation, as _execute_auto_query
-            # does: the refined query is adopted only once it has run. The log holds the
-            # redacted text, as the user-facing path does.
-            category = _classify(adapter, exc)
-            logger.debug(
-                "Zero-result re-execution failed, keeping original (%s): %s",
-                category,
-                redact_error_for_user(category, _exec_error_text(exc)),
-            )
+            _log_zero_result_failure(adapter, exc)
             out["zero_result_reexecuted"] = False
+            # Back to the original statement: its accumulator, then its SQL and columns on
+            # the client, whose result the refined query's ``sql`` event cleared.
+            acc.restore(original)
+            yield SqlEvent(type="sql", query=out["clean_query"], dialect=adapter.query_dialect)
+            # The real adapters yield no batch for a 0-row result, so the original columns
+            # are usually empty: the ``sql`` event alone then leaves the client with no
+            # columns, as the stored message has. A batch is sent only when there were some.
+            if acc.columns:
+                yield RowBatchEvent(
+                    type="row_batch",
+                    rows=[],
+                    columns=acc.columns,
+                    column_types=acc.column_types,
+                    batch_index=0,
+                    truncated=acc.truncated,
+                )
         else:
             out["clean_query"] = zero_query
             out["explanation"] = zero_expl or out["explanation"]
@@ -741,16 +931,7 @@ async def _stream_execute_with_correction(
     if not connected:
         conn_result = await adapter.connect(config_dict)
         if not conn_result.success:
-            result_out.result = _ExecutionResult(
-                results_response=None,
-                execution_time_ms=None,
-                bytes_scanned=None,
-                status="error",
-                error=f"Connection failed: {conn_result.message}",
-                generated_query=generated_query,
-                explanation=explanation,
-                connected=False,
-            )
+            result_out.result = _connect_failed_result(conn_result, generated_query, explanation)
             return
         connected = True
 
@@ -821,6 +1002,9 @@ async def _stream_execute_with_correction(
             generated_query=out["clean_query"],
             explanation=out["explanation"],
             connected=connected,
+            query_fault=_is_query_fault(
+                out["exec_category"], out["exec_verbatim"], out["exec_hint"]
+            ),
         )
         return
 

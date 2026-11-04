@@ -3,7 +3,7 @@
 
 /**Chart configuration panel — inspired by Microsoft Fabric notebook chart editor. */
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { X, ChevronRight, ChevronDown, Plus } from 'lucide-react';
 
 import {
@@ -16,6 +16,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { cn } from '@/lib/utils';
+import { uniqueColumnNames } from '@/lib/columnNames';
 import type {
   UserChart,
   AggregationMethod,
@@ -99,7 +100,8 @@ function ColSelect({
   );
 }
 
-export default function ChartEditor({ chart, columns, onChange }: Props) {
+export default function ChartEditor({ chart, columns: rawColumns, onChange }: Props) {
+  const columns = useMemo(() => uniqueColumnNames(rawColumns), [rawColumns]);
   const [axisOpen, setAxisOpen] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [trendOpen, setTrendOpen] = useState(false);

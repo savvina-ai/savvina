@@ -134,7 +134,8 @@ async def get_shared_session(
     previews = []
     for m in rows:
         results_json = m.results_json
-        if results_json and isinstance(results_json.get("rows"), list):
+        # A non-dict (a tampered row) is passed on whole: serving it stale is the mask's job.
+        if isinstance(results_json, dict) and isinstance(results_json.get("rows"), list):
             results_json = {**results_json, "rows": results_json["rows"][:10]}
         previews.append((session.id, results_json, m.query_generated))
     served = await masks.serve_all(previews)

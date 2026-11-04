@@ -88,6 +88,8 @@ A provider with no saved config shows a grey "not configured" dot on the Setting
 | `APP_PORT` | int | `3000` | Port the frontend container is exposed on. Update `CORS_ORIGINS` if you change this. |
 | `DATABASE_URL` | string | **Required** | asyncpg connection URL for the application PostgreSQL database. See [Database Mode](#database-mode) for the correct value for your setup. |
 | `DB_LOCK_TIMEOUT_SECONDS` | int | `30` | Server-side cap, in seconds, on how long a statement waits for a row lock on the application database, set when each connection opens. A request that waits longer is answered `503` with `Retry-After: 5`. `0` disables the cap; negative values are rejected. Environment-only — not a UI setting. Behind PgBouncer in transaction mode, add `ignore_startup_parameters = lock_timeout` to its config, or set this to `0`. |
+| `DRIFT_CHECK_INTERVAL_MINUTES` | int | `0` | Minutes between background schema drift checks of every active connection that has a complete semantic model. `0` (the default) disables them; negative values are rejected. Each check introspects the source (catalog reads only), refreshes the schema cache and, when the schema changed, drops the connection's cached answers and table embeddings, so chat stops describing a dropped or renamed column. The result is shown on the Semantic Model page and served by `GET …/semantic/drift/last`. The check only reports: it never applies drift and makes no LLM call. In Community Edition the check runs for the single user; a connection whose schema cache no single user owns is skipped. Environment-only, read at startup — not a UI setting. |
+| `SEMANTIC_MODEL_CACHE_SIZE` | int | `32` | How many connections' semantic models each backend worker process keeps assembled in memory for chat. A cached model is checked against the stored version on every turn (one small query) and rebuilt only when it changed. `0` disables the cache, so every turn reassembles the model from the database; negative values are rejected. Lower it to bound memory on a deployment with many large models. Environment-only, read at startup — not a UI setting. |
 | `CORS_ORIGINS` | JSON array | `["http://localhost:3000"]` | Allowed CORS origins as a JSON array string. Example: `["http://localhost:3000","https://analytics.example.com"]` |
 
 ---
@@ -190,7 +192,7 @@ These are stored in the `app_settings` table and edited from the **Settings** pa
 | `db_max_overflow` | `20` | Connections allowed beyond the pool size under load. **Restart required.** |
 | `bcrypt_rounds` | `12` | Password hashing cost factor. Raising it slows every login and registration. |
 
-Read them with `GET /api/v1/settings` and change them with `PUT /api/v1/settings`. The database lock timeout, `DB_LOCK_TIMEOUT_SECONDS` (see [Application Settings](#application-settings)), is environment-only and is not listed here.
+Read them with `GET /api/v1/settings` and change them with `PUT /api/v1/settings`. The database lock timeout, `DB_LOCK_TIMEOUT_SECONDS`, the background drift check interval, `DRIFT_CHECK_INTERVAL_MINUTES`, and the semantic model cache size, `SEMANTIC_MODEL_CACHE_SIZE` (see [Application Settings](#application-settings)), are environment-only and are not listed here.
 
 ---
 

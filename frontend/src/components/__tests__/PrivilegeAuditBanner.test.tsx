@@ -197,7 +197,7 @@ describe('PrivilegeAuditBanner', () => {
     expect(screen.getByText('The role has BYPASSRLS. No row policy applies to it.')).toBeInTheDocument();
     expect(
       screen.getByText(
-        'The role owns public.orders and the table does not force row-level security, so no policy applies to the owner.',
+        'The role owns public.orders and the table does not force row-level security, so no policy applies to the owner. After FORCE the role reads no rows from a table where no SELECT policy applies to it; the fix marks each such table with a comment: create a policy there first.',
       ),
     ).toBeInTheDocument();
     expect(
@@ -207,7 +207,7 @@ describe('PrivilegeAuditBanner', () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        'The role can execute public.dblink(text), which runs SQL passed as a string. Savvina rejects it by name; revoking it closes the path for good.',
+        'The role can execute public.dblink(text), which runs SQL passed as a string. Savvina refuses dblink and dblink_exec in every query, and the other functions of this kind only on a connection with row filters; revoking it closes the path for good. The fix revokes it from PUBLIC, so every role loses EXECUTE, not only this one.',
       ),
     ).toBeInTheDocument();
   });

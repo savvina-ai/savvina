@@ -63,6 +63,20 @@ class DriftReport(BaseModel):
     has_actionable_changes: bool = False
 
 
+class LastDriftResponse(BaseModel):
+    """Returned by ``GET /connections/{id}/semantic/drift/last``.
+
+    ``report`` is the background monitor's latest report when it still describes the
+    stored model: ``None`` when no monitor report exists, when a later Check Drift
+    superseded it (the page has that one), or when the model changed since (an apply, a
+    regenerate, a save). ``monitor_interval_minutes`` is ``DRIFT_CHECK_INTERVAL_MINUTES``;
+    the page polls only while it is positive.
+    """
+
+    report: DriftReport | None = None
+    monitor_interval_minutes: int = 0
+
+
 class ApplyDriftResponse(BaseModel):
     """Returned by ``POST /connections/{id}/semantic/apply-drift``.
 
@@ -72,7 +86,7 @@ class ApplyDriftResponse(BaseModel):
     ``GET .../semantic/drift/history``.
     """
 
-    semantic_model: SemanticModel
+    semantic_model: SemanticModelResponse
     summary: DriftApplySummary
 
 
@@ -210,6 +224,42 @@ class SemanticModelUpdate(BaseModel):
     segments: list[Segment] | None = None
     notes: list[str] | None = None
     is_user_reviewed: bool | None = None
+    # The ``version`` the draft was loaded from (``SemanticModelResponse.version``). When
+    # given, the PUT is refused (409) if the stored model has moved since; when omitted the
+    # PUT is unconditional (API clients, "save anyway"). Read by the route, never a section:
+    # ``apply_user_patch`` excludes it.
+    base_version: int | None = None
+
+
+TombstoneKind = Literal["metric", "segment", "derived_column", "common_join", "relationship"]
+
+
+class TombstoneEntry(BaseModel):
+    """One deleted item (``GET /connections/{id}/semantic/tombstones``): its kind, its key
+    (the metric, segment or derived-column name, the join pattern, or the relationship's
+    ``from_table.from_column->to_table.to_column``) and when it was deleted."""
+
+    kind: TombstoneKind
+    key: str
+    created_at: datetime
+
+
+class TombstoneRestore(BaseModel):
+    """Body of ``POST /connections/{id}/semantic/tombstones/restore``: the tombstone to lift.
+    A body, not a path segment: ``key`` is free text (a join pattern, a dotted key)."""
+
+    kind: TombstoneKind
+    key: str = Field(min_length=1)
+
+
+class SemanticModelResponse(SemanticModel):
+    """The stored model as every model-serving route returns it, plus the header's
+    content ``version`` (bumped by every content write). The page sends it back as
+    ``SemanticModelUpdate.base_version`` on its next PUT. Not a ``SemanticModel`` field:
+    ``store.save_model`` fits the model's dump onto ``SemanticModelRow``, which has a
+    ``version`` column of its own."""
+
+    version: int
 
 
 # ── POST /connections/{id}/semantic/business-metrics — create payload ─────────
@@ -230,3 +280,7 @@ class BusinessMetricCreate(BaseModel):
     filters: list[str] = []
     related_tables: list[str] = []
     format_hint: FormatHint | None = None
+
+
+# ``ApplyDriftResponse`` names ``SemanticModelResponse`` before it is defined.
+ApplyDriftResponse.model_rebuild()

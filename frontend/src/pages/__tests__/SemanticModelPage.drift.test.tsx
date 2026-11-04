@@ -11,6 +11,9 @@ vi.mock('../../api/semantic', () => ({
   semanticApi: {
     get: vi.fn(),
     getDrift: vi.fn(),
+    getLastDrift: vi.fn(),
+    getTombstones: vi.fn(),
+    restoreTombstone: vi.fn(),
     applyDrift: vi.fn(),
     getDriftHistory: vi.fn(),
     getSuggestions: vi.fn(),
@@ -116,6 +119,8 @@ const SUGGESTION = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(semanticApi.getLastDrift).mockResolvedValue({ report: null, monitor_interval_minutes: 0 } as never);
+  vi.mocked(semanticApi.getTombstones).mockResolvedValue([] as never);
   providers.data = [];
   vi.mocked(semanticApi.get).mockResolvedValue(MODEL as never);
   vi.mocked(semanticApi.getDriftHistory).mockResolvedValue([] as never);
@@ -309,6 +314,8 @@ const SUMMARY = {
   columns_added: {},
   columns_removed: {},
   columns_renamed: {},
+  tables_renamed: {},
+  references_cleared: {},
   metrics_added: [],
   metrics_removed: ['Coupon uses'],
   joins_added: [],
@@ -640,6 +647,45 @@ describe('SemanticModelPage — Apply Drift', () => {
 
     // The rename applies and the backend warns the new column was not annotated.
     expect(await screen.findByRole('button', { name: 'Apply these changes' })).toBeEnabled();
+  });
+
+  it('lets a preview that adds columns beside a renamed table apply without a provider', async () => {
+    vi.mocked(semanticApi.getDrift).mockResolvedValue(DRIFTED as never);
+    vi.mocked(semanticApi.applyDrift).mockResolvedValue({
+      semantic_model: MODEL,
+      summary: {
+        ...PREVIEW,
+        tables_removed: [],
+        metrics_removed: [],
+        columns_added: { 'ecommerce.orders': ['region'] },
+        tables_renamed: { 'ecommerce.Orders': 'ecommerce.orders' },
+      },
+    } as never);
+    await previewFromBanner();
+
+    // A table rename makes no LLM call, so the apply has something to save without one.
+    expect(await screen.findByRole('button', { name: 'Apply these changes' })).toBeEnabled();
+  });
+
+  it('still needs a provider when new columns come only with a cleared table reference', async () => {
+    vi.mocked(semanticApi.getDrift).mockResolvedValue(DRIFTED as never);
+    vi.mocked(semanticApi.applyDrift).mockResolvedValue({
+      semantic_model: MODEL,
+      summary: {
+        ...PREVIEW,
+        tables_removed: [],
+        metrics_removed: [],
+        columns_added: { 'ecommerce.orders': ['region'] },
+        references_cleared: { 'ecommerce.orders': ['primary_timestamp_column'] },
+      },
+    } as never);
+    await previewFromBanner();
+
+    // The backend decides from the schema drift, where a cleared reference is not a change
+    // of its own (its column was never annotated), so the apply is new columns only.
+    const apply = await screen.findByRole('button', { name: 'Apply these changes' });
+    expect(apply).toBeDisabled();
+    expect(apply).toHaveAttribute('title', 'Configure an LLM provider in Settings first');
   });
 
   it('holds Preview & apply over unsaved edits', async () => {
@@ -1208,5 +1254,91 @@ describe('SemanticModelPage — Drift history', () => {
     // Once on load, once more after the apply invalidated it.
     await waitFor(() => expect(semanticApi.getDriftHistory).toHaveBeenCalledTimes(2));
     expect(semanticApi.getDriftHistory).toHaveBeenCalledWith('conn-1', 10);
+  });
+});
+
+describe('SemanticModelPage — background drift notice', () => {
+  const BACKGROUND = {
+    ...REPORT,
+    warnings: ['Table public.coupons no longer exists', 'New column public.orders.note'],
+    warning_count: 2,
+    checked_at: '2026-11-03T09:00:00Z',
+    has_actionable_changes: true,
+  };
+  const last = (report: unknown, monitor_interval_minutes = 15) =>
+    ({ report, monitor_interval_minutes }) as never;
+
+  it('shows what the monitor found and Check Drift runs the live check', async () => {
+    vi.mocked(semanticApi.getLastDrift).mockResolvedValue(last(BACKGROUND));
+    vi.mocked(semanticApi.getDrift).mockResolvedValue({
+      ...BACKGROUND,
+      checked_at: '2026-11-03T10:00:00Z',
+    } as never);
+    const user = userEvent.setup();
+    renderPage();
+    const notice = (await screen.findByText(/Background check at .*: 2 schema changes/)).closest(
+      '[role="status"]',
+    )!;
+    expect(notice).toHaveTextContent('Check Drift to review it and apply it.');
+    const buttons = screen.getAllByRole('button', { name: 'Check Drift' });
+    await user.click(buttons[buttons.length - 1]);
+    await waitFor(() => expect(semanticApi.getDrift).toHaveBeenCalledTimes(1));
+    // The live report answers the notice.
+    await waitFor(() =>
+      expect(screen.queryByText(/Background check at/)).not.toBeInTheDocument(),
+    );
+  });
+
+  it('shows nothing without a report, or for one with no warnings', async () => {
+    vi.mocked(semanticApi.getLastDrift).mockResolvedValue(last(null));
+    const first = renderPage();
+    await screen.findByRole('button', { name: 'Check Drift' });
+    await waitFor(() => expect(semanticApi.getLastDrift).toHaveBeenCalled());
+    expect(screen.queryByText(/Background check at/)).not.toBeInTheDocument();
+    first.unmount();
+
+    vi.mocked(semanticApi.getLastDrift).mockResolvedValue(last({ ...REPORT, checked_at: '2026-11-03T09:00:00Z' }));
+    renderPage();
+    await screen.findByRole('button', { name: 'Check Drift' });
+    await waitFor(() => expect(semanticApi.getLastDrift).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText(/Background check at/)).not.toBeInTheDocument();
+  });
+
+  it('stays dismissed for its report and shows again for a newer one', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.mocked(semanticApi.getLastDrift).mockResolvedValue(last(BACKGROUND));
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      renderPage();
+      await screen.findByText(/Background check at/);
+      await user.click(screen.getByRole('button', { name: 'Dismiss the background drift notice' }));
+      expect(screen.queryByText(/Background check at/)).not.toBeInTheDocument();
+
+      vi.mocked(semanticApi.getLastDrift).mockResolvedValue(
+        last({ ...BACKGROUND, checked_at: '2026-11-03T11:00:00Z', warning_count: 3 }),
+      );
+      // The monitor is on: the page polls every minute.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(61_000);
+      });
+      expect(await screen.findByText(/Background check at .*: 3 schema changes/)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not poll while the monitor is off', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.mocked(semanticApi.getLastDrift).mockResolvedValue(last(null, 0));
+      renderPage();
+      await waitFor(() => expect(semanticApi.getLastDrift).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(130_000);
+      });
+      expect(semanticApi.getLastDrift).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

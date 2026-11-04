@@ -6,7 +6,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import DriftSummaryPanel from '../DriftSummaryPanel';
-import { summaryDescription, summaryRows } from '../driftSummaryRows';
+import { SUMMARY_ROW_KEYS, summaryDescription, summaryRows } from '../driftSummaryRows';
 import type { DriftApplySummary } from '@/types';
 
 const EMPTY: DriftApplySummary = {
@@ -17,6 +17,8 @@ const EMPTY: DriftApplySummary = {
   columns_added: {},
   columns_removed: {},
   columns_renamed: {},
+  tables_renamed: {},
+  references_cleared: {},
   metrics_added: [],
   metrics_removed: [],
   joins_added: [],
@@ -241,6 +243,48 @@ describe('DriftSummaryPanel', () => {
       },
       { key: 'columns_added', label: 'Added 1 column', names: ['public.orders.tier'] },
     ]);
+  });
+
+  it('lists renamed tables as old key to live key, and cleared references as table.field', () => {
+    const summary: DriftApplySummary = {
+      ...EMPTY,
+      changed: true,
+      tables_renamed: { 'public.Orders': 'public.orders' },
+      references_cleared: { 'public.orders': ['hierarchies', 'primary_timestamp_column'] },
+    };
+    expect(summaryRows(summary)).toEqual([
+      {
+        key: 'references_cleared',
+        label: 'Cleared 2 table references',
+        names: ['public.orders.hierarchies', 'public.orders.primary_timestamp_column'],
+      },
+      { key: 'tables_renamed', label: 'Renamed 1 table', names: ['public.Orders → public.orders'] },
+    ]);
+    expect(summaryRows({ ...summary, dry_run: true }).map((r) => r.label)).toEqual([
+      'Will clear 2 table references',
+      'Will rename 1 table',
+    ]);
+  });
+
+  it('has a row for every change list of the summary', () => {
+    // Every key of the summary but the flags and the notes: a list the backend adds must
+    // get a row (the ROWS table is typed exhaustively), and this checks each one renders.
+    const notes = ['dry_run', 'changed', 'tables_not_annotated', 'column_tables_failed', 'warnings'];
+    const keys = (Object.keys(EMPTY) as (keyof DriftApplySummary)[]).filter(
+      (k) => !notes.includes(k),
+    );
+    expect([...SUMMARY_ROW_KEYS].sort()).toEqual([...keys].sort());
+    // One entry in every list; the map-shaped ones in the shape each takes.
+    const full: DriftApplySummary = {
+      ...EMPTY,
+      ...Object.fromEntries(keys.map((k) => [k, ['x']])),
+      columns_added: { t: ['c'] },
+      columns_removed: { t: ['c'] },
+      references_cleared: { t: ['f'] },
+      columns_renamed: { t: { a: 'b' } },
+      tables_renamed: { a: 'b' },
+    };
+    expect(summaryRows(full).map((r) => r.key).sort()).toEqual([...keys].sort());
   });
 
   it('words a preview of a rename as a plan', () => {

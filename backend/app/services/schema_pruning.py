@@ -457,7 +457,7 @@ async def _resolve_schema(
 
     Also computes and persists per-table embeddings (used for schema pruning) if not
     already stored. Embeddings are keyed by "schema.table" and built from table name,
-    description, and column names.
+    description, and column names of the privacy-narrowed schema.
     """
     usc_result = await db.execute(
         select(UserSchemaCache).where(
@@ -499,9 +499,13 @@ async def _resolve_schema(
         await db.flush()
         await db.commit()
 
+    # Privacy first: a cache written before a privacy change can still carry an excluded
+    # table or column, and the embedding text is built from the names below.
+    schema = _apply_privacy_to_schema(schema, privacy or PrivacySettings())
+
     # Compute and persist per-table embeddings if not already stored in table_embedding_cache.
-    # Done before privacy filtering so all tables get embeddings, even those that will be
-    # excluded by privacy — harmless, and avoids recomputing when privacy settings change.
+    # A privacy save purges them (``_invalidate_connection_caches``), so they are rebuilt
+    # from the narrowed schema on the next question.
     embeddings_available = False
     if query_cache is not None:
         existing_keys_result = await db.execute(
@@ -544,8 +548,6 @@ async def _resolve_schema(
             )
             await db.commit()
         embeddings_available = True
-
-    schema = _apply_privacy_to_schema(schema, privacy or PrivacySettings())
 
     return _SchemaResult(
         schema=schema, connected=connected, embeddings_available=embeddings_available

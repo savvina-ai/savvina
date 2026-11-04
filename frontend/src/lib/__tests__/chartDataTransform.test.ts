@@ -2,7 +2,9 @@
 // Licensed under the Business Source License 1.1 — see LICENSE for details.
 
 import { describe, it, expect } from 'vitest';
-import { computeTrendLine } from '../chartDataTransform';
+import { computeTrendLine, transformChartData } from '../chartDataTransform';
+import type { QueryResults } from '../../types';
+import type { UserChart } from '../../types/charts';
 
 describe('computeTrendLine', () => {
   describe('linear regression', () => {
@@ -76,5 +78,16 @@ describe('computeTrendLine', () => {
       computeTrendLine(data, 'v', 'moving_avg', 2);
       expect(data[0]).not.toHaveProperty('__trend__');
     });
+  });
+});
+
+describe('transformChartData with duplicate column names', () => {
+  it('keeps every value under a unique key', () => {
+    const results: QueryResults = {
+      columns: ['count', 'count'], column_types: ['int', 'int'],
+      rows: [[1, 2]], row_count: 1, truncated: false, bytes_scanned: null,
+    };
+    const chart = { type: 'bar', xKey: 'count', yKeys: ['count_2'], aggregation: 'none' } as UserChart;
+    expect(transformChartData(results, chart).data).toEqual([{ count: 1, count_2: 2 }]);
   });
 });

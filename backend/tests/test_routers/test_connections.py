@@ -274,6 +274,26 @@ class TestCreateConnection:
         assert resp.json()["detail"] == "sensitive_columns must be a list of strings"
         db.add.assert_not_called()
 
+    async def test_a_qualified_sensitive_column_returns_422_and_creates_nothing(self, http_client):
+        # The list is matched on the bare column name; a table.column entry would never
+        # match, so it is refused rather than stored as a silent no-op.
+        db = _mock_db()
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.post(
+            "/api/v1/connections",
+            json={
+                "name": "My DB",
+                "source_type": "postgresql",
+                "config": {"host": "localhost"},
+                "privacy_settings": {"sensitive_columns": ["name", " customers.notes "]},
+            },
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            "sensitive_columns lists column names only, without a table or schema: customers.notes"
+        )
+        db.add.assert_not_called()
+
 
 # ── GET /api/v1/connections ───────────────────────────────────────────────────────
 
@@ -326,6 +346,11 @@ class TestGetConnection:
         assert body["id"] == "conn-123"
         assert body["name"] == "My DB"
         assert "semantic_model_updated_at" not in body
+        # The version the privacy form sends back as base_privacy_version.
+        from app.schemas.connection import privacy_version
+
+        assert body["privacy_version"] == privacy_version(conn.privacy_settings)
+        assert "updated_at" not in body
 
     async def test_returns_404_for_unknown_connection(self, http_client):
         db = _mock_db(MockResult(single=None))
@@ -630,10 +655,51 @@ class TestDeleteConnection:
 # ── GET /api/v1/connections/{id}/schema ─────────────────────────────────────────
 
 
+def _explorer_schema() -> dict:
+    """A cached schema dict: ``public.orders`` (a stats sample, a row count, a ``secret``
+    column) and ``public.payroll``."""
+    from dataclasses import asdict
+
+    from app.datasources.models import ColumnInfo, DataSourceSchema, TableInfo
+
+    def _table(name: str, columns: list[ColumnInfo]) -> TableInfo:
+        return TableInfo(
+            catalog=None,
+            schema_name="public",
+            name=name,
+            table_type="table",
+            columns=columns,
+            row_count_approx=100,
+        )
+
+    return asdict(
+        DataSourceSchema(
+            source_type="postgresql",
+            schemas=[],
+            tables=[
+                _table(
+                    "orders",
+                    [
+                        ColumnInfo(
+                            name="status",
+                            data_type="text",
+                            native_type="text",
+                            sample_values=["paid"],
+                            sample_source="stats",
+                        ),
+                        ColumnInfo(name="secret", data_type="text", native_type="text"),
+                    ],
+                ),
+                _table("payroll", [ColumnInfo(name="id", data_type="int", native_type="int4")]),
+            ],
+        )
+    )
+
+
 class TestGetSchema:
     async def test_returns_cached_schema(self, http_client):
-        schema = {"tables": {"users": {}}}
-        conn = _make_conn()
+        schema = _explorer_schema()
+        conn = _make_conn(privacy_settings={"include_sample_values": True})
         usc = MagicMock()
         usc.schema_cache = schema
         db = _mock_db(
@@ -645,6 +711,42 @@ class TestGetSchema:
         assert resp.status_code == 200
         assert resp.json() == schema
         assert db.execute.call_count == 2
+
+    async def test_cached_schema_is_served_through_the_privacy_pass(self, http_client):
+        """The explorer sees what the LLM paths see: a cache written before a privacy
+        change loses the newly excluded table and column, and a row-filtered table its
+        row count and its statistics samples."""
+        conn = _make_conn(
+            privacy_settings={
+                "include_sample_values": True,
+                "excluded_tables": ["public.payroll"],
+                "excluded_columns": ["public.orders.secret"],
+                "row_filters": {"public.orders": "tenant_id = 1"},
+            }
+        )
+        usc = MagicMock()
+        usc.schema_cache = _explorer_schema()
+        db = _mock_db(MockResult(single=conn), MockResult(single=usc))
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/connections/conn-123/schema")
+        assert resp.status_code == 200
+        tables = resp.json()["tables"]
+        assert [t["name"] for t in tables] == ["orders"]
+        assert [c["name"] for c in tables[0]["columns"]] == ["status"]
+        assert tables[0]["row_count_approx"] is None
+        assert tables[0]["columns"][0]["sample_values"] is None
+
+    async def test_one_no_store_cache_control_header(self, http_client):
+        """The security middleware's ``no-store`` is the only Cache-Control the response
+        carries: no second, cacheable value and no ETag a browser could revalidate."""
+        usc = MagicMock()
+        usc.schema_cache = _explorer_schema()
+        db = _mock_db(MockResult(single=_make_conn()), MockResult(single=usc))
+        app.dependency_overrides[get_db] = lambda: db
+        resp = await http_client.get("/api/v1/connections/conn-123/schema")
+        assert resp.status_code == 200
+        assert resp.headers.get_list("cache-control") == ["no-store, private"]
+        assert "etag" not in resp.headers
 
     async def test_no_cache_returns_404(self, http_client):
         conn = _make_conn()
@@ -669,14 +771,10 @@ class TestGetSchema:
 
 class TestRefreshSchema:
     async def test_success_returns_schema(self, http_client):
-        from dataclasses import dataclass
-
-        @dataclass
-        class FakeSchema:
-            tables: dict
+        from app.datasources.models import DataSourceSchema
 
         conn = _make_conn()
-        fake_schema = FakeSchema(tables={})
+        fake_schema = DataSourceSchema(source_type="postgresql", schemas=[], tables=[])
         adapter = MagicMock()
         adapter.connect = AsyncMock()
         adapter.introspect = AsyncMock(return_value=fake_schema)
@@ -739,6 +837,43 @@ class TestRefreshSchema:
         deleted = [call.args[0].table.name for call in db.execute.await_args_list[2:]]
         assert deleted == [TableEmbeddingCache.__tablename__, QueryCacheEntry.__tablename__]
         db.commit.assert_awaited_once()
+
+    async def test_refreshed_schema_is_served_through_the_privacy_pass(self, http_client):
+        """Introspection already leaves the excluded objects out; the row-filter hints are
+        withheld by the privacy pass, which the response goes through as every LLM path."""
+        from app.services.schema_utils import _schema_from_dict
+
+        conn = _make_conn(
+            privacy_settings={
+                "include_sample_values": True,
+                "row_filters": {"public.orders": "tenant_id = 1"},
+            }
+        )
+        adapter = MagicMock()
+        adapter.connect = AsyncMock()
+        adapter.introspect = AsyncMock(return_value=_schema_from_dict(_explorer_schema()))
+        adapter.disconnect = AsyncMock()
+        db = _mock_db(
+            MockResult(single=conn),  # get_connection_or_404
+            MockResult(single=None),  # no existing cache
+            MockResult(),  # delete TableEmbeddingCache
+            MockResult(),  # delete QueryCacheEntry
+        )
+        app.dependency_overrides[get_db] = lambda: db
+        with (
+            patch("app.services.schema_utils.decrypt_value", return_value='{"host":"localhost"}'),
+            patch("app.services.schema_utils.create_datasource", return_value=adapter),
+        ):
+            resp = await http_client.post("/api/v1/connections/conn-123/schema/refresh")
+        assert resp.status_code == 200
+        orders, payroll = resp.json()["tables"]
+        assert orders["row_count_approx"] is None
+        assert orders["columns"][0]["sample_values"] is None
+        # A table without a filter keeps its hints.
+        assert payroll["row_count_approx"] == 100
+        # What is stored is the introspection as it came: the pass runs on every read.
+        stored = db.add.call_args.args[0].schema_cache
+        assert stored["tables"][0]["row_count_approx"] == 100
 
     async def test_introspection_error_returns_400(self, http_client):
         conn = _make_conn()
@@ -838,6 +973,162 @@ class TestUpdatePrivacy:
         assert resp.status_code == 200
         assert self._stored_privacy(db)["sensitive_columns"] == ["Name", "notes"]
 
+    async def test_a_current_base_privacy_version_saves_and_serves_the_new_one(self, http_client):
+        from app.schemas.connection import privacy_version
+
+        conn = _make_conn(privacy_settings={"include_sample_values": False})
+        loaded = privacy_version(conn.privacy_settings)
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={"include_row_counts": False, "base_privacy_version": loaded},
+        )
+        assert resp.status_code == 200
+        stored = self._stored_privacy(db)
+        # The version is a precondition, never a setting.
+        assert stored == {"include_sample_values": False, "include_row_counts": False}
+        assert resp.json()["privacy_version"] == privacy_version(stored) != loaded
+
+    async def test_a_stale_base_privacy_version_returns_409_and_writes_nothing(self, http_client):
+        """A tab loaded before another save sends the version it loaded; the save that
+        moved it on is not overwritten."""
+        from app.schemas.connection import privacy_version
+
+        conn = _make_conn(privacy_settings={"row_filters": {"public.t": "tenant_id = 2"}})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={
+                "row_filters": {"public.t": "tenant_id = 1"},
+                "base_privacy_version": privacy_version({}),
+            },
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == (
+            "The privacy settings changed since this form was loaded. "
+            "Reload them and apply your changes again."
+        )
+        # Only the locked read: nothing is verified or written.
+        assert self._executes(db) == 1
+        db.commit.assert_not_awaited()
+
+    async def test_a_config_save_does_not_make_a_loaded_privacy_form_stale(self, http_client):
+        """A rename (or config edit) between loading the form and saving it changes no
+        privacy setting, so the privacy save goes through."""
+        conn = _make_conn(privacy_settings={"excluded_tables": ["public.audit"]})
+        self._use_db(_mock_db(MockResult(single=conn)))
+        loaded = (await http_client.get("/api/v1/connections/conn-123")).json()
+        rename_db = _mock_db(MockResult(single=conn), MockResult())
+
+        async def _renamed(obj) -> None:
+            obj.name = "Renamed DB"
+            obj.updated_at = obj.updated_at.replace(year=2030)
+
+        rename_db.refresh = AsyncMock(side_effect=_renamed)
+        self._use_db(rename_db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/config", json={"name": "Renamed DB"}
+        )
+        assert resp.status_code == 200
+
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={
+                "include_row_counts": False,
+                "base_privacy_version": loaded["privacy_version"],
+            },
+        )
+        assert resp.status_code == 200
+
+    async def test_a_second_tab_saving_after_a_privacy_save_gets_409(self, http_client):
+        conn = _make_conn(privacy_settings={"excluded_tables": ["public.audit"]})
+        self._use_db(_mock_db(MockResult(single=conn)))
+        loaded = (await http_client.get("/api/v1/connections/conn-123")).json()
+        body = {"base_privacy_version": loaded["privacy_version"]}
+
+        first = self._db_for_update(conn)
+        self._use_db(first)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={**body, "include_row_counts": False}
+        )
+        assert resp.status_code == 200
+
+        second = self._db_for_update(conn)
+        self._use_db(second)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={**body, "excluded_tables": ["public.audit", "public.payroll"]},
+        )
+        assert resp.status_code == 409
+        assert self._executes(second) == 1
+        second.commit.assert_not_awaited()
+
+    def test_the_privacy_version_ignores_key_order_and_reads_none_as_empty(self) -> None:
+        from app.schemas.connection import privacy_version
+
+        a = {"excluded_tables": ["t"], "include_row_counts": True}
+        b = {"include_row_counts": True, "excluded_tables": ["t"]}
+        assert privacy_version(a) == privacy_version(b)
+        assert privacy_version(None) == privacy_version({})
+        assert privacy_version(a) != privacy_version({**a, "excluded_tables": ["u"]})
+
+    async def test_a_privacy_save_moves_updated_at(self, http_client):
+        # updated_at still records every edit of the row, privacy included; the precondition
+        # no longer reads it.
+        conn = _make_conn(privacy_settings={})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={"include_row_counts": False}
+        )
+        assert resp.status_code == 200
+        assert "updated_at" in db.execute.call_args_list[1].args[0].compile().params
+
+    async def test_a_stored_qualified_sensitive_column_does_not_block_a_save(self, http_client):
+        """A connection saved before dotted entries were refused can still save: only a
+        new dotted entry is refused; the stored one is kept (it never matched)."""
+        conn = _make_conn(privacy_settings={"sensitive_columns": ["customers.notes"]})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={"sensitive_columns": ["Customers.Notes", "name"]},
+        )
+        assert resp.status_code == 200
+        assert self._stored_privacy(db)["sensitive_columns"] == ["Customers.Notes", "name"]
+
+    async def test_a_new_qualified_entry_is_refused_beside_a_stored_one(self, http_client):
+        conn = _make_conn(privacy_settings={"sensitive_columns": ["customers.notes"]})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={"sensitive_columns": ["customers.notes", "orders.memo"]},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"].endswith(": orders.memo")
+
+    async def test_privacy_save_refuses_a_qualified_sensitive_column(self, http_client):
+        conn = _make_conn(privacy_settings={})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy",
+            json={"sensitive_columns": ["name", "public.customers.notes"]},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            "sensitive_columns lists column names only, without a table or schema: "
+            "public.customers.notes"
+        )
+        # Only the locked read: nothing is written.
+        assert self._executes(db) == 1
+        db.commit.assert_not_awaited()
+
     async def test_privacy_save_stores_sensitive_columns_trimmed(self, http_client):
         conn = _make_conn(privacy_settings={"include_sample_values": False})
         db = self._db_for_update(conn)
@@ -880,6 +1171,22 @@ class TestUpdatePrivacy:
         }
         # lookup + update + delete TableEmbeddingCache + delete QueryCacheEntry: the
         # UserSchemaCache row stays.
+        assert self._executes(db) == 4
+        assert not self._touches_schema_cache(db)
+
+    async def test_the_strict_toggle_keeps_the_schema_cache(self, http_client):
+        # Strict mode changes what may run, not what is introspected or how the schema is
+        # formatted (the [SENSITIVE] marks come from the patterns and names): the schema
+        # cache stays, the cached answers and embeddings go as on every privacy save.
+        conn = _make_conn(privacy_settings={"include_sample_values": False})
+        db = self._db_for_update(conn)
+        self._use_db(db)
+        resp = await http_client.put(
+            "/api/v1/connections/conn-123/privacy", json={"strict_sensitive_columns": True}
+        )
+        assert resp.status_code == 200
+        assert self._stored_privacy(db)["strict_sensitive_columns"] is True
+        # lookup + update + delete TableEmbeddingCache + delete QueryCacheEntry
         assert self._executes(db) == 4
         assert not self._touches_schema_cache(db)
 
@@ -1555,8 +1862,10 @@ class TestRowFilterVerification:
         return TestUpdatePrivacy._db_for_update(conn)
 
     async def test_new_pair_is_planned_as_the_rewriter_writes_it(self, http_client):
-        """The statement planned is ``SELECT * FROM "s"."t"`` after ``apply_row_filters``:
-        the condition as sqlglot writes it back, inside the fenced derived table."""
+        """The statement planned is ``SELECT * FROM "s"."t" WHERE EXISTS (SELECT 1 FROM
+        "s"."t")`` after ``apply_row_filters``: the condition as sqlglot writes it back, as
+        written at the top level and qualified inside the subquery, each inside the fenced
+        derived table."""
         conn = _make_conn(privacy_settings={})
         adapter = _verifying_adapter()
         app.dependency_overrides[get_db] = lambda: self._db(conn)
@@ -1568,7 +1877,8 @@ class TestRowFilterVerification:
         assert resp.status_code == 200
         adapter.explain.assert_awaited_once_with(
             'SELECT * FROM (SELECT * FROM "public"."orders" WHERE (tenant_id = 42) OFFSET 0)'
-            ' AS "orders"',
+            ' AS "orders" WHERE EXISTS(SELECT 1 FROM (SELECT * FROM "public"."orders"'
+            ' WHERE ("orders".tenant_id = 42) OFFSET 0) AS "orders")',
             timeout=get_settings().default_query_timeout,
         )
         adapter.disconnect.assert_awaited_once()
@@ -1585,9 +1895,76 @@ class TestRowFilterVerification:
         assert resp.status_code == 200
         adapter.explain.assert_awaited_once_with(
             "SELECT * FROM (SELECT * FROM `shop`.`orders` WHERE (tenant_id = 42)"
-            " LIMIT 18446744073709551615) AS `orders`",
+            " LIMIT 18446744073709551615) AS `orders` WHERE EXISTS(SELECT 1 FROM"
+            " (SELECT * FROM `shop`.`orders` WHERE (`orders`.tenant_id = 42)"
+            " LIMIT 18446744073709551615) AS `orders`)",
             timeout=get_settings().default_query_timeout,
         )
+
+    @pytest.mark.parametrize(
+        "condition",
+        ["owner <> 'dom\\user'", "name NOT LIKE 'a\\_%'", "note <> 'a\tb'", "x = 'a\nb'"],
+    )
+    async def test_mysql_no_backslash_escapes_refuses_a_condition_with_an_escape(
+        self, http_client, condition: str
+    ):
+        conn = _make_conn(source_type="mysql", privacy_settings={})
+        adapter = _verifying_adapter()
+        adapter.backslash_is_escape = False
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"shop.orders": condition}},
+            )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == (
+            'row_filters["shop.orders"]: the condition contains a backslash, tab, carriage'
+            " return or line break inside a string literal, a quoted name or a comment, which"
+            " this MySQL server (NO_BACKSLASH_ESCAPES) reads differently from the way the"
+            " filter is applied; remove it"
+        )
+        adapter.explain.assert_not_awaited()
+
+    async def test_mysql_default_mode_plans_such_a_condition(self, http_client):
+        conn = _make_conn(source_type="mysql", privacy_settings={})
+        adapter = _verifying_adapter()
+        adapter.backslash_is_escape = True
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"shop.orders": "name NOT LIKE 'a\\_%'"}},
+            )
+        assert resp.status_code == 200
+        adapter.explain.assert_awaited_once()
+
+    async def test_mysql_no_backslash_escapes_plans_a_condition_with_a_line_break_between_tokens(
+        self, http_client
+    ):
+        conn = _make_conn(source_type="mysql", privacy_settings={})
+        adapter = _verifying_adapter()
+        adapter.backslash_is_escape = False
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"shop.orders": "tenant_id = 42\nAND active = 1"}},
+            )
+        assert resp.status_code == 200
+        adapter.explain.assert_awaited_once()
+
+    async def test_postgresql_never_runs_the_backslash_check(self, http_client):
+        conn = _make_conn(source_type="postgresql", privacy_settings={})
+        adapter = _verifying_adapter()  # a MagicMock attribute reads as "not an escape"
+        app.dependency_overrides[get_db] = lambda: self._db(conn)
+        with patch("app.routers.connections.create_datasource", return_value=adapter):
+            resp = await http_client.put(
+                "/api/v1/connections/conn-123/privacy",
+                json={"row_filters": {"public.orders": "name NOT LIKE 'a\\_%'"}},
+            )
+        assert resp.status_code == 200
+        adapter.explain.assert_awaited_once()
 
     async def test_a_quoted_key_is_planned_with_its_case(self, http_client):
         conn = _make_conn(privacy_settings={})

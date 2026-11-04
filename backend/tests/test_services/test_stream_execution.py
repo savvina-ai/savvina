@@ -670,10 +670,16 @@ _FILTERS = {
 }
 
 
+def _limited(sql: str) -> str:
+    """*sql* with the row limit ``row_filter._executable`` appends to a query without one."""
+    return f"{sql}\nLIMIT {get_settings().default_row_limit + 1}"
+
+
 def _filtered(sql: str) -> str:
+    """*sql* as executed: rewritten by the row filter, then given the row limit."""
     rewritten = apply_row_filters(sql, _FILTERS, "postgresql")
     assert "WHERE (tenant_id = 7)" in rewritten
-    return rewritten
+    return _limited(rewritten)
 
 
 def _capturing_adapter(*batch_sequences: list[QueryResult]) -> tuple[MagicMock, list[str]]:
@@ -1135,9 +1141,11 @@ class TestZeroResultReexecutionFailure:
         )
 
         assert len(executed) == 2
-        # The refined query is still announced before it runs.
+        # The refined query is announced before it runs; once it fails the original is
+        # announced again, so the client ends on the SQL the stored message carries.
         assert [e["query"] for e in events if e["type"] == "sql"] == [
-            "SELECT id FROM t WHERE x = 2"
+            "SELECT id FROM t WHERE x = 2",
+            "SELECT id FROM t WHERE x = 1",
         ]
         assert result_out.result.status == "executed"
         assert result_out.result.generated_query == "SELECT id FROM t WHERE x = 1"
@@ -1173,7 +1181,125 @@ class TestZeroResultReexecutionFailure:
 
         assert len(executed) == 2
         assert "secret-value" not in caplog.text
-        assert "Zero-result re-execution failed, keeping original (data): " in caplog.text
+        # The shared line (the non-streaming path writes the same), with the exception class.
+        assert (
+            "Zero-result refinement failed, keeping the original result (data, RuntimeError): "
+            in caplog.text
+        )
+
+    async def test_a_failed_refinement_restores_the_original_columns(self) -> None:
+        """The ``sql`` event of the refined query clears the client's columns; when the
+        re-run fails the original columns come back in an empty first batch, so the live
+        message matches the stored one (which keeps the original result)."""
+        executed: list[str] = []
+
+        async def _stream_gen(query, **_kwargs):
+            executed.append(query)
+            if len(executed) == 1:
+                yield _make_batch([], columns=("id", "name"), column_types=("int", "text"))
+                return
+            # The refined query streams a batch of other columns, then fails.
+            yield _make_batch([[1]], columns=("other",), execution_time_ms=99.0)
+            raise RuntimeError("boom")
+
+        adapter = MagicMock()
+        adapter.query_dialect = "postgresql"
+        adapter.execute_query_stream = _stream_gen
+        adapter.validate_query = MagicMock(
+            return_value=ValidationResult(is_valid=True, error_message=None)
+        )
+        provider = _sequenced_provider("SELECT other FROM t")
+
+        events, result_out = await _run_stream(
+            generated_query="SELECT id, name FROM t WHERE x = 1",
+            adapter=adapter,
+            provider=provider,
+        )
+
+        tail = events[-2:]
+        assert tail[0]["type"] == "sql"
+        assert tail[0]["query"] == "SELECT id, name FROM t WHERE x = 1"
+        assert tail[1]["type"] == "row_batch"
+        assert tail[1]["rows"] == []
+        assert tail[1]["batch_index"] == 0
+        assert tail[1]["columns"] == ["id", "name"]
+        assert tail[1]["column_types"] == ["int", "text"]
+        stored = result_out.result.results_response
+        assert stored.columns == ["id", "name"]
+        assert stored.rows == []
+        assert result_out.result.execution_time_ms == 5.0
+
+    async def test_a_failed_refinement_after_a_batchless_empty_result(self) -> None:
+        """The real adapters yield no batch for a 0-row result, so there are no columns to
+        restore: the original ``sql`` event alone leaves the client with no columns and no
+        rows, which is what the stored message holds."""
+        executed: list[str] = []
+
+        async def _stream_gen(query, **_kwargs):
+            executed.append(query)
+            if len(executed) == 1:
+                return
+                yield  # pragma: no cover
+            raise RuntimeError("boom")
+            yield  # pragma: no cover
+
+        adapter = MagicMock()
+        adapter.query_dialect = "postgresql"
+        adapter.execute_query_stream = _stream_gen
+        adapter.validate_query = MagicMock(
+            return_value=ValidationResult(is_valid=True, error_message=None)
+        )
+        provider = _sequenced_provider("SELECT id FROM t WHERE x = 2")
+
+        events, result_out = await _run_stream(
+            generated_query="SELECT id FROM t WHERE x = 1",
+            adapter=adapter,
+            provider=provider,
+        )
+
+        assert [e["type"] for e in events if e["type"] in ("sql", "row_batch")] == [
+            "sql",
+            "sql",
+        ]
+        assert events[-1]["type"] == "sql"
+        assert events[-1]["query"] == "SELECT id FROM t WHERE x = 1"
+        stored = result_out.result.results_response
+        assert stored.columns == []
+        assert stored.rows == []
+        assert result_out.result.generated_query == "SELECT id FROM t WHERE x = 1"
+
+    async def test_a_refused_refinement_is_never_announced(self) -> None:
+        """A refined query the row filter refuses never runs: no ``sql`` event is sent for
+        it, so the client keeps the original query and columns."""
+        from app.services import row_filter
+
+        real = row_filter.apply_row_filters
+
+        def _refuse_the_refinement(sql, *args, **kwargs):
+            if "x = 2" in sql:
+                raise RowFilterRejectedError("The query was refused.", llm_hint="Fix it.")
+            return real(sql, *args, **kwargs)
+
+        adapter, executed = _capturing_adapter([_make_batch([], columns=("id",))])
+        adapter.validate_query = MagicMock(
+            return_value=ValidationResult(is_valid=True, error_message=None)
+        )
+        provider = _sequenced_provider("SELECT id FROM t WHERE x = 2")
+
+        with patch("app.services.row_filter.apply_row_filters", side_effect=_refuse_the_refinement):
+            events, result_out = await _run_stream(
+                generated_query="SELECT id FROM t WHERE x = 1",
+                explanation="original",
+                adapter=adapter,
+                provider=provider,
+                privacy=PrivacySettings(row_filters=_FILTERS),
+            )
+
+        assert len(executed) == 1
+        assert [e for e in events if e["type"] == "sql"] == []
+        assert result_out.result.status == "executed"
+        assert result_out.result.generated_query == "SELECT id FROM t WHERE x = 1"
+        assert result_out.result.explanation == "original"
 
 
 class TestStreamUserFacingErrorText:
@@ -1264,7 +1390,7 @@ class TestNoBackslashEscapesOnTheStreamingPath:
         first = executable.call_args_list[0]
         assert first.args[0] == bypass
         assert first.kwargs["backslash_is_escape"] is False
-        assert executed == [fixed]
+        assert executed == [_limited(fixed)]
         assert "NO_BACKSLASH_ESCAPES" in _llm_text(provider)
         assert result_out.result.status == "executed"
 
@@ -1353,3 +1479,146 @@ class TestHintlessRejectionEndsTheCorrection:
 
         assert provider.generate_response.await_count == 1
         assert result_out.result.status == "executed"
+
+
+def _raising_adapter(exc: BaseException, category: ErrorCategory | None = None) -> MagicMock:
+    """An adapter whose every streamed execution raises *exc*, classified as *category*."""
+
+    async def _stream_gen(query, **_kwargs):
+        raise exc
+        yield  # pragma: no cover — makes this an async generator
+
+    adapter = MagicMock()
+    adapter.query_dialect = "postgresql"
+    adapter.execute_query_stream = _stream_gen
+    if category is not None:
+        adapter.classify_error = MagicMock(return_value=category)
+    return adapter
+
+
+class TestQueryFault:
+    """``query_fault`` marks a failure a fresh query could fix: running the statement failed,
+    not for a timeout, a permission error or a rejection the model cannot change, and not
+    because the connection failed. Only such a cached failure is evicted and regenerated."""
+
+    async def test_an_unknown_name_is_a_query_fault(self) -> None:
+        adapter = _raising_adapter(
+            RuntimeError('relation "t" does not exist'), ErrorCategory.UNKNOWN_NAME
+        )
+
+        _, result_out = await _run_stream(adapter=adapter, cache_hit=True)
+
+        assert result_out.result.status == "error"
+        assert result_out.result.query_fault is True
+
+    async def test_a_rejection_with_a_hint_is_a_query_fault(self) -> None:
+        adapter, _ = _capturing_adapter([_make_batch([[1]])])
+
+        with patch(
+            "app.services.row_filter.apply_row_filters",
+            side_effect=RowFilterRejectedError("Table t is ambiguous.", llm_hint="Qualify it."),
+        ):
+            _, result_out = await _run_stream(
+                generated_query="SELECT id FROM t",
+                adapter=adapter,
+                cache_hit=True,
+                privacy=PrivacySettings(row_filters=_FILTERS),
+            )
+
+        assert result_out.result.status == "error"
+        assert result_out.result.query_fault is True
+
+    async def test_a_success_is_not_a_query_fault(self) -> None:
+        _, result_out = await _run_stream(
+            adapter=_make_adapter([_make_batch([[1]])]), cache_hit=True
+        )
+
+        assert result_out.result.status == "cached"
+        assert result_out.result.query_fault is False
+
+    async def test_a_timeout_is_not_a_query_fault(self) -> None:
+        _, result_out = await _run_stream(adapter=_raising_adapter(TimeoutError()), cache_hit=True)
+
+        assert result_out.result.status == "error"
+        assert result_out.result.query_fault is False
+
+    async def test_a_permission_error_is_not_a_query_fault(self) -> None:
+        adapter = _raising_adapter(
+            RuntimeError("permission denied for table t"), ErrorCategory.PERMISSION
+        )
+
+        _, result_out = await _run_stream(adapter=adapter, cache_hit=True)
+
+        assert result_out.result.status == "error"
+        assert result_out.result.query_fault is False
+
+    async def test_a_hintless_rejection_is_not_a_query_fault(self) -> None:
+        adapter, _ = _capturing_adapter([_make_batch([[1]])])
+
+        with patch(
+            "app.services.row_filter.apply_row_filters",
+            side_effect=RowFilterRejectedError("The row filter on public.t needs migration."),
+        ):
+            _, result_out = await _run_stream(
+                generated_query="SELECT id FROM t",
+                adapter=adapter,
+                cache_hit=True,
+                privacy=PrivacySettings(row_filters=_FILTERS),
+            )
+
+        assert result_out.result.status == "error"
+        assert result_out.result.query_fault is False
+
+    async def test_a_connection_failure_is_not_a_query_fault(self) -> None:
+        adapter = MagicMock()
+        adapter.connect = AsyncMock(return_value=ConnectionResult(success=False, message="refused"))
+
+        _, result_out = await _run_stream(adapter=adapter, connected=False, cache_hit=True)
+
+        assert result_out.result.status == "error"
+        assert result_out.result.query_fault is False
+
+    async def test_a_lost_connection_is_not_a_query_fault(self) -> None:
+        adapter = _raising_adapter(
+            RuntimeError("connection was closed in the middle of operation"),
+            ErrorCategory.CONNECTION,
+        )
+
+        _, result_out = await _run_stream(adapter=adapter, cache_hit=True)
+
+        assert result_out.result.status == "error"
+        assert result_out.result.query_fault is False
+        assert result_out.result.error == (
+            "The connection to the database was lost while the query ran. Try again."
+        )
+
+
+class TestNoCorrectionForADenialOrALostConnection:
+    """A rewrite cannot lift a permission denial or restore a lost connection, so the
+    correction loop ends before its LLM call and the user sees the failure."""
+
+    async def test_a_permission_error_makes_no_llm_call(self) -> None:
+        adapter = _raising_adapter(
+            RuntimeError("permission denied for table t"), ErrorCategory.PERMISSION
+        )
+        provider = _sequenced_provider("SELECT id FROM u")
+
+        events, result_out = await _run_stream(adapter=adapter, provider=provider)
+
+        provider.generate_response.assert_not_awaited()
+        assert [e for e in events if e["type"] in ("sql", "status")] == []
+        assert result_out.result.status == "error"
+        assert result_out.result.error == "permission denied for table t"
+
+    async def test_a_lost_connection_makes_no_llm_call(self) -> None:
+        adapter = _raising_adapter(
+            RuntimeError("Lost connection to MySQL server during query"),
+            ErrorCategory.CONNECTION,
+        )
+        provider = _sequenced_provider("SELECT id FROM u")
+
+        _, result_out = await _run_stream(adapter=adapter, provider=provider)
+
+        provider.generate_response.assert_not_awaited()
+        assert result_out.result.status == "error"
+        assert result_out.result.query_fault is False

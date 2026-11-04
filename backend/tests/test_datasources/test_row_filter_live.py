@@ -583,6 +583,53 @@ async def test_postgresql_can_select_needs_usage_on_the_schema() -> None:
         await _pg_admin(_PG_SCHEMA_TEARDOWN)
 
 
+_PG_RESTRICTIVE_TEARDOWN = _pg_teardown(
+    tables=["ecommerce.audit_probe_restrictive"], roles=["savvina_audit_restrictive"]
+)
+
+
+async def test_postgresql_a_restrictive_policy_alone_does_not_apply() -> None:
+    """A restrictive policy only narrows what a permissive one grants: with no permissive
+    policy the engine returns no rows, so select_policy_applies reads False until a
+    permissive policy exists."""
+    table_name = "ecommerce.audit_probe_restrictive"
+    count = f"SELECT count(*) FROM {table_name}"
+    setup = [
+        f"CREATE TABLE {table_name} (id int, tenant_id int)",
+        f"INSERT INTO {table_name} VALUES (1, 1), (2, 2)",
+        f"ALTER TABLE {table_name} ENABLE ROW LEVEL SECURITY",
+        f"CREATE POLICY r ON {table_name} AS RESTRICTIVE FOR SELECT TO PUBLIC"
+        " USING (tenant_id = 1)",
+        f"CREATE ROLE savvina_audit_restrictive LOGIN PASSWORD '{_PROBE_PASSWORD}'",
+        "GRANT USAGE ON SCHEMA ecommerce TO savvina_audit_restrictive",
+        f"GRANT SELECT ON {table_name} TO savvina_audit_restrictive",
+    ]
+    reader = {**_PG, "username": "savvina_audit_restrictive", "password": _PROBE_PASSWORD}
+    privacy = PrivacySettings(row_filters={"ecommerce.audit_probe_restrictive": "tenant_id = 1"})
+    try:
+        await _pg_admin([*_PG_RESTRICTIVE_TEARDOWN, *setup])
+        facts = await _audit(reader, "postgresql", [("ecommerce", "audit_probe_restrictive")])
+        (table,) = facts.tables
+        assert table.rls_enabled is True and table.is_owner is False
+        assert table.select_policy_applies is False
+        assert evaluate(facts, privacy, "postgresql").rls_effective == {
+            "ecommerce.audit_probe_restrictive": False
+        }
+        assert await _pg_count(reader, count) == 0  # the engine agrees: no row passes
+
+        await _pg_admin([f"CREATE POLICY p ON {table_name} FOR SELECT TO PUBLIC USING (true)"])
+        facts = await _audit(reader, "postgresql", [("ecommerce", "audit_probe_restrictive")])
+        (table,) = facts.tables
+        assert table.select_policy_applies is True
+        assert evaluate(facts, privacy, "postgresql").rls_effective == {
+            "ecommerce.audit_probe_restrictive": True
+        }
+        assert await _pg_count(reader, count) == 1  # permissive grants, restrictive narrows
+    finally:
+        await evict_pool(reader)
+        await _pg_admin(_PG_RESTRICTIVE_TEARDOWN)
+
+
 _PG_COLS_TEARDOWN = _pg_teardown(
     tables=["ecommerce.audit_probe_cols", "ecommerce.audit_probe_owned_acl"],
     roles=["savvina_audit_colprobe", "savvina_audit_colgroup"],

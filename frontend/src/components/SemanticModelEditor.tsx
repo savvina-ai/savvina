@@ -201,9 +201,11 @@ function ColumnEditor({
 }
 
 /**
- * Fields the generator writes but `TableSemanticUpdate` does not accept — shown so the
- * user can see what the LLM is being told, but not editable, since a PUT would silently
- * drop any change.
+ * Table fields `TableSemanticUpdate` does not accept — shown so the user can see what the
+ * LLM is being told, but not editable, since a PUT would silently drop any change. Only
+ * `hierarchies` come from generation; no generation path writes `base_sql`,
+ * `partition_columns` or `cluster_columns` today (the introspection enrichment that would
+ * fill the first two is not wired in), so they show only on a model that already holds them.
  */
 function GeneratedTableFields({ table }: { table: TableSemantic }) {
   const rows: { label: string; value: string }[] = [];
@@ -223,7 +225,7 @@ function GeneratedTableFields({ table }: { table: TableSemantic }) {
   return (
     <div>
       <h4 className="text-xs font-semibold text-muted-foreground uppercase mb-2">
-        Generated (read-only)
+        Read-only (not editable here)
       </h4>
       <dl className="space-y-1">
         {rows.map((r) => (

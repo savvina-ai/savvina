@@ -153,6 +153,9 @@ class TestAuditPrivileges:
         sql = table_call.args[0]
         assert "pg_catalog.pg_class" in sql and "pg_catalog.pg_policies" in sql
         assert "CASE WHEN r.name = 'public' THEN true" in sql
+        # A restrictive policy only narrows what a permissive one grants: alone it lets no
+        # row through, so only a permissive policy counts as applying.
+        assert "AND p.permissive = 'PERMISSIVE'" in sql
         assert "pg_has_role(current_user, r.name, 'USAGE')" in sql
         # The owner by oid; else, for a non-superuser, a role whose privileges it inherits
         # (pg_has_role answers true for every role when asked about a superuser).

@@ -3,6 +3,7 @@
 
 """Tests for the normalised semantic store."""
 
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -21,6 +22,7 @@ from app.models.semantic_store import (
     SemanticModelRow,
     SemanticRelationshipRow,
     SemanticTableRow,
+    SemanticTombstoneRow,
 )
 from app.schemas.semantic import ColumnSemanticUpdate, SemanticModelUpdate, TableSemanticUpdate
 from app.semantic import store
@@ -89,6 +91,12 @@ def _index_shape(table: str, columns, unique, where) -> tuple:
     return (table, tuple(columns), bool(unique), str(where) if where is not None else None)
 
 
+# Columns of the 0002 tables that later migrations add, by table.
+_ADDED_AFTER_0002: dict[str, tuple[str, ...]] = {
+    "semantic_models": ("last_drift_report", "last_drift_checked_at"),
+}
+
+
 class TestMigrationMatchesOrm:
     """Server defaults are not compared: the ORM uses Python-side defaults by design."""
 
@@ -121,7 +129,12 @@ class TestMigrationMatchesOrm:
         orm_index_names: set[str] = set()
         for table_name, migration_cols in tables.items():
             orm_table = Base.metadata.tables[table_name]
-            orm_cols = {c.name: _column_shape(c) for c in orm_table.columns}
+            # Columns a later migration adds (0007: the last drift report) are not 0002's.
+            orm_cols = {
+                c.name: _column_shape(c)
+                for c in orm_table.columns
+                if c.name not in _ADDED_AFTER_0002.get(table_name, ())
+            }
             col_diff = {
                 name: {"migration": migration_cols.get(name), "orm": orm_cols.get(name)}
                 for name in migration_cols.keys() | orm_cols.keys()
@@ -147,6 +160,38 @@ class TestMigrationMatchesOrm:
             assert not idx_diff, f"{table_name}: index mismatch {idx_diff}"
             orm_index_names |= orm_indexes.keys()
         assert set(indexes) == orm_index_names
+
+    def test_0006_creates_the_tombstones_table_the_orm_declares(self) -> None:
+        tables: dict[str, dict[str, tuple]] = {}
+        indexes: dict[str, tuple] = {}
+
+        def fake_create_table(name, *columns, **_kw):
+            tables[name] = {c.name: _column_shape(c) for c in columns}
+
+        def fake_create_index(name, table, columns, unique=False, **kw):
+            indexes[name] = _index_shape(table, columns, unique, kw.get("postgresql_where"))
+
+        module = load_migration("0006_semantic_tombstones.py")
+        with (
+            patch("alembic.op.create_table", fake_create_table),
+            patch("alembic.op.create_index", fake_create_index),
+        ):
+            module.upgrade()
+
+        assert set(tables) == {"semantic_tombstones"}
+        orm_table = Base.metadata.tables["semantic_tombstones"]
+        assert tables["semantic_tombstones"] == {
+            c.name: _column_shape(c) for c in orm_table.columns
+        }
+        assert indexes == {
+            i.name: _index_shape(
+                "semantic_tombstones",
+                (c.name for c in i.columns),
+                i.unique,
+                i.dialect_options["postgresql"]["where"],
+            )
+            for i in orm_table.indexes
+        }
 
     def test_0004_creates_the_known_columns_table_the_orm_declares(self) -> None:
         tables: dict[str, dict[str, tuple]] = {}
@@ -1792,6 +1837,19 @@ class TestUserPatch:
         keys = (await semantic_db.scalars(select(SemanticTableRow.table_key))).all()
         assert "public.ghost" not in keys
 
+    async def test_base_version_is_not_a_section(self, semantic_db, connection_id) -> None:
+        # The route reads ``base_version``; the store must neither fit it onto the header
+        # nor record it as a changed section.
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        patch_ = SemanticModelUpdate.model_validate({"notes": ["kept"], "base_version": 1})
+        model = await store.apply_user_patch(semantic_db, connection_id, patch_, updated_by="u1")
+        await semantic_db.commit()
+        assert model.notes == ["kept"]
+        assert await store.load_version(semantic_db, connection_id) == 2
+        sections = (await semantic_db.scalars(select(SemanticHistoryRow.entity_key))).all()
+        assert "base_version" not in sections
+
     async def test_a_patch_naming_a_column_the_model_lacks_needs_display_name(
         self, semantic_db, connection_id
     ) -> None:
@@ -2561,7 +2619,7 @@ class TestModelCache:
         first = await store.load_model_cached(semantic_db, connection_id)
         assert first is not None
 
-        with patch.object(store, "load_model", wraps=store.load_model) as spy:
+        with patch.object(store, "_fetch_rows", wraps=store._fetch_rows) as spy:
             again = await store.load_model_cached(semantic_db, connection_id)
         assert again is first
         spy.assert_not_called()
@@ -2620,12 +2678,12 @@ class TestModelCache:
         assert again.notes == ["fresh"]
 
     async def test_the_cache_is_bounded(self, semantic_db, connection_id) -> None:
-        for i in range(store._MODEL_CACHE_SIZE + 5):
+        for i in range(store._model_cache_size() + 5):
             store._model_cache[f"conn-{i}"] = ("h", 1, SemanticModel())
         await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
         await semantic_db.commit()
         await store.load_model_cached(semantic_db, connection_id)
-        assert len(store._model_cache) <= store._MODEL_CACHE_SIZE
+        assert len(store._model_cache) <= store._model_cache_size()
         assert connection_id in store._model_cache
         assert all(f"conn-{i}" not in store._model_cache for i in range(6))
         assert "conn-6" in store._model_cache
@@ -2643,7 +2701,7 @@ class TestModelCache:
         first = await store.load_model_cached(semantic_db, connection_id)
         # Fill the cache behind it: ``connection_id`` is now the oldest entry and
         # ``conn-0`` the next oldest, newer but never read.
-        for i in range(store._MODEL_CACHE_SIZE - 1):
+        for i in range(store._model_cache_size() - 1):
             store._model_cache[f"conn-{i}"] = ("h", 1, SemanticModel())
         assert next(iter(store._model_cache)) == connection_id
 
@@ -2653,7 +2711,7 @@ class TestModelCache:
         assert connection_id in store._model_cache
         assert "conn-0" not in store._model_cache
         assert other in store._model_cache
-        assert len(store._model_cache) == store._MODEL_CACHE_SIZE
+        assert len(store._model_cache) == store._model_cache_size()
 
     async def test_an_unrelated_pending_change_still_uses_it(
         self, semantic_db, connection_id
@@ -2667,7 +2725,7 @@ class TestModelCache:
         conn.name = "renamed, not flushed"
         assert semantic_db.dirty
 
-        with patch.object(store, "load_model", wraps=store.load_model) as spy:
+        with patch.object(store, "_fetch_rows", wraps=store._fetch_rows) as spy:
             again = await store.load_model_cached(semantic_db, connection_id)
 
         assert again is first
@@ -2746,7 +2804,7 @@ class TestModelCache:
         await semantic_db.commit()
         store.clear_model_cache()
         with (
-            patch.object(store, "load_model", side_effect=RuntimeError("boom")),
+            patch.object(store, "_fetch_rows", side_effect=RuntimeError("boom")),
             pytest.raises(store.SemanticModelUnavailable) as raised,
         ):
             await store.load_model_cached(semantic_db, connection_id)
@@ -2821,6 +2879,123 @@ class TestModelCache:
         assert model.tables["public.orders"].description == "first edit"
         assert model.notes == ["hand written"]
         assert store._model_cache[connection_id][1] == 2
+
+    def test_the_cache_size_comes_from_the_settings(self, monkeypatch) -> None:
+        monkeypatch.setattr(store.get_settings(), "semantic_model_cache_size", 7)
+        assert store._model_cache_size() == 7
+
+    async def test_a_zero_cache_size_disables_it(
+        self, semantic_db, connection_id, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(store.get_settings(), "semantic_model_cache_size", 0)
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        store._model_cache["other"] = ("h", 1, SemanticModel())
+
+        first = await store.load_model_cached(semantic_db, connection_id)
+        second = await store.load_model_cached(semantic_db, connection_id)
+
+        assert first is not None and second is not None
+        assert second is not first
+        assert not store._model_cache
+
+
+class _SaveMidRead:
+    """Patch ``db.scalars`` so that another writer's ``save_model`` lands just before
+    the column rows are read: what a commit between ``_fetch_rows``' statements does
+    on PostgreSQL, where each statement sees the latest committed state. Fires on
+    the first ``times`` column reads; each save changes the notes and bumps the
+    version, deleting and reinserting every table row with new ids."""
+
+    def __init__(self, db, connection_id: str, times: int = 1) -> None:
+        self.db = db
+        self.connection_id = connection_id
+        self.times = times
+        self.fired = 0
+        self._scalars = db.scalars
+
+    async def __call__(self, statement, *args, **kwargs):
+        entity = statement.column_descriptions[0].get("entity")
+        if entity is SemanticColumnRow and self.fired < self.times:
+            self.fired += 1
+            model = _rich_model()
+            model.notes = [f"saved mid-read {self.fired}"]
+            await store.save_model(self.db, self.connection_id, model, updated_by="other")
+            # The save stands for another session's commit, not this session's write.
+            self.db.info.get(store._WROTE_KEY, set()).discard(self.connection_id)
+        return await self._scalars(statement, *args, **kwargs)
+
+
+class TestLoadModelWithVersion:
+    async def test_returns_the_model_with_the_version_its_rows_were_read_at(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        hook = _SaveMidRead(semantic_db, connection_id)
+
+        with patch.object(semantic_db, "scalars", hook):
+            model, version = await store.load_model_with_version(semantic_db, connection_id)
+
+        # The save mid-read moved the version to 2; the reread content is that state.
+        assert version == 2
+        assert model.notes == ["saved mid-read 1"]
+
+    async def test_no_model_is_none(self, semantic_db, connection_id) -> None:
+        assert await store.load_model_with_version(semantic_db, connection_id) is None
+
+
+class TestConsistentRead:
+    """``_fetch_rows`` re-reads the header's id and version after its statements and
+    reads again when they moved, so a ``save_model`` landing mid-read cannot hand a
+    caller tables with no columns, nor get a torn model cached."""
+
+    async def test_load_model_rereads_after_a_save_lands_mid_read(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        hook = _SaveMidRead(semantic_db, connection_id)
+
+        with patch.object(semantic_db, "scalars", hook):
+            model = await store.load_model(semantic_db, connection_id)
+
+        assert hook.fired == 1
+        assert model.notes == ["saved mid-read 1"]
+        assert set(model.tables["public.orders"].columns) == {"status", "email", "total"}
+        assert set(model.tables["public.customers"].columns) == {"id"}
+
+    async def test_the_cache_holds_the_consistent_read_under_its_own_version(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        hook = _SaveMidRead(semantic_db, connection_id)
+
+        with patch.object(semantic_db, "scalars", hook):
+            model = await store.load_model_cached(semantic_db, connection_id)
+
+        assert set(model.tables["public.orders"].columns) == {"status", "email", "total"}
+        assert store._model_cache[connection_id][1] == 2
+        assert store._model_cache[connection_id][2] is model
+
+    async def test_a_read_that_never_settles_is_served_but_not_cached(
+        self, semantic_db, connection_id, caplog
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        hook = _SaveMidRead(semantic_db, connection_id, times=store._READ_ATTEMPTS)
+
+        with (
+            patch.object(semantic_db, "scalars", hook),
+            caplog.at_level("WARNING", logger="app.semantic.store"),
+        ):
+            model = await store.load_model_cached(semantic_db, connection_id)
+
+        assert model is not None
+        assert hook.fired == store._READ_ATTEMPTS
+        assert connection_id not in store._model_cache
+        assert "changed during every read" in caplog.text
 
 
 class TestOptimisticLock:
@@ -3001,6 +3176,185 @@ class TestDriftApplyLog:
         assert [r.summary["tables_removed"] for r in page] == [["public.b"]]
 
 
+class TestTombstones:
+    """``apply_user_patch`` tombstones every item that leaves a list section (whatever its
+    marks) and lifts the tombstone of every incoming item; the finalisation reads them
+    through ``load_tombstones``."""
+
+    async def _stored(self, semantic_db, connection_id) -> SemanticModel:
+        model = await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        return model
+
+    @staticmethod
+    def _patch(**sections) -> SemanticModelUpdate:
+        return SemanticModelUpdate.model_validate(
+            {
+                field: [item.model_dump(mode="json") for item in items]
+                for field, items in sections.items()
+            }
+        )
+
+    async def _apply(self, semantic_db, connection_id, patch_) -> SemanticModel:
+        model = await store.apply_user_patch(semantic_db, connection_id, patch_, updated_by="u1")
+        await semantic_db.commit()
+        return model
+
+    def test_tombstone_key_strips_nuls_and_bounds_long_keys(self) -> None:
+        assert store.tombstone_key("Reve\x00nue") == "Revenue"
+        long = "a" * 3000
+        bounded = store.tombstone_key(long)
+        assert bounded.startswith("sha256:") and len(bounded) == len("sha256:") + 64
+        assert store.tombstone_key(long) == bounded
+        assert store.tombstone_key("a" * 2000) == "a" * 2000
+
+    async def test_no_model_loads_every_kind_empty(self, semantic_db, connection_id) -> None:
+        assert await store.load_tombstones(semantic_db, connection_id) == {
+            kind: set() for kind in store.TOMBSTONE_KINDS
+        }
+
+    async def test_a_deleted_generated_metric_is_tombstoned(
+        self, semantic_db, connection_id
+    ) -> None:
+        model = await self._stored(semantic_db, connection_id)
+        kept = [m for m in model.business_metrics if m.name != "Revenue"]
+        await self._apply(semantic_db, connection_id, self._patch(business_metrics=kept))
+        tombs = await store.load_tombstones(semantic_db, connection_id)
+        assert tombs["metric"] == {"Revenue"}
+        assert all(not tombs[kind] for kind in tombs if kind != "metric")
+        [row] = await store.list_tombstones(semantic_db, connection_id)
+        assert (row.kind, row.key, row.created_by) == ("metric", "Revenue", "u1")
+
+    async def test_a_deleted_user_marked_metric_is_tombstoned_too(
+        self, semantic_db, connection_id
+    ) -> None:
+        model = await self._stored(semantic_db, connection_id)
+        edited = [
+            m.model_copy(update={"description": "mine"}) if m.name == "Revenue" else m
+            for m in model.business_metrics
+        ]
+        await self._apply(semantic_db, connection_id, self._patch(business_metrics=edited))
+        assert (await store.load_tombstones(semantic_db, connection_id))["metric"] == set()
+        kept = [m for m in edited if m.name != "Revenue"]
+        await self._apply(semantic_db, connection_id, self._patch(business_metrics=kept))
+        assert (await store.load_tombstones(semantic_db, connection_id))["metric"] == {"Revenue"}
+
+    async def test_re_adding_the_item_lifts_the_tombstone(self, semantic_db, connection_id) -> None:
+        model = await self._stored(semantic_db, connection_id)
+        kept = [m for m in model.business_metrics if m.name != "Revenue"]
+        await self._apply(semantic_db, connection_id, self._patch(business_metrics=kept))
+        await self._apply(
+            semantic_db, connection_id, self._patch(business_metrics=model.business_metrics)
+        )
+        assert (await store.load_tombstones(semantic_db, connection_id))["metric"] == set()
+
+    async def test_a_rename_tombstones_the_old_name_and_marks_the_new_item(
+        self, semantic_db, connection_id
+    ) -> None:
+        model = await self._stored(semantic_db, connection_id)
+        renamed = [
+            m.model_copy(update={"name": "Income"}) if m.name == "Revenue" else m
+            for m in model.business_metrics
+        ]
+        after = await self._apply(semantic_db, connection_id, self._patch(business_metrics=renamed))
+        assert {m.name for m in after.business_metrics} == {"Income", "Orders"}
+        assert (await store.load_tombstones(semantic_db, connection_id))["metric"] == {"Revenue"}
+        _, snapshot = await store.load_model_with_provenance(semantic_db, connection_id)
+        assert "Income" in snapshot.marks["metric"]
+
+    async def test_an_echoed_section_writes_none(self, semantic_db, connection_id) -> None:
+        model = await self._stored(semantic_db, connection_id)
+        await self._apply(
+            semantic_db,
+            connection_id,
+            self._patch(
+                business_metrics=model.business_metrics,
+                segments=model.segments,
+                derived_columns=model.derived_columns,
+                common_joins=model.common_joins,
+                relationships=model.relationships,
+            ),
+        )
+        assert await store.list_tombstones(semantic_db, connection_id) == []
+
+    async def test_every_list_section_is_covered(self, semantic_db, connection_id) -> None:
+        await self._stored(semantic_db, connection_id)
+        await self._apply(
+            semantic_db,
+            connection_id,
+            self._patch(segments=[], derived_columns=[], common_joins=[], relationships=[]),
+        )
+        tombs = await store.load_tombstones(semantic_db, connection_id)
+        assert tombs == {
+            "metric": set(),
+            "segment": {"Paid"},
+            "derived_column": {"net"},
+            "common_join": {"public.orders.customer_id = public.customers.id"},
+            "relationship": {"public.orders.customer_id->public.customers.id"},
+        }
+
+    async def test_delete_tombstone_lifts_one_and_reports_a_miss(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._stored(semantic_db, connection_id)
+        await self._apply(semantic_db, connection_id, self._patch(segments=[]))
+        assert await store.delete_tombstone(semantic_db, connection_id, "segment", "Paid") is True
+        assert await store.delete_tombstone(semantic_db, connection_id, "segment", "Paid") is False
+        assert (await store.load_tombstones(semantic_db, connection_id))["segment"] == set()
+
+    async def test_tombstones_bump_no_version_and_go_with_the_model(
+        self, semantic_db, connection_id
+    ) -> None:
+        await self._stored(semantic_db, connection_id)
+        await self._apply(semantic_db, connection_id, self._patch(segments=[]))
+        version = await store.load_version(semantic_db, connection_id)
+        assert await store.delete_tombstone(semantic_db, connection_id, "segment", "Paid")
+        await semantic_db.commit()
+        assert await store.load_version(semantic_db, connection_id) == version
+        await self._apply(semantic_db, connection_id, self._patch(derived_columns=[]))
+        await store.delete_model(semantic_db, connection_id, changed_by="u1")
+        await semantic_db.commit()
+        assert (
+            await semantic_db.scalar(select(func.count()).select_from(SemanticTombstoneRow))
+        ) == 0
+
+
+class TestLastDriftReport:
+    async def test_no_model_stores_and_loads_nothing(self, semantic_db, connection_id) -> None:
+        await store.record_drift_report(
+            semantic_db, connection_id, {"warning_count": 0}, datetime.now(UTC)
+        )
+        assert await store.load_last_drift_report(semantic_db, connection_id) is None
+
+    async def test_records_the_latest_without_a_version_bump(
+        self, semantic_db, connection_id
+    ) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        version = await store.load_version(semantic_db, connection_id)
+        assert await store.load_last_drift_report(semantic_db, connection_id) is None
+        when = datetime(2026, 11, 3, 12, 0, tzinfo=UTC)
+        await store.record_drift_report(semantic_db, connection_id, {"warning_count": 1}, when)
+        await store.record_drift_report(semantic_db, connection_id, {"warning_count": 2}, when)
+        await semantic_db.commit()
+        assert await store.load_last_drift_report(semantic_db, connection_id) == {
+            "warning_count": 2
+        }
+        assert await store.load_version(semantic_db, connection_id) == version
+
+    async def test_a_full_save_keeps_the_report(self, semantic_db, connection_id) -> None:
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await store.record_drift_report(
+            semantic_db, connection_id, {"warning_count": 1}, datetime.now(UTC)
+        )
+        await semantic_db.commit()
+        await store.save_model(semantic_db, connection_id, _rich_model(), updated_by="u1")
+        await semantic_db.commit()
+        assert await store.load_last_drift_report(semantic_db, connection_id) == {
+            "warning_count": 1
+        }
+
+
 class TestKnownColumns:
     async def _stored(self, semantic_db, connection_id) -> None:
         await store.save_model(semantic_db, connection_id, _rich_model(), updated_by=None)
@@ -3013,6 +3367,19 @@ class TestKnownColumns:
             semantic_db, connection_id, {"public.customers", "public.ghosts"}
         )
         assert names == {"public.customers": ["id"]}
+
+    async def test_load_column_names_lists_a_held_table_with_no_column_row(
+        self, semantic_db, connection_id
+    ) -> None:
+        """Check Drift completes the entry of every table the model holds, so a table with
+        no column row must be told apart from one the model no longer has."""
+        model = _rich_model()
+        model.tables["public.empty"] = TableSemantic(display_name="Empty")
+        await store.save_model(semantic_db, connection_id, model, updated_by=None)
+        names = await store.load_column_names(
+            semantic_db, connection_id, {"public.empty", "public.ghosts"}
+        )
+        assert names == {"public.empty": []}
 
     async def test_load_column_names_without_a_model_reads_nothing(
         self, semantic_db, connection_id

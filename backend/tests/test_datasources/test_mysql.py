@@ -974,11 +974,19 @@ class MockSSCursor:
         self._pos = 0
         self.description = description or (("col1", None, None, None, None, None, None),)
         self.execute = AsyncMock()
+        self.close = AsyncMock()
 
     async def fetchmany(self, size: int) -> list:
         chunk = self._rows[self._pos : self._pos + size]
         self._pos += len(chunk)
         return chunk
+
+    def __await__(self):
+        # ``await conn.cursor(SSCursor)``: aiomysql's cursor context manager is awaitable.
+        async def _self() -> "MockSSCursor":
+            return self
+
+        return _self().__await__()
 
     async def __aenter__(self) -> "MockSSCursor":
         return self
@@ -1200,6 +1208,151 @@ class TestReadOnlySession:
             await adapter.execute_query("SELECT 1")
 
         assert "SET SESSION TRANSACTION READ WRITE" in _executed_statements(conn._cursor)
+
+    async def test_a_cancelled_query_closes_the_connection_and_sends_no_reset(self) -> None:
+        """A client disconnect cancels the turn while the statement runs. aiomysql closes the
+        connection when a read is cancelled, so a reset sent afterwards would raise
+        InterfaceError and replace the CancelledError: the caller would read a disconnect as
+        an execution error and start a correction. No reset is sent; the connection is
+        closed."""
+        adapter, conn = _make_adapter()
+        running = asyncio.Event()
+
+        async def execute(statement: str, args: object = None) -> None:
+            if running.is_set():
+                raise aiomysql.InterfaceError("Cancelled during execution")
+            if statement == "SELECT 1":
+                running.set()
+                await asyncio.Event().wait()
+
+        conn._cursor.execute = AsyncMock(side_effect=execute)
+        task = asyncio.create_task(adapter.execute_query("SELECT 1"))
+        await running.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert _executed_statements(conn._cursor)[-1] == "SELECT 1"
+        conn.close.assert_called_once_with()
+
+    async def test_a_cancelled_stream_closes_the_connection_and_sends_no_reset(self) -> None:
+        """As for execute_query, and the unbuffered cursor is not closed either: closing it
+        drains the result from the connection aiomysql already closed."""
+        adapter = _make_stream_adapter(rows=[("a",)])
+        conn = adapter._pool._conn  # type: ignore[attr-defined]
+        plain = conn._plain_cursor
+        ss_cursor = conn._ss_cursor
+        fetching = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def fetchmany(size: int) -> list:
+            fetching.set()
+            await asyncio.Event().wait()
+            return []
+
+        async def plain_execute(statement: str, args: object = None) -> None:
+            if cancelled.is_set():
+                raise aiomysql.InterfaceError("Cancelled during execution")
+
+        ss_cursor.fetchmany = fetchmany
+        ss_cursor.close = AsyncMock(side_effect=aiomysql.InterfaceError("closed"))
+        plain.execute = AsyncMock(side_effect=plain_execute)
+
+        async def consume() -> None:
+            async for _batch in adapter.execute_query_stream("SELECT 1"):
+                pass
+
+        task = asyncio.create_task(consume())
+        await fetching.wait()
+        cancelled.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert _executed_statements(plain)[-1] == "SET SESSION TRANSACTION READ ONLY"
+        ss_cursor.close.assert_not_awaited()
+        conn.close.assert_called_once_with()
+
+    async def test_an_early_stop_drops_the_connection_without_draining(self) -> None:
+        """A consumer that stops reading (aclose: the turn ended or the client went away)
+        leaves rows on the server. Closing the unbuffered cursor would read every one of
+        them first; the connection is closed instead, with no reset, and the pool replaces
+        it."""
+        adapter = _make_stream_adapter(rows=[(i,) for i in range(10)])
+        conn = adapter._pool._conn  # type: ignore[attr-defined]
+        plain = conn._plain_cursor
+
+        stream = adapter.execute_query_stream("SELECT 1", batch_size=2, max_rows=10)
+        first = await stream.__anext__()
+        assert first.rows == [[0], [1]]
+        await stream.aclose()
+
+        conn._ss_cursor.close.assert_not_awaited()
+        conn.close.assert_called_once_with()
+        assert _executed_statements(plain)[-1] == "SET SESSION TRANSACTION READ ONLY"
+
+    async def test_a_stream_cut_at_max_rows_drops_the_connection_without_draining(
+        self,
+    ) -> None:
+        """At max_rows the server may still hold rows (a truncated result on a large
+        table): closing the unbuffered cursor would read all of them. The connection is
+        closed instead, with no reset."""
+        adapter = _make_stream_adapter(rows=[(i,) for i in range(100)])
+        conn = adapter._pool._conn  # type: ignore[attr-defined]
+        plain = conn._plain_cursor
+
+        batches = [
+            batch
+            async for batch in adapter.execute_query_stream("SELECT 1", batch_size=10, max_rows=25)
+        ]
+
+        assert sum(len(b.rows) for b in batches) == 25
+        assert batches[-1].truncated is True
+        conn._ss_cursor.close.assert_not_awaited()
+        conn.close.assert_called_once_with()
+        assert _executed_statements(plain)[-1] == "SET SESSION TRANSACTION READ ONLY"
+
+    async def test_a_result_of_exactly_max_rows_keeps_the_connection(self) -> None:
+        """At max_rows a one-row probe tells an exhausted result from a truncated one: when
+        it reads nothing, the cursor is closed and the session reset as usual."""
+        adapter = _make_stream_adapter(rows=[(i,) for i in range(20)])
+        conn = adapter._pool._conn  # type: ignore[attr-defined]
+
+        batches = [
+            batch
+            async for batch in adapter.execute_query_stream("SELECT 1", batch_size=10, max_rows=20)
+        ]
+
+        assert sum(len(b.rows) for b in batches) == 20
+        conn._ss_cursor.close.assert_awaited_once()
+        conn.close.assert_not_called()
+        assert _executed_statements(conn._plain_cursor)[-1] == (
+            "SET SESSION TRANSACTION READ WRITE"
+        )
+
+    async def test_an_exhausted_stream_keeps_the_connection(self) -> None:
+        adapter = _make_stream_adapter(rows=[(i,) for i in range(5)])
+        conn = adapter._pool._conn  # type: ignore[attr-defined]
+
+        async for _batch in adapter.execute_query_stream("SELECT 1", batch_size=2, max_rows=25):
+            pass
+
+        conn._ss_cursor.close.assert_awaited_once()
+        conn.close.assert_not_called()
+        assert _executed_statements(conn._plain_cursor)[-1] == (
+            "SET SESSION TRANSACTION READ WRITE"
+        )
+
+    async def test_a_finished_stream_closes_its_cursor_before_the_reset(self) -> None:
+        adapter = _make_stream_adapter(rows=[("a",)])
+        conn = adapter._pool._conn  # type: ignore[attr-defined]
+        order: list[str] = []
+        conn._ss_cursor.close = AsyncMock(side_effect=lambda: order.append("close"))
+        conn._plain_cursor.execute = AsyncMock(side_effect=lambda q, *a: order.append(q))
+
+        async for _batch in adapter.execute_query_stream("SELECT 1"):
+            pass
+
+        assert order.index("close") < order.index("SET SESSION MAX_EXECUTION_TIME = 0")
+        conn.close.assert_not_called()
 
     async def test_stream_runs_read_only_and_resets(self) -> None:
         adapter = _make_stream_adapter(rows=[("a",)])

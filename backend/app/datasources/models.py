@@ -156,8 +156,9 @@ class TablePrivilegeFacts:
     is_owner: bool = False
     rls_enabled: bool = False  # relrowsecurity
     rls_forced: bool = False  # relforcerowsecurity
-    # A policy with cmd SELECT or ALL whose roles include the role, a role whose privileges
-    # it inherits (pg_has_role ... 'USAGE'), or PUBLIC.
+    # A permissive policy with cmd SELECT or ALL whose roles include the role, a role whose
+    # privileges it inherits (pg_has_role ... 'USAGE'), or PUBLIC (a restrictive policy
+    # alone lets no row through).
     select_policy_applies: bool = False
     # The grants through which the role holds SELECT on the table, each at the scope it is
     # granted at, with the grantee a REVOKE must name (PrivilegeGrant.grantee's encoding).

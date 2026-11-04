@@ -45,6 +45,7 @@ from app.models.semantic_store import (
     SemanticModelRow,
     SemanticRelationshipRow,
     SemanticTableRow,
+    SemanticTombstoneRow,
 )
 from app.models.semantic_suggestion import SemanticSuggestion
 from app.models.table_embedding_cache import TableEmbeddingCache
@@ -78,6 +79,7 @@ _TABLES = (
     SemanticGlobalItemRow,
     SemanticHistoryRow,
     SemanticKnownColumnsRow,
+    SemanticTombstoneRow,
     SemanticSuggestion,
     # Emptied by _invalidate_connection_caches on the writes that change the model.
     QueryCacheEntry,
@@ -401,6 +403,88 @@ class TestGenerationFlow:
         assert set(stored.tables["public.customers"].columns) == {"id", "status"}
         assert stored.tables["public.customers"].columns["status"].display_name == "Legacy"
         assert (await store.load_known_columns(db, _CID))["public.customers"] == {"id", "status"}
+
+    async def test_finishing_a_run_renames_a_table_held_only_under_a_near_miss_key(
+        self, http_client, db, flow
+    ) -> None:
+        """A blob-era ``public.Customers`` row with a hand edit, for the live
+        ``public.customers``: the finalisation renames it, marks and columns carried,
+        rather than dropping it with a warning."""
+        llm, _set_schema = flow
+        await _generate(http_client)
+        await db.execute(
+            update(SemanticTableRow)
+            .where(SemanticTableRow.table_key == "public.customers")
+            .values(
+                table_key="public.Customers",
+                display_name="Legacy",
+                user_edited_fields=["display_name"],
+            )
+        )
+        await db.commit()
+
+        # "Finish with what's generated": no batch reaches ``customers``.
+        await _init(http_client)
+        body = await _globals(http_client)
+
+        # The globals prompt read it under its live key.
+        assert set(llm.globals_tables) == {"public.orders", "public.customers"}
+        assert set(body["tables"]) == {"public.orders", "public.customers"}
+        assert not any("no annotation" in w for w in body["generation_warnings"])
+        stored = await store.load_model(db, _CID)
+        assert stored.tables["public.customers"].display_name == "Legacy"
+        assert set(stored.tables["public.customers"].columns) == {"id"}
+        marks = (await store.provenance_snapshot(db, _CID)).marks
+        assert marks["table"] == {"public.customers": ["display_name"]}
+        assert set(await store.load_known_columns(db, _CID)) == {
+            "public.orders",
+            "public.customers",
+        }
+
+    async def test_a_deleted_edge_stays_deleted_when_its_table_key_is_renamed(
+        self, http_client, db, flow
+    ) -> None:
+        """The edge was deleted while the model held ``orders`` as a blob-era
+        ``public.Orders``, so its tombstone names that key. The finalisation renames the
+        table, and the catalog edge under the live key must stay deleted."""
+        _llm, set_schema = flow
+        fk = RelationshipInfo(
+            from_schema="public",
+            from_table="orders",
+            from_column="customer_id",
+            to_schema="public",
+            to_table="customers",
+            to_column="id",
+        )
+        set_schema({"orders": ["id", "customer_id"], "customers": ["id"]}, fks=[fk])
+        await _generate(http_client)
+        await db.execute(
+            update(SemanticTableRow)
+            .where(SemanticTableRow.table_key == "public.orders")
+            .values(table_key="public.Orders")
+        )
+        await db.execute(
+            update(SemanticRelationshipRow)
+            .where(SemanticRelationshipRow.from_table == "public.orders")
+            .values(from_table="public.Orders")
+        )
+        await db.commit()
+        current = (await http_client.get(_BASE)).json()
+        resp = await http_client.put(
+            _BASE, json={"relationships": [], "base_version": current["version"]}
+        )
+        assert resp.status_code == 200, resp.text
+        listed = (await http_client.get(f"{_BASE}/tombstones")).json()
+        assert [(t["kind"], t["key"]) for t in listed] == [
+            ("relationship", "public.Orders.customer_id->public.customers.id")
+        ]
+
+        # "Finish with what's generated": the rename happens here.
+        await _init(http_client)
+        body = await _globals(http_client)
+
+        assert set(body["tables"]) == {"public.orders", "public.customers"}
+        assert body["relationships"] == []
 
     async def test_regenerate_keeps_a_hand_edit_and_prunes_a_dropped_column(
         self, http_client, db, flow
@@ -1003,6 +1087,49 @@ class TestGenerationFlow:
         assert "description" in marks["table"]["public.customers"]
         assert set(llm.globals_tables) == {"public.orders"}
 
+    async def test_a_deleted_generated_metric_stays_deleted_until_restored(
+        self, http_client, db, flow
+    ) -> None:
+        """Deleting a generated metric through PUT tombstones it, a Regenerate leaves it
+        out, the page's list shows it, and Restore lets the next Regenerate bring it back."""
+        await _generate(http_client)
+        first = (await http_client.get(_BASE)).json()
+        assert [m["name"] for m in first["business_metrics"]] == ["Row count"]
+
+        resp = await http_client.put(
+            _BASE, json={"business_metrics": [], "base_version": first["version"]}
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["business_metrics"] == []
+        assert resp.json()["version"] > first["version"]
+
+        regenerated = await _generate(http_client)
+        assert regenerated["business_metrics"] == []
+        listed = await http_client.get(f"{_BASE}/tombstones")
+        assert listed.status_code == 200, listed.text
+        assert [(t["kind"], t["key"]) for t in listed.json()] == [("metric", "Row count")]
+
+        restored = await http_client.post(
+            f"{_BASE}/tombstones/restore", json={"kind": "metric", "key": "Row count"}
+        )
+        assert restored.status_code == 204, restored.text
+        assert (await http_client.get(f"{_BASE}/tombstones")).json() == []
+        again = await _generate(http_client)
+        assert [m["name"] for m in again["business_metrics"]] == ["Row count"]
+
+    async def test_a_stale_draft_is_409_and_writes_nothing(self, http_client, db, flow) -> None:
+        await _generate(http_client)
+        loaded = (await http_client.get(_BASE)).json()
+        other_tab = await http_client.put(
+            _BASE, json={"notes": ["from the other tab"], "base_version": loaded["version"]}
+        )
+        assert other_tab.status_code == 200, other_tab.text
+        stale = await http_client.put(
+            _BASE, json={"notes": ["mine"], "base_version": loaded["version"]}
+        )
+        assert stale.status_code == 409, stale.text
+        assert (await http_client.get(_BASE)).json()["notes"] == ["from the other tab"]
+
 
 class TestApplyDriftFlow:
     """Check Drift and Apply Drift over a generated model, the baseline included: what
@@ -1031,7 +1158,11 @@ class TestApplyDriftFlow:
             seen.append(schema)
             return compute_drift(schema, *args, **kwargs)
 
-        with patch("app.routers.semantic.compute_drift", new=spy):
+        # Check Drift compares in ``services/drift_check``, the apply in the router.
+        with (
+            patch("app.services.drift_check.compute_drift", new=spy),
+            patch("app.routers.semantic.compute_drift", new=spy),
+        ):
             await _check_drift(http_client, live)
             await _apply_drift(http_client, live, dry_run=True)
 
@@ -1168,6 +1299,102 @@ class TestApplyDriftFlow:
         report = await _check_drift(http_client, live)
         assert report["has_actionable_changes"] is False
         assert report["warnings"] == []
+
+    async def test_a_near_miss_table_key_is_reported_as_a_rename_and_renamed_with_no_llm_call(
+        self, http_client, db, flow
+    ) -> None:
+        """A blob-era ``public.Customers`` holding a hand edit and a quoted column key, for
+        the live ``public.customers``. Check Drift words both as renames; Apply Drift makes
+        them, annotations and marks carried, without asking the LLM; the next check is
+        clean."""
+        llm, set_schema = flow
+        set_schema({"orders": ["id"], "customers": ["id", "status"]})
+        llm.omit_columns = {"public.customers.status"}
+        await _generate(http_client)
+        table_id = await db.scalar(
+            select(SemanticTableRow.id).where(SemanticTableRow.table_key == "public.customers")
+        )
+        await db.execute(
+            update(SemanticTableRow)
+            .where(SemanticTableRow.id == table_id)
+            .values(
+                table_key="public.Customers",
+                display_name="Legacy",
+                user_edited_fields=["display_name"],
+            )
+        )
+        db.add(
+            SemanticColumnRow(
+                table_id=table_id,
+                column_name='"status"',
+                display_name="Legacy status",
+                user_edited_fields=["display_name"],
+            )
+        )
+        await db.commit()
+        llm.batches = []
+        live = _schema({"orders": ["id"], "customers": ["id", "status"]})
+
+        report = await _check_drift(http_client, live)
+        assert report["has_actionable_changes"] is True
+        assert report["warnings"] == [
+            'Table key "public.Customers" in the semantic model is a near-miss spelling of '
+            '"public.customers"; Apply Drift renames it to "public.customers", keeping its '
+            "annotation",
+            'Column key "public.customers."status"" in the semantic model is a near-miss '
+            'spelling of "status"; Apply Drift renames it to "status", keeping its annotation',
+        ]
+
+        preview = await _apply_drift(http_client, live, dry_run=True)
+        assert preview["summary"]["tables_renamed"] == {"public.Customers": "public.customers"}
+        assert preview["summary"]["tables_added"] == preview["summary"]["tables_removed"] == []
+
+        applied = await _apply_drift(http_client, live)
+        summary = applied["summary"]
+        assert summary["tables_renamed"] == {"public.Customers": "public.customers"}
+        assert summary["columns_renamed"] == {"public.customers": {'"status"': "status"}}
+        assert summary["tables_added"] == summary["tables_removed"] == []
+        assert summary["changed"] is True
+        assert llm.batches == [] and llm.column_batches == []
+        stored = await store.load_model(db, _CID)
+        assert set(stored.tables) == {"public.orders", "public.customers"}
+        customers = stored.tables["public.customers"]
+        assert customers.display_name == "Legacy"
+        assert customers.columns["status"].display_name == "Legacy status"
+        marks = (await store.provenance_snapshot(db, _CID)).marks
+        assert marks["table"] == {"public.customers": ["display_name"]}
+        assert marks["column"] == {"public.customers.status": ["display_name"]}
+        assert (await store.load_known_columns(db, _CID))["public.customers"] == {"id", "status"}
+
+        report = await _check_drift(http_client, live)
+        assert report["has_actionable_changes"] is False
+        assert report["warnings"] == []
+
+    async def test_a_new_column_of_a_renamed_table_is_annotated_in_the_same_apply(
+        self, http_client, db, flow
+    ) -> None:
+        """The renamed table's columns are diffed under its live key: a column its
+        baseline never saw is asked for, with the stored table as context, and added to
+        the table under its live key."""
+        llm, _set_schema = flow
+        await _generate(http_client)
+        await db.execute(
+            update(SemanticTableRow)
+            .where(SemanticTableRow.table_key == "public.customers")
+            .values(table_key="public.Customers")
+        )
+        await db.commit()
+        live = _schema({"orders": ["id", "total"], "customers": ["id", "region"]})
+
+        applied = await _apply_drift(http_client, live)
+
+        assert applied["summary"]["tables_renamed"] == {"public.Customers": "public.customers"}
+        assert applied["summary"]["columns_added"] == {"public.customers": ["region"]}
+        assert llm.column_batches == [{"public.customers": ["region"]}]
+        stored = await store.load_model(db, _CID)
+        assert set(stored.tables["public.customers"].columns) == {"id", "region"}
+        assert (await store.load_known_columns(db, _CID))["public.customers"] == {"id", "region"}
+        assert (await _check_drift(http_client, live))["warnings"] == []
 
     async def test_a_hidden_near_miss_key_is_renamed_once_its_column_is_unhidden(
         self, http_client, db, flow

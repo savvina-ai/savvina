@@ -615,6 +615,45 @@ class TestResolveSchemaNarrowsStaleCache:
         assert status.sample_values is None
         assert status.native_type == "enum(…)"
 
+    async def test_table_embeddings_are_built_from_the_narrowed_schema(self) -> None:
+        """The embedding input text comes from the schema after the privacy pass: a
+        stale cache's excluded column or table never reaches the embedding model."""
+        stale = _make_schema(
+            _make_table("store", "orders", ["id", "amount", "secret_ts"]),
+            _make_table("store", "payroll", ["id", "salary"]),
+        )
+        usc = MagicMock()
+        usc.schema_cache = _schema_to_dict(stale)
+        db = MagicMock()
+        db.execute = AsyncMock(
+            side_effect=[
+                MagicMock(scalar_one_or_none=MagicMock(return_value=usc)),
+                [],  # no stored embeddings yet
+                MagicMock(),  # the upsert
+            ]
+        )
+        db.commit = AsyncMock()
+        query_cache = MagicMock()
+        query_cache.compute_embedding_async = AsyncMock(return_value=[0.1, 0.2])
+        privacy = PrivacySettings(
+            excluded_columns=["store.orders.secret_ts"], excluded_tables=["store.payroll"]
+        )
+
+        result = await _resolve_schema(
+            conn=MagicMock(id="conn-1"),
+            adapter=MagicMock(),
+            config_dict={},
+            privacy=privacy,
+            connected=False,
+            db=db,
+            user_id="u1",
+            query_cache=query_cache,
+        )
+
+        texts = [c.args[0] for c in query_cache.compute_embedding_async.await_args_list]
+        assert texts == ["store.orders. Columns: id, amount"]
+        assert result.embeddings_available is True
+
 
 # ── Domain-aware schema pruning ────────────────────────────────────────────────
 

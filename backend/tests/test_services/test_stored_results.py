@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from app.config import get_settings
 from app.datasources.models import PrivacySettings
+from app.schemas.chat import QueryResultsResponse
 from app.services import result_masking, stored_results
 from app.services.row_filter import row_filter_fingerprint
 from app.services.stored_results import (
@@ -21,9 +23,6 @@ from app.services.stored_results import (
     served_query,
     stored_result_privacy,
 )
-
-if TYPE_CHECKING:
-    import pytest
 
 _R = "[REDACTED]"
 
@@ -98,7 +97,7 @@ class TestMask:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         def boom(*_a: object, **_k: object) -> None:
-            raise RuntimeError("boom")
+            raise ValueError("boom")  # a parse failure; any other exception masks every column
 
         monkeypatch.setattr(result_masking, "_classify_output_items", boom)
         stored = _results(["x", "id"], [["a@x.io", 1]])
@@ -111,16 +110,13 @@ class TestMask:
         stored = _results(["id", "name"], [[1, "Al"]])
         assert _DEFAULT.mask(stored, "SELECT id, name FROM users")["rows"] == [[1, "Al"]]
 
-    def test_none_and_empty_pass_through(self) -> None:
+    def test_none_passes_through(self) -> None:
         assert _DEFAULT.mask(None, "SELECT 1") is None
-        assert _DEFAULT.mask({}, "SELECT 1") == {}
 
     def test_malformed_rows_fail_closed(self) -> None:
         stored = {"columns": ["id"], "rows": "not-a-list"}
         assert _DEFAULT.mask(stored, "SELECT id FROM t")["rows"] == []
-        stored = {"columns": "id", "rows": [[1, 2]]}
-        assert _DEFAULT.mask(stored, "SELECT id FROM t")["rows"] == [[_R, _R]]
-        stored = {"columns": ["id", "email"], "rows": [{"id": 1}]}
+        stored = {**_results(["id", "email"], []), "rows": [{"id": 1}]}
         assert _DEFAULT.mask(stored, "SELECT id FROM t")["rows"] == [[_R, _R]]
 
 
@@ -338,6 +334,42 @@ class TestStaleRowFilter:
         assert out["stale_row_filter"] is True
         assert out["row_filter_fingerprint"] is None
         assert stored["row_filter_fingerprint"] == {"x": 1}  # the stored dict is untouched
+
+    @pytest.mark.parametrize(
+        "stored",
+        [
+            ["x"],
+            [],
+            "rows",
+            "",
+            7,
+            0,
+            True,
+            {},
+            {"rows": [[1, "a@x.io"]]},
+            {**_results(["id"], [[1]]), "row_count": "many"},
+            {**_results(["id"], [[1]]), "columns": "id"},
+            {**_results(["id"], [[1]]), "columns": [1]},
+            {**_results(["id"], [[1]]), "truncated": None},
+        ],
+    )
+    def test_a_result_that_does_not_validate_is_stale(self, stored: object) -> None:
+        # A tampered or corrupt row (not a dict, or a dict QueryResultsResponse rejects):
+        # served as an empty stale result that validates, never an error.
+        for privacy in (_DEFAULT, _filtered_privacy()):
+            out = privacy.mask(stored, "SELECT id FROM users")  # type: ignore[arg-type]
+            assert out == {
+                "columns": [],
+                "column_types": [],
+                "rows": [],
+                "row_count": 0,
+                "truncated": False,
+                "execution_time_ms": 0.0,
+                "bytes_scanned": None,
+                "row_filter_fingerprint": None,
+                "stale_row_filter": True,
+            }
+            QueryResultsResponse(**out)
 
     def test_a_null_fingerprint_still_means_no_filters(self) -> None:
         stored = {**_results(["id"], [[1]]), "row_filter_fingerprint": None}

@@ -70,7 +70,6 @@ export interface Connection {
   source_type: string;
   execution_mode: 'auto_execute' | 'review_first' | 'generate_only';
   is_active: boolean;
-  schema_cached_at: string | null;
   created_at: string;
 }
 
@@ -115,7 +114,10 @@ export interface ConnectionDetail extends Connection {
   privacy_settings: PrivacySettings | null;
   row_filter_needs_migration: boolean;
   privilege_audit: PrivilegeAudit | null;
-  schema_cache: Record<string, unknown> | null;
+  /** Version of the stored privacy settings (moves only when they change); the privacy form
+   *  sends the value it loaded back as `base_privacy_version`, and a save that finds it moved
+   *  is refused (409). */
+  privacy_version: string;
 }
 
 // ── Chat ──
@@ -272,6 +274,12 @@ export interface SemanticModel {
     tables_total: number;
     batch_size: number;
   } | null;
+  /**
+   * The stored model's content version, served by every model-returning route. A draft
+   * keeps the value it was seeded from and sends it back as `base_version` on save, so a
+   * draft loaded before another tab saved is refused (409) and merged, not overwritten.
+   */
+  version?: number;
 }
 
 export interface TableSemantic {
@@ -283,8 +291,9 @@ export interface TableSemantic {
   primary_date_column?: string | null;
   grain?: string | null;
   domain?: string | null;
-  // Generator-only — `TableSemanticUpdate` does not accept these, so the editor
-  // shows them read-only.
+  // Read-only in the editor: `TableSemanticUpdate` does not accept these. Only
+  // `hierarchies` comes from generation; nothing on the generation path writes
+  // `partition_columns`, `cluster_columns` or `base_sql` today.
   hierarchies?: Hierarchy[];
   partition_columns?: string[];
   cluster_columns?: string[];
@@ -435,6 +444,19 @@ export interface DriftApplySummary {
    * renamed column is in neither `columns_added` nor `columns_removed`.
    */
   columns_renamed: Record<string, Record<string, string>>;
+  /**
+   * Stored table key → the live key it was renamed to: a near-miss spelling (quoted, or in
+   * another letter case) of a live table, renamed with its columns, hand edits and
+   * relationships, with no LLM call. A renamed table is in neither `tables_added` nor
+   * `tables_removed`; the column lists name it by its live key.
+   */
+  tables_renamed: Record<string, string>;
+  /**
+   * Surviving table key → the reference fields (`primary_timestamp_column`,
+   * `primary_date_column`, `partition_columns`, `cluster_columns`, `hierarchies`) that lost
+   * a column name, sorted.
+   */
+  references_cleared: Record<string, string[]>;
   metrics_added: string[];
   metrics_removed: string[];
   joins_added: string[];
@@ -461,6 +483,30 @@ export interface DriftApplySummary {
 export interface ApplyDriftResponse {
   semantic_model: SemanticModel;
   summary: DriftApplySummary;
+}
+
+/**
+ * `GET .../semantic/drift/last`: the background monitor's latest report while it still
+ * describes the stored model (`null` otherwise), and the monitor's interval in minutes
+ * (`0` when it is off; the page polls only while it is positive).
+ */
+export interface LastDriftResponse {
+  report: DriftReport | null;
+  monitor_interval_minutes: number;
+}
+
+/** What a tombstone names: the store's item kinds. */
+export type TombstoneKind = 'metric' | 'segment' | 'derived_column' | 'common_join' | 'relationship';
+
+/**
+ * An item the user deleted from the model (`GET .../semantic/tombstones`). Regenerate and
+ * Apply Drift leave it out until it is added back or restored. `key` is the item's name,
+ * the join pattern, or the relationship's `from_table.from_column->to_table.to_column`.
+ */
+export interface TombstoneEntry {
+  kind: TombstoneKind;
+  key: string;
+  created_at: string;
 }
 
 /** Mirrors `DriftApplyHistoryEntry` in backend/app/schemas/semantic.py. */

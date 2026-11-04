@@ -27,6 +27,7 @@ from app.cache.query_cache import CacheHit
 from app.config import get_settings
 from app.datasources.errors import ErrorCategory
 from app.datasources.models import (
+    ConnectionResult,
     DataSourceSchema,
     PrivacySettings,
     QueryResult,
@@ -36,8 +37,9 @@ from app.datasources.models import (
 from app.providers.base import LLMResponse
 from app.schemas.chat import ChatResponse, QueryResultsResponse
 from app.semantic.models import SemanticModel
-from app.services.chat_service import ChatService
+from app.services.chat_service import ChatService, _PipelineError, _with_spent_tokens
 from app.services.execution import _results_to_response
+from app.services.pipeline import _GenerationResult
 from app.services.result_masking import _mask_sensitive_result_columns
 from app.services.row_filter import row_filter_fingerprint
 from app.services.row_filter_rewrite import apply_row_filters
@@ -49,6 +51,11 @@ from app.services.schema_utils import (
 )
 
 # ── Shared mock helpers ────────────────────────────────────────────────────────
+
+
+def _limited(sql: str) -> str:
+    """*sql* with the row limit ``row_filter._executable`` appends to a query without one."""
+    return f"{sql}\nLIMIT {get_settings().default_row_limit + 1}"
 
 
 class MockResult:
@@ -595,6 +602,43 @@ class TestProcessMessageFullPipeline:
             await service.process_message("conn-1", None, "q?", "claude", {})
 
         service.cache.store.assert_called_once()
+        # A plain miss stores without overwriting an entry stored meanwhile.
+        assert service.cache.store.await_args.kwargs["force"] is False
+
+    async def test_a_strict_refused_cache_hit_is_overwritten_by_the_fresh_query(self):
+        # The refused entry stays in the cache; a store without force would keep it, so
+        # every repeat of the question would call the LLM again.
+        conn = _make_connection(
+            privacy_settings={
+                "strict_sensitive_columns": True,
+                "sensitive_column_patterns": ["email"],
+            }
+        )
+        adapter = _make_adapter()
+        provider = _make_llm_provider()
+        db = self._make_full_db(conn)
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.lookup = AsyncMock(
+            return_value=_make_cache_hit(query="SELECT id FROM users NATURAL JOIN orders")
+        )
+        service.cache.store = AsyncMock()
+        service.cache.compute_embedding_async = AsyncMock(return_value=[0.1])
+        service.examples.find_similar_examples = AsyncMock(return_value=[])
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            _patch_create_provider(provider),
+            _patch_pipeline_session(),
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, _make_null_db())),
+        ):
+            resp = await service.process_message("conn-1", None, "How many users?", "claude", {})
+
+        provider.generate_response.assert_awaited_once()
+        assert resp.cache_hit is False
+        service.cache.store.assert_awaited_once()
+        assert service.cache.store.await_args.kwargs["force"] is True
 
     async def test_invalid_query_returns_error_status(self):
         conn = _make_connection()
@@ -647,7 +691,7 @@ class TestProcessMessageFullPipeline:
             resp = await service.process_message("conn-1", None, "q?", "claude", {})
 
         executed = adapter.execute_query.await_args.args[0]
-        assert executed == apply_row_filters(clean, filters, "postgresql")
+        assert executed == _limited(apply_row_filters(clean, filters, "postgresql"))
         assert "WHERE (tenant_id = 7)" in executed
         assert resp.query == clean
         assert save.await_args.kwargs["query"] == clean
@@ -966,6 +1010,27 @@ class TestExecutePending:
         stored = db.execute.await_args_list[1].args[0].compile().params["results_json"]
         assert stored["row_filter_fingerprint"] == expected
 
+    async def test_a_failed_run_stores_the_error_text(self):
+        # As edit_and_execute does: a reloaded history shows why the approved query failed.
+        msg = _make_msg(status="pending_approval")
+        db = _make_db(MockResult(row=(msg, _make_session(), _make_connection())), MockResult())
+        adapter = _make_adapter()
+        adapter.execute_query = AsyncMock(side_effect=RuntimeError("relation users is gone"))
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+        ):
+            resp = await service.execute_pending(message_id="msg-1", db=db)
+
+        assert resp.status == "error"
+        params = db.execute.await_args_list[1].args[0].compile().params
+        assert params["status"] == "error"
+        assert params["error"] == resp.error
+        assert "relation users is gone" in params["error"]
+
 
 # ── Scenario 5: edit_and_execute ──────────────────────────────────────────────
 
@@ -1112,6 +1177,84 @@ class TestUserFacingErrorOnReExecution:
         assert "Jane" not in str(excinfo.value)
 
 
+class TestSortUsesTheConnection:
+    """The sort quotes the column for the connection's engine and stops on a failed
+    connect, as the other execution paths do."""
+
+    async def test_a_legacy_row_without_a_dialect_is_quoted_for_mysql(self):
+        # A NULL query_dialect on a MySQL connection: a double-quoted column would be a
+        # string literal there and sort nothing.
+        msg = _make_msg(status="executed", query_generated="SELECT n FROM t")
+        msg.query_dialect = None
+        msg.results_json = {"columns": ["n"], "rows": []}
+        db = _make_db(MockResult(row=(msg, _make_session(), _make_connection())))
+        adapter = _make_adapter()
+        adapter.query_dialect = "MySQL"
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+        ):
+            await service.sort_and_execute(
+                message_id="msg-1", sort_column="n", sort_order="desc", db=db
+            )
+
+        executed = adapter.execute_query.await_args.args[0]
+        assert "ORDER BY `n` DESC" in executed
+
+    async def test_a_failed_connect_runs_nothing(self):
+        msg = _make_msg(status="executed", query_generated="SELECT n FROM t")
+        msg.results_json = {"columns": ["n"], "rows": []}
+        db = _make_db(MockResult(row=(msg, _make_session(), _make_connection())))
+        adapter = _make_adapter()
+        adapter.connect = AsyncMock(return_value=ConnectionResult(success=False, message="refused"))
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            pytest.raises(ValueError, match="Sort execution failed: Connection failed: refused"),
+        ):
+            await service.sort_and_execute(
+                message_id="msg-1", sort_column="n", sort_order="asc", db=db
+            )
+
+        adapter.execute_query.assert_not_awaited()
+        adapter.disconnect.assert_awaited_once()
+
+
+class TestSortOnAnInvalidStoredResult:
+    """A stored result that is not a dict, or whose columns are not a list, has nothing to
+    sort: the 400 path (ValueError), never an AttributeError (500)."""
+
+    @pytest.mark.parametrize(
+        "stored",
+        [["n"], "not a result", {"columns": "n"}, {"rows": []}],
+        ids=["list", "string", "columns-not-a-list", "no-columns"],
+    )
+    async def test_is_no_stored_results(self, stored):
+        msg = _make_msg(status="executed")
+        msg.results_json = stored
+        db = _make_db(MockResult(row=(msg, _make_session(), _make_connection())))
+        adapter = _make_adapter()
+        service = ChatService(MagicMock(), MagicMock())
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            pytest.raises(ValueError, match="no stored results"),
+        ):
+            await service.sort_and_execute(
+                message_id="msg-1", sort_column="n", sort_order="asc", db=db
+            )
+
+        adapter.execute_query.assert_not_called()
+
+
 class TestRowFilterRejectionOnReExecution:
     async def test_unparsable_edit_is_rejected_without_running(self):
         msg = _make_msg(status="pending_approval")
@@ -1253,7 +1396,7 @@ class TestSubmitFeedback:
         )
 
     async def test_thumbs_up_adds_to_example_library(self):
-        msg = _make_msg()
+        msg = _make_msg(status="executed")
         session = _make_session()
         user_msg = self._make_user_msg()
         db = _make_db(
@@ -1289,7 +1432,7 @@ class TestSubmitFeedback:
         service.cache.evict_similar.assert_called_once()
 
     async def test_thumbs_up_does_not_delete_from_cache(self):
-        msg = _make_msg()
+        msg = _make_msg(status="executed")
         session = _make_session()
         user_msg = self._make_user_msg()
         db = _make_db(
@@ -1334,7 +1477,7 @@ class TestSubmitFeedback:
             "SELECT * FROM (\nSELECT id, tenant_id FROM users\n)"
             " AS _sift_q WHERE tenant_id = 7 LIMIT 10"
         )
-        msg = _make_msg(query_generated=wrapped)
+        msg = _make_msg(query_generated=wrapped, status="executed")
         db = _make_db(
             MockResult(row=(msg, _make_session())),
             MockResult(single=self._make_user_msg()),
@@ -1348,6 +1491,35 @@ class TestSubmitFeedback:
         assert service.examples.add_example.call_args.kwargs["query"] == (
             "SELECT id, tenant_id FROM users LIMIT 10"
         )
+
+    @pytest.mark.parametrize(
+        ("status", "added"),
+        [
+            ("executed", True),
+            ("cached", True),
+            ("pending_approval", False),
+            ("query_only", True),
+            ("error", False),
+        ],
+    )
+    async def test_thumbs_up_adds_only_an_endorsed_query(self, status, added):
+        # A failed query, or one still awaiting approval, must not become a few-shot
+        # example; a generate-only answer the user reviewed may. The rating itself is
+        # always recorded.
+        msg = _make_msg(status=status)
+        db = _make_db(
+            MockResult(row=(msg, _make_session())),
+            MockResult(single=self._make_user_msg()),
+        )
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.compute_embedding_async = AsyncMock(return_value=[0.1])
+        service.examples.add_example = AsyncMock()
+
+        await service.submit_feedback(message_id="msg-1", feedback="thumbs_up", db=db)
+
+        assert service.examples.add_example.await_count == (1 if added else 0)
+        assert msg.feedback == "thumbs_up"
+        db.commit.assert_awaited()
 
 
 class TestRetractFeedback:
@@ -1731,7 +1903,7 @@ class TestStoredWrappedSqlRunsRewrittenOnce:
         assert resp.query == _CLEAN_SQL
         executed = adapter.execute_query.await_args.args[0]
         assert "_sift_q" not in executed
-        assert executed == apply_row_filters(_CLEAN_SQL, _FILTERS, "postgresql")
+        assert executed == _limited(apply_row_filters(_CLEAN_SQL, _FILTERS, "postgresql"))
         assert "WHERE (tenant_id = 7)" in executed
 
     async def test_execute_pending_on_a_stored_wrapped_query(self):
@@ -1749,7 +1921,7 @@ class TestStoredWrappedSqlRunsRewrittenOnce:
 
         assert resp.status == "executed"
         executed = adapter.execute_query.await_args.args[0]
-        assert executed == apply_row_filters(_CLEAN_SQL, _FILTERS, "postgresql")
+        assert executed == _limited(apply_row_filters(_CLEAN_SQL, _FILTERS, "postgresql"))
         assert "WHERE (tenant_id = 7)" in executed
         assert resp.query == _CLEAN_SQL
 
@@ -1771,7 +1943,7 @@ class TestStoredWrappedSqlRunsRewrittenOnce:
 
         executed = adapter.execute_query.await_args.args[0]
         sorted_sql = 'SELECT id, tenant_id FROM users\nORDER BY "id" DESC'
-        assert executed == apply_row_filters(sorted_sql, _FILTERS, "postgresql")
+        assert executed == _limited(apply_row_filters(sorted_sql, _FILTERS, "postgresql"))
         assert "WHERE (tenant_id = 7)" in executed
 
 
@@ -1899,3 +2071,357 @@ class TestRowFilterMigrationState:
 
         assert _MIGRATION_MESSAGE in str(excinfo.value)
         adapter.execute_query.assert_not_called()
+
+
+class TestRegenerateAfterCachedFailure:
+    """A cached query failed at execution: the entry goes, generation runs again with the
+    cache bypassed; a regeneration that yields no valid query returns None (the caller keeps
+    the cached failure)."""
+
+    @staticmethod
+    def _ok(**fields) -> MagicMock:
+        """A stage result carrying a query and no error."""
+        return MagicMock(
+            **{"error": None, "generated_query": "SELECT COUNT(*) FROM users", **fields}
+        )
+
+    def _args(self, gen) -> dict:
+        return dict(
+            gen=gen,
+            connection_id="conn-1",
+            session_id=None,
+            message="How many users?",
+            adapter=MagicMock(),
+            schema=MagicMock(),
+            privacy=None,
+            semantic_model=None,
+            provider_name="claude",
+            options={"max_rows": 5},
+            settings=_make_settings(),
+        )
+
+    async def test_evicts_then_regenerates_with_the_cache_bypassed(self):
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.evict_question = AsyncMock(return_value=1)
+        gen = MagicMock(cached_question="How many users?")
+        fresh, val = self._ok(), self._ok()
+        db = _make_null_db()
+        with (
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, db)),
+            patch(f"{_MODULE}._stage_generate", new=AsyncMock(return_value=fresh)) as stage_gen,
+            patch(f"{_MODULE}._stage_validate", new=AsyncMock(return_value=val)) as stage_val,
+        ):
+            out = await service._regenerate_after_cached_failure(**self._args(gen))
+
+        assert out == (fresh, val)
+        service.cache.evict_question.assert_awaited_once_with("conn-1", "How many users?", db)
+        assert stage_gen.await_args.kwargs["options"] == {"max_rows": 5, "bypass_cache": True}
+        stage_val.assert_awaited_once()
+
+    async def test_a_generation_error_returns_none_after_evicting(self):
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.evict_question = AsyncMock(return_value=1)
+        gen = MagicMock(cached_question="How many users?")
+        db = _make_null_db()
+        with (
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, db)),
+            patch(
+                f"{_MODULE}._stage_generate",
+                new=AsyncMock(side_effect=_PipelineError("Generation error: boom")),
+            ),
+        ):
+            out = await service._regenerate_after_cached_failure(**self._args(gen))
+
+        assert out == (None, None)
+        service.cache.evict_question.assert_awaited_once()
+
+    async def test_a_provider_exception_during_regeneration_yields_no_query(self):
+        # The real _stage_generate wraps every exception of the generation in
+        # _PipelineError, so a provider failure (network, rate limit) ends the
+        # regeneration, not the request: the caller reports the cached failure.
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.evict_question = AsyncMock(return_value=1)
+        gen = MagicMock(cached_question="How many users?")
+        db = _make_null_db()
+        with (
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, db)),
+            patch(
+                f"{_MODULE}._generate_query",
+                new=AsyncMock(side_effect=ConnectionError("rate limited")),
+            ),
+        ):
+            out = await service._regenerate_after_cached_failure(**self._args(gen))
+
+        assert out == (None, None)
+        service.cache.evict_question.assert_awaited_once()
+
+    async def test_a_crash_in_validation_keeps_the_fresh_generation_and_no_query(self):
+        # The real _stage_validate wraps the crash too; the fresh generation's tokens are
+        # still reported with the cached failure.
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.evict_question = AsyncMock(return_value=1)
+        gen = MagicMock(cached_question="How many users?")
+        fresh = self._ok()
+        db = _make_null_db()
+        with (
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, db)),
+            patch(f"{_MODULE}._stage_generate", new=AsyncMock(return_value=fresh)),
+            patch(
+                f"{_MODULE}._validate_and_correct_query",
+                new=AsyncMock(side_effect=RuntimeError("boom")),
+            ),
+        ):
+            out = await service._regenerate_after_cached_failure(**self._args(gen))
+
+        assert out == (fresh, None)
+
+    async def test_an_eviction_error_does_not_stop_the_regeneration(self):
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.evict_question = AsyncMock(side_effect=RuntimeError("db down"))
+        gen = MagicMock(cached_question="How many users?")
+        fresh, val = self._ok(), self._ok()
+        db = _make_null_db()
+        with (
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, db)),
+            patch(f"{_MODULE}._stage_generate", new=AsyncMock(return_value=fresh)),
+            patch(f"{_MODULE}._stage_validate", new=AsyncMock(return_value=val)),
+        ):
+            assert await service._regenerate_after_cached_failure(**self._args(gen)) == (fresh, val)
+
+    @pytest.mark.parametrize(
+        "fresh_fields",
+        [
+            {"error": "The model could not answer that.", "status": "error"},
+            {"generated_query": None},
+        ],
+        ids=["soft-generation-failure", "no-query"],
+    )
+    async def test_a_generation_with_no_query_returns_no_query_after_evicting(self, fresh_fields):
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.evict_question = AsyncMock(return_value=1)
+        gen = MagicMock(cached_question="How many users?")
+        fresh = self._ok(**fresh_fields)
+        db = _make_null_db()
+        with (
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, db)),
+            patch(f"{_MODULE}._stage_generate", new=AsyncMock(return_value=fresh)),
+            patch(f"{_MODULE}._stage_validate", new=AsyncMock()) as stage_val,
+        ):
+            out = await service._regenerate_after_cached_failure(**self._args(gen))
+
+        # The failed generation comes back so the caller can report the tokens it spent.
+        assert out == (fresh, None)
+        service.cache.evict_question.assert_awaited_once()
+        stage_val.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "val_fields",
+        [
+            {"error": "Unsafe query", "status": "error"},
+            {"generated_query": ""},
+        ],
+        ids=["validation-failure", "empty-query"],
+    )
+    async def test_a_validation_with_no_query_returns_no_query_after_evicting(self, val_fields):
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.evict_question = AsyncMock(return_value=1)
+        gen = MagicMock(cached_question="How many users?")
+        fresh = self._ok()
+        db = _make_null_db()
+        with (
+            patch(f"{_MODULE}._create_session", _mock_two_sessions(db, db)),
+            patch(f"{_MODULE}._stage_generate", new=AsyncMock(return_value=fresh)),
+            patch(f"{_MODULE}._stage_validate", new=AsyncMock(return_value=self._ok(**val_fields))),
+        ):
+            out = await service._regenerate_after_cached_failure(**self._args(gen))
+
+        assert out == (fresh, None)
+        service.cache.evict_question.assert_awaited_once()
+
+
+class TestWithSpentTokens:
+    """The tokens a failed regeneration spent are added to the reported counts."""
+
+    @staticmethod
+    def _gen(**tokens) -> _GenerationResult:
+        return _GenerationResult(
+            generated_query="SELECT 1",
+            explanation="",
+            error=None,
+            status="executed",
+            cache_hit=True,
+            provider=None,
+            configured_model="",
+            configured_max_tokens=4096,
+            system_prompt="",
+            history=[],
+            **tokens,
+        )
+
+    def test_counts_are_added_and_a_count_neither_side_has_stays_none(self):
+        gen = self._gen(tokens_used=10, input_tokens=None, output_tokens=None)
+        failed = MagicMock(tokens_used=5, input_tokens=4, output_tokens=None)
+        out = _with_spent_tokens(gen, failed)
+        assert (out.tokens_used, out.input_tokens, out.output_tokens) == (15, 4, None)
+        assert out.cache_hit is True
+        assert gen.tokens_used == 10  # a copy, the original is untouched
+
+    @pytest.mark.parametrize(
+        "failed",
+        [None, MagicMock(tokens_used=None, input_tokens=None, output_tokens=None)],
+        ids=["generation-raised", "no-counts"],
+    )
+    def test_nothing_spent_returns_gen_unchanged(self, failed):
+        gen = self._gen()
+        assert _with_spent_tokens(gen, failed) is gen
+
+
+class TestProcessMessageCachedFailure:
+    """A cached query that fails at execution is evicted and regenerated in the request."""
+
+    @staticmethod
+    def _sessions(*dbs):
+        it = iter(dbs)
+
+        @contextlib.asynccontextmanager
+        async def _factory():
+            yield next(it)
+
+        return _factory
+
+    def _service(self, cached_query: str) -> ChatService:
+        service = ChatService(MagicMock(), MagicMock())
+        service.cache.lookup = AsyncMock(return_value=_make_cache_hit(query=cached_query))
+        service.cache.compute_embedding_async = AsyncMock(return_value=[0.1])
+        service.cache.evict_question = AsyncMock(return_value=1)
+        service.cache.store = AsyncMock()
+        service.examples.find_similar_examples = AsyncMock(return_value=[])
+        return service
+
+    @staticmethod
+    def _db(conn):
+        return _make_db(
+            MockResult(single=conn),
+            MockResult(single=_make_usc()),
+            MockResult(),
+            MockResult(),
+        )
+
+    async def test_the_failed_entry_is_evicted_and_a_fresh_query_runs(self):
+        conn = _make_connection(execution_mode="auto_execute")
+        adapter = _make_adapter()
+        adapter.execute_query = AsyncMock(
+            side_effect=[
+                RuntimeError("relation archived_users does not exist"),
+                _make_query_result(),
+            ]
+        )
+        provider = _make_llm_provider()
+        service = self._service("SELECT COUNT(*) FROM archived_users")
+        evict_db = _make_null_db()
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            _patch_create_provider(provider),
+            _patch_pipeline_session(),
+            patch(
+                f"{_MODULE}._create_session",
+                self._sessions(self._db(conn), evict_db, _make_null_db()),
+            ),
+        ):
+            resp = await service.process_message("conn-1", None, "How many users?", "claude", {})
+
+        service.cache.evict_question.assert_awaited_once_with("conn-1", "How many users?", evict_db)
+        provider.generate_response.assert_awaited_once()
+        assert adapter.execute_query.await_count == 2
+        assert resp.status == "executed"
+        assert resp.cache_hit is False
+        assert resp.error is None
+        assert resp.query == "SELECT COUNT(*) FROM users"
+        service.cache.store.assert_awaited_once()
+        assert service.cache.store.await_args.kwargs["force"] is True
+
+    async def test_when_regeneration_fails_the_cached_failure_is_reported(self):
+        failed = MagicMock(tokens_used=120, input_tokens=100, output_tokens=20)
+        conn = _make_connection(execution_mode="auto_execute")
+        adapter = _make_adapter()
+        adapter.execute_query = AsyncMock(side_effect=RuntimeError("relation does not exist"))
+        service = self._service("SELECT COUNT(*) FROM archived_users")
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            patch(f"{_MODULE}._create_session", self._sessions(self._db(conn), _make_null_db())),
+            patch.object(
+                ChatService,
+                "_regenerate_after_cached_failure",
+                new=AsyncMock(return_value=(failed, None)),
+            ) as regen,
+        ):
+            resp = await service.process_message("conn-1", None, "How many users?", "claude", {})
+
+        regen.assert_awaited_once()
+        assert adapter.execute_query.await_count == 1
+        assert resp.status == "error"
+        assert resp.cache_hit is True
+        assert resp.error
+        service.cache.store.assert_not_awaited()
+        # The failed regeneration's LLM call is reported (the cache hit itself spent none).
+        assert (resp.token_count, resp.input_tokens, resp.output_tokens) == (120, 100, 20)
+
+    async def test_a_cached_query_that_times_out_is_kept_and_not_regenerated(self):
+        # A timeout is the database's state, not the query's fault: the entry stays.
+        conn = _make_connection(execution_mode="auto_execute")
+        adapter = _make_adapter()
+        adapter.execute_query = AsyncMock(side_effect=TimeoutError())
+        provider = _make_llm_provider()
+        service = self._service("SELECT COUNT(*) FROM users")
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            _patch_create_provider(provider),
+            patch(f"{_MODULE}._create_session", self._sessions(self._db(conn), _make_null_db())),
+        ):
+            resp = await service.process_message("conn-1", None, "How many users?", "claude", {})
+
+        service.cache.evict_question.assert_not_awaited()
+        provider.generate_response.assert_not_awaited()
+        assert adapter.execute_query.await_count == 1
+        assert resp.status == "error"
+        assert resp.error == "Query timed out"
+        assert resp.cache_hit is True
+        assert resp.query == "SELECT COUNT(*) FROM users"
+        service.cache.store.assert_not_awaited()
+
+    async def test_an_exception_in_the_second_run_still_disconnects(self):
+        # The first run connected the adapter; the regenerated run raises before returning.
+        conn = _make_connection(execution_mode="auto_execute")
+        adapter = _make_adapter()
+        service = self._service("SELECT COUNT(*) FROM archived_users")
+        first = MagicMock(error="relation does not exist", query_fault=True, connected=True)
+        fresh = MagicMock(error=None, generated_query="SELECT COUNT(*) FROM users")
+
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+            patch(f"{_MODULE}._create_session", self._sessions(self._db(conn))),
+            patch(
+                f"{_MODULE}._execute_auto_query",
+                new=AsyncMock(side_effect=[first, RuntimeError("driver crashed")]),
+            ),
+            patch.object(
+                ChatService,
+                "_regenerate_after_cached_failure",
+                new=AsyncMock(return_value=(MagicMock(), fresh)),
+            ),
+            pytest.raises(RuntimeError, match="driver crashed"),
+        ):
+            await service.process_message("conn-1", None, "How many users?", "claude", {})
+
+        adapter.disconnect.assert_awaited_once()

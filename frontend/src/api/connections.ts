@@ -12,6 +12,11 @@ export interface CreateConnectionPayload {
   execution_mode?: Connection['execution_mode'];
 }
 
+/** The body of PUT /connections/{id}/privacy: the update plus, from the edit form, the
+ *  `privacy_version` it was loaded with. The server refuses the save (409) when the stored
+ *  settings have moved on (another tab saved first); without it the save is unconditional. */
+export type PrivacySaveRequest = PrivacySettingsUpdate & { base_privacy_version?: string };
+
 export const connectionsApi = {
   list: () =>
     apiClient
@@ -48,9 +53,9 @@ export const connectionsApi = {
   refreshSchema: (id: string) =>
     apiClient.post(`/api/v1/connections/${id}/schema/refresh`).then(r => r.data),
 
-  updatePrivacySettings: (id: string, settings: PrivacySettingsUpdate) =>
+  updatePrivacySettings: (id: string, settings: PrivacySaveRequest) =>
     apiClient
-      .put<PrivacySettings>(`/api/v1/connections/${id}/privacy`, settings)
+      .put<ConnectionDetail>(`/api/v1/connections/${id}/privacy`, settings)
       .then(r => r.data),
 
   updateExecutionMode: (id: string, mode: Connection['execution_mode']) =>
