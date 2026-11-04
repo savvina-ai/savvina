@@ -2,6 +2,23 @@
 
 <!-- version list -->
 
+## v3.0.2 (2026-11-04)
+
+### Bug Fixes
+
+- Check only code words for share locks and INTO, as the server reads them. refuse backslash escapes
+  only where the rewrite writes them, and derive the row limit from one parse. memoise strict-mode
+  example verdicts and pin regeneration failure handling in tests
+  ([`0553455`](https://github.com/savvina-ai/savvina/commit/05534558ba0061f53719c0c42dbccaa07b98a85f))
+
+- **frontend**: Override typescript-estree's minimatch to >=11.0.1
+  ([`0553455`](https://github.com/savvina-ai/savvina/commit/05534558ba0061f53719c0c42dbccaa07b98a85f))
+
+- **validators**: Refuse INTO in a MySQL query that holds a # comment, which sqlparse reads into the
+  keyword
+  ([`0553455`](https://github.com/savvina-ai/savvina/commit/05534558ba0061f53719c0c42dbccaa07b98a85f))
+
+
 ## v3.0.1 (2026-10-31)
 
 ### Bug Fixes
