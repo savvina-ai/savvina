@@ -74,9 +74,31 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
+      # Installed from the GitHub release rather than by trivy-action's setup-trivy,
+      # whose install script takes the tarball from get.trivy.dev. That host stopped
+      # resolving on 2026-11-03 and failed every run that missed the binary cache
+      # (aquasecurity/setup-trivy#42). The digest is pinned here so the scanner that
+      # gates a release never depends on what a download host serves that day. To
+      # upgrade, take both values from the release's trivy_<version>_checksums.txt.
+      - name: Install Trivy
+        env:
+          TRIVY_VERSION: 0.70.0
+          TRIVY_SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
+        run: |
+          set -euo pipefail
+          tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          bin_dir="${RUNNER_TEMP}/trivy-bin"
+          mkdir -p "$bin_dir"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${tarball}" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${tarball}"
+          echo "${TRIVY_SHA256}  ${RUNNER_TEMP}/${tarball}" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/${tarball}" -C "$bin_dir" trivy
+          echo "$bin_dir" >> "$GITHUB_PATH"
+
       - name: Trivy vulnerability scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
+          skip-setup-trivy: true
           image-ref: savvina-${{ matrix.image }}:scan
           scanners: vuln
           vuln-type: os,library
