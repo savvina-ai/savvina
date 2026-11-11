@@ -410,6 +410,8 @@ class TestConnect:
                 False,
             ),
             ("ansi_quotes", False),
+            # A server or proxy that reports the bare combination mode.
+            ("ANSI", False),
             ("", True),
             (None, True),
             # Some servers and drivers return the variable as bytes.

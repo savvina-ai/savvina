@@ -587,12 +587,14 @@ class MySQLDataSource(BaseDataSource):
                 sql_mode = "" if raw_mode is None else str(raw_mode)
             self._version = version
             self._is_mariadb = "MariaDB" in version
-            # @@sql_mode lists the mode expanded (ANSI appears as its members plus ANSI). The
-            # validator refuses the known ways a query can change it for its own run (a SET
-            # statement, MariaDB's SET STATEMENT ... FOR, MySQL's SET_VAR optimizer hint), so
-            # the session mode read here is the one queries on this pool run under.
+            # @@sql_mode normally lists a combination mode expanded (ANSI appears as its
+            # members plus ANSI), but ANSI alone is read as implying ANSI_QUOTES too, so a
+            # server or proxy that reports the bare name is not taken for the default. The
+            # validator refuses the known ways a query can change the mode for its own run (a
+            # SET statement, MariaDB's SET STATEMENT ... FOR, MySQL's SET_VAR optimizer hint),
+            # so the session mode read here is the one queries on this pool run under.
             modes = {part.strip().upper() for part in sql_mode.split(",")}
-            self.double_quote_is_string_literal = "ANSI_QUOTES" not in modes
+            self.double_quote_is_string_literal = not ({"ANSI_QUOTES", "ANSI"} & modes)
             self.backslash_is_escape = "NO_BACKSLASH_ESCAPES" not in modes
             logger.info(
                 "Connection pool established: host=%s, database=%s, version=%s",
