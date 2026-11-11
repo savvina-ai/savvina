@@ -64,13 +64,17 @@ All generated SQL passes through `MySQLSQLValidator` before execution:
 
 | Check | Detail |
 |---|---|
-| Statement type | Only `SELECT` and `WITH` (CTE) are permitted |
-| DML blocking | `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REPLACE` are rejected |
+| Statement type | The first word after comments and any opening parentheses must be `SELECT` or `WITH` (`(TABLE t)` and `(VALUES …)` are refused); `SET` is refused with its own message. A `#` line is a comment whatever it says, so one before the `SELECT` is skipped |
+| Executable comments | `/*! … */` and `/*M! … */` (either case) before the first word are refused unless empty, because the server may skip them: `/*!NNNNN …*/` runs only on a server of at least that version, and MySQL skips MariaDB's `/*M! …*/`, so `/*!99999 SELECT 1 */ SHOW TABLES` would show a read while the server runs the `SHOW`. Only an empty one (`/*!*/`, whitespace alone) is a gap. Three refusals: `Query is a SET statement, which is not allowed` (content or raw text opens with `SET`), `Only SELECT queries and CTEs (WITH) are allowed. Got: SHOW` (content opens with another statement, naming the word), otherwise `Query opens with an executable comment (/*! or /*M!), which is not allowed`. One after the first word (`SELECT /*! STRAIGHT_JOIN */ …`) stays allowed |
+| DML blocking | `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` are rejected, and the `REPLACE INTO` statement (also by the first-word and `INTO` rules). The `REPLACE(str, from, to)` string function passes |
 | DDL blocking | `CREATE`, `DROP`, `ALTER`, `RENAME` are rejected |
 | Dangerous statements | `LOAD DATA`, `SELECT INTO OUTFILE`, `CALL` are blocked |
 | Variable assignment | `@v := …` is rejected: the value could be read back as `@v` past result masking |
-| Writing keywords | Any `SELECT … INTO` (`@var`, `OUTFILE`, `DUMPFILE`) is rejected (`INTO` as a keyword; the word in a comment, string or quoted identifier is allowed) |
-| Auto-limit | A `LIMIT` clause is injected if none is present (default: 1,000 rows) |
+| Writing keywords | Any `SELECT … INTO` (`@var`, `OUTFILE`, `DUMPFILE`) is rejected (`INTO` as a keyword; the word in a comment, string or quoted identifier is allowed), also inside `/*! … */`, after a `#` comment (`INTO#x` ends the word at the `#`) and after `--1` (two minus signs, not a comment). In a text holding a backslash or a dollar sign `INTO` is refused as any word, a comment's or a literal's too: sqlparse reads `\'` as an escaped quote while under `NO_BACKSLASH_ESCAPES` `'a\'` is a whole literal. Trade-off: a `\` or `$` anywhere plus the word `into` anywhere is refused (`JSON_EXTRACT(doc, '$.k')` beside `LIKE '%logged into%'`), which costs one correction retry |
+| Share locks | `LOCK IN SHARE MODE`, `FOR SHARE`, `FOR KEY SHARE` as code words, in every comment form; a literal `'lock in share mode'` passes. With a backslash or `$` in the text every word is read, so there a `\` or `$` plus the words `for share` or `lock in share mode` anywhere is refused too |
+| Auto-limit | `LIMIT` (default 1,000 rows) is appended after the last code token when the query carries neither the word `LIMIT` nor, as code, a `FETCH FIRST/NEXT` clause (MariaDB 10.6+). A clause inside a `/*!NNNNN` or `/*M!` comment, which the server may skip, does not count; the word `FETCH` in a comment or literal still gets the `LIMIT`. The row filter uses the same check |
+| Multi-statement | A second statement after `;`, with comments (`/* */`, `--`, `#`, `/*! */`) read as the server reads them. Every `;` counts, one inside a string literal too |
+| `sql_mode` | Read once per pool at connect. `ANSI_QUOTES`, or `ANSI` alone (read as implying `ANSI_QUOTES`), marks `"…"` as a name so result masking tests it; the validator refuses the statement forms that could change the mode mid-session |
 
 Every statement then runs with `SET SESSION TRANSACTION READ ONLY` in effect, restored to `READ WRITE` afterwards. A write the validator misses is refused by the server with errno 1792.
 

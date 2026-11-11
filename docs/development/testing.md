@@ -62,6 +62,36 @@ cd backend && SAVVINA_LIVE_TEST_DBS=1 ../.venv/bin/pytest tests/test_datasources
 The credentials are the compose defaults (`savvina` / `savvina_demo`); set
 `SAMPLE_POSTGRES_PASSWORD` / `SAMPLE_MYSQL_PASSWORD` if you changed them.
 
+### Live validator cases (opt-in)
+
+`backend/tests/test_datasources/test_validator_live.py` runs the shapes the validator unit
+tests judge against the real engines, so the assumption each rule makes about how the server
+reads the text is checked where it can be. Every case names the unit test it backs. Beside
+the older shapes (nested comments, `--1`, `INTO#x`, `:=`, `set_config`, share locks, a
+`LIMIT` after `FETCH FIRST`), it covers:
+
+- the server-skips-the-comment cases: `/*!99999 SELECT 1 */ SELECT 2` and
+  `/*M! SELECT 1 */ SELECT 2` both return 2 on MySQL, and a mixture of a skipped and a run
+  comment returns the run one;
+- a quote in an executable comment hiding the comment's own closer;
+- the backslash and dollar-quote `FOR SHARE` cases on PostgreSQL (`'a\' … '/*' … FOR SHARE`,
+  `$$/*$$ … FOR SHARE`), which would take a row lock if the validator let them through;
+- a GLOBAL `sql_mode` case on MySQL (the adapter's reading of `ANSI_QUOTES`), which restores the mode in its own `finally`.
+
+They are skipped unless `SAVVINA_LIVE_TEST_DBS=1` is set, and CI does not run them. Bring up
+the sample databases and run it from the repo root, with the sample passwords exported from
+`.env` because compose reads that file and pytest does not:
+
+```bash
+docker compose --profile test-dbs up -d --wait sample-postgres sample-mysql
+set -a; . <(grep -E '^SAMPLE_(POSTGRES|MYSQL|MYSQL_ROOT)_PASSWORD=' .env 2>/dev/null); set +a
+SAVVINA_LIVE_TEST_DBS=1 .venv/bin/pytest backend/tests/test_datasources/test_validator_live.py -v
+```
+
+Never run two live runs at once: the GLOBAL `sql_mode` case changes the shared server's
+setting while it runs. A new validator rule that depends on the server's reading gets a case
+here.
+
 ---
 
 ## Test Structure
@@ -83,7 +113,8 @@ backend/tests/
 ├── test_datasources/
 │   ├── test_postgresql.py         ← PostgreSQL adapter: connect, introspect, execute, validate
 │   ├── test_mysql.py              ← MySQL adapter: connect, introspect, execute, validate
-│   └── test_streaming.py          ← SSE streaming integration tests
+│   ├── test_streaming.py          ← SSE streaming integration tests
+│   └── test_validator_live.py     ← Opt-in (SAVVINA_LIVE_TEST_DBS=1): validator shapes against the real engines
 ├── test_overhead/
 │   └── test_no_user_table_scans.py ← introspect reads only catalog + pg_stats; sample values fall back to TABLESAMPLE, never a full scan
 ├── test_providers/
@@ -115,7 +146,8 @@ backend/tests/
 │   ├── test_llm_error_handling.py ← Provider errors surfaced through the service
 │   └── test_tpm_warning.py        ← Tokens-per-minute warning thresholds
 ├── test_validators/
-│   └── test_sql_validator.py      ← BaseSQLValidator and PostgreSQLValidator rules
+│   ├── test_sql_validator.py      ← BaseSQLValidator and PostgreSQLValidator rules
+│   └── test_validator_contract.py ← Cases both dialects must refuse or pass: executable comments, backslash/dollar text, FETCH, parentheses, REPLACE, refusal messages
 └── test_routers/
     ├── conftest.py                ← MockResult, _mock_db(), _make_conn(), auth + http_client fixtures
     ├── test_auth.py               ← All /api/v1/auth/* endpoints

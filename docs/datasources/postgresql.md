@@ -53,13 +53,15 @@ All generated SQL passes through `PostgreSQLValidator` before execution:
 
 | Check | Detail |
 |---|---|
-| Statement type | Only `SELECT` and `WITH` (CTE) are permitted |
-| DML blocking | `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `MERGE` are rejected |
+| Statement type | The first word after comments must be `SELECT`, `WITH`, or an opening parenthesis that itself opens with one of the two (`(SELECT 1) UNION (SELECT 2)` passes; `(TABLE t)` and `(VALUES (1))` are refused, as the bare forms are); `SET` is refused with its own message |
+| DML blocking | `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `MERGE` are rejected, and the `REPLACE INTO` pattern. The `REPLACE(str, from, to)` string function passes |
 | DDL blocking | `CREATE`, `DROP`, `ALTER`, `RENAME` are rejected |
 | Dangerous functions | `pg_sleep`, `pg_read_file`, `pg_write_file`, `lo_export`, `copy_to`, `set_config` are blocked |
 | Privilege escalation | `SET ROLE`, `SET SESSION AUTHORIZATION`, `RESET` are blocked |
-| Writing keywords | `SELECT … INTO` is rejected (`INTO` as a keyword; the word in a comment, string or quoted identifier is allowed) |
-| Auto-limit | A `LIMIT` clause is injected if none is present (default: 1,000 rows) |
+| Writing keywords | `SELECT … INTO` is rejected (`INTO` as a keyword; the word in a comment, string or quoted identifier is allowed). In a text holding a backslash or a dollar sign `INTO` is refused as any word, a comment's or a literal's too: sqlparse reads `\'` as an escaped quote, while PostgreSQL (`standard_conforming_strings` on) ends the string there, so `SELECT 'a\' INTO t -- '` has an `INTO`. Trade-off: a `\` or `$` anywhere plus the word `into` anywhere is refused, which costs one correction retry |
+| Share locks | `FOR SHARE`, `FOR KEY SHARE` as code words (`'up for share'` passes); `FOR UPDATE` is refused by the `UPDATE` keyword. With a backslash or `$` in the text every word is read, so a `\` or `$` plus the words `for share` anywhere is refused too |
+| Multi-statement | A second statement after `;`, with comments read as gaps (`;/**/SET` is two statements). Every `;` counts, one inside a string literal too |
+| Auto-limit | `LIMIT` (default 1,000 rows) is appended after the last code token, unless the query carries the word `LIMIT` or, as code, a `FETCH FIRST/NEXT` clause: a `LIMIT` after `FETCH FIRST n ROWS ONLY` is a syntax error. The word `FETCH` in a comment, a literal or a column name still gets the `LIMIT`. The row filter uses the same check |
 
 Validation is based on `sqlparse` token analysis — it runs before any database connection is opened.
 
