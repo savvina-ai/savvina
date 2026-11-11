@@ -15,6 +15,7 @@ from .base_sql_validator import (
     SET_STATEMENT_ERROR,
     BaseSQLValidator,
     code_words,
+    has_fetch_clause,
     has_second_statement,
     not_a_read_error,
     strip_query,
@@ -40,21 +41,45 @@ _LEADING_GAP = r"(?>\s|/\*.*?\*/|\*/|--(?![^\s\x00-\x1f])[^\n]*(?:\n|$)|#[^\n]*(
 # A statement that starts with SET, after any gaps (a # comment with no space after it
 # included, which sqlparse reads as an operator).
 _LEADING_SET = re.compile(rf"(?:{_LEADING_GAP})*+SET\b", re.IGNORECASE | re.DOTALL)
-# A statement that starts with a read, after any gaps: SELECT, WITH or an opening parenthesis.
+# A statement that starts with a read, after any gaps and opening parentheses: SELECT or WITH.
+# The parentheses are skipped, not accepted: (TABLE t) and (VALUES …) are not reads. Matched
+# on the raw text, where an executable comment is a gap like any other: the ones before the
+# first word that hold a word are refused first (see _leading_statement_error).
 _LEADING_READ = re.compile(
-    rf"(?:{_LEADING_GAP})*+(?:SELECT\b|WITH\b|\()", re.IGNORECASE | re.DOTALL
+    rf"(?:{_LEADING_GAP}|\()*+(?:SELECT\b|WITH\b)", re.IGNORECASE | re.DOTALL
 )
-# The opener of a MySQL or MariaDB executable comment, with its optional version number: the
-# server runs the content, so for the pattern scan it is code, not a comment. Result masking
-# and the strict guard use the same opener (``services.result_masking.EXECUTABLE_COMMENT``);
-# keep the two in step.
-_EXECUTABLE_OPENER = re.compile(r"/\*M?!\d*")
+# One piece of the region before the first word: a gap or an opening parenthesis.
+_LEADING_PIECE = re.compile(rf"{_LEADING_GAP}|\(", re.DOTALL)
+# The refusal for a non-empty executable comment before the first word. sqlparse reads the
+# comment as a comment, so the not-a-read message would name the SELECT after it (Got:
+# SELECT) and send the correction loop back with the same query. A comment whose content
+# opens with another statement (SHOW, HANDLER) gets the not-a-read message naming that word.
+EXECUTABLE_COMMENT_ERROR = (
+    "Query opens with an executable comment (/*! or /*M!), which is not allowed"
+)
+# The start of an executable comment, the one empty one (whitespace alone: a version number
+# is content), and one whose content opens with SET. Each is matched against a single comment
+# piece, which ends at its first */. Case-insensitive, which only refuses more (/*m! too).
+_EXECUTABLE_START = re.compile(r"/\*M?!", re.IGNORECASE)
+_EMPTY_EXECUTABLE = re.compile(r"/\*M?!\s*\*/", re.IGNORECASE)
+_EXECUTABLE_SET = re.compile(r"/\*M?!\d*\s*SET\b", re.IGNORECASE)
+# The first word of an executable comment's content, after its version number.
+_EXECUTABLE_FIRST_WORD = re.compile(r"/\*M?!\d*\s*([A-Z_]\w*)", re.IGNORECASE)
+# The opener of a MySQL or MariaDB executable comment, with its optional version number. The
+# server may run the content, so the pattern scans remove the opener and read it as code,
+# which refuses more. Whether it does depends on the comment: /*!NNNNN runs only on a server
+# of at least that version, and MySQL skips MariaDB's /*M! entirely. So before the first word
+# such a comment is refused unless it is empty (_leading_statement_error). Result masking and
+# the strict guard use the same opener (``services.result_masking.EXECUTABLE_COMMENT``);
+# keep the two in step. Case-insensitive, like the leading-region patterns: reading /*m! as
+# code only refuses more.
+_EXECUTABLE_OPENER = re.compile(r"/\*M?!\d*", re.IGNORECASE)
 # Text sqlparse reads differently from the server: an executable-comment opener or two dashes
 # the server does not read as a comment (sqlparse takes both for comments while the server
 # runs them), or a # (sqlparse reads INTO#x as one name, the server ends the word at the #).
 # Where one is present, sqlparse's tokens do not show all the code, so the INTO check falls
 # back to the words of the scan text the server reads as code (code_words).
-_HIDDEN_FROM_SQLPARSE = re.compile(rf"/\*M?!|{_DASHES_AS_CODE}|#")
+_HIDDEN_FROM_SQLPARSE = re.compile(rf"/\*M?!|{_DASHES_AS_CODE}|#", re.IGNORECASE)
 
 
 class MySQLValidator(BaseSQLValidator):
@@ -157,6 +182,23 @@ class MySQLValidator(BaseSQLValidator):
 
         return result
 
+    def _has_fetch_clause(self, query: str) -> bool:
+        """Whether the query carries a FETCH FIRST/NEXT clause the server always runs.
+
+        MariaDB has the clause (10.6 and later). It is read by MySQL's comment rules, where
+        a hash line is a gap, and on both readings of an executable comment: with its
+        content as code, and with the whole comment as a gap. The server skips a versioned
+        comment on an older version, and MySQL skips a MariaDB-only one, so a clause inside
+        either may not run; the LIMIT is left off only when the clause is code on both
+        readings, because the LIMIT is the bound on the rows read. With several executable
+        comments, a mixture of run and skipped ones could in theory differ from both
+        readings, but at worst that removes the row bound, which the rule that the word
+        LIMIT anywhere counts as a row limit already allows.
+        """
+        return has_fetch_clause(
+            _EXECUTABLE_OPENER.sub(" ", query), mysql_comments=True, quotes=self.QUOTE_CHARS
+        ) and has_fetch_clause(query, mysql_comments=True, quotes=self.QUOTE_CHARS)
+
     def _pieces(self, statements: tuple[sql_nodes.Statement, ...]) -> list[tuple[str, bool]]:
         """Each token's text and whether the server reads it as a gap, by MySQL's rules.
 
@@ -194,14 +236,40 @@ class MySQLValidator(BaseSQLValidator):
         """Judge the first word on the raw text rather than on sqlparse's first token.
 
         sqlparse reads an executable comment as a comment and a # comment with no space
-        after it (#x) as an operator; the server runs the first and skips the second. The
-        scan removes the executable-comment openers, skips the comment forms the server
-        skips (_GAP), and asks for SELECT, WITH or an opening parenthesis next, so neither
-        /*!SET*/ … nor /*!SHOW TABLES WHERE*/ (SELECT 1) passes, and #x then SELECT does.
+        after it (#x) as an operator. The server skips the second; whether it runs the first
+        is decided by the comment itself: a versioned comment runs only on a server of at
+        least that version, and MySQL skips a MariaDB-only one. Before the first word, a
+        mixture of comments the server runs and skips can lead with a statement that neither
+        the content read as code nor the content read as a gap shows (/*!99999 SELECT 1 */
+        SHOW TABLES), so an executable comment there is refused (the validator used to read
+        the content of every one as code): with the SET message when its content or the raw
+        text opens with SET, the not-a-read message naming the word when its content opens
+        with another statement, and EXECUTABLE_COMMENT_ERROR otherwise, since sqlparse reads
+        the comment as a comment and the not-a-read message would name the SELECT after it.
+        Content with no word changes the reading too: a quote in a comment the server runs
+        hides the comment's own closer, and a (, a -- or a ; moves what follows. Only an empty
+        one (whitespace alone) is a gap. After that the statement must start with SELECT or
+        WITH on the raw text, past the comment forms the server skips (_LEADING_GAP) and any
+        opening parentheses (so (TABLE t) is refused); a SET there gets the SET message.
+        Executable comments after the first word stay allowed (SELECT /*! STRAIGHT_JOIN */
+        …), as does a plain comment anywhere. A hash line is a comment to the server whatever
+        it says, so a response that opens with a markdown heading and then a SELECT is judged
+        on the SELECT.
         """
-        scan = _EXECUTABLE_OPENER.sub(" ", query)
-        if _LEADING_SET.match(scan):
+        leading_set = _LEADING_SET.match(query) is not None
+        i = 0
+        while (piece := _LEADING_PIECE.match(query, i)) is not None:
+            text = piece.group()
+            if _EXECUTABLE_START.match(text) and not _EMPTY_EXECUTABLE.fullmatch(text):
+                if leading_set or _EXECUTABLE_SET.match(text):
+                    return SET_STATEMENT_ERROR
+                first = _EXECUTABLE_FIRST_WORD.match(text)
+                if first is not None and first.group(1).upper() not in ("SELECT", "WITH"):
+                    return not_a_read_error(first.group(1).upper())
+                return EXECUTABLE_COMMENT_ERROR
+            i = piece.end()
+        if leading_set:
             return SET_STATEMENT_ERROR
-        if _LEADING_READ.match(scan):
+        if _LEADING_READ.match(query):
             return None
         return not_a_read_error(stmt.get_type())

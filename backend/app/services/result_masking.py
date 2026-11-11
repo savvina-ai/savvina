@@ -1111,8 +1111,9 @@ def _engine_lexing() -> tuple[object, object, frozenset[object], Any]:
 # server runs the content, so for every check it is code, not a comment. Shared with
 # ``sensitive_guard``, which refuses it in strict mode. The MySQL validator keeps its own copy
 # (``mysql_validator._EXECUTABLE_OPENER``, which also eats the version digits): datasources
-# do not import from services, so keep the two in step.
-EXECUTABLE_COMMENT = re.compile(r"/\*M?!")
+# do not import from services, so keep the two in step, case-insensitivity included (a
+# lower-case /*m! is a plain comment to the server; reading it as an opener only refuses more).
+EXECUTABLE_COMMENT = re.compile(r"/\*M?!", re.IGNORECASE)
 
 
 def has_escape_string_continuation(sql: str) -> bool:

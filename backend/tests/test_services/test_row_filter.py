@@ -640,6 +640,25 @@ class TestRowLimit:
         sql = "SELECT id FROM users FETCH FIRST 5 ROWS ONLY"
         assert _executable(sql, None, "PostgreSQL", **_MODES) == sql
 
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM users -- Fetch every order",
+            "SELECT id FROM users /* fetch next page */",
+            "SELECT id FROM users WHERE action = 'fetch first'",
+            "SELECT id, fetch FROM users",
+        ],
+    )
+    def test_the_word_fetch_outside_a_clause_still_gets_the_limit(self, sql: str) -> None:
+        # The LIMIT is the only bound on the rows read into memory (non-streaming path), so a
+        # comment, a literal or a column named fetch must not drop it.
+        out = _executable(sql, None, "PostgreSQL", **_MODES)
+        assert out.endswith(f"\nLIMIT {self._n()}")
+
+    def test_a_fetch_clause_after_a_comment_with_the_word_is_still_a_limit(self) -> None:
+        sql = "SELECT id FROM users -- Fetch every order\nFETCH FIRST 5 ROWS ONLY"
+        assert _executable(sql, None, "PostgreSQL", **_MODES) == sql
+
     def test_the_configured_limit_is_used(self) -> None:
         settings = MagicMock(default_row_limit=50)
         with patch("app.services.row_filter.get_settings", return_value=settings):

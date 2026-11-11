@@ -32,6 +32,11 @@ def strip_query(query: str) -> str:
     return query.strip().lstrip(_BYTE_ORDER_MARK).strip()
 
 
+# The word LIMIT anywhere counts as a row limit, as the server always has one (a comment or a
+# literal naming it leaves the LIMIT off). The FETCH clause is read more strictly: see
+# has_fetch_clause.
+_LIMIT_WORD = re.compile(r"\bLIMIT\b", re.IGNORECASE)
+
 # A keyword glued to the next word ("SELECTday"): the space the model dropped is put back.
 _MISSING_SPACE = re.compile(r"(?i)^(SELECT|WITH|INSERT|UPDATE|DELETE)(?=[^\s(])")
 
@@ -177,6 +182,10 @@ def has_second_statement(text: str, *, mysql_comments: bool = False) -> bool:
     return False
 
 
+# The share-locking clauses as consecutive words of a text joined by single spaces.
+_LOCK_WORDS = re.compile(r"\b(?:FOR (?:KEY )?SHARE|LOCK IN SHARE MODE)\b")
+
+
 def takes_row_locks(
     text: str, *, mysql_comments: bool = False, quotes: str = _COMMON_QUOTES
 ) -> bool:
@@ -185,12 +194,17 @@ def takes_row_locks(
     Read on the words the server reads as code (code_words): a comment between the words
     does not hide the clause, and the words inside a string literal, a quoted name or a
     comment ('Up for share', -- lock in share mode?) do not count, except in a text with a
-    backslash or a dollar sign, where every word counts (refuses more). ``quotes`` are the
-    dialect's quote characters (see code_words): the backtick is one on MySQL only, and
-    PostgreSQL reads it as an operator character, so its words count there. FOR UPDATE and
-    FOR NO KEY UPDATE are refused by the UPDATE keyword.
+    backslash or a dollar sign (_QUOTES_NOT_FOLLOWED). There the quotes are not followed, so
+    a literal holding a comment opener ('/*') would read as a comment and hide the clause
+    after it, while the server ends a literal such as 'a\\' at its quote: in such a text the
+    clause also counts as consecutive words anywhere, a comment's or a literal's too (refuses
+    more). ``quotes`` are the dialect's quote characters (see code_words): the backtick is
+    one on MySQL only, and PostgreSQL reads it as an operator character, so its words count
+    there. FOR UPDATE and FOR NO KEY UPDATE are refused by the UPDATE keyword.
     """
     upper = text.upper()
+    if _QUOTES_NOT_FOLLOWED.search(upper) and _LOCK_WORDS.search(" ".join(_WORD.findall(upper))):
+        return True
     gaps = _Gaps(upper, mysql_comments=mysql_comments)
 
     def follows(i: int, words: tuple[str, ...]) -> bool:
@@ -207,6 +221,29 @@ def takes_row_locks(
                 return True
         elif word == "LOCK" and follows(end, ("IN", "SHARE", "MODE")):
             return True
+    return False
+
+
+def has_fetch_clause(
+    text: str, *, mysql_comments: bool = False, quotes: str = _COMMON_QUOTES
+) -> bool:
+    """Whether the text holds the standard row-limiting clause as code: FETCH FIRST or NEXT.
+
+    A LIMIT appended after the clause is a syntax error (PostgreSQL, MariaDB), so a query
+    that carries it gets none. Only the clause counts, read on the words the server reads
+    as code (code_words): the word FETCH in a comment, a string literal or a name
+    (-- Fetch every order, a column called fetch) still gets the LIMIT, because on the
+    non-streaming execute path the LIMIT is the only bound on the rows read into memory.
+    Unlike the lock scan, a backslash or a dollar sign does not switch to an every-word
+    reading: that would drop the LIMIT.
+    """
+    upper = text.upper()
+    gaps = _Gaps(upper, mysql_comments=mysql_comments)
+    for word, end in code_words(upper, mysql_comments=mysql_comments, quotes=quotes):
+        if word == "FETCH":
+            match = _WORD.match(upper, gaps.skip(end))
+            if match is not None and match.group() in ("FIRST", "NEXT"):
+                return True
     return False
 
 
@@ -229,15 +266,20 @@ class BaseSQLValidator:
         "GRANT",
         "REVOKE",
         "MERGE",
-        "REPLACE",
         "CALL",
         "EXECUTE",
         "EXEC",
     }
 
+    # REPLACE is deliberately not a blocked word: REPLACE(str, from, to) is an ordinary
+    # string function on every dialect. MySQL's REPLACE INTO (DML) is refused by the
+    # statement rule (its first word is not a read) and by the INTO token rule; the pattern
+    # here is the backstop behind both, and it also refuses the two words inside a string
+    # literal or a comment.
     DANGEROUS_PATTERNS: ClassVar[list[str]] = [
         r"INTO\s+OUTFILE",
         r"INTO\s+DUMPFILE",
+        r"\bREPLACE\s+INTO\b",
     ]
 
     # INTO in clause position writes: PostgreSQL's SELECT … INTO creates a table, MySQL's
@@ -258,10 +300,12 @@ class BaseSQLValidator:
         3. Check the statement's first word after comments: SET is refused with its own
            message, anything but SELECT, WITH or an opening parenthesis is refused
         4. Scan for BLOCKED_STATEMENT_TYPES as whole words in query text
-           4b. Reject WRITING_KEYWORDS (INTO) where sqlparse tokenises them as keywords
+           4b. Reject WRITING_KEYWORDS (INTO) where sqlparse tokenises them as keywords,
+               or anywhere in a text with a backslash or a dollar sign
         5. Reject a second statement (has_second_statement), a share-locking read
            (takes_row_locks) and the DANGEROUS_PATTERNS
-        6. Add LIMIT if missing, then return the ValidationResult
+        6. Add LIMIT if the query carries no row limit (the word LIMIT, or a FETCH FIRST/NEXT
+           clause read as code), then return the ValidationResult
         """
         query = strip_query(query)
         if not query:
@@ -314,16 +358,26 @@ class BaseSQLValidator:
 
         # 4b. Keywords that write when they are SQL, checked on tokens so the same word in
         #     a comment, literal or quoted identifier is not mistaken for a clause.
-        for statement in non_empty:
-            for token in statement.flatten():
-                if (
-                    token.ttype in sql_tokens.Keyword
-                    and token.normalized.upper() in self.WRITING_KEYWORDS
-                ):
-                    return ValidationResult(
-                        is_valid=False,
-                        error_message="SELECT … INTO is not allowed: it writes to the database",
-                    )
+        writes = any(
+            token.ttype in sql_tokens.Keyword and token.normalized.upper() in self.WRITING_KEYWORDS
+            for statement in non_empty
+            for token in statement.flatten()
+        )
+        #     sqlparse reads a backslash before a quote as an escape, so in 'a\' INTO t -- '
+        #     the INTO is inside one literal to it, while PostgreSQL (standard_conforming_strings
+        #     on) and MySQL under NO_BACKSLASH_ESCAPES end the literal at that quote and run
+        #     the INTO. Where the text holds a backslash or a dollar sign (_QUOTES_NOT_FOLLOWED)
+        #     the tokens may not show all the code, so the word counts wherever it is, in a
+        #     comment too: code_words is not enough here, because with the quotes not
+        #     followed a comment opener inside a literal ('/*') would hide the INTO after it.
+        #     Rare in a generated query; it only refuses more.
+        if not writes and _QUOTES_NOT_FOLLOWED.search(query):
+            writes = any(word in self.WRITING_KEYWORDS for word in _WORD.findall(query_upper))
+        if writes:
+            return ValidationResult(
+                is_valid=False,
+                error_message="SELECT … INTO is not allowed: it writes to the database",
+            )
 
         # 5. A second statement, a share-locking read (it takes row locks other sessions
         #    wait on, as FOR UPDATE, which the UPDATE keyword refuses), dangerous patterns
@@ -345,10 +399,14 @@ class BaseSQLValidator:
         #    comments and whitespace after the statement go first, or "SELECT 1; -- c" would
         #    get the LIMIT as a second statement.
         sanitized = query
-        if not re.search(r"\bLIMIT\b", query, re.IGNORECASE):
+        if not (_LIMIT_WORD.search(query) or self._has_fetch_clause(query)):
             sanitized = f"{self._without_trailing_gaps(parsed)}\nLIMIT {default_limit}"
 
         return ValidationResult(is_valid=True, sanitized_query=sanitized)
+
+    def _has_fetch_clause(self, query: str) -> bool:
+        """Whether the query carries a FETCH FIRST/NEXT clause, by the dialect's comment rules."""
+        return has_fetch_clause(query, quotes=self.QUOTE_CHARS)
 
     def _without_trailing_gaps(self, statements: tuple[sql_nodes.Statement, ...]) -> str:
         """The query text up to its last code token: no trailing ;, comment or whitespace.
@@ -415,8 +473,21 @@ class BaseSQLValidator:
         is_read = first is not None and (
             (first.ttype in sql_tokens.Keyword.DML and first.normalized == "SELECT")
             or first.ttype in sql_tokens.Keyword.CTE
-            or isinstance(first, sql_nodes.Parenthesis)
+            or (isinstance(first, sql_nodes.Parenthesis) and self._opens_with_a_read(first))
         )
         if is_read:
             return None
         return not_a_read_error(stmt.get_type())
+
+    @staticmethod
+    def _opens_with_a_read(group: sql_nodes.Parenthesis) -> bool:
+        """Whether the first word inside the (possibly nested) parentheses is SELECT or WITH."""
+        for token in group.flatten():
+            if token.ttype in sql_tokens.Whitespace or token.ttype in sql_tokens.Comment:
+                continue
+            if token.value == "(":
+                continue
+            return (
+                token.ttype in sql_tokens.Keyword.DML and token.normalized == "SELECT"
+            ) or token.ttype in sql_tokens.Keyword.CTE
+        return False

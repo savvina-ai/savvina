@@ -495,9 +495,6 @@ def _filtered_executable(
 
 
 _VALIDATORS = {"postgresql": PostgreSQLValidator(), "mysql": MySQLValidator()}
-# A FETCH FIRST clause is a row limit the validator's LIMIT check does not see; a LIMIT
-# after it is a syntax error.
-_FETCH = re.compile(r"\bFETCH\b", re.IGNORECASE)
 _LIMIT = re.compile(r"\bLIMIT\b", re.IGNORECASE)
 
 
@@ -512,8 +509,9 @@ def _with_row_limit(clean: str, executed: str, dialect: str) -> str:
     query, which every display, cache and prompt carries: the rewrite's own fences (a MySQL
     ``LIMIT 18446744073709551615`` inside a derived table) must not count as the query's
     limit. Unchanged when the dialect has no validator, the query already has a LIMIT
-    anywhere or a FETCH clause, or sqlparse cannot parse it (the callers' validation is the
-    gate; this never validates again).
+    anywhere or a FETCH FIRST/NEXT clause read as code (the validator's own check, so a
+    comment, a literal or a column named fetch does not count), or sqlparse cannot parse it
+    (the callers' validation is the gate; this never validates again).
 
     The rewritten form (sqlglot output: no comments, no trailing semicolon, the outer query
     unchanged) takes ``\nLIMIT n`` at its end; the unrewritten one is the validator's text
@@ -521,7 +519,7 @@ def _with_row_limit(clean: str, executed: str, dialect: str) -> str:
     result-column position, which a trailing LIMIT does not change.
     """
     validator = _VALIDATORS.get((dialect or "").lower())
-    if validator is None or _FETCH.search(clean) or _LIMIT.search(clean):
+    if validator is None or _LIMIT.search(clean) or validator._has_fetch_clause(clean):
         return executed
     suffix = f"\nLIMIT {get_settings().default_row_limit + 1}"
     if executed != clean:

@@ -1831,6 +1831,15 @@ class TestHasEscapeStringContinuation:
     def test_a_mysql_executable_comment_is_a_plain_comment_on_postgresql(self, sql: str) -> None:
         assert result_masking.has_escape_string_continuation(sql)
 
+    @pytest.mark.parametrize("opener", ["/*!", "/*!50000", "/*M!", "/*m!", "/*m!100000"])
+    @pytest.mark.parametrize("dq", [True, False])
+    def test_the_opener_is_matched_in_any_case(self, opener: str, dq: bool) -> None:
+        # Kept in step with mysql_validator._EXECUTABLE_OPENER, which is case-insensitive.
+        sql = f"SELECT {opener} email */ 1"
+        with pytest.raises(result_masking._ExecutableCommentError):
+            result_masking._lex_like_the_engine(sql, dq)
+        assert result_masking.EXECUTABLE_COMMENT.search(sql)
+
     @pytest.mark.parametrize("dq", [True, False])
     def test_masking_still_refuses_an_executable_comment(self, dq: bool) -> None:
         with pytest.raises(result_masking._ExecutableCommentError):
