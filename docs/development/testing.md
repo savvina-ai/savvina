@@ -76,7 +76,11 @@ the older shapes (nested comments, `--1`, `INTO#x`, `:=`, `set_config`, share lo
 - a quote in an executable comment hiding the comment's own closer;
 - the backslash and dollar-quote `FOR SHARE` cases on PostgreSQL (`'a\' … '/*' … FOR SHARE`,
   `$$/*$$ … FOR SHARE`), which would take a row lock if the validator let them through;
-- a GLOBAL `sql_mode` case on MySQL (the adapter's reading of `ANSI_QUOTES`), which restores the mode in its own `finally`.
+- a GLOBAL `sql_mode` case on MySQL (the adapter's reading of `ANSI_QUOTES`), which restores the mode in its own `finally`;
+- the `INTO` the server runs where sqlparse shows none: after a `#` on PostgreSQL, after a dot and behind an exponent on MySQL (`7.INTO @v`, `1E5INTO @v`), between two acute accents on both;
+- a skipped versioned comment that does not hide the executable comment after it (`/*!99999 ' */ /*! INTO @v */`), and `--/*! 0 INTO @v*/`, where the dashes are arithmetic;
+- MySQL's `--` rule on a no-break space and on DEL, and where each server ends a line comment (PostgreSQL at a carriage return too);
+- a share lock behind an exponent and behind a dollar literal, a nested comment where sqlparse shows none, and `FETCH` as part of a name or inside a parenthesis.
 
 They are skipped unless `SAVVINA_LIVE_TEST_DBS=1` is set, and CI does not run them. Bring up
 the sample databases and run it from the repo root, with the sample passwords exported from
@@ -84,7 +88,7 @@ the sample databases and run it from the repo root, with the sample passwords ex
 
 ```bash
 docker compose --profile test-dbs up -d --wait sample-postgres sample-mysql
-set -a; . <(grep -E '^SAMPLE_(POSTGRES|MYSQL|MYSQL_ROOT)_PASSWORD=' .env 2>/dev/null); set +a
+set -a; . <(grep -E '^SAMPLE_(POSTGRES|MYSQL|MYSQL_ROOT)_PASSWORD=.+' .env 2>/dev/null); set +a
 SAVVINA_LIVE_TEST_DBS=1 .venv/bin/pytest backend/tests/test_datasources/test_validator_live.py -v
 ```
 
