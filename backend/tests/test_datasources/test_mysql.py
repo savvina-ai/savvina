@@ -412,6 +412,16 @@ class TestConnect:
             ("ansi_quotes", False),
             # A server or proxy that reports the bare combination mode.
             ("ANSI", False),
+            # MariaDB's other combination modes (MySQL had them up to 5.7) imply it too.
+            ("ORACLE", False),
+            ("MSSQL", False),
+            ("DB2", False),
+            ("MAXDB", False),
+            ("POSTGRESQL", False),
+            ("oracle,STRICT_TRANS_TABLES", False),
+            # MYSQL40 and MYSQL323 are combination modes without ANSI_QUOTES.
+            ("MYSQL40", True),
+            ("MYSQL323,NO_BACKSLASH_ESCAPES", True),
             ("", True),
             (None, True),
             # Some servers and drivers return the variable as bytes.
