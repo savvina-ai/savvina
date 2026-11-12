@@ -16,6 +16,7 @@ from sqlparse.exceptions import SQLParseError
 
 from app.datasources.errors import ErrorCategory
 from app.datasources.models import DataSourceSchema, PrivacySettings, QueryResult, ValidationResult
+from app.datasources.validators.mysql_validator import MySQLValidator
 from app.datasources.validators.postgresql_validator import PostgreSQLValidator
 from app.providers.base import LLMResponse
 from app.services.error_feedback import redact_error_for_user
@@ -658,6 +659,51 @@ class TestRowLimit:
     def test_a_fetch_clause_after_a_comment_with_the_word_is_still_a_limit(self) -> None:
         sql = "SELECT id FROM users -- Fetch every order\nFETCH FIRST 5 ROWS ONLY"
         assert _executable(sql, None, "PostgreSQL", **_MODES) == sql
+
+    def test_a_fetch_clause_inside_a_subquery_still_gets_the_limit(self) -> None:
+        # The clause bounds the subquery, not the rows the statement returns.
+        sql = "SELECT id FROM (SELECT id FROM users FETCH FIRST 5 ROWS ONLY) s"
+        out = _executable(sql, None, "PostgreSQL", **_MODES)
+        assert out == f"{sql}\nLIMIT {self._n()}"
+
+    @pytest.mark.parametrize(
+        ("validator", "query", "expected"),
+        [
+            (PostgreSQLValidator, "SELECT id FROM users", False),
+            (PostgreSQLValidator, "SELECT id FROM users LIMIT 5", True),
+            (PostgreSQLValidator, "SELECT id FROM users -- no limit", True),
+            (PostgreSQLValidator, "SELECT id FROM users FETCH FIRST 5 ROWS ONLY", True),
+            (PostgreSQLValidator, "SELECT id FROM users -- Fetch every order", False),
+            (MySQLValidator, "SELECT id FROM users # FETCH FIRST 5 ROWS ONLY", False),
+            (MySQLValidator, "SELECT id FROM users /*! FETCH FIRST 5 ROWS ONLY */", True),
+        ],
+    )
+    def test_has_row_limit_is_the_validators_rule(self, validator, query, expected) -> None:
+        assert validator().has_row_limit(query) is expected
+
+    @pytest.mark.parametrize("dialect", ["PostgreSQL", "MySQL"])
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM users",
+            "SELECT id FROM users LIMIT 5",
+            "SELECT id FROM users -- limit",
+            "SELECT id FROM users FETCH FIRST 5 ROWS ONLY",
+            "SELECT id FROM users WHERE action = 'fetch first'",
+            "SELECT id FROM (SELECT id FROM users FETCH FIRST 5 ROWS ONLY) s",
+            "SELECT s.fetch first FROM s",
+            "SELECT 1;  -- c",
+            "SELECT id FROM users FETCH FIRST 5 ROWS ONLY;",
+            "SELECT id FROM users LIMIT 5;",
+        ],
+    )
+    def test_the_executed_form_is_the_validated_form(self, dialect: str, sql: str) -> None:
+        # Unfiltered, the executed form gets the LIMIT exactly where and when validate puts
+        # it: same decision (has_row_limit), same text (without_trailing_gaps).
+        validator = {"PostgreSQL": PostgreSQLValidator, "MySQL": MySQLValidator}[dialect]()
+        validated = validator.validate(sql, default_limit=self._n())
+        assert validated.is_valid
+        assert _executable(sql, None, dialect, **_MODES) == validated.sanitized_query
 
     def test_the_configured_limit_is_used(self) -> None:
         settings = MagicMock(default_row_limit=50)

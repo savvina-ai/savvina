@@ -3,22 +3,33 @@
 
 """Contract rules of the PostgreSQL and MySQL validators that test_sql_validator.py does
 not pin: the REPLACE() string function passes, a FETCH FIRST/NEXT clause is a row limit, a
-parenthesis must open with a read, an executable comment before the first word is refused,
-a backslash or a dollar sign does not hide INTO or a share lock, and every fixed error
-message is safe to show and to send to the correction prompt."""
+parenthesis must open with a read, and every fixed error message is safe to show and to
+send to the correction prompt."""
 
 from __future__ import annotations
 
 import ast
 import inspect
+import time
 
 import pytest
 
 from app.datasources.validators import base_sql_validator, mysql_validator, postgresql_validator
-from app.datasources.validators.mysql_validator import EXECUTABLE_COMMENT_ERROR, MySQLValidator
+from app.datasources.validators.base_sql_validator import TABLE_STATEMENT_ERROR
+from app.datasources.validators.mysql_validator import MySQLValidator
 from app.datasources.validators.postgresql_validator import PostgreSQLValidator
+from tests.test_validators.test_sql_validator import (
+    GLUED_LOCK_SHAPES,
+    LONG_LOCK_WORD_RUNS,
+    MYSQL_COMMENT_LOCK_SHAPES,
+    MYSQL_INTO_SHAPES,
+    PG_INTO_SHAPES,
+    PG_NESTED_COMMENT_LOCK_SHAPES,
+    SHARE_LOCK_SHAPES,
+)
 
 _VALIDATORS = [PostgreSQLValidator, MySQLValidator]
+_INTO_ERROR = "SELECT … INTO is not allowed: it writes to the database"
 _MODULES = [base_sql_validator, postgresql_validator, mysql_validator]
 
 
@@ -56,9 +67,11 @@ class TestReplaceIsAFunctionNotAStatement:
 
 class TestFetchIsARowLimit:
     """FETCH FIRST n ROWS ONLY is a row limit (PostgreSQL, MariaDB); a LIMIT appended after
-    it is a syntax error, so none is appended. Only the clause counts, as code: on the
-    non-streaming execute path the LIMIT is the only bound on the rows read into memory, so
-    the word FETCH in a comment, a literal or a name must still get one."""
+    it is a syntax error, so none is appended. Only the statement's own clause counts, as
+    code: on the non-streaming execute path the LIMIT is the only bound on the rows read
+    into memory, so the word FETCH in a comment, a literal or a name must still get one,
+    and so must a clause inside a subquery, which bounds the subquery alone. The
+    statement's own body may itself stand in parentheses."""
 
     def test_no_limit_is_appended_after_fetch_first(self):
         q = "SELECT id FROM t ORDER BY id FETCH FIRST 10 ROWS ONLY"
@@ -104,11 +117,102 @@ class TestFetchIsARowLimit:
         result = MySQLValidator().validate("SELECT id FROM t # fetch first ten\n")
         assert result.sanitized_query == "SELECT id FROM t\nLIMIT 1000"
 
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT * FROM (SELECT a FROM t ORDER BY a FETCH FIRST 5 ROWS ONLY) s JOIN b ON true",
+            "WITH c AS (SELECT a FROM t ORDER BY a FETCH FIRST 5 ROWS ONLY) SELECT * FROM c",
+            "(SELECT a FROM t FETCH FIRST 5 ROWS ONLY) UNION ALL (SELECT a FROM u)",
+            "(SELECT a FROM t) UNION ALL (SELECT a FROM u FETCH FIRST 5 ROWS ONLY)",
+            "SELECT 1 AS a UNION ALL (SELECT a FROM u FETCH FIRST 5 ROWS ONLY)",
+            "WITH c AS (SELECT 1 AS a) (SELECT a FROM c FETCH FIRST 5 ROWS ONLY) UNION SELECT 2",
+            "SELECT a FROM t WHERE b IN (SELECT b FROM u FETCH NEXT 5 ROWS ONLY)",
+            "SELECT (SELECT a FROM t FETCH FIRST 1 ROWS ONLY) AS x FROM big",
+        ],
+    )
+    def test_a_clause_inside_parentheses_does_not_bound_the_statement(self, validator, query):
+        result = validator().validate(query)
+        assert result.is_valid
+        assert result.sanitized_query == f"{query}\nLIMIT 1000"
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT a FROM t WHERE b IN (SELECT 1) ORDER BY a FETCH FIRST 5 ROWS ONLY",
+            "SELECT a FROM t WHERE b = '(' ORDER BY a FETCH FIRST 5 ROWS ONLY",
+            "SELECT a FROM t /* ( */ ORDER BY a FETCH FIRST 5 ROWS ONLY",
+            # The parentheses are the statement's own body: the clause is its own, and
+            # PostgreSQL refuses a LIMIT after it (multiple LIMIT clauses). The body may
+            # be the whole statement, follow a WITH clause or precede the ORDER BY.
+            "(SELECT a FROM t ORDER BY a FETCH FIRST 5 ROWS ONLY)",
+            "((SELECT a FROM t ORDER BY a FETCH FIRST 5 ROWS ONLY));",
+            "WITH c AS (SELECT 1 AS a) (SELECT a FROM c FETCH FIRST 5 ROWS ONLY)",
+            "WITH c AS (SELECT 1 AS a) ((SELECT a FROM c FETCH NEXT 5 ROWS ONLY))",
+            "(SELECT a FROM t FETCH FIRST 5 ROWS ONLY) ORDER BY a",
+            # The clause of a set operation stands outside its branches.
+            "(SELECT a FROM t) UNION ALL (SELECT a FROM u) FETCH FIRST 5 ROWS ONLY",
+        ],
+    )
+    def test_the_statements_own_clause_still_counts(self, validator, query):
+        result = validator().validate(query)
+        assert result.is_valid
+        assert result.sanitized_query == query
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    def test_a_text_whose_quotes_are_not_followed_keeps_the_limit(self, validator):
+        # A parenthesis inside a literal would be counted there, so the clause is not
+        # recognised: a syntax error on the server rather than an unbounded read.
+        query = r"SELECT a FROM t WHERE b LIKE '%\_%' ESCAPE '\' ORDER BY a FETCH FIRST 5 ROWS ONLY"
+        result = validator().validate(query)
+        assert result.is_valid
+        assert result.sanitized_query == f"{query}\nLIMIT 1000"
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # After a dot FETCH is a column name, which both servers take for a reserved
+            # word too, and FIRST is its alias. PostgreSQL also takes a gap after the dot.
+            'SELECT o.id, s.fetch FIRST FROM (SELECT 1 AS "fetch") s, orders o',
+            'SELECT o.id, s . fetch FIRST FROM (SELECT 1 AS "fetch") s, orders o',
+            'SELECT o.id, s./* c */fetch FIRST FROM (SELECT 1 AS "fetch") s, orders o',
+            # Both servers read a non-ASCII character as part of a name, so a no-break space
+            # or a euro sign glued to FETCH makes one name of it and the word beside it.
+            "SELECT o.id FETCH\u00a0FIRST FROM orders o",
+            "SELECT o.id, x\u00a0FETCH FIRST FROM (SELECT 1 AS x\u00a0FETCH) s, orders o",
+            "SELECT o.id, \u20acFETCH FIRST FROM (SELECT 1 AS \u20acFETCH) s, orders o",
+            # A dollar sign is a name character to both servers after a name's first
+            # character, and MySQL reads @fetch as a user variable.
+            "SELECT a$fetch first FROM (SELECT id AS a$fetch FROM orders) d",
+            "SELECT fetch$a first FROM (SELECT id AS fetch$a FROM orders) d",
+            "SELECT @fetch first FROM orders",
+        ],
+    )
+    def test_fetch_as_part_of_a_name_is_no_row_limit(self, validator, query):
+        # Without the LIMIT each returns every order on the sample servers (the gapped
+        # dot forms on PostgreSQL only, a syntax error on MySQL; test_validator_live.py),
+        # so the LIMIT is appended.
+        result = validator().validate(query)
+        assert result.is_valid
+        assert result.sanitized_query == f"{query}\nLIMIT 1000"
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    def test_a_dollar_name_elsewhere_leaves_the_clause_alone(self, validator):
+        query = "SELECT a$b, @v FROM t ORDER BY a$b FETCH FIRST 5 ROWS ONLY"
+        assert validator().validate(query).sanitized_query == query
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    def test_a_non_ascii_character_elsewhere_leaves_the_clause_alone(self, validator):
+        query = "SELECT a FROM t WHERE label = '\u20ac\u00a0' ORDER BY a FETCH FIRST 5 ROWS ONLY"
+        assert validator().validate(query).sanitized_query == query
+
 
 class TestAParenthesisMustOpenARead:
     """A statement may start with a parenthesis only when the parenthesis itself opens with
     SELECT or WITH. (TABLE t) reads a whole table that no FROM or JOIN names, so the schema
-    check never sees it, and the validators did not refuse it before this rule."""
+    check never sees it, and the validators before this change refused it."""
 
     @pytest.mark.parametrize("validator", _VALIDATORS)
     @pytest.mark.parametrize(
@@ -132,6 +236,69 @@ class TestAParenthesisMustOpenARead:
     )
     def test_a_parenthesised_read_passes(self, validator, query):
         assert validator().validate(query).is_valid
+
+
+class TestTheTableWordIsRefusedAnywhere:
+    """In PostgreSQL and MySQL, TABLE t is shorthand for SELECT * FROM t. Only the start of
+    the statement was judged before (TABLE t, (TABLE t)), so in any other position it passed
+    and ran: SELECT * FROM (TABLE hr.secret) s, a CTE body, a UNION arm, an EXISTS. The
+    schema check reads only FROM and JOIN, so a table excluded by the privacy settings was
+    readable by naming it after TABLE. The word is refused wherever it is code."""
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT * FROM (TABLE hr.salaries) s",
+            "WITH s AS (TABLE t) SELECT * FROM s",
+            "(SELECT 1) UNION ALL (TABLE t)",
+            "SELECT 1 UNION TABLE t",
+            "SELECT 1 WHERE EXISTS (TABLE t)",
+            "SELECT * FROM u WHERE x IN (TABLE t)",
+            "SELECT 1 /* c */ UNION /* d */ TABLE t",
+            "select 1 union table t",
+            "SELECT '/*' AS a, 'x\\' AS b FROM (TABLE t) s -- */'",
+            "SELECT $$/*$$ AS a FROM (TABLE t) s -- */",
+        ],
+    )
+    def test_the_word_as_code_is_refused(self, validator, query):
+        result = validator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == TABLE_STATEMENT_ERROR
+
+    def test_mysql_unversioned_executable_comment_content_is_code(self):
+        result = MySQLValidator().validate("SELECT * FROM (/*! TABLE t */) s")
+        assert not result.is_valid
+        assert result.error_message == TABLE_STATEMENT_ERROR
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT 'table' AS s",
+            "SELECT 1 /* TABLE t */",
+            "SELECT 1 -- TABLE t",
+            "SELECT table_name FROM information_schema.tables",
+            'SELECT "table" FROM t',
+            "SELECT * FROM (VALUES (1, 'a')) AS v(id, name)",
+        ],
+    )
+    def test_the_word_as_text_or_a_name_passes(self, validator, query):
+        assert validator().validate(query).is_valid
+
+    @pytest.mark.parametrize("query", ["SELECT `table` FROM t", "SELECT 1 # TABLE t"])
+    def test_mysql_backtick_name_and_hash_comment_pass(self, query):
+        assert MySQLValidator().validate(query).is_valid
+
+    def test_postgresql_tablesample_passes(self):
+        assert PostgreSQLValidator().validate("SELECT * FROM t TABLESAMPLE SYSTEM (10)").is_valid
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize("query", ["TABLE t", "(TABLE t)"])
+    def test_the_leading_forms_keep_their_own_message(self, validator, query):
+        result = validator().validate(query)
+        assert not result.is_valid
+        assert result.error_message.startswith("Only SELECT queries and CTEs (WITH) are allowed")
 
 
 class TestMySQLHashLinesBeforeTheRead:
@@ -161,9 +328,9 @@ class TestMySQLExecutableCommentTheServerMaySkip:
     lead with a statement no fixed reading of them shows, so an executable comment before
     the first word is refused (the validator before this rule refused them all). Content with no
     word changes the reading too (a quote hides the comment's own closer), so only an empty
-    one (/*!*/, whitespace alone) is a gap; one after the first word stays allowed
-    (/*! STRAIGHT_JOIN */). The FETCH clause counts only when it is code with
-    the comments' content read as code and as a gap, the direction that keeps the LIMIT."""
+    one (/*!*/, whitespace alone) is a gap. After the first word, one the server always runs
+    stays allowed (/*! STRAIGHT_JOIN */); one it may skip is refused wherever it stands
+    (TestMySQLGatedCommentsAreRefused)."""
 
     _NOT_A_READ = "Only SELECT queries and CTEs (WITH) are allowed"
     _SET = "Query is a SET statement, which is not allowed"
@@ -222,7 +389,7 @@ class TestMySQLExecutableCommentTheServerMaySkip:
         # message would say Got: SELECT and the correction loop would resend the query.
         result = MySQLValidator().validate(query)
         assert not result.is_valid
-        assert result.error_message == EXECUTABLE_COMMENT_ERROR
+        assert result.error_message == mysql_validator.EXECUTABLE_COMMENT_ERROR
         assert "Got:" not in result.error_message
 
     @pytest.mark.parametrize(
@@ -275,29 +442,124 @@ class TestMySQLExecutableCommentTheServerMaySkip:
     def test_the_comment_content_still_counts_as_code(self, query):
         assert not MySQLValidator().validate(query).is_valid
 
-    @pytest.mark.parametrize(
-        "query",
-        [
-            "SELECT id FROM t /*M! FETCH FIRST 1 ROWS ONLY */",
-            "SELECT id FROM t /*!99999 FETCH FIRST 1 ROWS ONLY */",
-        ],
-    )
-    def test_a_fetch_clause_the_server_may_skip_keeps_the_limit(self, query):
-        result = MySQLValidator().validate(query)
-        assert result.is_valid
-        assert result.sanitized_query.endswith("\nLIMIT 1000")
-
     def test_a_fetch_clause_outside_any_comment_still_counts(self):
         q = "SELECT id FROM t ORDER BY id FETCH FIRST 10 ROWS ONLY"
         assert MySQLValidator().validate(q).sanitized_query == q
 
 
+class TestMySQLRegionBeforeTheFirstWord:
+    """The verdicts of the region before the first word that no other test pins: gaps,
+    parentheses and executable comments in every order. Written before the walk moved
+    from a pattern of its own onto _Gaps, and unchanged by the move."""
+
+    _NOT_A_READ = "Only SELECT queries and CTEs (WITH) are allowed"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "( /*!*/ (SELECT 1))",
+            "#\n(\n-- c\n/* d */ WITH c AS (SELECT 1 AS a) SELECT a FROM c)",
+            "--\tc\nSELECT 1",
+            "/*M! */ ( /*!*/ SELECT 1)",
+        ],
+    )
+    def test_a_read_past_gaps_parentheses_and_empty_comments_passes(self, query):
+        assert MySQLValidator().validate(query).is_valid
+
+    @pytest.mark.parametrize(
+        ("query", "message"),
+        [
+            # A SET behind a parenthesis is not a SET statement: not a read.
+            ("(SET @x = 1)", f"{_NOT_A_READ}. Got: UNKNOWN"),
+            ("/*!*/ ( /*! */ SET @x = 1)", f"{_NOT_A_READ}. Got: UNKNOWN"),
+            ("/*!*/ SET @x = 1", "Query is a SET statement, which is not allowed"),
+            # The comment is judged where it stands, behind a parenthesis too.
+            ("( /*! x */ SET @x = 1)", f"{_NOT_A_READ}. Got: X"),
+            ("/*! select 1 */ ( SET @x = 1)", mysql_validator.EXECUTABLE_COMMENT_ERROR),
+            # An executable comment that is never closed is no gap.
+            ("/*! SELECT 1", f"{_NOT_A_READ}. Got: UNKNOWN"),
+            ("SETTINGS", f"{_NOT_A_READ}. Got: UNKNOWN"),
+        ],
+    )
+    def test_everything_else_keeps_its_refusal(self, query, message):
+        result = MySQLValidator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == message
+
+
+class TestMySQLGatedCommentsAreRefused:
+    """Every MySQL scan reads an executable comment's content as code. That is the server's
+    reading only for a comment it always runs (/*! … */ with no version). A versioned
+    /*!NNNNN and MariaDB's /*M! are run by one server and skipped by another, and a mixture
+    has readings no single scan shows: on MySQL 8 the quote in /*!99999 ' */ is skipped
+    with its comment, so the /*! INTO @v */ after it runs, while a scan that reads both as
+    code sees the quote open a literal that swallows the INTO. So a comment the server may
+    skip is refused anywhere in the query, not only before the first word."""
+
+    _INTO = "SELECT … INTO is not allowed: it writes to the database"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT a FROM t WHERE 1 /*!99999 ' */ /*! INTO @v */ -- '",
+            "SELECT a FROM t WHERE 1 /*M! ' */ /*! INTO @v */ -- '",
+            "SELECT a FROM t WHERE 1 /*!99999 ' */ /*! FOR SHARE */ -- '",
+            # The clause straddles a skipped comment and a run one.
+            "SELECT a FROM t FOR /*!99999 x */ /*! SHARE */",
+            "SELECT a /*!50000 SQL_NO_CACHE */ FROM t",
+            "SELECT a /*M! x */ FROM t",
+            "SELECT a /*m! x */ FROM t",
+            # A digit straight after the ! is taken for a version whatever its length.
+            "SELECT a /*!1 x */ FROM t",
+            "SELECT id FROM t /*M! FETCH FIRST 1 ROWS ONLY */",
+            "SELECT id FROM t /*!99999 FETCH FIRST 1 ROWS ONLY */",
+        ],
+    )
+    def test_a_comment_the_server_may_skip_is_refused_anywhere(self, query):
+        result = MySQLValidator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == mysql_validator.GATED_COMMENT_ERROR
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT /*! STRAIGHT_JOIN */ a FROM t",
+            "SELECT a /*! */ FROM t",
+            # An empty MariaDB-only comment is nothing on either server.
+            "SELECT a /*M!*/ FROM t",
+            "SELECT a /*M! */ FROM t",
+            # A plain comment that merely mentions a version.
+            "SELECT a FROM t /* since !50000 */",
+        ],
+    )
+    def test_a_comment_the_server_always_runs_or_an_empty_one_passes(self, query):
+        assert MySQLValidator().validate(query).is_valid
+
+    @pytest.mark.parametrize(
+        ("query", "message"),
+        [
+            ("SELECT id FROM u WHERE id=1 /*!50000 INTO @x */", _INTO),
+            ("SELECT * FROM t /*!50000 FOR SHARE */", base_sql_validator.LOCKING_READ_ERROR),
+            ("SELECT 1;/*!50000 SHOW GRANTS*/", "Multiple statements are not allowed"),
+        ],
+    )
+    def test_what_the_comment_holds_is_named_first(self, query, message):
+        # The gated-comment refusal is the last check, so the more specific message wins.
+        result = MySQLValidator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == message
+
+    def test_postgresql_has_no_executable_comments(self):
+        assert PostgreSQLValidator().validate("SELECT a /*!50000 x */ FROM t").is_valid
+
+
 class TestABackslashDoesNotHideInto:
     """sqlparse reads a backslash before a quote as an escape, so SELECT 'a\\' INTO t -- '
     is one literal to it. PostgreSQL (standard_conforming_strings on) and MySQL under
-    NO_BACKSLASH_ESCAPES end the literal at that quote and run the INTO. When the text holds
-    a backslash or a dollar sign the token check is not the whole story, so INTO as a word
-    anywhere is refused."""
+    NO_BACKSLASH_ESCAPES end the literal at that quote and run the INTO. When a backslash
+    stands directly before a quote, or the text opens a dollar-quoted string, where a
+    literal ends depends on the server, so INTO as a word anywhere is refused. A backslash
+    or a dollar sign anywhere else moves no literal's end and changes nothing."""
 
     _INTO = "SELECT … INTO is not allowed: it writes to the database"
 
@@ -321,12 +583,43 @@ class TestABackslashDoesNotHideInto:
         assert validator().validate(query).is_valid
 
     @pytest.mark.parametrize("validator", _VALIDATORS)
-    def test_into_in_a_comment_after_a_backslash_is_refused_too(self, validator):
+    @pytest.mark.parametrize(
+        "query",
+        [
+            r"SELECT 'a\' AS s -- split into buckets",
+            r"SELECT a FROM t WHERE b LIKE '%\_%' ESCAPE '\' -- split into buckets",
+            # A backslash before a backtick triggers too, on both validators: conservative,
+            # since only MySQL quotes with a backtick and it does not escape inside one.
+            r"SELECT `a\` AS s -- split into buckets",
+            "SELECT $$a$$ AS s -- split into buckets",
+            "SELECT $tag$a$tag$ AS s -- split into buckets",
+            "SELECT $\u20ac$a$\u20ac$ AS s -- split into buckets",
+        ],
+    )
+    def test_into_in_a_comment_of_such_a_text_is_refused_too(self, validator, query):
         # A known over-refusal, pinned: with the quotes not followed, a comment opener inside
         # a literal ('/*', the second case above) would hide the INTO, so a comment is no gap.
-        result = validator().validate(r"SELECT 'a\b' AS s -- split into buckets")
+        result = validator().validate(query)
         assert not result.is_valid
         assert result.error_message == self._INTO
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # A regular expression, a bind parameter, a JSON path, a file-path column: the
+            # backslash stands before no quote and the dollar sign opens no string.
+            r"SELECT 'a\b' AS s -- split into buckets",
+            r"SELECT regexp_replace(name, '\s+', ' ') FROM t WHERE d ILIKE '%into%'",
+            "SELECT $1, $2 FROM t -- load into view",
+            "SELECT JSON_EXTRACT(doc, '$.address') FROM t -- bucket customers into tiers",
+            "SELECT \"$path\" FROM t WHERE note = 'moved into storage'",
+            r"SELECT regexp_replace(a, '\d+', '') FROM t WHERE note = 'up for share'",
+            'SELECT price AS "cost in $" FROM t /* for share of wallet */',
+        ],
+    )
+    def test_a_backslash_or_dollar_that_moves_no_quote_changes_nothing(self, validator, query):
+        assert validator().validate(query).is_valid
 
     def test_the_backslash_is_in_the_text(self):
         # The raw strings above hold one backslash, not two: the shape under test.
@@ -334,7 +627,7 @@ class TestABackslashDoesNotHideInto:
 
 
 class TestABackslashDoesNotHideAShareLock:
-    """The share-lock scan reads code words, and with a backslash or a dollar sign in the
+    """The share-lock scan reads code words, and with a backslash before a quote in the
     text the quotes are not followed, so a '/*' literal opens what the scan takes for a
     comment and hides the clause after it, while PostgreSQL ends 'a\\' at its quote and
     takes the lock. In such a text the clause counts as consecutive words anywhere."""
@@ -366,6 +659,91 @@ class TestABackslashDoesNotHideAShareLock:
 
     def test_the_shape_holds_one_backslash(self):
         assert self._SHAPE.count("\\") == 1
+
+
+class TestTheFallbackReadsWhatTheCodeWordScanReads:
+    """A dollar-quote opener inside a literal turns the every-word fallback on, and a comment
+    opener beside it ('$$/* limit', '$$--') makes the code-word scan read the rest of the
+    text, or of the line, as a comment. The server ends the literal at its quote and runs
+    what follows, so the fallback is the one reading that sees it, and it must read what
+    the code-word scan reads: INTO and the clause's first word glued to a number (7.E5INTO,
+    1.E0FOR, see _reads_as), and the clause's words with gaps between them (FOR /* x */
+    SHARE). The MySQL and PostgreSQL 16 shapes run on the sample servers
+    (test_validator_live.py)."""
+
+    @pytest.mark.parametrize(
+        ("validator", "query"),
+        [
+            (
+                MySQLValidator,
+                "SELECT 3 FROM DUAL WHERE '$$/* limit' <> '' AND 1 <> 7.E5INTO @sv_probe",
+            ),
+            # PostgreSQL 14 and older read 1INTO as the number and then the keyword.
+            (PostgreSQLValidator, "SELECT '$$', '/*', 1INTO t FROM x WHERE c = '*/'"),
+            (PostgreSQLValidator, "SELECT '$$--', 1.E5INTO t FROM x"),
+        ],
+    )
+    def test_into_glued_to_a_number_is_refused(self, validator, query):
+        result = validator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == _INTO_ERROR
+
+    @pytest.mark.parametrize(
+        ("validator", "query"),
+        [
+            (
+                MySQLValidator,
+                "SELECT id FROM orders WHERE '$$/* limit' <> '' AND id = 1.E0FOR SHARE",
+            ),
+            (
+                PostgreSQLValidator,
+                "SELECT id FROM ecommerce.orders WHERE '$$--' <> '' FOR /* x */\nSHARE",
+            ),
+            (MySQLValidator, "SELECT id FROM orders WHERE '$$/* limit' <> '' FOR /* x */ SHARE"),
+            (
+                MySQLValidator,
+                "SELECT id FROM orders WHERE '$$/* limit' <> '' LOCK /* x */ IN SHARE MODE",
+            ),
+            (
+                PostgreSQLValidator,
+                "SELECT id FROM t WHERE '$$--' <> '' FOR /* a */ KEY -- b\nSHARE",
+            ),
+            (MySQLValidator, "SELECT id FROM orders WHERE '$$/* limit' <> '' FOR #x\nSHARE"),
+            (MySQLValidator, "SELECT id FROM orders WHERE '$$/* limit' <> '' FOR /*!*/ SHARE"),
+        ],
+    )
+    def test_a_share_lock_glued_or_spaced_is_refused(self, validator, query):
+        result = validator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == base_sql_validator.LOCKING_READ_ERROR
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # No trigger at all: the code-word scan decides.
+            r"SELECT regexp_replace(a, '\d', '') FROM t WHERE b = 'it''s' -- up for review",
+            # A trigger, and a FOR that no gap joins to a SHARE: the clause's words must
+            # stand with nothing but gaps between them, so the words apart make no clause.
+            "SELECT $$a$$ AS s, 'for' AS f FROM t",
+            "SELECT $$a$$ AS s, 'for' AS f, share FROM t",
+            r"SELECT 'O\'Brien' AS n FROM t -- totals for each share class",
+            "SELECT $$a$$ AS s, x.e5intox, into_date FROM x",
+        ],
+    )
+    def test_the_words_apart_still_pass(self, validator, query):
+        assert validator().validate(query).is_valid
+
+    @pytest.mark.parametrize(("piece", "count"), LONG_LOCK_WORD_RUNS)
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    def test_a_long_run_after_a_trigger_validates_quickly(
+        self, validator, piece, count, validate_seconds_without_sqlparse
+    ):
+        seconds = validate_seconds_without_sqlparse(
+            validator(),
+            "SELECT $$a$$ FROM t WHERE a = 1 " + piece * count,  # noqa: S608
+        )
+        assert seconds < 2.0
 
 
 def _string_literals(module) -> list[str]:
@@ -452,11 +830,12 @@ class TestErrorMessageWording:
 
 
 class TestADollarQuoteKeepsTheFallback:
-    """A dollar sign triggers the every-word INTO and share-lock fallbacks as a backslash
-    does. sqlparse lexes $$/*$$ as one literal, so the INTO token check alone would catch
-    the first shape, but the lock scan reads code words, and with the quotes not followed
-    the /* inside the literal opens what it takes for a comment: without the dollar trigger
-    the FOR SHARE after it passes, and PostgreSQL takes the lock."""
+    """A dollar-quote opener ($$, $tag$) triggers the every-word INTO and share-lock
+    fallbacks as a backslash before a quote does. sqlparse lexes $$/*$$ as one literal, so
+    the INTO token check alone would catch the first shape, but the lock scan reads code
+    words, and with the quotes not followed the /* inside the literal opens what it takes
+    for a comment: without the dollar trigger the FOR SHARE after it passes, and PostgreSQL
+    takes the lock."""
 
     @pytest.mark.parametrize("validator", _VALIDATORS)
     @pytest.mark.parametrize(
@@ -476,3 +855,89 @@ class TestADollarQuoteKeepsTheFallback:
         result = validator().validate(query)
         assert not result.is_valid
         assert result.error_message == message
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        ("query", "message"),
+        [
+            (
+                "SELECT $\u20ac$ ' $\u20ac$ INTO newt FROM secrets -- '",
+                "SELECT … INTO is not allowed: it writes to the database",
+            ),
+            (
+                "SELECT $\u2014tag$ ' $\u2014tag$ INTO newt FROM secrets -- '",
+                "SELECT … INTO is not allowed: it writes to the database",
+            ),
+            (
+                "SELECT * FROM t WHERE a = $\u20ac$ ' $\u20ac$ FOR SHARE -- '",
+                base_sql_validator.LOCKING_READ_ERROR,
+            ),
+        ],
+    )
+    def test_a_tag_of_non_ascii_characters_opens_a_string_too(self, validator, query, message):
+        # PostgreSQL takes any non-ASCII character in a dollar-quote tag (a euro sign, a
+        # dash), so the quote inside is part of the string and the clause after it runs. A
+        # trigger that knew a tag of word characters only did not fire here, and the scan
+        # then read that quote as opening a literal that swallowed the clause.
+        result = validator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == message
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    def test_a_long_tag_with_no_closing_dollar_validates_quickly(self, validator):
+        # The tag pattern stays linear. Its tail was once two overlapping alternatives (a
+        # word character, a non-ASCII character); every non-ASCII letter is both, so a run
+        # of them after a dollar sign with no closing one backtracked exponentially: about a
+        # second at 24 letters, doubling with each one after.
+        query = "SELECT $" + "\u00e9" * 5000 + " AS s FROM t"
+        start = time.monotonic()
+        result = validator().validate(query)
+        assert time.monotonic() - start < 2.0
+        assert result.is_valid
+
+
+_LOCK_ERROR = base_sql_validator.LOCKING_READ_ERROR
+_NESTED_ERROR = postgresql_validator.NESTED_COMMENT_ERROR
+_CODE_WORD_SHAPES = (
+    [(PostgreSQLValidator, q, _INTO_ERROR) for q in PG_INTO_SHAPES]
+    + [(MySQLValidator, q, _INTO_ERROR) for q in MYSQL_INTO_SHAPES]
+    + [(v, q, _LOCK_ERROR) for v in _VALIDATORS for q in GLUED_LOCK_SHAPES + SHARE_LOCK_SHAPES]
+    + [(MySQLValidator, q, _LOCK_ERROR) for q in MYSQL_COMMENT_LOCK_SHAPES]
+    + [(PostgreSQLValidator, q, _NESTED_ERROR) for q in PG_NESTED_COMMENT_LOCK_SHAPES]
+)
+# A literal that turns the every-word fallback on and holds a comment opener, put first in
+# the select list, and what closes the construction: past the literal the code-word scan
+# reads the rest of the text (/*) or of the line (--) as a comment. In the third, sqlparse
+# reads the backslash as an escape and keeps everything up to the closing quote of the
+# trailing comment inside the literal, so it shows no token there either.
+_HIDING = [("'$$/*', ", ""), ("'$$--', ", ""), (r"'--a\', ", " -- '")]
+
+
+class TestEveryReadingAgreesOnTheCodeWordShapes:
+    """The code-word scan and the every-word fallback are two readings of one rule. Each
+    shape the code-word tests refuse (test_sql_validator.py: TestIntoOnCodeWords and
+    TestLockingReads) stays refused, with the same message, when a literal put first in its
+    select list hides it from the code-word scan and leaves the fallback to see it. A
+    nested comment behind a line-comment opener in such a literal is one of the shapes."""
+
+    def test_the_literal_hides_the_rest_from_the_code_word_scan(self):
+        assert [w for w, _ in base_sql_validator.code_words("SELECT '$$/*', 1INTO T")] == ["SELECT"]
+        words = base_sql_validator.code_words("SELECT '$$--', 1INTO T\nFROM X")
+        assert [w for w, _ in words] == ["SELECT", "FROM", "X"]
+
+    def test_sqlparse_shows_no_comment_inside_the_escaped_literal(self):
+        import sqlparse
+
+        statement = sqlparse.parse(r"SELECT '--a\', * FROM t FOR /* /* */ x */ SHARE -- '")[0]
+        assert not any(t.ttype in sqlparse.tokens.Comment for t in statement.flatten())
+
+    @pytest.mark.parametrize(("prefix", "suffix"), _HIDING)
+    @pytest.mark.parametrize(("validator", "query", "message"), _CODE_WORD_SHAPES)
+    def test_a_shape_hidden_from_the_code_word_scan_is_still_refused(
+        self, validator, query, message, prefix, suffix
+    ):
+        assert query[:7].upper() == "SELECT "
+        hidden = query[:7] + prefix + query[7:] + suffix
+        result = validator().validate(hidden)
+        assert not result.is_valid, hidden
+        assert result.error_message == message, hidden

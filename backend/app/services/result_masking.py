@@ -1109,8 +1109,8 @@ def _engine_lexing() -> tuple[object, object, frozenset[object], Any]:
 
 # The opener of a MySQL or MariaDB executable comment, with its optional version number: the
 # server runs the content, so for every check it is code, not a comment. Shared with
-# ``sensitive_guard``, which refuses it in strict mode. The MySQL validator keeps its own copy
-# (``mysql_validator._EXECUTABLE_OPENER``, which also eats the version digits): datasources
+# ``sensitive_guard``, which refuses it in strict mode. The validators keep their own copy
+# (``base_sql_validator.EXECUTABLE_OPENER``, which also eats the version digits): datasources
 # do not import from services, so keep the two in step, case-insensitivity included (a
 # lower-case /*m! is a plain comment to the server; reading it as an opener only refuses more).
 EXECUTABLE_COMMENT = re.compile(r"/\*M?!", re.IGNORECASE)
