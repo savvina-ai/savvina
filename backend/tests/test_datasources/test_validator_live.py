@@ -27,6 +27,8 @@ import asyncpg
 import pytest
 
 from app.datasources.adapters.mysql import MySQLDataSource
+from app.datasources.validators.mysql_validator import MySQLValidator
+from app.datasources.validators.postgresql_validator import PostgreSQLValidator
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("SAVVINA_LIVE_TEST_DBS") != "1",
@@ -324,6 +326,90 @@ class TestPostgreSQLReads:
         await pg.execute("SET statement_timeout = 12345")
         assert await pg.fetchval("SHOW statement_timeout") == "12345ms"
 
+    async def test_a_semicolon_after_a_hash_ends_the_statement(self, pg) -> None:
+        # TestLimitAfterATrailingSemicolon::test_a_semicolon_inside_a_token_sqlparse_reads_
+        # as_a_comment_is_dropped: # is XOR here, so the text runs as it stands, and a LIMIT
+        # put after its ; would be a second statement.
+        sanitized = PostgreSQLValidator().validate("SELECT 6 # 3 AS x;").sanitized_query
+        assert sanitized == "SELECT 6 # 3 AS x\nLIMIT 1000"
+        assert await pg.fetchval(sanitized) == 5
+        with pytest.raises(asyncpg.PostgresSyntaxError):
+            await pg.fetchval("SELECT 6 # 3 AS x;\nLIMIT 1000")
+
+    async def test_limit_is_a_name_after_a_dot_and_after_as(self, pg) -> None:
+        # TestLimitIsARowLimitWhenItIsTheStatementsOwn: a reserved word, yet a name in these
+        # two places, so such a statement has no row limit and gets one.
+        assert await pg.fetchval('SELECT t.limit FROM (SELECT 7 AS "limit") t') == 7
+        assert await pg.fetchval("SELECT 7 AS limit") == 7
+
+    async def test_a_dot_ending_a_number_is_not_the_dot_of_a_name(self, pg) -> None:
+        # TestLimitIsARowLimitWhenItIsTheStatementsOwn: in 1. LIMIT 5 the number is 1. and
+        # LIMIT is the clause, so a LIMIT appended after it would be a second one.
+        query = "SELECT n FROM generate_series(1, 20) AS g(n) WHERE n > 1. LIMIT 5"
+        assert PostgreSQLValidator().validate(query).sanitized_query == query
+        assert len(await pg.fetch(query)) == 5
+        with pytest.raises(asyncpg.PostgresSyntaxError):
+            await pg.fetch(f"{query}\nLIMIT 1000")
+        # With a digit that belongs to a name it is t1.limit, a column: no clause.
+        named = 'SELECT t1.limit FROM (SELECT 7 AS "limit") t1'
+        assert PostgreSQLValidator().validate(named).sanitized_query == f"{named}\nLIMIT 1000"
+        assert await pg.fetchval(named) == 7
+
+    async def test_a_limit_inside_a_subquery_bounds_only_the_subquery(self, pg) -> None:
+        # The same class: the outer query returns every row its filter lets through.
+        query = (
+            "SELECT n FROM generate_series(1, 20) AS g(n)"
+            " WHERE n IN (SELECT n FROM generate_series(1, 20) AS h(n) LIMIT 15)"
+        )
+        assert len(await pg.fetch(query)) == 15
+        sanitized = PostgreSQLValidator().validate(query, default_limit=5).sanitized_query
+        assert sanitized.endswith("\nLIMIT 5")
+        assert len(await pg.fetch(sanitized)) == 5
+
+    async def test_a_session_advisory_lock_outlives_the_transaction(self, pg) -> None:
+        # TestPostgreSQLValidatorBlockedFunctions::test_sleep_and_advisory_lock_functions_
+        # blocked: the lock is still held by the connection after the commit.
+        async with pg.transaction():
+            assert await pg.fetchval("SELECT pg_try_advisory_lock(777001)") is True
+        try:
+            held = await pg.fetchval(
+                "SELECT count(*) FROM pg_locks"
+                " WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+            )
+            assert held == 1
+        finally:
+            await pg.fetchval("SELECT pg_advisory_unlock_all()")
+
+    async def test_pg_sleep_for_and_until_are_functions(self, pg) -> None:
+        # The same test: pg_sleep matched as a whole word does not cover these two.
+        await pg.fetchval("SELECT pg_sleep_for('1 millisecond')")
+        await pg.fetchval("SELECT pg_sleep_until(now())")
+
+    @pytest.mark.parametrize(
+        ("sql", "rows"),
+        [
+            ("SELECT 'a'::text AS n UNION /**/ TABLE savvina_tbl", 2),
+            ("SELECT 'a'::text AS n UNION -- c\nTABLE savvina_tbl", 2),
+            ("SELECT n FROM (TABLE savvina_tbl) s", 1),
+            ("WITH s AS (SELECT 'a'::text AS n) TABLE s", 1),
+            # A backslash before the quote ends the literal here, so TABLE is code.
+            ("SELECT 'a\\' AS n UNION /**/ TABLE savvina_tbl -- '", 2),
+        ],
+    )
+    async def test_table_opens_a_query_after_a_set_operator_a_comment_or_a_parenthesis(
+        self, pg, sql: str, rows: int
+    ) -> None:
+        # TestTheTableWordIsRefusedAnywhere.
+        async with pg.transaction():
+            await pg.execute("CREATE TEMP TABLE savvina_tbl AS SELECT 'b'::text AS n")
+            assert len(await pg.fetch(sql)) == rows
+
+    async def test_table_is_a_name_after_a_dot_and_after_as(self, pg) -> None:
+        # The same class: a name, so the refusal that says to name the table in FROM has
+        # nothing to say.
+        assert await pg.fetchval('SELECT t.table FROM (SELECT 7 AS "table") t') == 7
+        assert await pg.fetchval("SELECT 7 AS table") == 7
+
 
 # ── MySQL ─────────────────────────────────────────────────────────────────────
 
@@ -581,6 +667,69 @@ class TestMySQLReads:
         # column instead of returning the string.
         with pytest.raises(Exception, match="Unknown column"):
             await _one(my, 'SELECT "not_a_column"')
+
+    async def test_two_dashes_before_a_digit_are_code_and_the_semicolon_ends_the_statement(
+        self, my
+    ) -> None:
+        # TestLimitAfterATrailingSemicolon::test_a_semicolon_inside_a_token_sqlparse_reads_
+        # as_a_comment_is_dropped: 5--3 is 5 - -3 here (sqlparse reads a comment), so the
+        # text runs as it stands, and a LIMIT put after its ; would be a second statement.
+        sanitized = MySQLValidator().validate("SELECT 5--3 AS x;").sanitized_query
+        assert sanitized == "SELECT 5--3 AS x\nLIMIT 1000"
+        assert await _one(my, sanitized) == 8
+        with pytest.raises(aiomysql.Error):
+            await _one(my, "SELECT 5--3 AS x;\nLIMIT 1000")
+
+    async def test_limit_is_a_name_after_a_dot_but_not_after_as(self, my) -> None:
+        # TestLimitIsARowLimitWhenItIsTheStatementsOwn: MySQL takes a reserved word as a name
+        # after a dot only, so the validator's reading of AS limit (a name, PostgreSQL) costs
+        # nothing here: the statement is a syntax error with or without a LIMIT.
+        assert await _one(my, "SELECT t.limit FROM (SELECT 7 AS `limit`) t") == 7
+        with pytest.raises(aiomysql.Error):
+            await _one(my, "SELECT 7 AS limit")
+
+    async def test_a_dot_ending_a_number_is_not_the_dot_of_a_name(self, my) -> None:
+        # TestLimitIsARowLimitWhenItIsTheStatementsOwn: in 1. LIMIT 5 the number is 1. and
+        # LIMIT is the clause, so a LIMIT appended after it would be a second one.
+        query = "SELECT id FROM orders WHERE id > 1. LIMIT 5"
+        assert MySQLValidator().validate(query).sanitized_query == query
+        cur = await my.cursor()
+        await cur.execute(query)
+        assert len(await cur.fetchall()) == 5
+        with pytest.raises(aiomysql.Error):
+            await _one(my, f"{query}\nLIMIT 1000")
+        named = "SELECT t1.limit FROM (SELECT 7 AS `limit`) t1"
+        assert MySQLValidator().validate(named).sanitized_query == f"{named}\nLIMIT 1000"
+        assert await _one(my, named) == 7
+
+    async def test_an_escaped_quote_and_a_limit_run_as_written(self, my) -> None:
+        # TestLimitIsARowLimitWhenItIsTheStatementsOwn::test_a_text_whose_quotes_are_not_
+        # followed_keeps_the_word_rule: the query has its LIMIT, and none is appended.
+        query = "SELECT 'O\\'Brien' AS n LIMIT 10"
+        assert MySQLValidator().validate(query).sanitized_query == query
+        assert await _one(my, query) == "O'Brien"
+
+    @pytest.mark.parametrize(
+        ("sql", "rows"),
+        [
+            ("SELECT 'a' AS n UNION /**/ TABLE savvina_tbl", 2),
+            ("SELECT 'a' AS n UNION -- c\nTABLE savvina_tbl", 2),
+            ("SELECT n FROM (TABLE savvina_tbl) s", 1),
+            ("SELECT 'a' AS n UNION # c\nTABLE savvina_tbl", 2),
+        ],
+    )
+    async def test_table_opens_a_query_after_a_set_operator_a_comment_or_a_parenthesis(
+        self, my_root, sql: str, rows: int
+    ) -> None:
+        # TestTheTableWordIsRefusedAnywhere. MySQL 8.0.19 and later.
+        async with my_root.cursor() as cur:
+            await cur.execute("CREATE TEMPORARY TABLE savvina_tbl AS SELECT 'b' AS n")
+        assert await _row_count(my_root, sql) == rows
+
+    async def test_table_is_a_name_after_a_dot(self, my) -> None:
+        # The same class: a name, so the refusal that says to name the table in FROM has
+        # nothing to say.
+        assert await _one(my, "SELECT t.table FROM (SELECT 7 AS `table`) t") == 7
 
 
 class TestMySQLAdapterReadsSqlMode:

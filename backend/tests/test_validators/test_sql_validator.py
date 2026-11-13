@@ -7,7 +7,12 @@ from unittest.mock import patch
 
 import pytest
 
-from app.datasources.validators.base_sql_validator import BaseSQLValidator, nests_block_comment
+from app.datasources.validators.base_sql_validator import (
+    MULTIPLE_STATEMENTS_ERROR,
+    BaseSQLValidator,
+    code_end,
+    nests_block_comment,
+)
 from app.datasources.validators.mysql_validator import MySQLValidator
 from app.datasources.validators.postgresql_validator import PostgreSQLValidator
 
@@ -258,6 +263,47 @@ class TestPostgreSQLValidatorBlockedFunctions:
     def test_blocked_function_error_message_names_function(self):
         r = self.v.validate("SELECT pg_sleep(5)")
         assert "pg_sleep" in r.error_message
+
+    @pytest.mark.parametrize(
+        "func",
+        [
+            "pg_sleep_for",
+            "pg_sleep_until",
+            "pg_advisory_lock",
+            "pg_advisory_lock_shared",
+            "pg_advisory_xact_lock",
+            "pg_advisory_xact_lock_shared",
+            "pg_try_advisory_lock",
+            "pg_try_advisory_lock_shared",
+            "pg_try_advisory_xact_lock",
+            "pg_try_advisory_xact_lock_shared",
+            "pg_advisory_unlock",
+            "pg_advisory_unlock_shared",
+            "pg_advisory_unlock_all",
+        ],
+    )
+    def test_sleep_and_advisory_lock_functions_blocked(self, func):
+        # The check matches whole words, so pg_sleep does not cover pg_sleep_for; an advisory
+        # lock stays on the pooled connection after the read-only transaction ends.
+        result = self.v.validate(f"SELECT {func}(7)")
+        assert not result.is_valid
+        assert result.error_message == f"Query uses a blocked PostgreSQL function: {func}"
+
+    def test_a_schema_qualified_or_quoted_name_is_blocked_too(self):
+        for query in (
+            "SELECT pg_catalog.pg_try_advisory_lock(7)",
+            "SELECT \"pg_sleep_for\"('1 hour')",
+        ):
+            assert not self.v.validate(query).is_valid, query
+
+    def test_every_listed_function_is_refused(self):
+        for func in PostgreSQLValidator.PG_DANGEROUS_FUNCTIONS:
+            assert not self.v.validate(f"SELECT {func}(1)").is_valid, func
+
+    def test_reading_the_locks_held_is_not_blocked(self):
+        # pg_locks only lists locks; taking one is what is refused.
+        query = "SELECT locktype, pid FROM pg_locks WHERE locktype = 'advisory'"
+        assert self.v.validate(query).is_valid
 
     @pytest.mark.parametrize(
         "query",
@@ -520,7 +566,8 @@ class TestIntoOnCodeWords:
 class TestFirstTokenAllowList:
     """The statement must start with SELECT, WITH or an opening parenthesis. Mentioning
     SELECT elsewhere, in a comment, is not enough: RESET, LOCK, HANDLER or SHOW would run
-    as written (a LIMIT in the comment keeps the appended LIMIT from breaking them)."""
+    as written (the first-word rule has to refuse them: a LIMIT appended to them would only
+    break them, and the word LIMIT in a comment no longer stops the validator appending one)."""
 
     @pytest.mark.parametrize(
         "query",
@@ -838,7 +885,7 @@ class TestMultiStatementAfterAComment:
     def test_a_second_statement_after_a_comment_is_refused(self, validator, query):
         result = validator().validate(query)
         assert not result.is_valid
-        assert result.error_message == "Multiple statements are not allowed"
+        assert result.error_message == MULTIPLE_STATEMENTS_ERROR
 
     @pytest.mark.parametrize(
         "query",
@@ -852,7 +899,7 @@ class TestMultiStatementAfterAComment:
     def test_mysql_second_statement_after_a_comment_is_refused(self, query):
         result = MySQLValidator().validate(query)
         assert not result.is_valid
-        assert result.error_message == "Multiple statements are not allowed"
+        assert result.error_message == MULTIPLE_STATEMENTS_ERROR
 
     @pytest.mark.parametrize(
         "query",
@@ -870,7 +917,7 @@ class TestMultiStatementAfterAComment:
     def test_mysql_dashes_that_are_code_after_a_semicolon_are_refused(self, query):
         result = MySQLValidator().validate(query)
         assert not result.is_valid
-        assert result.error_message == "Multiple statements are not allowed"
+        assert result.error_message == MULTIPLE_STATEMENTS_ERROR
 
     @pytest.mark.parametrize(
         "query",
@@ -1003,7 +1050,7 @@ class TestACarriageReturnEndsALineComment:
     def test_a_second_statement_after_a_carriage_return_is_refused(self):
         result = PostgreSQLValidator().validate("SELECT 1;-- c\rSET statement_timeout = 0 -- LIMIT")
         assert not result.is_valid
-        assert result.error_message == "Multiple statements are not allowed"
+        assert result.error_message == MULTIPLE_STATEMENTS_ERROR
 
     @pytest.mark.parametrize("validator", [PostgreSQLValidator, MySQLValidator])
     @pytest.mark.parametrize(
@@ -1134,6 +1181,58 @@ class TestLimitAfterATrailingSemicolon:
         # PostgreSQL reads # as the XOR operator, not a comment.
         result = PostgreSQLValidator().validate("SELECT 1 # 2")
         assert result.sanitized_query == "SELECT 1 # 2\nLIMIT 1000"
+
+    @pytest.mark.parametrize(
+        ("validator", "query", "expected"),
+        [
+            # sqlparse reads "# …" to the end of the line as a comment, PostgreSQL reads an
+            # XOR operator and code, so the ; after it ends the statement.
+            (PostgreSQLValidator, "SELECT a # 1 FROM big;", "SELECT a # 1 FROM big\nLIMIT 1000"),
+            (PostgreSQLValidator, "SELECT a # 1 FROM big ; ;", "SELECT a # 1 FROM big\nLIMIT 1000"),
+            (PostgreSQLValidator, "SELECT a # 'xy';", "SELECT a # 'xy'\nLIMIT 1000"),
+            (
+                PostgreSQLValidator,
+                "SELECT j #> '{a}' FROM t;",
+                "SELECT j #> '{a}' FROM t\nLIMIT 1000",
+            ),
+            # The same on MySQL for --1, which is two minus signs and code there.
+            (MySQLValidator, "SELECT a--1 FROM t;", "SELECT a--1 FROM t\nLIMIT 1000"),
+            (MySQLValidator, "SELECT 5--3;", "SELECT 5--3\nLIMIT 1000"),
+            (MySQLValidator, "SELECT a--1 'xy';", "SELECT a--1 'xy'\nLIMIT 1000"),
+        ],
+    )
+    def test_a_semicolon_inside_a_token_sqlparse_reads_as_a_comment_is_dropped(
+        self, validator, query, expected
+    ):
+        # Left in, the LIMIT would follow the ; as a second statement and fail on the server
+        # although the query itself runs.
+        result = validator().validate(query)
+        assert result.is_valid
+        assert result.sanitized_query == expected
+
+    @pytest.mark.parametrize(
+        ("validator", "query"),
+        [
+            # Only whitespace and semicolons at the end of the token go. A comment opener
+            # inside a literal or a name, a comment after the code and the closer of an
+            # executable comment are code to the server whatever the quote rules, and a cut
+            # inside any of them would send it a statement it cannot run.
+            (PostgreSQLValidator, "SELECT 1 # length($$a -- b$$)"),
+            (PostgreSQLValidator, "SELECT 1 # length($t$a /* b$t$)"),
+            (PostgreSQLValidator, "SELECT 1 # length(E'a\\' -- b')"),
+            (PostgreSQLValidator, 'SELECT 3 # 1 AS "x -- y" -- cost $$'),
+            (PostgreSQLValidator, "SELECT a # 1 FROM big /* c */"),
+            (MySQLValidator, "SELECT 5--1 'a\\' -- b'"),
+            (MySQLValidator, "SELECT 5--1 /*! + 1 */"),
+            (MySQLValidator, "SELECT 5--1 AS `x # y` -- see \\' here"),
+        ],
+    )
+    def test_nothing_but_semicolons_and_blanks_at_the_end_of_the_token_is_cut(
+        self, validator, query
+    ):
+        result = validator().validate(query)
+        assert result.is_valid
+        assert result.sanitized_query == f"{query}\nLIMIT 1000"
 
 
 class TestLeadingByteOrderMark:
@@ -1344,6 +1443,19 @@ class TestWithoutTrailingGaps:
         assert MySQLValidator().without_trailing_gaps("SELECT 1 #c") == "SELECT 1"
         assert PostgreSQLValidator().without_trailing_gaps("SELECT 1 #c") == "SELECT 1 #c"
 
+    @pytest.mark.parametrize(
+        ("validator", "query", "expected"),
+        [
+            (PostgreSQLValidator, "SELECT a # 1 FROM big;", "SELECT a # 1 FROM big"),
+            (MySQLValidator, "SELECT a--1 FROM t;", "SELECT a--1 FROM t"),
+            (MySQLValidator, "SELECT 5--1 /*! + 1 */;", "SELECT 5--1 /*! + 1 */"),
+        ],
+    )
+    def test_a_semicolon_inside_a_token_sqlparse_reads_as_a_comment_goes(
+        self, validator, query, expected
+    ):
+        assert validator().without_trailing_gaps(query) == expected
+
     def test_an_empty_or_unparseable_query_is_none(self):
         from sqlparse.exceptions import SQLParseError
 
@@ -1353,3 +1465,39 @@ class TestWithoutTrailingGaps:
             side_effect=SQLParseError("too deep"),
         ):
             assert PostgreSQLValidator().without_trailing_gaps("SELECT 1") is None
+
+
+class TestCodeEnd:
+    """``code_end``: the length of one token without the whitespace and semicolons at its end."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("", ""),
+            (";", ""),
+            (";;", ""),
+            (" ; ;\n", ""),
+            ("x", "x"),
+            ("x ;", "x"),
+            ("x ; ;", "x"),
+            ("x ;\n", "x"),
+            ("a ; b", "a ; b"),
+            # Nothing else is read: a comment, a quote or a closer after the code stays (a ;
+            # that ends a trailing comment goes with it, which changes nothing).
+            ("x /* c */", "x /* c */"),
+            ("x -- c;", "x -- c"),
+            ("# 1 FROM big; -- done", "# 1 FROM big; -- done"),
+            ("a 'b ; c'", "a 'b ; c'"),
+            ("--1 /*! + 1 */ ;", "--1 /*! + 1 */"),
+        ],
+    )
+    def test_only_whitespace_and_semicolons_at_the_end_go(self, text, expected):
+        assert text[: code_end(text)] == expected
+
+
+def test_a_semicolon_inside_a_literal_gets_the_explained_message():
+    result = PostgreSQLValidator().validate("SELECT 'a; b' AS x")
+
+    assert not result.is_valid
+    assert result.error_message == MULTIPLE_STATEMENTS_ERROR
+    assert "even inside a string literal" in result.error_message

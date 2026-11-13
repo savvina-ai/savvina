@@ -9,7 +9,7 @@ import sqlparse.sql as sql_nodes
 import sqlparse.tokens as sql_tokens
 
 from ..models import ValidationResult
-from .base_sql_validator import BaseSQLValidator, code_words, nests_block_comment
+from .base_sql_validator import BaseSQLValidator, code_pieces, nests_block_comment
 
 NESTED_COMMENT_ERROR = "Query nests a block comment inside another, which is not allowed"
 
@@ -19,6 +19,24 @@ class PostgreSQLValidator(BaseSQLValidator):
 
     PG_DANGEROUS_FUNCTIONS: ClassVar[list[str]] = [
         "pg_sleep",
+        # The check matches whole words, so pg_sleep does not cover these two.
+        "pg_sleep_for",
+        "pg_sleep_until",
+        # An advisory lock is state in the user's database that other applications can wait
+        # on: a session-level one outlives the read-only transaction on the pooled
+        # connection, and any of them can block on a lock another application holds.
+        # MySQL's GET_LOCK and RELEASE_LOCK are blocked for the same reason.
+        "pg_advisory_lock",
+        "pg_advisory_lock_shared",
+        "pg_advisory_xact_lock",
+        "pg_advisory_xact_lock_shared",
+        "pg_try_advisory_lock",
+        "pg_try_advisory_lock_shared",
+        "pg_try_advisory_xact_lock",
+        "pg_try_advisory_xact_lock_shared",
+        "pg_advisory_unlock",
+        "pg_advisory_unlock_shared",
+        "pg_advisory_unlock_all",
         "pg_terminate_backend",
         "pg_cancel_backend",
         "pg_read_file",
@@ -71,14 +89,15 @@ class PostgreSQLValidator(BaseSQLValidator):
 
         return result
 
-    def _code_words(self, text: str) -> Iterator[tuple[str, int]]:
-        """The words PostgreSQL reads as code: -- and /* … */ are comments, ' and " quote,
-        and # is an operator, so the words after it count. The base INTO check reads them,
-        which refuses SELECT 1 # 2 INTO t and SELECT 1.INTO t, where sqlparse shows no INTO
-        keyword. The scan ends a block comment at its first */ and PostgreSQL at the
-        matching one, so a query whose comments nest is refused rather than read
-        (_token_error on sqlparse's tokens, nests_block_comment on the text)."""
-        return code_words(text, quotes=self.QUOTE_CHARS)
+    def _code_pieces(self, text: str) -> Iterator[tuple[str, int]]:
+        """The pieces PostgreSQL reads as code: -- and /* … */ are comments, ' and " quote,
+        and # is an operator, so the words after it count. The base INTO check reads the
+        words, which refuses SELECT 1 # 2 INTO t and SELECT 1.INTO t, where sqlparse shows
+        no INTO keyword; the TABLE check reads the pieces. The scan ends a block comment at
+        its first */ and PostgreSQL at the matching one, so a query whose comments nest is
+        refused rather than read (_token_error on sqlparse's tokens, nests_block_comment on
+        the text)."""
+        return code_pieces(text, quotes=self.QUOTE_CHARS)
 
     def _token_error(self, statements: tuple[sql_nodes.Statement, ...]) -> str | None:
         """Refuse a block comment nested in another, as sqlparse reads it.

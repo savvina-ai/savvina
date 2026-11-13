@@ -12,8 +12,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app.datasources.models import PrivacySettings
+from app.datasources.validators.base_sql_validator import EXECUTABLE_OPENER
 from app.schemas.chat import QueryResultsResponse
-from app.services import result_masking
+from app.services import result_masking, sensitive_guard
 from app.services.result_masking import (
     MASK_ALL_COLUMNS,
     _backslash_is_escape,
@@ -1834,11 +1835,17 @@ class TestHasEscapeStringContinuation:
     @pytest.mark.parametrize("opener", ["/*!", "/*!50000", "/*M!", "/*m!", "/*m!100000"])
     @pytest.mark.parametrize("dq", [True, False])
     def test_the_opener_is_matched_in_any_case(self, opener: str, dq: bool) -> None:
-        # Kept in step with base_sql_validator.EXECUTABLE_OPENER, which is case-insensitive.
+        # The pattern is base_sql_validator.EXECUTABLE_OPENER, which is case-insensitive.
         sql = f"SELECT {opener} email */ 1"
         with pytest.raises(result_masking._ExecutableCommentError):
             result_masking._lex_like_the_engine(sql, dq)
-        assert result_masking.EXECUTABLE_COMMENT.search(sql)
+        assert EXECUTABLE_OPENER.search(sql)
+
+    def test_the_validators_and_the_guards_share_one_opener_pattern(self) -> None:
+        # One object, so a change to the pattern reaches the validators, result masking and
+        # the strict guard together.
+        assert result_masking.EXECUTABLE_OPENER is EXECUTABLE_OPENER
+        assert sensitive_guard.EXECUTABLE_OPENER is EXECUTABLE_OPENER
 
     @pytest.mark.parametrize("dq", [True, False])
     def test_masking_still_refuses_an_executable_comment(self, dq: bool) -> None:

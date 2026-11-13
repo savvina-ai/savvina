@@ -656,6 +656,23 @@ class TestRowLimit:
         out = _executable(sql, None, "PostgreSQL", **_MODES)
         assert out.endswith(f"\nLIMIT {self._n()}")
 
+    @pytest.mark.parametrize("dialect", ["PostgreSQL", "MySQL"])
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM users -- limit to the top rows",
+            "SELECT id FROM users WHERE note = 'limit'",
+            "SELECT id FROM users WHERE id IN (SELECT id FROM users LIMIT 5000)",
+        ],
+    )
+    def test_the_word_limit_outside_the_statements_own_clause_still_gets_the_limit(
+        self, dialect: str, sql: str
+    ) -> None:
+        # Same reason as for FETCH: the executed LIMIT is the only bound on the rows the
+        # server sends, so a comment, a literal or a subquery's own LIMIT must not drop it.
+        out = _executable(sql, None, dialect, **_MODES)
+        assert out.endswith(f"\nLIMIT {self._n()}")
+
     def test_a_fetch_clause_after_a_comment_with_the_word_is_still_a_limit(self) -> None:
         sql = "SELECT id FROM users -- Fetch every order\nFETCH FIRST 5 ROWS ONLY"
         assert _executable(sql, None, "PostgreSQL", **_MODES) == sql
@@ -671,7 +688,12 @@ class TestRowLimit:
         [
             (PostgreSQLValidator, "SELECT id FROM users", False),
             (PostgreSQLValidator, "SELECT id FROM users LIMIT 5", True),
-            (PostgreSQLValidator, "SELECT id FROM users -- no limit", True),
+            (PostgreSQLValidator, "SELECT id FROM users -- no limit", False),
+            (PostgreSQLValidator, "SELECT id FROM users WHERE note = 'limit'", False),
+            (PostgreSQLValidator, "SELECT id FROM (SELECT id FROM users LIMIT 5) s", False),
+            (PostgreSQLValidator, "SELECT id FROM users ORDER BY id LIMIT 5 OFFSET 2", True),
+            (MySQLValidator, "SELECT id FROM users # LIMIT 5", False),
+            (MySQLValidator, "SELECT id FROM users /*! LIMIT 5 */", True),
             (PostgreSQLValidator, "SELECT id FROM users FETCH FIRST 5 ROWS ONLY", True),
             (PostgreSQLValidator, "SELECT id FROM users -- Fetch every order", False),
             (MySQLValidator, "SELECT id FROM users # FETCH FIRST 5 ROWS ONLY", False),

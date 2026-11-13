@@ -15,11 +15,11 @@ from .base_sql_validator import (
     _WORD,
     EXECUTABLE_OPENER,
     LOCKING_READ_ERROR,
+    MULTIPLE_STATEMENTS_ERROR,
     SET_STATEMENT_ERROR,
     BaseSQLValidator,
     _Gaps,
-    code_words,
-    has_fetch_clause,
+    code_pieces,
     has_second_statement,
     mysql_dashes_open_a_comment,
     not_a_read_error,
@@ -76,6 +76,11 @@ class MySQLValidator(BaseSQLValidator):
     # MySQL quotes a name with a backtick as well; the lock and INTO scans skip that region.
     QUOTE_CHARS: ClassVar[str] = "'\"`"
 
+    # A hash line is a gap, --1 is code and an executable comment's content is code. The only
+    # executable comments a query that validates may hold are the ones the server always runs
+    # (see _GATED_COMMENT), so a row limit inside one is a clause the server runs.
+    MYSQL_COMMENTS: ClassVar[bool] = True
+
     MYSQL_DANGEROUS_FUNCTIONS: ClassVar[list[str]] = [
         "SLEEP",
         "BENCHMARK",
@@ -131,7 +136,7 @@ class MySQLValidator(BaseSQLValidator):
         if has_second_statement(query_upper, mysql_comments=True):
             return ValidationResult(
                 is_valid=False,
-                error_message="Multiple statements are not allowed",
+                error_message=MULTIPLE_STATEMENTS_ERROR,
             )
         # A share-locking read inside an executable comment, after a # comment or after
         # dashes the server does not read as a comment (--1 FOR SHARE), which the base
@@ -158,29 +163,18 @@ class MySQLValidator(BaseSQLValidator):
 
         return result
 
-    def _code_words(self, text: str) -> Iterator[tuple[str, int]]:
-        """The words the server reads as code by MySQL's rules: a # line is a gap, --1 is
+    def _code_pieces(self, text: str) -> Iterator[tuple[str, int]]:
+        """The pieces the server reads as code by MySQL's rules: a # line is a gap, --1 is
         code, an executable comment's content is code, and a backtick quotes a name.
 
-        The base INTO check reads them. INTO writes the selected value into a user variable
-        (or a file), where it sits on the pooled connection for a later SELECT @x to return
-        past result masking, and sqlparse does not show every INTO the server runs: it
-        takes /*! INTO @x */ and the rest of the line after --1 for a comment, reads INTO#x
-        then @v on the next line as one name, and reads the INTO of SELECT 1.INTO @v as a
-        name after a dot.
+        The base TABLE check reads the pieces and the INTO check the words among them. INTO
+        writes the selected value into a user variable (or a file), where it sits on the
+        pooled connection for a later SELECT @x to return past result masking, and sqlparse
+        does not show every INTO the server runs: it takes /*! INTO @x */ and the rest of
+        the line after --1 for a comment, reads INTO#x then @v on the next line as one name,
+        and reads the INTO of SELECT 1.INTO @v as a name after a dot.
         """
-        return code_words(text, mysql_comments=True, quotes=self.QUOTE_CHARS)
-
-    def _has_fetch_clause(self, query: str) -> bool:
-        """Whether the statement carries its own FETCH FIRST/NEXT clause, by MySQL's
-        comment rules (has_fetch_clause).
-
-        MariaDB has the clause (10.6 and later). A hash line is a gap and an executable
-        comment's content is code: the only executable comments a query that validates may
-        hold are the ones the server always runs (see _GATED_COMMENT), so the clause inside
-        one is a clause the server runs.
-        """
-        return has_fetch_clause(query, mysql_comments=True, quotes=self.QUOTE_CHARS)
+        return code_pieces(text, mysql_comments=True, quotes=self.QUOTE_CHARS)
 
     def _pieces(self, statements: tuple[sql_nodes.Statement, ...]) -> list[tuple[str, bool]]:
         """Each token's text and whether the server reads it as a gap, by MySQL's rules.

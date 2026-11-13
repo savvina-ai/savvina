@@ -508,10 +508,10 @@ def _with_row_limit(clean: str, executed: str, dialect: str) -> str:
     query, which every display, cache and prompt carries: the rewrite's own fences (a MySQL
     ``LIMIT 18446744073709551615`` inside a derived table) must not count as the query's
     limit. Unchanged when the dialect has no validator, the query already carries a row
-    limit by the validator's own rule (``has_row_limit``: the word LIMIT anywhere, or the
-    statement's own FETCH FIRST/NEXT clause, so the word in a comment, a literal or a column
-    named fetch does not count, and neither does a clause inside a subquery), or sqlparse
-    cannot parse it (the callers' validation is the gate; this never validates again).
+    limit by the validator's own rule (``has_row_limit``: the statement's own LIMIT or FETCH
+    FIRST/NEXT clause, so the word in a comment, a literal or a column named limit or fetch
+    does not count, and neither does a clause inside a subquery), or sqlparse cannot parse
+    it (the callers' validation is the gate; this never validates again).
 
     The rewritten form (sqlglot output: no comments, no trailing semicolon, the outer query
     unchanged) takes ``\nLIMIT n`` at its end; the unrewritten one is the validator's text

@@ -188,6 +188,8 @@ class TestFetchIsARowLimit:
             "SELECT a$fetch first FROM (SELECT id AS a$fetch FROM orders) d",
             "SELECT fetch$a first FROM (SELECT id AS fetch$a FROM orders) d",
             "SELECT @fetch first FROM orders",
+            # The digit before the dot belongs to a name.
+            'SELECT t1.fetch FIRST FROM (SELECT 1 AS "fetch") t1, orders o',
         ],
     )
     def test_fetch_as_part_of_a_name_is_no_row_limit(self, validator, query):
@@ -206,6 +208,135 @@ class TestFetchIsARowLimit:
     @pytest.mark.parametrize("validator", _VALIDATORS)
     def test_a_non_ascii_character_elsewhere_leaves_the_clause_alone(self, validator):
         query = "SELECT a FROM t WHERE label = '\u20ac\u00a0' ORDER BY a FETCH FIRST 5 ROWS ONLY"
+        assert validator().validate(query).sanitized_query == query
+
+
+class TestLimitIsARowLimitWhenItIsTheStatementsOwn:
+    """The word LIMIT is a row limit only as the statement's own clause, as code, like FETCH:
+    on the non-streaming execute path the LIMIT is the only bound on the rows read into
+    memory, so the word in a comment, a literal or a subquery must not drop it."""
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT a FROM t LIMIT 5",
+            "select a from t limit 5",
+            "SELECT a FROM t ORDER BY a LIMIT 5 OFFSET 2",
+            "SELECT a FROM t OFFSET 2 LIMIT 5",
+            "SELECT a FROM t LIMIT 5;",
+            "SELECT a FROM t /* c */ LIMIT /* d */ 5",
+            "SELECT a FROM t WHERE b IN (SELECT 1) AND c = 'x' LIMIT 5",
+            "WITH c AS (SELECT 1 AS a) SELECT a FROM c LIMIT 5",
+            "(SELECT a FROM t LIMIT 5)",
+            "(SELECT a FROM t) UNION ALL (SELECT a FROM u) LIMIT 5",
+            "(SELECT a FROM t LIMIT 5) ORDER BY a",
+            "SELECT a FROM t LIMIT 5, 10",
+            "SELECT a FROM t LIMIT ALL",
+            "SELECT a FROM t UNION ALL SELECT a FROM u LIMIT 5",
+            "WITH c AS (SELECT 1) (SELECT a FROM t LIMIT 5)",
+            # A name called limit earlier on does not hide the clause.
+            "SELECT a AS limit FROM t LIMIT 5",
+            # A quoted name stands between the dot, or the AS, and the LIMIT: it is the clause.
+            'SELECT a FROM "s"."t" LIMIT 5',
+            'SELECT a FROM t AS "x" LIMIT 5',
+            "SELECT a FROM `db`.`t` LIMIT 5",
+            "SELECT a FROM t AS `x` LIMIT 5",
+            # A number with a trailing dot (1.) ends in that dot, which is not the dot of a
+            # name: the LIMIT after it is the keyword. The gap forms read the same.
+            "SELECT a FROM t WHERE a > 1. LIMIT 5",
+            "SELECT a FROM t WHERE a > 1.\nLIMIT 5",
+            "SELECT a FROM t WHERE a > 1./* c */LIMIT 5",
+            "SELECT a FROM t WHERE a > 12. LIMIT 5",
+            "SELECT a FROM t WHERE a > 1. FETCH FIRST 5 ROWS ONLY",
+        ],
+    )
+    def test_the_statements_own_limit_is_left_alone(self, validator, query):
+        result = validator().validate(query)
+        assert result.is_valid
+        assert result.sanitized_query == query
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        ("query", "sanitized"),
+        [
+            ("SELECT a FROM big WHERE note = 'limit'", None),
+            ("SELECT a FROM big WHERE a LIKE '%rate limit%'", None),
+            ("SELECT a FROM big -- limit to top rows", "SELECT a FROM big"),
+            ("SELECT a FROM big /* limit */", "SELECT a FROM big"),
+            # A subquery's own LIMIT bounds the subquery, not the rows the statement returns.
+            ("SELECT a FROM big WHERE a IN (SELECT a FROM big LIMIT 5000)", None),
+            ("SELECT * FROM (SELECT a FROM big LIMIT 5000) s", None),
+            ("WITH c AS (SELECT a FROM big LIMIT 5000) SELECT * FROM c", None),
+            ("SELECT (SELECT 1 LIMIT 1) AS x FROM big", None),
+            ("(SELECT a FROM big LIMIT 5) UNION ALL (SELECT a FROM big)", None),
+            # A name, not the keyword: reserved, but a server takes it after a dot and,
+            # on PostgreSQL, after AS.
+            ("SELECT t.limit FROM big t", None),
+            # The digit before the dot belongs to a name here, not to a number.
+            ("SELECT t1.limit FROM big t1", None),
+            ("SELECT a FROM big t1 WHERE t1.limit > 3", None),
+            ("SELECT t . limit FROM big t", None),
+            ("SELECT t./* c */limit FROM big t", None),
+            ("SELECT a AS limit FROM big", None),
+            ("SELECT a$limit FROM big", None),
+            ("SELECT a FROM big WHERE a = 1 AND limit_value > 3", None),
+        ],
+    )
+    def test_the_word_elsewhere_still_gets_the_limit(self, validator, query, sanitized):
+        result = validator().validate(query)
+        assert result.is_valid
+        assert result.sanitized_query == f"{sanitized or query}\nLIMIT 1000"
+
+    def test_mysql_reads_a_hash_comment_naming_the_clause_as_a_gap(self):
+        result = MySQLValidator().validate("SELECT a FROM big # limit 5\n")
+        assert result.sanitized_query == "SELECT a FROM big\nLIMIT 1000"
+
+    def test_mysql_executable_comment_content_is_code(self):
+        query = "SELECT a FROM big /*! LIMIT 5 */"
+        assert MySQLValidator().validate(query).sanitized_query == query
+
+    def test_postgresql_reads_the_words_after_a_hash_as_code(self):
+        # # is the XOR operator there, so the LIMIT after it is the statement's own.
+        query = "SELECT a # 1 FROM big LIMIT 5"
+        assert PostgreSQLValidator().validate(query).sanitized_query == query
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT a FROM t WHERE n = 'O\\'Brien' ORDER BY a LIMIT 10",
+            "SELECT $$x$$ AS a FROM t LIMIT 10",
+            "SELECT a FROM t WHERE n = 'it''s' AND m = 'a\\\\' LIMIT 10",
+        ],
+    )
+    def test_a_text_whose_quotes_are_not_followed_keeps_the_word_rule(self, validator, query):
+        # Where a literal ends is a guess there, so the clause is not found on the code
+        # pieces and the word anywhere counts, as it always has: a LIMIT appended after a
+        # LIMIT the query has is a syntax error, and this form (an escaped quote and a
+        # LIMIT) is an ordinary MySQL query.
+        result = validator().validate(query)
+        assert result.is_valid
+        assert result.sanitized_query == query
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    def test_a_text_whose_quotes_are_not_followed_still_adds_a_limit_when_the_word_is_absent(
+        self, validator
+    ):
+        query = "SELECT a FROM t WHERE n = 'O\\'Brien'"
+        assert validator().validate(query).sanitized_query == f"{query}\nLIMIT 1000"
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        "query",
+        [
+            'SELECT a FROM public."Orders" FETCH FIRST 5 ROWS ONLY',
+            'SELECT a FROM "s"."t" ORDER BY a FETCH NEXT 5 ROWS ONLY',
+        ],
+    )
+    def test_a_quoted_name_before_a_fetch_clause_does_not_make_it_a_name(self, validator, query):
+        # The same adjacency rule as for LIMIT: the dot before the quoted name is not the
+        # token next to FETCH.
         assert validator().validate(query).sanitized_query == query
 
 
@@ -243,7 +374,8 @@ class TestTheTableWordIsRefusedAnywhere:
     the statement was judged before (TABLE t, (TABLE t)), so in any other position it passed
     and ran: SELECT * FROM (TABLE hr.secret) s, a CTE body, a UNION arm, an EXISTS. The
     schema check reads only FROM and JOIN, so a table excluded by the privacy settings was
-    readable by naming it after TABLE. The word is refused wherever it is code."""
+    readable by naming it after TABLE. The word is refused wherever it is code, except as a
+    name right after a dot or AS (t.table, AS table)."""
 
     @pytest.mark.parametrize("validator", _VALIDATORS)
     @pytest.mark.parametrize(
@@ -285,6 +417,84 @@ class TestTheTableWordIsRefusedAnywhere:
     )
     def test_the_word_as_text_or_a_name_passes(self, validator, query):
         assert validator().validate(query).is_valid
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # The end of a WITH clause, and a set operation with its modifiers.
+            "WITH s AS (SELECT 1 AS a) TABLE s",
+            "SELECT 1 UNION ALL TABLE t",
+            "SELECT 1 EXCEPT DISTINCT TABLE t",
+            "SELECT 1 INTERSECT TABLE t",
+            "SELECT 1 UNION -- c\nTABLE t",
+            # A word no list of openers would hold: the name that ends the SEARCH or CYCLE
+            # clause of a recursive CTE (PostgreSQL 14 and later), DISTINCTROW (MySQL).
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3)"
+            " SEARCH DEPTH FIRST BY n SET o TABLE hr.secret",
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3)"
+            " CYCLE n SET m USING p TABLE hr.secret",
+            "SELECT 1 UNION DISTINCTROW TABLE t",
+            # An opener glued to a number: the server reads the number, then the keyword
+            # (MySQL, and PostgreSQL 14 and older).
+            "SELECT 1E5UNION TABLE t",
+            "SELECT 1.5UNION TABLE t",
+            "SELECT 4242E0INTERSECT TABLE t",
+            "SELECT 1UNION TABLE t",
+            # A quoted name between the dot, or the AS, and TABLE: the word is not the name.
+            'SELECT a FROM s."t" TABLE u',
+            "SELECT a AS `x` TABLE u",
+            # In a text whose quotes are not followed every TABLE word is refused.
+            "SELECT 'a\\' AS a UNION /**/ TABLE t -- '",
+            "SELECT 'a\\' AS a UNION -- '\nTABLE t",
+            "SELECT 'a\\' AS a, (/**/TABLE t) -- '",
+            "SELECT 'a\\' AS a UNION TABLE t",
+        ],
+    )
+    def test_the_word_is_refused_whatever_stands_before_it(self, validator, query):
+        result = validator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == TABLE_STATEMENT_ERROR
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # A column or an alias called table: valid right after a dot, and after AS on
+            # PostgreSQL (a syntax error on MySQL, which the server then reports).
+            "SELECT t.table FROM t",
+            "SELECT t . table FROM t",
+            "SELECT t./* c */table FROM t",
+            "SELECT a AS table FROM t",
+            "SELECT a AS /* c */ table FROM t",
+            "SELECT t.table AS x, u.table AS y FROM t JOIN u ON t.id = u.id",
+        ],
+    )
+    def test_a_name_called_table_right_after_a_dot_or_as_passes(self, validator, query):
+        assert validator().validate(query).is_valid
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT a FROM t WHERE x LIKE '%table%' AND n = 'O\\'Brien'",
+            "SELECT a FROM t WHERE n = 'O\\'Brien' -- the table",
+            "SELECT t.table FROM t WHERE n = 'O\\'Brien'",
+            "SELECT $$a table$$ AS s FROM t",
+        ],
+    )
+    def test_in_a_text_whose_quotes_are_not_followed_every_table_word_is_refused(
+        self, validator, query
+    ):
+        # A known limit, kept on purpose: where a literal ends is a guess there, and a
+        # comment opener inside a literal can hide the word from the scan, so no name rule
+        # is applied and the message tells how to write the text.
+        result = validator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == TABLE_STATEMENT_ERROR
+
+    def test_the_message_says_how_to_write_a_column_called_table(self):
+        assert "quote a column called table" in TABLE_STATEMENT_ERROR
 
     @pytest.mark.parametrize("query", ["SELECT `table` FROM t", "SELECT 1 # TABLE t"])
     def test_mysql_backtick_name_and_hash_comment_pass(self, query):
@@ -540,7 +750,7 @@ class TestMySQLGatedCommentsAreRefused:
         [
             ("SELECT id FROM u WHERE id=1 /*!50000 INTO @x */", _INTO),
             ("SELECT * FROM t /*!50000 FOR SHARE */", base_sql_validator.LOCKING_READ_ERROR),
-            ("SELECT 1;/*!50000 SHOW GRANTS*/", "Multiple statements are not allowed"),
+            ("SELECT 1;/*!50000 SHOW GRANTS*/", base_sql_validator.MULTIPLE_STATEMENTS_ERROR),
         ],
     )
     def test_what_the_comment_holds_is_named_first(self, query, message):
@@ -941,3 +1151,53 @@ class TestEveryReadingAgreesOnTheCodeWordShapes:
         result = validator().validate(hidden)
         assert not result.is_valid, hidden
         assert result.error_message == message, hidden
+
+
+class TestAQueryWithoutAScansKeywordSkipsTheScan:
+    """Each text scan looks for a word (INTO, TABLE, SHARE, LIMIT or FETCH, a ; or a second
+    /*), so a query that holds none of them runs none of them: the scans are linear but each
+    reads the whole text, and nearly every query holds none."""
+
+    _QUERY = "SELECT a, b FROM t WHERE c = 1 ORDER BY a"
+
+    @staticmethod
+    def _forbid_the_scans(monkeypatch, validator_class, *, gaps):
+        def boom(*args, **kwargs):
+            raise AssertionError("a scan ran on a query that holds none of its keywords")
+
+        monkeypatch.setattr(base_sql_validator, "code_pieces", boom)
+        monkeypatch.setattr(validator_class, "_code_pieces", boom)
+        if gaps:
+            monkeypatch.setattr(base_sql_validator, "_Gaps", boom)
+
+    def test_postgresql_runs_no_scan(self, monkeypatch):
+        self._forbid_the_scans(monkeypatch, PostgreSQLValidator, gaps=True)
+        result = PostgreSQLValidator().validate(self._QUERY)
+        assert result.sanitized_query == f"{self._QUERY}\nLIMIT 1000"
+
+    def test_mysql_runs_no_scan_but_the_one_before_the_first_word(self, monkeypatch):
+        # The region before the first word is read by _Gaps on every query.
+        self._forbid_the_scans(monkeypatch, MySQLValidator, gaps=False)
+        result = MySQLValidator().validate(self._QUERY)
+        assert result.sanitized_query == f"{self._QUERY}\nLIMIT 1000"
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "select 1 into @x",
+            "SELECT 1 UNION TABLE t",
+            "SELECT 1 FROM t FOR SHARE",
+            "SELECT 1; SELECT 2",
+        ],
+    )
+    def test_the_keyword_brings_the_scan_back(self, validator, query):
+        assert not validator().validate(query).is_valid
+
+    def test_the_keyword_brings_the_scan_back_for_a_nested_comment(self):
+        assert not PostgreSQLValidator().validate("SELECT 1 /* a /* b */ */").is_valid
+
+    @pytest.mark.parametrize("validator", _VALIDATORS)
+    def test_a_limit_or_a_fetch_clause_is_still_found(self, validator):
+        for query in ("SELECT 1 FROM t LIMIT 5", "SELECT 1 FROM t FETCH FIRST 5 ROWS ONLY"):
+            assert validator().validate(query).sanitized_query == query

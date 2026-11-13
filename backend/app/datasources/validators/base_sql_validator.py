@@ -21,9 +21,14 @@ def not_a_read_error(statement_type: str | None) -> str:
     return f"Only SELECT queries and CTEs (WITH) are allowed. Got: {statement_type or 'UNKNOWN'}"
 
 
+MULTIPLE_STATEMENTS_ERROR = (
+    "Multiple statements are not allowed: a semicolon followed by a word, a number or an "
+    "opening parenthesis is refused, even inside a string literal or a comment"
+)
 LOCKING_READ_ERROR = "Query takes row locks (FOR SHARE, LOCK IN SHARE MODE), which is not allowed"
 TABLE_STATEMENT_ERROR = (
-    "Query reads a table with TABLE, which is not allowed: name the table in FROM instead"
+    "Query uses the word TABLE, which is not allowed: name the table in FROM instead,"
+    " quote a column called table, or leave the word out of text"
 )
 
 # A byte order mark an editor left before the query: not a word, and not whitespace to str.strip.
@@ -38,16 +43,17 @@ def strip_query(query: str) -> str:
 # A keyword glued to the next word ("SELECTday"): the space the model dropped is put back.
 _MISSING_SPACE = re.compile(r"(?i)^(SELECT|WITH|INSERT|UPDATE|DELETE)(?=[^\s(])")
 
-# The word LIMIT anywhere in the text counts as a row limit the query already carries, as it
-# always has (a comment or a literal naming it leaves the LIMIT off). The FETCH clause is
-# read more strictly: see has_fetch_clause.
+# The word LIMIT anywhere in a text whose quotes are not followed (_QUOTES_NOT_FOLLOWED): there
+# the clause cannot be told from the word in a literal or a comment, and the word counts as
+# the row limit the query carries, as it always has (see has_row_limit_clause).
 _LIMIT_WORD = re.compile(r"\bLIMIT\b", re.IGNORECASE)
 
 # The opener of a MySQL or MariaDB executable comment, with its optional version number. The
 # server runs the content, so under MySQL's comment rules the opener alone is a gap and the
-# content is code (_Gaps). Case-insensitive: reading /*m! as code only refuses more. Result
-# masking and the strict guard keep their own copy (``services.result_masking.
-# EXECUTABLE_COMMENT``); keep the two in step.
+# content is code (_Gaps). Case-insensitive: reading /*m! as code only refuses more. This is the
+# one pattern for it: result masking and the strict guard (``services.result_masking``,
+# ``services.sensitive_guard``) import it from here, as services may import from datasources
+# and not the reverse. A search for it is true exactly where a search for the bare /*M?! is.
 EXECUTABLE_OPENER = re.compile(r"/\*M?!\d*", re.IGNORECASE)
 
 
@@ -207,7 +213,7 @@ def _quoted_end(text: str, i: int) -> int:
     return size
 
 
-def _code_pieces(
+def code_pieces(
     text: str, *, mysql_comments: bool = False, quotes: str = _COMMON_QUOTES
 ) -> Iterator[tuple[str, int]]:
     """Each piece of *text* the server reads as code, with the position after it: a word,
@@ -247,10 +253,28 @@ def code_words(
     text: str, *, mysql_comments: bool = False, quotes: str = _COMMON_QUOTES
 ) -> Iterator[tuple[str, int]]:
     """Each word of *text* the server reads as code, with the position after it: the
-    words among _code_pieces, which sets out what counts as code."""
-    for piece, end in _code_pieces(text, mysql_comments=mysql_comments, quotes=quotes):
-        if piece[0] == "_" or piece[0].isalnum():
+    words among code_pieces, which sets out what counts as code."""
+    for piece, end in code_pieces(text, mysql_comments=mysql_comments, quotes=quotes):
+        if _is_word(piece):
             yield piece, end
+
+
+def _is_word(piece: str) -> bool:
+    """Whether a piece of code_pieces is a word, not one character that is part of none."""
+    return piece[0] == "_" or piece[0].isalnum()
+
+
+def code_end(text: str) -> int:
+    """The length of *text* without the whitespace and semicolons at its end.
+
+    It is read for the one token that sqlparse shows as a comment to the end of its line
+    and the server reads as code (a # on PostgreSQL, --1 on MySQL): a ; at the end of that
+    line ends the statement, and the LIMIT must not follow it. Nothing else is read there,
+    neither a comment after the ; nor a quote: that would take the dialect's quoting rules,
+    and a cut that is wrong removes code the server runs. Only a character that ends the
+    text can go, and a quoted region ends in its quote, never in a ;.
+    """
+    return len(text.rstrip(" \t\r\n\f\v;"))
 
 
 # The words that join two queries into one: a parenthesised query before one of them is a
@@ -285,6 +309,8 @@ def has_second_statement(text: str, *, mysql_comments: bool = False) -> bool:
     ('a; b'), which only refuses more; a trailing semicolon, or one followed by comments
     alone, passes.
     """
+    if ";" not in text:
+        return False
     gaps = _Gaps(text, mysql_comments=mysql_comments)
     for match in re.finditer(";", text):
         i = gaps.skip(match.end())
@@ -318,6 +344,8 @@ def takes_row_locks(
     ('for' AS f, share). FOR UPDATE and FOR NO KEY UPDATE are refused by the UPDATE keyword.
     """
     upper = text.upper()
+    if "SHARE" not in upper:
+        return False
     gaps = _Gaps(upper, mysql_comments=mysql_comments)
 
     def follows(i: int, words: tuple[str, ...]) -> bool:
@@ -343,51 +371,94 @@ def takes_row_locks(
 
 
 # The ASCII characters a server takes inside a name that \w does not: $ after a name's first
-# character (PostgreSQL, MySQL) and @ as MySQL's user-variable sigil. Glued before FETCH, each
-# makes it part of a name. # is listed too: glued before FETCH it starts no clause on either
-# server (see _opens_fetch_clause), so reading it as name glue costs nothing.
+# character (PostgreSQL, MySQL) and @ as MySQL's user-variable sigil. Glued before FETCH or
+# LIMIT, each makes it part of a name. # is listed too: glued before either it starts no
+# clause on either server (see _is_a_name), so reading it as name glue costs nothing.
 _NAME_GLUE = "$@#"
 
 
-def _opens_fetch_clause(text: str, code: list[tuple[str, int]], k: int, gaps: _Gaps) -> bool:
-    """Whether the FETCH at ``code[k]`` is the keyword and FIRST or NEXT follows it.
+def _right_after(code: list[tuple[str, int]], k: int, length: int, gaps: _Gaps, piece: str) -> bool:
+    """Whether the piece before ``code[k]``, a word ``length`` characters long, is *piece* and
+    nothing but gaps lies between them.
 
-    It is a name in three shapes, which the servers run unbounded: after a dot (s.fetch
-    FIRST is a column, even for a reserved word, and its alias); with a non-ASCII character
+    code_pieces skips a quoted region whole, so the piece before a word is not always the
+    token next to it: in "s"."t" LIMIT the piece before LIMIT is the dot, with a quoted name
+    between, and in t AS "x" LIMIT it is the AS.
+    """
+    if not k or code[k - 1][0] != piece:
+        return False
+    return gaps.skip(code[k - 1][1]) == code[k][1] - length
+
+
+# A number literal that ends at a dot: the digits stand alone, so nothing of a name (a letter,
+# an underscore, a $ or a non-ASCII character) or an earlier dot (1.5.) comes before them.
+_NUMBER_BEFORE_DOT = re.compile(r"(?<![\w$.])[0-9]+\Z")
+
+
+def _is_a_name(text: str, code: list[tuple[str, int]], k: int, length: int, gaps: _Gaps) -> bool:
+    """Whether the word at ``code[k]``, a keyword ``length`` characters long, is part of a name.
+
+    It is in three shapes, which the servers read as a name: right after a dot (s.fetch
+    FIRST is a column, even for a reserved word, and its alias), unless the dot ends a number
+    (a > 1. LIMIT 5: the number is 1., and both servers read the word after it as the
+    keyword; t1.limit is a name, its digit is part of one); with a non-ASCII character
     glued to it, which PostgreSQL and MySQL read as a name character, so FETCH, a no-break
     space and FIRST is one name; and behind a character of _NAME_GLUE (a$fetch FIRST, and
-    @fetch FIRST, a MySQL user variable). Any other character glued after it already stops
-    FIRST from following. Reading a name as the keyword only adds the LIMIT, the safe
-    direction: a statement that does end in the clause then fails as a syntax error. On
-    PostgreSQL # and @ are operators, which no reserved FETCH may follow, and on MySQL # opens
-    a comment, so the glue costs no real clause there.
+    @fetch FIRST, a MySQL user variable). Each way of being wrong costs a query: a name read
+    as the keyword leaves a statement unbounded, and the keyword read as a name appends a
+    LIMIT after the statement's own, which the server refuses. So only these shapes count,
+    and the dot must be the one next to the word. On PostgreSQL # and @ are operators, which
+    no reserved word may follow, and on MySQL # opens a comment, so the glue costs no real
+    clause there.
     """
     end = code[k][1]
-    start = end - len("FETCH")
-    if k and code[k - 1][0] == ".":
-        return False
+    start = end - length
+    if _right_after(code, k, length, gaps, ".") and not _NUMBER_BEFORE_DOT.search(
+        text, 0, code[k - 1][1] - 1
+    ):
+        return True
     before = text[start - 1] if start else ""
     if before and (before in _NAME_GLUE or not before.isascii()):
+        return True
+    return end < len(text) and not text[end].isascii()
+
+
+def _opens_fetch_clause(text: str, code: list[tuple[str, int]], k: int, gaps: _Gaps) -> bool:
+    """Whether the FETCH at ``code[k]`` is the keyword (not a name, see _is_a_name) and
+    FIRST or NEXT follows it. Any other character glued after it already stops FIRST from
+    following."""
+    if _is_a_name(text, code, k, len("FETCH"), gaps):
         return False
-    if end < len(text) and not text[end].isascii():
-        return False
-    match = _WORD.match(text, gaps.skip(end))
+    match = _WORD.match(text, gaps.skip(code[k][1]))
     return match is not None and match.group() in ("FIRST", "NEXT")
 
 
-def has_fetch_clause(
+def _opens_limit_clause(text: str, code: list[tuple[str, int]], k: int, gaps: _Gaps) -> bool:
+    """Whether the LIMIT at ``code[k]`` is the keyword and not a name (see _is_a_name).
+
+    LIMIT is reserved on PostgreSQL and MySQL, so it is a name only where a server takes a
+    reserved word for one: right after a dot (t.limit), right after AS (SELECT 1 AS limit,
+    PostgreSQL), and in the glued shapes of _is_a_name. A name is no clause, so the
+    statement still gets its LIMIT.
+    """
+    return not _is_a_name(text, code, k, len("LIMIT"), gaps) and not _right_after(
+        code, k, len("LIMIT"), gaps, "AS"
+    )
+
+
+def has_row_limit_clause(
     text: str, *, mysql_comments: bool = False, quotes: str = _COMMON_QUOTES
 ) -> bool:
-    """Whether the statement itself carries the standard row-limiting clause: FETCH FIRST
-    or NEXT as code, outside every parenthesis but the ones around the statement's own body.
+    """Whether the statement itself carries a row limit: LIMIT, or the standard FETCH FIRST
+    or NEXT, as code, outside every parenthesis but the ones around the statement's own body.
 
     A LIMIT appended after the statement's own clause is a syntax error (PostgreSQL,
-    MariaDB), so a query that carries it gets none. Nothing else counts, because on the
+    MariaDB), so a query that carries one gets none. Nothing else counts, because on the
     non-streaming execute path the LIMIT is the only bound on the rows read into memory:
 
-    - the word FETCH in a comment, a string literal or a name (-- Fetch every order, a
-      column called fetch) still gets the LIMIT; the clause is read on the pieces the
-      server reads as code (_code_pieces);
+    - the word LIMIT or FETCH in a comment, a string literal or a name (-- Fetch every
+      order, WHERE note = 'limit', a column called fetch, t.limit) still gets the LIMIT;
+      the clause is read on the pieces the server reads as code (code_pieces);
     - a clause inside parentheses (a subquery, a CTE, one branch of a set operation)
       bounds that subquery and not the rows the statement returns, and a LIMIT after the
       closing parenthesis is valid, so it still gets the LIMIT. The exception is the
@@ -398,16 +469,22 @@ def has_fetch_clause(
       or directly follows a closing parenthesis (the end of a WITH clause), unless a set
       operator follows its closing parenthesis; the scan then repeats inside it;
     - in a text whose quotes are not followed (_QUOTES_NOT_FOLLOWED) a parenthesis inside
-      a literal would be counted, so no clause is recognised and the LIMIT stays. A
-      statement that does end in the clause then fails on the server with a syntax error
-      instead of running unbounded;
-    - FETCH as part of a name still gets the LIMIT (_opens_fetch_clause).
+      a literal would be counted, so no clause is recognised on the code pieces. The word
+      LIMIT anywhere then counts (_LIMIT_WORD), as it always has: LIMIT is the common
+      clause, and not seeing it would fail every query that holds an escaped quote
+      ('O\\'Brien' … LIMIT 10) with a syntax error on the server. FETCH is not looked for
+      there: a statement that does end in that clause then gets a LIMIT and fails with a
+      syntax error instead of running unbounded;
+    - a word that is part of a name still gets the LIMIT (_opens_fetch_clause,
+      _opens_limit_clause).
     """
     upper = text.upper()
-    if _QUOTES_NOT_FOLLOWED.search(upper):
+    if "FETCH" not in upper and "LIMIT" not in upper:
         return False
+    if _QUOTES_NOT_FOLLOWED.search(upper):
+        return _LIMIT_WORD.search(upper) is not None
     gaps = _Gaps(upper, mysql_comments=mysql_comments)
-    code = list(_code_pieces(upper, mysql_comments=mysql_comments, quotes=quotes))
+    code = list(code_pieces(upper, mysql_comments=mysql_comments, quotes=quotes))
     pieces = [piece for piece, _ in code]
     low, high = 0, len(pieces) - 1
     while high >= 0 and pieces[high] == ";":
@@ -422,7 +499,10 @@ def has_fetch_clause(
                 depth += 1
             elif piece == ")":
                 depth -= 1
-            elif piece == "FETCH" and depth == 0 and _opens_fetch_clause(upper, code, k, gaps):
+            elif depth == 0 and (
+                (piece == "FETCH" and _opens_fetch_clause(upper, code, k, gaps))
+                or (piece == "LIMIT" and _opens_limit_clause(upper, code, k, gaps))
+            ):
                 return True
         closer = _closing_parenthesis(pieces, body, high) if body >= 0 else -1
         if closer < 0 or (closer < high and pieces[closer + 1] in _SET_OPERATORS):
@@ -449,6 +529,8 @@ def nests_block_comment(text: str, *, quotes: str = _COMMON_QUOTES) -> bool:
     the literal at its quote, reads as one. There every /* counts, wherever it stands, and
     a second /* before the next */ is refused, a literal's too, which only refuses more.
     """
+    if text.count("/*") < 2:
+        return False
     gaps = _Gaps(text)
     if _QUOTES_NOT_FOLLOWED.search(text) is not None:
         return any(
@@ -478,6 +560,10 @@ class BaseSQLValidator:
     # scan skips the region they open, so a character the dialect does not quote with must
     # not be listed: PostgreSQL reads a backtick as an operator character (MySQL overrides).
     QUOTE_CHARS: ClassVar[str] = "'\""
+
+    # Whether the dialect reads comments by MySQL's rules (_Gaps): a # line is a gap, --1 is
+    # code, and an executable comment's content is code. MySQL overrides.
+    MYSQL_COMMENTS: ClassVar[bool] = False
 
     BLOCKED_STATEMENT_TYPES: ClassVar[set[str]] = {
         "INSERT",
@@ -529,11 +615,11 @@ class BaseSQLValidator:
            two is refused
         4. Scan for BLOCKED_STATEMENT_TYPES as whole words in query text
            4b. Reject WRITING_KEYWORDS (INTO) where they are code (_into_is_code)
-           4c. Reject the word TABLE where it is code (_table_word_is_code)
+           4c. Reject the word TABLE where it is code, unless it is a name (_table_word_is_code)
         5. Reject a second statement (has_second_statement), a share-locking read
            (takes_row_locks) and the DANGEROUS_PATTERNS
-        6. Add LIMIT if the query carries no row limit (the word LIMIT, or the
-           statement's own FETCH FIRST/NEXT clause), then return the ValidationResult
+        6. Add LIMIT if the query carries no row limit (the statement's own LIMIT or
+           FETCH FIRST/NEXT clause), then return the ValidationResult
         """
         query = strip_query(query)
         if not query:
@@ -593,7 +679,8 @@ class BaseSQLValidator:
             )
 
         # 4c. TABLE t reads a whole table that no FROM or JOIN names, so the schema check
-        #     never sees it: refused wherever it is code, not only at the start.
+        #     never sees it: refused wherever it is code, not only at the start. A name right
+        #     after a dot or AS (t.table, AS table) is the one thing that passes.
         if self._table_word_is_code(query_upper):
             return ValidationResult(is_valid=False, error_message=TABLE_STATEMENT_ERROR)
 
@@ -602,7 +689,7 @@ class BaseSQLValidator:
         if has_second_statement(query):
             return ValidationResult(
                 is_valid=False,
-                error_message="Multiple statements are not allowed",
+                error_message=MULTIPLE_STATEMENTS_ERROR,
             )
         if takes_row_locks(query, quotes=self.QUOTE_CHARS):
             return ValidationResult(is_valid=False, error_message=LOCKING_READ_ERROR)
@@ -647,6 +734,8 @@ class BaseSQLValidator:
         An INTO followed by one of INTO_READ_FOLLOWERS is part of a read and passes the
         first two readings.
         """
+        if not any(keyword in upper for keyword in self.WRITING_KEYWORDS):
+            return False
         followers = self.INTO_READ_FOLLOWERS
         tokens = [
             token
@@ -676,43 +765,71 @@ class BaseSQLValidator:
         return False
 
     def _table_word_is_code(self, upper: str) -> bool:
-        """Whether the word TABLE is code anywhere in the query.
+        """Whether the word TABLE is code anywhere in the query, except as a name.
 
         TABLE t is shorthand for a SELECT of a whole table. Unlike FROM and JOIN it names
         no table to the schema check, so a table excluded by the privacy settings would be
-        read unseen. It is judged on the words the dialect's server reads as code
-        (_code_words), so the word in a comment, a literal or a quoted name passes. In a
-        text whose quotes are not followed (_QUOTES_NOT_FOLLOWED) every word counts, a
-        comment's or a literal's too, as for INTO: a comment opener inside a literal would
-        hide the word from the code-word scan. A validator with no _code_words is not
-        judged here. An unquoted column called table is refused with it (it is valid only
-        after a dot or AS): quote the name.
+        read unseen. A list of the words that may stand before it as a query would fail
+        open: any word the list misses (a SEARCH or CYCLE clause's name, DISTINCTROW, an
+        operator glued to a number) lets the query through. So the word is refused wherever
+        it is code, and only two shapes pass, both names: right after a dot (t.table) and
+        right after AS (AS table, PostgreSQL), with nothing but gaps between (_right_after).
+
+        It is judged on the pieces the dialect's server reads as code (_code_pieces), so the
+        word in a comment, a literal or a quoted name passes. In a text whose quotes are not
+        followed (_QUOTES_NOT_FOLLOWED) every word counts, a comment's or a literal's too, as
+        for INTO: a comment opener inside a literal would hide the word from the code-piece
+        scan, and no name rule is applied. A validator with no _code_pieces is judged there
+        only.
         """
-        if any(word == "TABLE" for word, _ in self._code_words(upper)):
-            return True
-        return _QUOTES_NOT_FOLLOWED.search(upper) is not None and "TABLE" in _WORD.findall(upper)
+        if "TABLE" not in upper:
+            return False
+        if _QUOTES_NOT_FOLLOWED.search(upper):
+            return "TABLE" in _WORD.findall(upper)
+        code = list(self._code_pieces(upper))
+        gaps = _Gaps(upper, mysql_comments=self.MYSQL_COMMENTS)
+        length = len("TABLE")
+        return any(
+            piece == "TABLE"
+            and not _right_after(code, k, length, gaps, ".")
+            and not _right_after(code, k, length, gaps, "AS")
+            for k, (piece, _) in enumerate(code)
+        )
 
-    def _code_words(self, text: str) -> Iterator[tuple[str, int]]:
-        """The words of *text* the dialect's server reads as code, for the INTO check.
+    def _code_pieces(self, text: str) -> Iterator[tuple[str, int]]:
+        """The pieces of *text* (a word, or one character that is part of none) the dialect's
+        server reads as code, for the INTO and TABLE checks.
 
-        None on the base. The word scan follows only the quotes in QUOTE_CHARS and reads #
-        as code, and dialects differ on both (a backtick name, a # comment), so on a
-        dialect with other rules it would refuse a quoted name or a comment that holds
-        the word: a validator that does not override this is judged on sqlparse's tokens.
-        The PostgreSQL and MySQL validators override this.
+        None on the base. The scan follows only the quotes in QUOTE_CHARS and reads # as
+        code, and dialects differ on both (a backtick name, a # comment), so on a dialect
+        with other rules it would refuse a quoted name or a comment that holds the word: a
+        validator that does not override this is judged on sqlparse's tokens. The
+        PostgreSQL and MySQL validators override this.
         """
         return iter(())
+
+    def _code_words(self, text: str) -> Iterator[tuple[str, int]]:
+        """The words among _code_pieces, with the position after each."""
+        return ((piece, end) for piece, end in self._code_pieces(text) if _is_word(piece))
 
     def _without_trailing_gaps(self, statements: tuple[sql_nodes.Statement, ...]) -> str:
         """The query text up to its last code token: no trailing ;, comment or whitespace.
 
         Built from sqlparse's tokens, so a ; or -- inside a string literal is code and stays.
+        One token is shortened: sqlparse takes # … (PostgreSQL's XOR operator) and --1 …
+        (two minus signs on MySQL) for a comment to the end of the line, and _pieces calls it
+        code, so a ; at the end of that line is inside it (code_end). Cut there, or the
+        LIMIT would follow the ; and be a second statement.
         """
         pieces = self._pieces(statements)
         end = len(pieces)
         while end and (pieces[end - 1][1] or pieces[end - 1][0] == ";"):
             end -= 1
-        return "".join(text for text, _ in pieces[:end])
+        text = "".join(piece for piece, _ in pieces[:end])
+        last = pieces[end - 1][0] if end else ""
+        if last.startswith(("#", "--")):
+            text = text[: len(text) - len(last) + code_end(last)]
+        return text
 
     def without_trailing_gaps(self, query: str) -> str | None:
         """*query* up to its last code token, read as ``validate`` reads it (stripped, the
@@ -745,17 +862,15 @@ class BaseSQLValidator:
         ]
 
     def has_row_limit(self, query: str) -> bool:
-        """Whether *query* already carries a row limit, so no LIMIT is appended to it: the
-        word LIMIT anywhere (_LIMIT_WORD), or the statement's own FETCH FIRST/NEXT clause
-        (_has_fetch_clause). ``validate`` and ``services.row_filter._with_row_limit`` both
-        ask this, so the validated form and the executed form get a LIMIT in the same cases.
+        """Whether *query* already carries a row limit of its own, so no LIMIT is appended to
+        it: the statement's own LIMIT or FETCH FIRST/NEXT clause, read by the dialect's
+        comment rules (has_row_limit_clause). ``validate`` and
+        ``services.row_filter._with_row_limit`` both ask this, so the validated form and the
+        executed form get a LIMIT in the same cases.
         """
-        return _LIMIT_WORD.search(query) is not None or self._has_fetch_clause(query)
-
-    def _has_fetch_clause(self, query: str) -> bool:
-        """Whether the statement carries its own FETCH FIRST/NEXT clause, by the dialect's
-        comment rules (has_fetch_clause)."""
-        return has_fetch_clause(query, quotes=self.QUOTE_CHARS)
+        return has_row_limit_clause(
+            query, mysql_comments=self.MYSQL_COMMENTS, quotes=self.QUOTE_CHARS
+        )
 
     def _token_error(self, statements: tuple[sql_nodes.Statement, ...]) -> str | None:
         """A dialect's refusal read off sqlparse's tokens (the parse is done once, here)."""
