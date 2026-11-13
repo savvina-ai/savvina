@@ -2,6 +2,60 @@
 
 <!-- version list -->
 
+## v3.0.4 (2026-11-13)
+
+### Bug Fixes
+
+- **auth**: Add a session hint cookie so anonymous visitors skip /auth/refresh, plus a higher
+  refresh rate limit and nginx security headers
+  ([#31](https://github.com/savvina-ai/savvina/pull/31),
+  [`f477055`](https://github.com/savvina-ai/savvina/commit/f477055b2afea3aea4b80a2e7667570aad6f3d12))
+
+- **chat**: Keep the edited query and its error on a refused edit and tighten feedback retraction
+  ([#31](https://github.com/savvina-ai/savvina/pull/31),
+  [`f477055`](https://github.com/savvina-ai/savvina/commit/f477055b2afea3aea4b80a2e7667570aad6f3d12))
+
+- **mysql**: ANSI in sql_mode implies ANSI_QUOTES
+  ([#31](https://github.com/savvina-ai/savvina/pull/31),
+  [`f477055`](https://github.com/savvina-ai/savvina/commit/f477055b2afea3aea4b80a2e7667570aad6f3d12))
+
+- **mysql**: Combination sql_modes with ANSI_QUOTES
+  ([#31](https://github.com/savvina-ai/savvina/pull/31),
+  [`f477055`](https://github.com/savvina-ai/savvina/commit/f477055b2afea3aea4b80a2e7667570aad6f3d12))
+
+- **providers**: Drop the never-computed is_healthy and show the Test result in Settings
+  ([#31](https://github.com/savvina-ai/savvina/pull/31),
+  [`f477055`](https://github.com/savvina-ai/savvina/commit/f477055b2afea3aea4b80a2e7667570aad6f3d12))
+
+- **validators**: Align the SQL validators with prod's 9.34 hardening (executable comments,
+  backslash INTO and locks, FETCH, parenthesis, REPLACE)
+  ([#31](https://github.com/savvina-ai/savvina/pull/31),
+  [`f477055`](https://github.com/savvina-ai/savvina/commit/f477055b2afea3aea4b80a2e7667570aad6f3d12))
+
+- **validators**: Close the code-review findings and read a number ending in a dot before LIMIT as a
+  number ([#31](https://github.com/savvina-ai/savvina/pull/31),
+  [`f477055`](https://github.com/savvina-ai/savvina/commit/f477055b2afea3aea4b80a2e7667570aad6f3d12))
+
+- **validators**: Close the review findings in the SQL validators
+  ([#31](https://github.com/savvina-ai/savvina/pull/31),
+  [`f477055`](https://github.com/savvina-ai/savvina/commit/f477055b2afea3aea4b80a2e7667570aad6f3d12))
+
+### Documentation
+
+- Update the validator rules and the live validator tests
+  ([#31](https://github.com/savvina-ai/savvina/pull/31),
+  [`f477055`](https://github.com/savvina-ai/savvina/commit/f477055b2afea3aea4b80a2e7667570aad6f3d12))
+
+- Validator rules ([#31](https://github.com/savvina-ai/savvina/pull/31),
+  [`f477055`](https://github.com/savvina-ai/savvina/commit/f477055b2afea3aea4b80a2e7667570aad6f3d12))
+
+### Testing
+
+- **validators**: Opt-in live-engine validator cases
+  ([#31](https://github.com/savvina-ai/savvina/pull/31),
+  [`f477055`](https://github.com/savvina-ai/savvina/commit/f477055b2afea3aea4b80a2e7667570aad6f3d12))
+
+
 ## v3.0.3 (2026-11-04)
 
 ### Bug Fixes
