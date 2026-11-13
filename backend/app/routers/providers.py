@@ -51,8 +51,6 @@ def _is_configured(provider_name: str, config: ProviderConfig | None) -> bool:
 def _build_status(
     provider_name: str,
     config: ProviderConfig | None,
-    *,
-    is_healthy: bool = False,
 ) -> ProviderStatusResponse:
     """Assemble a ProviderStatusResponse from static metadata + saved config."""
     try:
@@ -82,7 +80,6 @@ def _build_status(
         display_name=display_name,
         provider_display_name=provider_display_name,
         is_configured=_is_configured(provider_name, config),
-        is_healthy=is_healthy,
         is_active=config.is_active if config else False,
         current_model=current_model,
         available_models=available_models,

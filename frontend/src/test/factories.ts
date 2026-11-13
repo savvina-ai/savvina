@@ -92,7 +92,6 @@ export function makeProviderStatus(overrides?: Partial<ProviderStatus>): Provide
     provider_display_name: 'Anthropic Claude',
     is_active: true,
     is_configured: true,
-    is_healthy: true,
     current_model: 'claude-sonnet-4-5-20250929',
     available_models: ['claude-sonnet-4-5-20250929', 'claude-haiku-4-5-20251001'],
     base_url: null,

@@ -31,6 +31,41 @@ _QUERY_MARKER = re.compile(r"QUERY:", re.IGNORECASE)
 _EXPLANATION_MARKER = re.compile(r"EXPLANATION:", re.IGNORECASE)
 _REASONING_MARKER = re.compile(r"REASONING:", re.IGNORECASE)
 
+# A QUERY block that holds a note instead of SQL. A model that refuses writes the refusal in
+# EXPLANATION and often a placeholder here: a bare null word, or the same in parentheses
+# ("(None)", "(Cannot generate query due to safety rules)"). Left as the query, the
+# placeholder would be sent as a SQL event and refused by the validator as "Got: UNKNOWN",
+# hiding the model's own explanation behind it.
+_NULL_QUERY_WORDS = frozenset({"none", "null", "n/a"})
+_PARENTHESISED_NOTE_RE = re.compile(r"\(([^()]*)\)\.?")
+# What a QUERY block may start with and still be left to the validator, which refuses
+# everything but a read: a statement word (whole word, so "Updates are not allowed" is a
+# note), a comment, or the opening of a structured value.
+_SQL_STATEMENT_WORDS = frozenset(
+    {"SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "EXPLAIN"}
+)
+_SQL_OPENERS = ("--", "/*", "[", "{")
+
+
+def _is_no_query(query: str) -> bool:
+    """True when *query* is a "no query" signal, not SQL.
+
+    A bare null word, or one pair of parentheses with no other parenthesis inside whose text
+    does not start like a statement. ``(SELECT 1)`` and any nested ``(SELECT … (…))`` are SQL
+    and ``(DELETE FROM t)`` is a statement for the validator to refuse; none of them is a note.
+    """
+    text = query.strip()
+    if text.lower() in _NULL_QUERY_WORDS:
+        return True
+    note = _PARENTHESISED_NOTE_RE.fullmatch(text)
+    if note is None:
+        return False
+    inner = note.group(1).lstrip()
+    if inner.startswith(_SQL_OPENERS):
+        return False
+    first_word = re.match(r"[A-Za-z]+", inner)
+    return first_word is None or first_word.group().upper() not in _SQL_STATEMENT_WORDS
+
 
 class ProviderConnectError(Exception):
     """Raised when a provider's API is unreachable (network/TLS/DNS failure)."""
@@ -261,8 +296,8 @@ def _parse_structured_response(raw: str) -> tuple[str, str]:
         _leaked = _marker.search(query)
         if _leaked:
             query = query[: _leaked.start()].strip()
-    # LLM wrote a null signal as the query — surface the explanation instead.
-    if query.strip().lower() in ("none", "null", "n/a"):
+    # LLM wrote a null signal or a parenthesised note as the query — surface the explanation.
+    if _is_no_query(query):
         query = ""
     return query, explanation
 
@@ -340,6 +375,55 @@ def is_degenerate_output(raw: str) -> bool:
     return len(compact) >= _DEGENERATE_MIN_CHARS and len(set(compact)) == 1
 
 
+# Reasoning models (DeepSeek-R1, Qwen3, GLM via Ollama/OpenRouter/Groq/Cerebras, Gemma 4 via
+# Gemini) put a chain-of-thought scratchpad in the completion, wrapped in <think>…</think>,
+# <thinking>…</thinking> or <thought>…</thought>. It is not an answer: it can carry the
+# model's discarded draft query, and a refusal parsed from it shows the user the model's
+# working. The unpaired shapes are the common case (a chat-template token is consumed by the
+# server, so the completion carries only the closing tag, or stops mid-thought with only the
+# opener), so both orphans are handled, greedily to the last/first tag. A literal
+# <think>/</think> tag inside a real answer (e.g. LIKE '%<think>%') is cut as a scratchpad
+# too; nothing is executed from the remainder, an accepted trade-off shared with prod.
+_THINK_TAG = r"(?:think(?:ing)?|thought)"
+_THINK_BLOCK_RE = re.compile(
+    rf"<\s*{_THINK_TAG}\s*>.*?<\s*/\s*{_THINK_TAG}\s*>", re.DOTALL | re.IGNORECASE
+)
+_THINK_CLOSER_RE = re.compile(rf"<\s*/\s*{_THINK_TAG}\s*>", re.IGNORECASE)
+_THINK_ORPHAN_CLOSE_RE = re.compile(rf"\A.*<\s*/\s*{_THINK_TAG}\s*>", re.DOTALL | re.IGNORECASE)
+_THINK_ORPHAN_OPEN_RE = re.compile(rf"<\s*{_THINK_TAG}\s*>.*\Z", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_reasoning_blocks(text: str) -> str:
+    """Remove chain-of-thought scratchpads from a raw LLM completion.
+
+    Returns *text* unchanged when it names no scratchpad tag, so ordinary completions take
+    the path they always took. Returns "" when the completion was nothing but scratchpad.
+    """
+    lowered = text.lower()
+    if "think" not in lowered and "thought" not in lowered:
+        return text
+    # Paired blocks first, so any surviving closer provably has no opener.
+    # Only text up to the last closer can hold a paired block; the rest goes to the orphan-opener
+    # rule. Scanning only that part keeps many unclosed openers linear instead of quadratic.
+    split = 0
+    for closer in _THINK_CLOSER_RE.finditer(text):
+        split = closer.end()
+    cleaned = _THINK_BLOCK_RE.sub("", text[:split]) + text[split:]
+    cleaned = _THINK_ORPHAN_CLOSE_RE.sub("", cleaned)
+    cleaned = _THINK_ORPHAN_OPEN_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
+def is_reasoning_only(raw: str) -> bool:
+    """True when a non-empty reply is nothing but a reasoning scratchpad.
+
+    Callers use it to tell "the model only thought" from any other reply that parses to
+    nothing (a bare ``EXPLANATION:`` label), which is not a scratchpad and must not be
+    reported as one.
+    """
+    return bool(raw.strip()) and not _strip_reasoning_blocks(raw)
+
+
 def parse_llm_response(
     raw: str,
     model: str,
@@ -368,12 +452,25 @@ def parse_llm_response(
     2. Otherwise fall back to finding any SQL code block (````sql`` or `` ``` ``).
     3. Last resort: treat the entire response as the query.
     """
-    if _QUERY_MARKER.search(raw) and _EXPLANATION_MARKER.search(raw):
-        query, explanation = _parse_structured_response(raw)
+    text = _strip_reasoning_blocks(raw)
+    if raw.strip() and not text:
+        # The whole completion was a scratchpad. Parsing it would show the user the model's
+        # working (or, under auto-execute, run its discarded draft).
+        logger.warning(
+            "parse_llm_response: model %r returned only a reasoning scratchpad "
+            "(raw_len=%d, truncated=%s); raw (first 600): %r",
+            model,
+            len(raw),
+            truncated,
+            raw[:600],
+        )
+        query, explanation = "", ""
+    elif _QUERY_MARKER.search(text) and _EXPLANATION_MARKER.search(text):
+        query, explanation = _parse_structured_response(text)
     else:
-        query, explanation = _parse_unstructured_response(raw, model)
+        query, explanation = _parse_unstructured_response(text, model)
 
-    if not query.strip() and not explanation.strip() and raw.strip():
+    if not query.strip() and not explanation.strip() and text.strip():
         logger.warning(
             "parse_llm_response: both query and explanation empty despite non-empty raw "
             "(%d chars) — raw (first 600): %r",
@@ -450,7 +547,10 @@ def _extract_json_from_text(text: str) -> str:
     Handles pure JSON, code-fenced JSON, and JSON embedded in prose.
     Used by BaseLLMProvider.generate_structured's fallback path.
     """
-    text = text.strip()
+    # Reasoning models rehearse JSON inside the scratchpad. When the reply was only a
+    # scratchpad, keep the original text so behaviour for that case is unchanged from before
+    # (a JSON draft inside it can still be extracted).
+    text = (_strip_reasoning_blocks(text) or text).strip()
     if text.startswith("{"):
         return text
     if "```" in text:

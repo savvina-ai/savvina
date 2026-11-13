@@ -36,11 +36,13 @@ Savvina AI supports multiple LLM providers through a unified adapter interface. 
 6. Click **Test** to verify connectivity
 7. Click **Add** to save the config
 
+The dot beside a provider on the Settings page is grey until you click **Test** on that card. It then turns green (the test passed) or red (it failed). It is not a live health check and is not remembered when you leave the page.
+
 For **Custom Providers** (OpenRouter, HuggingFace, Together.ai, custom URL), click **+ Add Custom Provider**. Enter the base URL and API key first, then click **Fetch Models** to populate the model dropdown. Click **Cancel** to dismiss the form without saving.
 
 ### No environment-variable keys
 
-Provider API keys are read **only** from saved configs. Setting `GROQ_API_KEY`, `ANTHROPIC_API_KEY` or similar in `.env` has no effect — a provider without a saved config shows a grey "not configured" dot and cannot be selected for chat. The only provider-related environment variables are `OLLAMA_BASE_URL` and `VERIFY_SSL`; see [Configuration — LLM Providers](../getting-started/02_configuration.md#llm-providers).
+Provider API keys are read **only** from saved configs. Setting `GROQ_API_KEY`, `ANTHROPIC_API_KEY` or similar in `.env` has no effect — a provider without a saved config cannot be tested or selected for chat. The only provider-related environment variables are `OLLAMA_BASE_URL` and `VERIFY_SSL`; see [Configuration — LLM Providers](../getting-started/02_configuration.md#llm-providers).
 
 ---
 

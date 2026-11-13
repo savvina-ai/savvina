@@ -4,7 +4,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, Check } from 'lucide-react';
 import { useProviders } from '../hooks/useProviders';
-import { cn } from '@/lib/utils';
 
 interface Props {
   value: string;
@@ -65,12 +64,6 @@ export default function ProviderSelector({ value, onChange }: Props) {
         onClick={() => setOpen(!open)}
         className="flex items-center gap-1.5 rounded-full border border-border bg-surface-elevated px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted"
       >
-        <div
-          className={cn(
-            'h-1.5 w-1.5 rounded-full',
-            selected?.is_healthy ? 'bg-success' : 'bg-destructive',
-          )}
-        />
         <span
           className="max-w-[14rem] truncate font-mono"
           title={selected ? `${selected.display_name} · ${selected.current_model}` : undefined}
@@ -93,12 +86,6 @@ export default function ProviderSelector({ value, onChange }: Props) {
               }}
               className="flex w-full items-start gap-3 px-3 py-2.5 text-left transition-colors hover:bg-muted"
             >
-              <div
-                className={cn(
-                  'mt-1 h-1.5 w-1.5 shrink-0 rounded-full',
-                  p.is_healthy ? 'bg-success' : 'bg-destructive',
-                )}
-              />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium text-foreground">{p.display_name}</span>
