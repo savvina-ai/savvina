@@ -665,7 +665,13 @@ async def add_example(
 ) -> ExampleResponse:
     """Manually add a verified question -> query pair to the example library."""
     conn = await get_connection_or_404(connection_id, db)
-    query_dialect = create_datasource(conn.source_type).query_dialect
+    adapter = create_datasource(conn.source_type)
+    validation = adapter.validate_query(body.query)
+    if not validation.is_valid:
+        raise HTTPException(
+            status_code=422, detail=f"Example query rejected: {validation.error_message}"
+        )
+    query_dialect = adapter.query_dialect
 
     shared_cache = _get_shared_cache()
     embedding = await shared_cache.compute_embedding_async(body.question)
@@ -716,6 +722,16 @@ async def update_example(
     row = result.scalar_one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="Example not found")
+
+    # Only a query the user changed is validated: the UI sends both fields on every save,
+    # and an unchanged query was accepted when it was stored.
+    if body.query is not None and body.query != unwrap_row_filter(row.query):
+        conn = await get_connection_or_404(row.connection_id, db)
+        validation = create_datasource(conn.source_type).validate_query(body.query)
+        if not validation.is_valid:
+            raise HTTPException(
+                status_code=422, detail=f"Example query rejected: {validation.error_message}"
+            )
 
     if body.question is not None and body.question != row.question:
         row.question = body.question
