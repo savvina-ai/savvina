@@ -11,6 +11,9 @@ import {
 } from '../lib/storageKeys'
 
 const REFRESH_LOCK_TTL_MS = 5_000
+// Non-HttpOnly hint the backend sets beside the HttpOnly refresh cookie; it carries no token.
+// Its presence is the only way JS can tell "a session may exist" from an anonymous visitor.
+const SESSION_HINT_COOKIE = 'savvina_session'
 // Refresh proactively at 85% of the token's lifetime so we don't wait for a 401.
 const PROACTIVE_REFRESH_FRACTION = 0.85
 
@@ -60,6 +63,10 @@ async function _tryRefresh(): Promise<void> {
   } finally {
     localStorage.removeItem(STORAGE_KEY_REFRESH_LOCK)
   }
+}
+
+function _hasSessionHintCookie(): boolean {
+  return document.cookie.split(';').some((c) => c.trim().startsWith(`${SESSION_HINT_COOKIE}=`))
 }
 
 function _scheduleProactiveRefresh(expiresIn: number): void {
@@ -159,7 +166,13 @@ export const useAuthStore = create<AuthState>((set) => {
       } catch {
         set({ needsSetup: false })
       }
-      // Phase 2: token restore — rely on HttpOnly cookie, no localStorage
+      // Phase 2: token restore — rely on HttpOnly cookie, no localStorage. The cookie is
+      // invisible to JS, so the attempt is gated on the session hint: an anonymous visitor
+      // skips /auth/refresh (a certain 401, which the browser logs on the login page).
+      if (!_hasSessionHintCookie()) {
+        set({ accessToken: null, user: null, isLoading: false })
+        return
+      }
       try {
         const { authApi } = await import('../api/auth')
         const data = await authApi.refresh()

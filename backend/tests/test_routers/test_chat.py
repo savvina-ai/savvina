@@ -773,6 +773,29 @@ class TestAddExample:
             )
         assert resp.status_code == 201
 
+    async def test_a_refused_query_is_not_stored(self, http_client):
+        db = _mock_db(MockResult(single=MagicMock()))
+        app.dependency_overrides[get_db] = lambda: db
+        mock_library = MagicMock()
+        mock_library.add_example = AsyncMock()
+        refusing = MagicMock(query_dialect="postgresql")
+        refusing.validate_query.return_value = MagicMock(
+            is_valid=False,
+            error_message="Only SELECT queries and CTEs (WITH) are allowed. Got: DELETE",
+        )
+        with (
+            patch("app.routers.chat._get_shared_cache", return_value=MagicMock()),
+            patch("app.routers.chat.ExampleLibrary", return_value=mock_library),
+            patch("app.routers.chat.create_datasource", return_value=refusing),
+        ):
+            resp = await http_client.post(
+                "/api/v1/chat/examples/conn-123",
+                json={"question": "remove them", "query": "DELETE FROM orders"},
+            )
+        assert resp.status_code == 422
+        assert "Got: DELETE" in resp.json()["detail"]
+        mock_library.add_example.assert_not_called()
+
     async def test_invalid_connection_returns_404(self, http_client):
         db = _mock_db(MockResult(single=None))
         app.dependency_overrides[get_db] = lambda: db
@@ -846,14 +869,60 @@ class TestUpdateExample:
 
     async def test_a_query_change_is_stored_and_served(self, http_client):
         row = self._row(self._WRAPPED)
-        db = _mock_db(MockResult(single=row))
-        app.dependency_overrides[get_db] = lambda: db
-        resp = await http_client.put(
-            "/api/v1/chat/examples/ex-1", json={"query": "SELECT count(*) FROM users"}
+        db = _mock_db(
+            MockResult(single=row), MockResult(single=MagicMock(source_type="postgresql"))
         )
+        app.dependency_overrides[get_db] = lambda: db
+        accepting = MagicMock()
+        accepting.validate_query.return_value = MagicMock(is_valid=True)
+        with patch("app.routers.chat.create_datasource", return_value=accepting):
+            resp = await http_client.put(
+                "/api/v1/chat/examples/ex-1", json={"query": "SELECT count(*) FROM users"}
+            )
         assert resp.status_code == 200
         assert resp.json()["query"] == "SELECT count(*) FROM users"
         assert row.query == "SELECT count(*) FROM users"
+
+    async def test_a_refused_query_change_stores_nothing(self, http_client):
+        row = self._row(self._WRAPPED)
+        db = _mock_db(
+            MockResult(single=row), MockResult(single=MagicMock(source_type="postgresql"))
+        )
+        app.dependency_overrides[get_db] = lambda: db
+        refusing = MagicMock()
+        refusing.validate_query.return_value = MagicMock(
+            is_valid=False, error_message="Query contains blocked keyword: DROP"
+        )
+        with patch("app.routers.chat.create_datasource", return_value=refusing):
+            resp = await http_client.put(
+                "/api/v1/chat/examples/ex-1",
+                json={"question": "renamed", "query": "SELECT 1; DROP TABLE orders"},
+            )
+        assert resp.status_code == 422
+        assert "blocked keyword: DROP" in resp.json()["detail"]
+        assert row.query == self._WRAPPED
+        assert row.question == "Active users"  # the question is not changed by a refused edit
+
+    async def test_an_unchanged_query_is_not_validated_again(self, http_client):
+        # The UI sends both fields on every save. Renaming the question must not re-validate
+        # SQL the user did not touch: one result only, so a connection lookup would fail.
+        row = self._row(self._WRAPPED)
+        db = _mock_db(MockResult(single=row))
+        app.dependency_overrides[get_db] = lambda: db
+        cache = MagicMock(compute_embedding_async=AsyncMock(return_value=[0.1]))
+        refusing = MagicMock()
+        refusing.validate_query.return_value = MagicMock(is_valid=False, error_message="refused")
+        with (
+            patch("app.routers.chat._get_shared_cache", return_value=cache),
+            patch("app.routers.chat.create_datasource", return_value=refusing),
+        ):
+            resp = await http_client.put(
+                "/api/v1/chat/examples/ex-1",
+                json={"question": "renamed", "query": "SELECT id, tenant_id FROM users"},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["question"] == "renamed"
+        refusing.validate_query.assert_not_called()
 
     async def test_not_found_returns_404(self, http_client):
         db = _mock_db(MockResult(single=None))

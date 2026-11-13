@@ -99,6 +99,9 @@ class Settings(BaseSettings):
 
     # Rate limiting
     auth_rate_limit: str = "10/minute"
+    # /auth/refresh gets its own, higher budget: every SPA page load fires one refresh, and a
+    # 429 there logs the user out. Several tabs behind one proxy IP share the bucket.
+    refresh_rate_limit: str = "60/minute"
     trusted_proxies: list[str] = [
         "127.0.0.1",
         "10.0.0.0/8",

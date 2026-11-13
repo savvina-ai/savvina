@@ -492,6 +492,23 @@ async def _run_shared_pipeline(
     )
 
 
+def _failed_edit_values(edited_query: str, error: str | None) -> dict:
+    """Message columns after an edited query is refused or fails.
+
+    The message must describe one query: the edited one, with its error. Leaving the
+    previous SQL, rows and timing in place showed them next to an error that belongs to
+    the edit.
+    """
+    return {
+        "status": "error",
+        "error": error,
+        "query_generated": edited_query,
+        "results_json": None,
+        "execution_time_ms": None,
+        "bytes_scanned": None,
+    }
+
+
 # ── ChatService ────────────────────────────────────────────────────────────────
 
 
@@ -1352,7 +1369,7 @@ class ChatService:
             await db.execute(
                 update(ChatMessage)
                 .where(ChatMessage.id == message_id)
-                .values(status="error", error=validation.error_message)
+                .values(**_failed_edit_values(edited_query, validation.error_message))
             )
             session.updated_at = datetime.now(UTC)
             await db.commit()
@@ -1371,7 +1388,7 @@ class ChatService:
             await db.execute(
                 update(ChatMessage)
                 .where(ChatMessage.id == message_id)
-                .values(status="error", error=complexity_error)
+                .values(**_failed_edit_values(edited_query, complexity_error))
             )
             session.updated_at = datetime.now(UTC)
             await db.commit()
@@ -1418,7 +1435,7 @@ class ChatService:
             await db.execute(
                 update(ChatMessage)
                 .where(ChatMessage.id == message_id)
-                .values(status="error", error=exec_error)
+                .values(**_failed_edit_values(edited_query, exec_error))
             )
             session.updated_at = datetime.now(UTC)
             await db.commit()
@@ -1447,6 +1464,7 @@ class ChatService:
             .values(
                 query_generated=edited_query,
                 status="executed",
+                error=None,
                 results_json=results_response.model_dump(),
                 execution_time_ms=query_result.execution_time_ms,
                 bytes_scanned=query_result.bytes_scanned,

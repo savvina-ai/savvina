@@ -57,7 +57,6 @@ class TestListProviders:
             "provider_type",
             "display_name",
             "is_configured",
-            "is_healthy",
             "is_active",
             "current_model",
             "available_models",
@@ -90,12 +89,14 @@ class TestListProviders:
         assert providers["groq"]["id"] is None
         assert providers["groq"]["is_configured"] is False
 
-    async def test_is_healthy_always_false_on_list(self, http_client):
+    async def test_the_listing_carries_no_health_flag(self, http_client):
+        # The flag was never computed: every configured provider read as down. Health is
+        # what POST /providers/{id}/test answers, on demand.
         db = _mock_db(MockResult(rows=[]))
         app.dependency_overrides[get_db] = lambda: db
         resp = await http_client.get("/api/v1/providers")
         for p in resp.json()["items"]:
-            assert p["is_healthy"] is False
+            assert "is_healthy" not in p
 
     async def test_saved_config_appears_with_id(self, http_client):
         """Each saved config row is listed individually with its own id."""

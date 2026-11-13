@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from httpx import AsyncClient
 
 from fastapi import Response
+import pytest
 from starlette.requests import Request
 
 from app.auth.dependencies import get_current_active_user
@@ -20,7 +21,7 @@ from app.config import get_settings
 from app.database import get_db
 from app.main import app
 from app.models.user import RefreshToken, User
-from app.routers.auth import _set_refresh_cookie
+from app.routers.auth import _clear_refresh_cookie, _set_refresh_cookie
 
 from .conftest import MockResult, _default_user, _mock_db
 
@@ -326,6 +327,23 @@ class TestPasswordReset:
             json={"password": "Reset-Pass-1!"},
         )
         assert resp.status_code == 401
+
+
+class TestRefreshRateLimit:
+    async def test_refresh_has_its_own_higher_budget(self, http_client: AsyncClient) -> None:
+        """Every SPA page load fires one refresh, so /refresh gets a larger budget than the
+        other auth endpoints; a 429 on it would log the user out."""
+        db = MagicMock()
+        app.dependency_overrides[get_db] = lambda: db
+
+        settings = get_settings()
+        limit = int(settings.refresh_rate_limit.split("/")[0])
+        assert limit > int(settings.auth_rate_limit.split("/")[0])
+        for _ in range(limit):
+            resp = await http_client.post("/api/v1/auth/refresh")
+            assert resp.status_code == 401  # no cookie: refused, but counted
+        resp = await http_client.post("/api/v1/auth/refresh")
+        assert resp.status_code == 429
 
 
 class TestRefreshRotation:
@@ -821,6 +839,58 @@ class TestRefreshCookieSecureFlag:
         header = resp.headers["set-cookie"].lower()
         assert "httponly" in header
         assert "samesite=strict" in header
+
+
+# ── Session hint cookie ─────────────────────────────────────────────────────────
+#
+# A JS-readable marker set beside the HttpOnly refresh cookie, so the SPA can skip
+# /auth/refresh (a guaranteed 401) for a visitor with no session.
+
+
+def _cookies(resp: Response) -> dict[str, str]:
+    """Each Set-Cookie header of the response, keyed by cookie name."""
+    return {h.split("=", 1)[0]: h for h in resp.headers.getlist("set-cookie")}
+
+
+class TestSessionHintCookie:
+    def test_set_with_the_refresh_cookie_and_readable_by_script(self) -> None:
+        resp = Response()
+        _set_refresh_cookie(resp, "tok", get_settings(), _request_with_scheme("http"))
+        cookies = _cookies(resp)
+        hint = cookies["savvina_session"].lower()
+        assert cookies["savvina_session"].startswith("savvina_session=1;")
+        assert "httponly" not in hint
+        assert "samesite=strict" in hint
+        assert "path=/" in hint
+
+    def test_carries_no_token(self) -> None:
+        resp = Response()
+        _set_refresh_cookie(resp, "secret-token", get_settings(), _request_with_scheme("http"))
+        assert "secret-token" not in _cookies(resp)["savvina_session"]
+        assert "secret-token" in _cookies(resp)["savvina_rt"]
+
+    def test_lives_exactly_as_long_as_the_refresh_cookie(self) -> None:
+        resp = Response()
+        _set_refresh_cookie(resp, "tok", get_settings(), _request_with_scheme("http"))
+        cookies = _cookies(resp)
+        max_age = [part for part in cookies["savvina_rt"].split("; ") if part.startswith("Max-Age")]
+        assert max_age
+        assert max_age[0] in cookies["savvina_session"]
+
+    @pytest.mark.parametrize(("scheme", "secure"), [("https", True), ("http", False)])
+    def test_secure_flag_follows_the_refresh_cookie(self, scheme: str, secure: bool) -> None:
+        resp = Response()
+        _set_refresh_cookie(resp, "tok", get_settings(), _request_with_scheme(scheme))
+        for header in _cookies(resp).values():
+            assert ("; secure" in header.lower()) is secure
+
+    def test_clearing_expires_both_cookies(self) -> None:
+        resp = Response()
+        _clear_refresh_cookie(resp)
+        cookies = _cookies(resp)
+        assert set(cookies) == {"savvina_rt", "savvina_session"}
+        for header in cookies.values():
+            assert "max-age=0" in header.lower()
 
 
 # ── Refresh cookie Secure flag — BEHIND_TLS_PROXY ───────────────────────────────

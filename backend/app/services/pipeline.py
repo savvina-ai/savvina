@@ -19,7 +19,7 @@ from ..datasources.base import BaseDataSource
 from ..datasources.models import DataSourceSchema, PrivacySettings
 from ..models.chat import ChatMessage
 from ..providers._factory import resolve_provider_config
-from ..providers.base import BaseLLMProvider, is_degenerate_output
+from ..providers.base import BaseLLMProvider, is_degenerate_output, is_reasoning_only
 from ..semantic.models import SemanticModel
 from .prompt_builder import PromptBuilder
 from .result_masking import sql_mentions_sensitive
@@ -722,6 +722,15 @@ async def _generate_query(
                 )
                 status = "error"
                 generated_query = llm_response.query  # keep for display, but won't execute
+            elif is_reasoning_only(llm_response.raw_response):
+                # parse_llm_response keeps only what follows a reasoning scratchpad; with
+                # nothing after it there is no answer to show.
+                error = (
+                    "The model returned only its internal reasoning and no answer. "
+                    "Try again, or switch to another model."
+                )
+                status = "error"
+                generated_query = ""
             else:
                 generated_query = llm_response.query
                 explanation = llm_response.explanation

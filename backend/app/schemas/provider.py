@@ -44,8 +44,6 @@ class ProviderStatusResponse(BaseModel):
     provider_display_name: str
     # True when an API key (or local server) is configured
     is_configured: bool
-    # True when the provider's health check passes
-    is_healthy: bool
     is_active: bool
     current_model: str
     available_models: list[str]

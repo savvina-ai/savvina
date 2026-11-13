@@ -111,7 +111,7 @@ When you click **Edit** in a Review First review panel:
 3. When submitted, the edited query goes through the **same safety validation** as any generated query
 4. If the edit introduces a disallowed statement (e.g., `UPDATE`), the execution is blocked with an error
 
-Edits are recorded in the message history — the stored query is updated to reflect the user-edited version, not the original LLM output.
+Edits are recorded in the message history — the stored query is updated to reflect the user-edited version, not the original LLM output. This includes an edit that is refused or fails to run: the message then shows your edited query with its error, and the earlier results are removed, so a reload never shows rows that came from a different query. Editing again and running successfully clears the error.
 
 ---
 

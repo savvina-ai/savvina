@@ -1110,6 +1110,68 @@ class TestEditAndExecute:
         stored = db.execute.await_args_list[1].args[0].compile().params["results_json"]
         assert stored["row_filter_fingerprint"] == expected
 
+    async def _stored_update(self, *, status: str, valid: bool, query: str) -> tuple:
+        msg = _make_msg(status=status)
+        db = _make_db(
+            MockResult(row=(msg, _make_session(), _make_connection())),
+            MockResult(),
+        )
+        service = ChatService(MagicMock(), MagicMock())
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(_make_adapter(valid=valid)),
+        ):
+            resp = await service.edit_and_execute(message_id="msg-1", edited_query=query, db=db)
+        return resp, db.execute.await_args_list[1].args[0].compile().params
+
+    async def test_a_refused_edit_stores_the_refused_query_and_drops_the_old_result(self):
+        resp, stored = await self._stored_update(
+            status="executed", valid=False, query="DELETE FROM users"
+        )
+
+        assert resp.status == "error"
+        assert stored["status"] == "error"
+        assert stored["error"] == resp.error
+        assert stored["query_generated"] == "DELETE FROM users"
+        assert stored["results_json"] is None
+        assert stored["execution_time_ms"] is None
+        assert stored["bytes_scanned"] is None
+
+    async def test_an_edit_that_fails_to_run_stores_the_edited_query_and_drops_the_old_result(
+        self,
+    ):
+        msg = _make_msg(status="executed")
+        db = _make_db(MockResult(row=(msg, _make_session(), _make_connection())), MockResult())
+        adapter = _make_adapter(valid=True)
+        adapter.execute_query = AsyncMock(side_effect=RuntimeError("relation does not exist"))
+        service = ChatService(MagicMock(), MagicMock())
+        with (
+            _patch_settings(_make_settings()),
+            _patch_decrypt({"host": "localhost"}),
+            _patch_create_datasource(adapter),
+        ):
+            resp = await service.edit_and_execute(
+                message_id="msg-1", edited_query="SELECT * FROM missing", db=db
+            )
+        stored = db.execute.await_args_list[1].args[0].compile().params
+
+        assert resp.status == "error"
+        assert stored["status"] == "error"
+        assert stored["error"] == resp.error
+        assert stored["query_generated"] == "SELECT * FROM missing"
+        assert stored["results_json"] is None
+        assert stored["execution_time_ms"] is None
+
+    async def test_a_successful_edit_clears_an_earlier_error(self):
+        resp, stored = await self._stored_update(
+            status="error", valid=True, query="SELECT * FROM users LIMIT 10"
+        )
+
+        assert resp.status == "executed"
+        assert stored["status"] == "executed"
+        assert stored["error"] is None
+
 
 class TestUserFacingErrorOnReExecution:
     """Approve, edit-and-execute and sort run SQL against the same columns: a DATA failure

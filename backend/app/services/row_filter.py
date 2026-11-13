@@ -495,25 +495,23 @@ def _filtered_executable(
 
 
 _VALIDATORS = {"postgresql": PostgreSQLValidator(), "mysql": MySQLValidator()}
-# A FETCH FIRST clause is a row limit the validator's LIMIT check does not see; a LIMIT
-# after it is a syntax error.
-_FETCH = re.compile(r"\bFETCH\b", re.IGNORECASE)
-_LIMIT = re.compile(r"\bLIMIT\b", re.IGNORECASE)
 
 
 def _with_row_limit(clean: str, executed: str, dialect: str) -> str:
     """*executed* with the read-only validator's row limit when *clean* has none.
 
     The read-only validator (``BaseSQLValidator.validate``) appends ``LIMIT n`` to a query
-    without the word LIMIT, after its last code token (a trailing semicolon or comment goes
-    first). The executed form carries the same limit so the server stops early;
+    that carries no row limit, after its last code token (a trailing semicolon or comment
+    goes first). The executed form carries the same limit so the server stops early;
     ``max_rows`` stays the fetch-time cap. ``n`` is ``default_row_limit`` plus one: the
     adapters tell a truncated result by one row more than they keep. Decided on the clean
     query, which every display, cache and prompt carries: the rewrite's own fences (a MySQL
     ``LIMIT 18446744073709551615`` inside a derived table) must not count as the query's
-    limit. Unchanged when the dialect has no validator, the query already has a LIMIT
-    anywhere or a FETCH clause, or sqlparse cannot parse it (the callers' validation is the
-    gate; this never validates again).
+    limit. Unchanged when the dialect has no validator, the query already carries a row
+    limit by the validator's own rule (``has_row_limit``: the statement's own LIMIT or FETCH
+    FIRST/NEXT clause, so the word in a comment, a literal or a column named limit or fetch
+    does not count, and neither does a clause inside a subquery), or sqlparse cannot parse
+    it (the callers' validation is the gate; this never validates again).
 
     The rewritten form (sqlglot output: no comments, no trailing semicolon, the outer query
     unchanged) takes ``\nLIMIT n`` at its end; the unrewritten one is the validator's text
@@ -521,7 +519,7 @@ def _with_row_limit(clean: str, executed: str, dialect: str) -> str:
     result-column position, which a trailing LIMIT does not change.
     """
     validator = _VALIDATORS.get((dialect or "").lower())
-    if validator is None or _FETCH.search(clean) or _LIMIT.search(clean):
+    if validator is None or validator.has_row_limit(clean):
         return executed
     suffix = f"\nLIMIT {get_settings().default_row_limit + 1}"
     if executed != clean:

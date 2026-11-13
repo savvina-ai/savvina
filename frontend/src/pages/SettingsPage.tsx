@@ -56,7 +56,7 @@ function ProviderCard({ provider }: { provider: ProviderStatus }) {
   const test = useTestProvider();
   const del = useDeleteProvider();
   const refreshModels = useRefreshSavedModels();
-  const [testResult, setTestResult] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
 
   const handleRefreshModels = async () => {
@@ -96,13 +96,14 @@ function ProviderCard({ provider }: { provider: ProviderStatus }) {
       const r = await test.mutateAsync(provider.id);
       setTestResult(
         r.success
-          ? `✓ ${r.message}${r.latency_ms ? ` (${r.latency_ms}ms)` : ''}`
-          : `✗ ${r.message}`,
+          ? { ok: true, text: `✓ ${r.message}${r.latency_ms ? ` (${r.latency_ms}ms)` : ''}` }
+          : { ok: false, text: `✗ ${r.message}` },
       );
     } catch (err) {
-      setTestResult(
-        `✗ Network error: ${err instanceof Error ? err.message : 'unable to reach provider'}`,
-      );
+      setTestResult({
+        ok: false,
+        text: `✗ Network error: ${err instanceof Error ? err.message : 'unable to reach provider'}`,
+      });
     }
   };
 
@@ -111,13 +112,14 @@ function ProviderCard({ provider }: { provider: ProviderStatus }) {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span
+            data-testid="provider-status-dot"
             className={cn(
               'h-2.5 w-2.5 rounded-full',
-              provider.is_healthy
-                ? 'bg-success'
-                : provider.is_configured
-                  ? 'bg-destructive'
-                  : 'bg-muted-foreground',
+              testResult === null
+                ? 'bg-muted-foreground'
+                : testResult.ok
+                  ? 'bg-success'
+                  : 'bg-destructive',
             )}
           />
           <span className="text-sm font-medium text-foreground">{provider.display_name}</span>
@@ -157,13 +159,8 @@ function ProviderCard({ provider }: { provider: ProviderStatus }) {
       </p>
 
       {testResult && (
-        <p
-          className={cn(
-            'text-xs',
-            testResult.startsWith('✓') ? 'text-success' : 'text-destructive',
-          )}
-        >
-          {testResult}
+        <p className={cn('text-xs', testResult.ok ? 'text-success' : 'text-destructive')}>
+          {testResult.text}
         </p>
       )}
 
@@ -977,6 +974,7 @@ function ExampleCard({
     setEditQuestion(ex.question);
     setEditQuery(ex.query);
     setEditing(false);
+    updateExample.reset();
   };
 
   if (editing) {
@@ -1008,6 +1006,14 @@ function ExampleCard({
             Cancel
           </button>
         </div>
+        {updateExample.isError && (
+          <div role="alert" className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            <span>✗</span>
+            <span className="break-all">
+              {apiErrorMessage(updateExample.error, 'Failed to save example')}
+            </span>
+          </div>
+        )}
       </div>
     );
   }
@@ -1118,6 +1124,14 @@ function ExamplesTab({ connectionId }: { connectionId: string }) {
         >
           Add Example
         </button>
+        {addExample.isError && (
+          <div role="alert" className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            <span>✗</span>
+            <span className="break-all">
+              {apiErrorMessage(addExample.error, 'Failed to add example')}
+            </span>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1204,9 +1218,9 @@ export default function SettingsPage() {
           {activeTab === 'providers' && (
             <div className="space-y-8">
               <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-                Configure the LLM providers that translate natural language into SQL. The colored dot
-                shows each provider's last health check: green = healthy, red = configured but failing,
-                grey = not configured.
+                Configure the LLM providers that translate natural language into SQL. The dot shows
+                the result of the Test button on this page: green = passed, red = failed, grey = not
+                tested yet.
               </p>
               {namedGroups.map((group) => (
                 <ProviderSection

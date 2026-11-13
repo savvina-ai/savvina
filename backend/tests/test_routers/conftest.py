@@ -165,6 +165,15 @@ def clear_overrides(apply_default_auth):
     app.dependency_overrides.clear()
 
 
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """Reset slowapi's in-memory counters so per-IP limits don't bleed between tests."""
+    from app.auth.limiter import limiter
+
+    limiter.reset()
+    yield
+
+
 @pytest.fixture
 async def http_client():
     """AsyncClient wired to the FastAPI app."""

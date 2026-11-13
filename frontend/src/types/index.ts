@@ -205,7 +205,6 @@ export interface ProviderStatus {
   provider_display_name: string;
   is_active: boolean;
   is_configured: boolean;
-  is_healthy: boolean;
   current_model: string;
   available_models: string[];
   base_url: string | null;

@@ -1188,7 +1188,12 @@ class TestExecutableComments:
             "SELECT id FROM u /*!80000 WHERE email LIKE 'a%' */",
             "SELECT id FROM u /*M! WHERE email LIKE 'a%' */",
             "SELECT id FROM u /*M!100000 WHERE email LIKE 'a%' */",
+            # The opener is matched case-insensitively, like the MySQL validator's, so a
+            # lower-case /*m! (a plain comment to the server) is refused like /*M!.
+            "SELECT id FROM u /*m! WHERE email LIKE 'a%' */",
+            "SELECT id FROM u /*m!100000 WHERE email LIKE 'a%' */",
             "SELECT id, '/*!' FROM u",
+            "SELECT id, '/*m!' FROM u",
         ],
     )
     def test_an_executable_comment_is_rejected_on_mysql(self, sql: str) -> None:

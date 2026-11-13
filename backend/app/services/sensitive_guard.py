@@ -78,8 +78,8 @@ from sqlglot import exp
 from sqlglot.errors import ErrorLevel, ParseError, TokenError
 
 from ..datasources.models import PrivacySettings
+from ..datasources.validators.base_sql_validator import EXECUTABLE_OPENER
 from .result_masking import (
-    EXECUTABLE_COMMENT,
     RECORD_FUNCTIONS,
     has_escape_string_continuation,
     is_sensitive_name,
@@ -647,7 +647,7 @@ def _check_escape_strings(sql: str) -> None:
 
 def _check(sql: str, privacy: PrivacySettings, dialect: str) -> exp.Expression:
     mysql = (dialect or "").lower() == "mysql"
-    if mysql and EXECUTABLE_COMMENT.search(sql):
+    if mysql and EXECUTABLE_OPENER.search(sql):
         # The server runs the content, sqlglot drops it: a condition inside is never seen.
         # Checked on the raw text, so the opener inside a string is refused too.
         raise _reject_shape("a MySQL executable comment (/*! ... */)", _EXECUTABLE_COMMENT_HINT)

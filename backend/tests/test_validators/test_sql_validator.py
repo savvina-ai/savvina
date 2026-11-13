@@ -7,7 +7,12 @@ from unittest.mock import patch
 
 import pytest
 
-from app.datasources.validators.base_sql_validator import BaseSQLValidator
+from app.datasources.validators.base_sql_validator import (
+    MULTIPLE_STATEMENTS_ERROR,
+    BaseSQLValidator,
+    code_end,
+    nests_block_comment,
+)
 from app.datasources.validators.mysql_validator import MySQLValidator
 from app.datasources.validators.postgresql_validator import PostgreSQLValidator
 
@@ -260,6 +265,47 @@ class TestPostgreSQLValidatorBlockedFunctions:
         assert "pg_sleep" in r.error_message
 
     @pytest.mark.parametrize(
+        "func",
+        [
+            "pg_sleep_for",
+            "pg_sleep_until",
+            "pg_advisory_lock",
+            "pg_advisory_lock_shared",
+            "pg_advisory_xact_lock",
+            "pg_advisory_xact_lock_shared",
+            "pg_try_advisory_lock",
+            "pg_try_advisory_lock_shared",
+            "pg_try_advisory_xact_lock",
+            "pg_try_advisory_xact_lock_shared",
+            "pg_advisory_unlock",
+            "pg_advisory_unlock_shared",
+            "pg_advisory_unlock_all",
+        ],
+    )
+    def test_sleep_and_advisory_lock_functions_blocked(self, func):
+        # The check matches whole words, so pg_sleep does not cover pg_sleep_for; an advisory
+        # lock stays on the pooled connection after the read-only transaction ends.
+        result = self.v.validate(f"SELECT {func}(7)")
+        assert not result.is_valid
+        assert result.error_message == f"Query uses a blocked PostgreSQL function: {func}"
+
+    def test_a_schema_qualified_or_quoted_name_is_blocked_too(self):
+        for query in (
+            "SELECT pg_catalog.pg_try_advisory_lock(7)",
+            "SELECT \"pg_sleep_for\"('1 hour')",
+        ):
+            assert not self.v.validate(query).is_valid, query
+
+    def test_every_listed_function_is_refused(self):
+        for func in PostgreSQLValidator.PG_DANGEROUS_FUNCTIONS:
+            assert not self.v.validate(f"SELECT {func}(1)").is_valid, func
+
+    def test_reading_the_locks_held_is_not_blocked(self):
+        # pg_locks only lists locks; taking one is what is refused.
+        query = "SELECT locktype, pid FROM pg_locks WHERE locktype = 'advisory'"
+        assert self.v.validate(query).is_valid
+
+    @pytest.mark.parametrize(
         "query",
         [
             # A value stored with set_config comes back under another column, unmasked.
@@ -392,13 +438,136 @@ class TestBaseSQLValidatorSelectInto:
         assert v.validate("SELECT 1 FROM notes WHERE body LIKE '%logged into%'").is_valid
 
 
+# The refused shapes of the code-word tests below. test_validator_contract.py reads them too:
+# each must stay refused when a literal before it hides it from the code-word scan.
+PG_INTO_SHAPES = [
+    "SELECT 1 # 2 INTO newt FROM secrets",
+    "SELECT a # b INTO TEMP x FROM t",
+    "SELECT 1.INTO t FROM x",
+    # PostgreSQL 14 and older lex a number glued to a word as the two.
+    "SELECT 1INTO t FROM x",
+    "SELECT 1E5INTO t FROM x",
+    "SELECT 1.5INTO t FROM x",
+    "SELECT 1.E5INTO t FROM x",
+    "SELECT 1 AS \u00b4 INTO newt FROM secrets -- \u00b4",
+]
+MYSQL_INTO_SHAPES = [
+    "SELECT 1.INTO @v FROM t",
+    "SELECT 1.into @v FROM t",
+    # MySQL reads a number that ends in an exponent, then the clause: the dot
+    # leaves the scan with the word E5INTO.
+    "SELECT 7.E5INTO @v",
+    "SELECT 7.e0into @v FROM t",
+    "SELECT a FROM t WHERE b = 1.E0INTO @v",
+    "SELECT 1E5INTO @v",
+    "SELECT 7 AS \u00b4 INTO @v -- \u00b4",
+]
+GLUED_LOCK_SHAPES = [
+    "SELECT * FROM t WHERE a = 1FOR SHARE",
+    "SELECT * FROM t WHERE a = 1FOR KEY SHARE",
+    "SELECT * FROM t WHERE a = 1LOCK IN SHARE MODE",
+    # The shapes MySQL 8 runs: the clause behind an exponent.
+    "SELECT * FROM t WHERE a = 1E0FOR SHARE",
+    "SELECT * FROM t WHERE a = 1.E0FOR SHARE",
+    "SELECT * FROM t WHERE a = 1.e0lock in share mode",
+]
+
+
+class TestIntoOnCodeWords:
+    """sqlparse does not show every INTO the server runs. It reads ``# …`` as a comment,
+    which PostgreSQL reads as the XOR operator, so ``SELECT 1 # 2 INTO newt FROM secrets``
+    shows it no INTO and creates a table (verified on PostgreSQL 16). It reads the word
+    after a dot as a name, so ``SELECT 7.INTO @v`` shows it no INTO either, while MySQL
+    reads the number ``7.`` and then INTO (verified on MySQL 8.0.46). And it reads a pair
+    of acute accents (U+00B4) as the quotes of a name, which no server does: to both
+    servers the accent is a name character, so in ``SELECT 1 AS <accent> INTO t --
+    <accent>`` the first is an alias and the INTO runs (verified on both). The PostgreSQL
+    and MySQL validators therefore also judge INTO on the words the server reads as code."""
+
+    _INTO = "SELECT … INTO is not allowed: it writes to the database"
+    _LOCK = "Query takes row locks (FOR SHARE, LOCK IN SHARE MODE), which is not allowed"
+
+    @pytest.mark.parametrize("query", PG_INTO_SHAPES)
+    def test_postgresql_refuses_into_that_sqlparse_does_not_show(self, query):
+        result = PostgreSQLValidator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == self._INTO
+
+    @pytest.mark.parametrize("query", MYSQL_INTO_SHAPES)
+    def test_mysql_refuses_into_that_sqlparse_does_not_show(self, query):
+        result = MySQLValidator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == self._INTO
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT data #> '{a,into}' FROM t",
+            "SELECT 1 # 2 FROM t",
+            "SELECT x.into_date FROM x",
+            "SELECT a FROM t WHERE code = '1INTO'",
+            'SELECT t."into" FROM t',
+            "SELECT a FROM t -- 1into\n",
+            # An exponent with no keyword behind it, and a keyword-like tail that is not one.
+            "SELECT 1.5e5 AS n, x.e5 FROM x",
+            "SELECT x.e5intox FROM x",
+        ],
+    )
+    def test_postgresql_passes_the_word_where_it_is_not_code(self, query):
+        assert PostgreSQLValidator().validate(query).is_valid
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT a FROM t # split into buckets\nWHERE b = 1",
+            "SELECT t.`into` FROM t",
+            "SELECT a FROM t WHERE code = '1.INTO'",
+        ],
+    )
+    def test_mysql_passes_the_word_where_it_is_not_code(self, query):
+        assert MySQLValidator().validate(query).is_valid
+
+    @pytest.mark.parametrize("validator", [PostgreSQLValidator, MySQLValidator])
+    @pytest.mark.parametrize("query", ["SELECT t.into FROM t", "SELECT t.e5into FROM t"])
+    def test_an_unquoted_column_called_into_after_a_dot_is_refused(self, validator, query):
+        # A known over-refusal, pinned: the word after the dot is code, and the scan cannot
+        # tell the column t.into from the clause of 1.INTO, nor t.e5into from the clause
+        # of 1.E5INTO. Quoted, the name passes.
+        result = validator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == self._INTO
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # A validator with no code-word rules of its own is judged on sqlparse's
+            # tokens alone: a backtick name, a bracketed name and a # comment holding the
+            # word are not refused.
+            "SELECT `into` FROM t",
+            "SELECT [into] FROM t",
+            "SELECT a FROM t # split into buckets\nWHERE b = 1",
+            "SELECT t.into FROM t",
+        ],
+    )
+    def test_the_base_validator_keeps_its_token_verdict(self, query):
+        assert BaseSQLValidator().validate(query).is_valid
+
+    @pytest.mark.parametrize("validator", [PostgreSQLValidator, MySQLValidator])
+    @pytest.mark.parametrize("query", GLUED_LOCK_SHAPES)
+    def test_a_share_lock_glued_to_a_number_is_refused(self, validator, query):
+        result = validator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == self._LOCK
+
+
 # ── First significant token ───────────────────────────────────────────────────
 
 
 class TestFirstTokenAllowList:
     """The statement must start with SELECT, WITH or an opening parenthesis. Mentioning
     SELECT elsewhere, in a comment, is not enough: RESET, LOCK, HANDLER or SHOW would run
-    as written (a LIMIT in the comment keeps the appended LIMIT from breaking them)."""
+    as written (the first-word rule has to refuse them: a LIMIT appended to them would only
+    break them, and the word LIMIT in a comment no longer stops the validator appending one)."""
 
     @pytest.mark.parametrize(
         "query",
@@ -456,6 +625,112 @@ class TestFirstTokenAllowList:
     )
     def test_mysql_comment_forms_before_a_read_pass(self, query):
         assert MySQLValidator().validate(query).is_valid
+
+
+# Share locks behind a nested comment, which only PostgreSQL reads as one comment: the scans
+# end it at its first */ and read the word after it, so they see no clause. Refused for the
+# nesting. test_validator_contract.py reads these too.
+PG_NESTED_COMMENT_LOCK_SHAPES = [
+    "SELECT * FROM t FOR /* /* */ x */ SHARE",
+    "SELECT * FROM t FOR /* /* */ x */ KEY SHARE",
+]
+
+
+class TestPostgreSQLNestedCommentsOnTheText:
+    """The nested-comment refusal read sqlparse's tokens alone, and sqlparse does not lex as
+    PostgreSQL does: it reads ``# …`` as a comment (an operator to the server), and ``[…]``
+    and a pair of acute accents (U+00B4) as a quoted name (a subscript and a name character
+    to the server). A nested comment inside one of them is no comment token, so the refusal
+    missed it, while the scans end the comment at its first ``*/`` and take the quote after
+    it for a literal that hides the clause: ``SELECT 1 # /* /* */ ' */ 2 INTO t -- '``
+    created the table and the FOR SHARE forms took the lock (verified on PostgreSQL 16). So
+    the comment is also read on the text, where the server reads one."""
+
+    _NESTED = "Query nests a block comment inside another, which is not allowed"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT 1 # /* /* */ ' */ 2 INTO newt FROM secrets -- '",
+            "SELECT 1 # /* /* */ ' */ 2 AS x FROM t FOR SHARE -- '",
+            "SELECT (ARRAY[1,2]) [/* /* */ ' */ 1] FROM t FOR SHARE -- '",
+            "SELECT 1 AS \u00b4 /* /* */ ' */ FROM t FOR SHARE -- ' \u00b4",
+            # Refused for the nesting, whatever follows it.
+            "SELECT 1 # /*/* */ */ 2 FROM t",
+        ],
+    )
+    def test_a_nested_comment_sqlparse_does_not_show_is_refused(self, query):
+        result = PostgreSQLValidator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == self._NESTED
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT 1 # 2 /* c */ FROM t",
+            "SELECT a FROM t /* one */ /* two */",
+            "SELECT '/* a /* b */' AS c, 1 # 2 FROM t",
+            'SELECT 1 # 2 AS "/* a /* b */" FROM t',
+            "SELECT 1 # 2 FROM t -- a /* b /* c\n",
+            # The line comment ends at the carriage return: two comments, not one in another.
+            "SELECT 1 # 2 FROM t -- a /* b\r/* c */",
+        ],
+    )
+    def test_comments_that_do_not_nest_pass(self, query):
+        assert PostgreSQLValidator().validate(query).is_valid
+
+    @pytest.mark.parametrize("query", PG_NESTED_COMMENT_LOCK_SHAPES)
+    def test_a_share_lock_behind_a_nested_comment_is_refused(self, query):
+        result = PostgreSQLValidator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == self._NESTED
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # In a text whose quotes are not followed the -- inside '--a\' read as a line
+            # comment and hid the nested comment on the rest of the line, while sqlparse,
+            # reading \' as an escape, kept the stretch inside one literal and showed no
+            # comment token. PostgreSQL ends '--a\' at its quote, reads the nested comment
+            # as one and takes the lock (verified on PostgreSQL 16.15).
+            r"SELECT id FROM ecommerce.orders WHERE '--a\' <> '' FOR /* /* */ x */ SHARE -- '",
+            r"SELECT id FROM t WHERE '--a\' <> '' FOR /* /* */ x */ KEY SHARE -- '",
+            "SELECT id FROM t WHERE '$$--' <> '' FOR /* /* */ x */ SHARE",
+        ],
+    )
+    def test_a_line_comment_opener_in_a_literal_hides_no_nested_comment(self, query):
+        result = PostgreSQLValidator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == self._NESTED
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            r"SELECT 'a\'' AS s FROM t /* one */ /* two */ -- c",
+            r"SELECT id FROM t WHERE '--a\' <> '' /* c */ -- '",
+        ],
+    )
+    def test_in_such_a_text_comments_that_do_not_nest_pass(self, query):
+        assert PostgreSQLValidator().validate(query).is_valid
+
+    def test_in_a_text_whose_quotes_are_not_followed_a_literal_is_refused_too(self):
+        # A known over-refusal, pinned: where a literal ends is not known in such a text,
+        # so the characters inside one count as a comment.
+        result = PostgreSQLValidator().validate(r"SELECT 'a\'' AS s, '/* /* */' AS t FROM x")
+        assert not result.is_valid
+        assert result.error_message == self._NESTED
+
+    def test_mysql_does_not_nest_block_comments(self):
+        # MySQL ends a comment at its first */ whatever it holds, as the scans read it.
+        assert MySQLValidator().validate("SELECT 1 /* a /* b */ FROM t").is_valid
+
+    def test_the_quotes_argument_decides_what_a_literal_is(self):
+        # The scan skips the regions the quotes argument names. A backtick quotes a name on
+        # MySQL and is an operator character on PostgreSQL, so the same text holds no nested
+        # comment for the first reading and one for the second.
+        text = "SELECT `/* /* */` AS c FROM t"
+        assert not nests_block_comment(text, quotes="'\"`")
+        assert nests_block_comment(text)
 
 
 class TestPostgreSQLNestedBlockComments:
@@ -610,7 +885,7 @@ class TestMultiStatementAfterAComment:
     def test_a_second_statement_after_a_comment_is_refused(self, validator, query):
         result = validator().validate(query)
         assert not result.is_valid
-        assert result.error_message == "Multiple statements are not allowed"
+        assert result.error_message == MULTIPLE_STATEMENTS_ERROR
 
     @pytest.mark.parametrize(
         "query",
@@ -624,7 +899,7 @@ class TestMultiStatementAfterAComment:
     def test_mysql_second_statement_after_a_comment_is_refused(self, query):
         result = MySQLValidator().validate(query)
         assert not result.is_valid
-        assert result.error_message == "Multiple statements are not allowed"
+        assert result.error_message == MULTIPLE_STATEMENTS_ERROR
 
     @pytest.mark.parametrize(
         "query",
@@ -642,7 +917,7 @@ class TestMultiStatementAfterAComment:
     def test_mysql_dashes_that_are_code_after_a_semicolon_are_refused(self, query):
         result = MySQLValidator().validate(query)
         assert not result.is_valid
-        assert result.error_message == "Multiple statements are not allowed"
+        assert result.error_message == MULTIPLE_STATEMENTS_ERROR
 
     @pytest.mark.parametrize(
         "query",
@@ -663,12 +938,10 @@ class TestMultiStatementAfterAComment:
 
     @pytest.mark.parametrize("gap", ["/*/", "/**/ ", "-- \n", " "])
     @pytest.mark.parametrize("validator", [PostgreSQLValidator, MySQLValidator])
-    def test_a_long_run_of_gaps_validates_quickly(self, validator, gap):
-        import time
-
-        start = time.monotonic()
-        validator().validate("SELECT 1;" + gap * 5000)
-        assert time.monotonic() - start < 1.0
+    def test_a_long_run_of_gaps_validates_quickly(
+        self, validator, gap, validate_seconds_without_sqlparse
+    ):
+        assert validate_seconds_without_sqlparse(validator(), "SELECT 1;" + gap * 5000) < 0.5
 
     @pytest.mark.parametrize("piece", [";/*", ";/**/", "; --", ";\n", ";#", ";*/", ";-- \n"])
     @pytest.mark.parametrize("mysql_comments", [False, True])
@@ -706,6 +979,32 @@ class TestMySQLDashesWithoutWhitespace:
         assert not result.is_valid
         assert result.error_message == "SELECT … INTO is not allowed: it writes to the database"
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # MySQL tests the byte after the dashes with its own ASCII classes. A no-break
+            # space, an ideographic space or a next-line character is whitespace to Python
+            # and a name character to MySQL, so the dashes are two minus signs and the INTO
+            # runs (verified on MySQL 8.0.46: the second shape sets the variable to 3).
+            "SELECT 1 --\u00a0INTO @x FROM t",
+            "SELECT 1 --\u00a0 INTO @sv_probe FROM (SELECT 2 AS `\u00a0`) d -- limit",
+            "SELECT 1 --\u3000INTO @x FROM t",
+            "SELECT 1 --\u0085INTO @x FROM t",
+        ],
+    )
+    def test_into_after_dashes_and_a_non_ascii_space_is_refused(self, query):
+        result = self.v.validate(query)
+        assert not result.is_valid
+        assert result.error_message == "SELECT … INTO is not allowed: it writes to the database"
+
+    def test_dashes_before_a_delete_character_open_a_comment(self):
+        # DEL (0x7f) is a control character to MySQL, so the dashes open a comment and the
+        # FETCH clause inside it bounds nothing: the LIMIT is appended (verified on MySQL
+        # 8.0.46, where the query without it returned every row).
+        result = self.v.validate("SELECT id FROM orders --\x7f FETCH FIRST 1 ROWS ONLY")
+        assert result.is_valid
+        assert result.sanitized_query == "SELECT id FROM orders\nLIMIT 1000"
+
     def test_a_statement_that_starts_with_dashes_is_not_a_read(self):
         assert not self.v.validate("--1\nSELECT 1").is_valid
 
@@ -715,6 +1014,7 @@ class TestMySQLDashesWithoutWhitespace:
             "SELECT 1 -- comment",
             "SELECT 1 -- split into buckets",
             "SELECT 1 --\tsplit into buckets",
+            "SELECT 1 --\x7f split into buckets",
             "SELECT a--1 FROM t",
             "-- c\nSELECT 1",
             "--\nSELECT 1",
@@ -722,6 +1022,120 @@ class TestMySQLDashesWithoutWhitespace:
     )
     def test_comments_and_arithmetic_keep_their_verdict(self, query):
         assert self.v.validate(query).is_valid
+
+
+class TestACarriageReturnEndsALineComment:
+    """PostgreSQL ends a -- comment at a carriage return as well as at a line feed, so in
+    ``-- c\\rFOR SHARE`` the clause is code and takes the lock (verified on PostgreSQL 16).
+    MySQL ends a line comment at a line feed only, so there the same text is all comment.
+    The base scan ends the comment at either, which reads more as code and refuses more."""
+
+    _LOCK = "Query takes row locks (FOR SHARE, LOCK IN SHARE MODE), which is not allowed"
+
+    @pytest.mark.parametrize("validator", [PostgreSQLValidator, MySQLValidator])
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT * FROM t -- c\rFOR SHARE",
+            "SELECT * FROM t -- c\rFOR KEY SHARE",
+            "SELECT * FROM t --\rFOR SHARE",
+        ],
+    )
+    def test_a_share_lock_after_a_carriage_return_is_refused(self, validator, query):
+        # Refused on the MySQL validator too: the base pass runs for every dialect.
+        result = validator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == self._LOCK
+
+    def test_a_second_statement_after_a_carriage_return_is_refused(self):
+        result = PostgreSQLValidator().validate("SELECT 1;-- c\rSET statement_timeout = 0 -- LIMIT")
+        assert not result.is_valid
+        assert result.error_message == MULTIPLE_STATEMENTS_ERROR
+
+    @pytest.mark.parametrize("validator", [PostgreSQLValidator, MySQLValidator])
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # Windows line endings: the comment's words stay inside the comment.
+            "SELECT id FROM t -- up for share\r\nWHERE x = 1",
+            "SELECT id FROM t -- lock in share mode\r\n",
+            "SELECT id FROM t WHERE note = 'for\rshare'",
+        ],
+    )
+    def test_a_comment_or_a_literal_with_a_carriage_return_keeps_its_verdict(
+        self, validator, query
+    ):
+        assert validator().validate(query).is_valid
+
+    def test_a_quote_between_the_two_line_ends_is_read_by_the_mysql_flag(self):
+        # Ending the comment at the carriage return does not only read more as code: the
+        # base scan reads the quote after it as opening a literal that hides the clause.
+        # MySQL ends the comment at the line feed, so the clause is code there, and the
+        # MySQL validator's own scan, which reads that rule, refuses it.
+        from app.datasources.validators.base_sql_validator import takes_row_locks
+
+        text = "SELECT 1 FROM T -- C\r' \nFOR SHARE 'X'"
+        assert not takes_row_locks(text)
+        assert takes_row_locks(text, mysql_comments=True)
+        result = MySQLValidator().validate("SELECT 1 FROM t -- c\r' \nFOR SHARE 'x'")
+        assert not result.is_valid
+        assert result.error_message == self._LOCK
+
+    def test_the_mysql_scan_ends_a_line_comment_at_a_line_feed_only(self):
+        from app.datasources.validators.base_sql_validator import takes_row_locks
+
+        text = "SELECT * FROM T -- C\rFOR SHARE"
+        assert takes_row_locks(text)
+        assert not takes_row_locks(text, mysql_comments=True)
+
+
+class TestMySQLDashesBeforeAnExecutableComment:
+    """MySQL reads -- as a comment only when whitespace follows, so in ``--/*! 0 INTO @v*/``
+    the dashes are two minus signs and the server runs the comment's content:
+    ``SELECT 7 - -0 INTO @v`` (verified on MySQL 8.0.46). A scan that first replaced the
+    opener with a space read ``-- 0 INTO @v*/``, a comment, and lost the content."""
+
+    _INTO = "SELECT … INTO is not allowed: it writes to the database"
+    _LOCK = "Query takes row locks (FOR SHARE, LOCK IN SHARE MODE), which is not allowed"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT 1 --/*! 0 INTO @v*/ FROM t",
+            "SELECT 1 --/*!0 INTO @v*/ FROM t",
+            "SELECT 1 --/*! 0 into @v*/",
+            "SELECT 1 ---/*! 0 INTO @v*/",
+        ],
+    )
+    def test_into_in_a_comment_after_dashes_is_refused(self, query):
+        result = MySQLValidator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == self._INTO
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT a FROM t WHERE 1 --/*! 0 FOR SHARE*/",
+            "SELECT a FROM t WHERE 1 --/*!0 FOR SHARE*/",
+            "SELECT a FROM t WHERE 1 --/*! 0 LOCK IN SHARE MODE*/",
+        ],
+    )
+    def test_a_share_lock_in_a_comment_after_dashes_is_refused(self, query):
+        result = MySQLValidator().validate(query)
+        assert not result.is_valid
+        assert result.error_message == self._LOCK
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # With a space after them the dashes open a comment, and the rest is in it.
+            "SELECT 1 -- /*! 0 INTO @v*/",
+            "SELECT a FROM t WHERE 1 -- /*! 0 FOR SHARE*/",
+            "SELECT /*! STRAIGHT_JOIN */ a FROM t -- fold into one row",
+        ],
+    )
+    def test_a_real_comment_keeps_its_verdict(self, query):
+        assert MySQLValidator().validate(query).is_valid
 
 
 class TestLimitAfterATrailingSemicolon:
@@ -768,6 +1182,58 @@ class TestLimitAfterATrailingSemicolon:
         result = PostgreSQLValidator().validate("SELECT 1 # 2")
         assert result.sanitized_query == "SELECT 1 # 2\nLIMIT 1000"
 
+    @pytest.mark.parametrize(
+        ("validator", "query", "expected"),
+        [
+            # sqlparse reads "# …" to the end of the line as a comment, PostgreSQL reads an
+            # XOR operator and code, so the ; after it ends the statement.
+            (PostgreSQLValidator, "SELECT a # 1 FROM big;", "SELECT a # 1 FROM big\nLIMIT 1000"),
+            (PostgreSQLValidator, "SELECT a # 1 FROM big ; ;", "SELECT a # 1 FROM big\nLIMIT 1000"),
+            (PostgreSQLValidator, "SELECT a # 'xy';", "SELECT a # 'xy'\nLIMIT 1000"),
+            (
+                PostgreSQLValidator,
+                "SELECT j #> '{a}' FROM t;",
+                "SELECT j #> '{a}' FROM t\nLIMIT 1000",
+            ),
+            # The same on MySQL for --1, which is two minus signs and code there.
+            (MySQLValidator, "SELECT a--1 FROM t;", "SELECT a--1 FROM t\nLIMIT 1000"),
+            (MySQLValidator, "SELECT 5--3;", "SELECT 5--3\nLIMIT 1000"),
+            (MySQLValidator, "SELECT a--1 'xy';", "SELECT a--1 'xy'\nLIMIT 1000"),
+        ],
+    )
+    def test_a_semicolon_inside_a_token_sqlparse_reads_as_a_comment_is_dropped(
+        self, validator, query, expected
+    ):
+        # Left in, the LIMIT would follow the ; as a second statement and fail on the server
+        # although the query itself runs.
+        result = validator().validate(query)
+        assert result.is_valid
+        assert result.sanitized_query == expected
+
+    @pytest.mark.parametrize(
+        ("validator", "query"),
+        [
+            # Only whitespace and semicolons at the end of the token go. A comment opener
+            # inside a literal or a name, a comment after the code and the closer of an
+            # executable comment are code to the server whatever the quote rules, and a cut
+            # inside any of them would send it a statement it cannot run.
+            (PostgreSQLValidator, "SELECT 1 # length($$a -- b$$)"),
+            (PostgreSQLValidator, "SELECT 1 # length($t$a /* b$t$)"),
+            (PostgreSQLValidator, "SELECT 1 # length(E'a\\' -- b')"),
+            (PostgreSQLValidator, 'SELECT 3 # 1 AS "x -- y" -- cost $$'),
+            (PostgreSQLValidator, "SELECT a # 1 FROM big /* c */"),
+            (MySQLValidator, "SELECT 5--1 'a\\' -- b'"),
+            (MySQLValidator, "SELECT 5--1 /*! + 1 */"),
+            (MySQLValidator, "SELECT 5--1 AS `x # y` -- see \\' here"),
+        ],
+    )
+    def test_nothing_but_semicolons_and_blanks_at_the_end_of_the_token_is_cut(
+        self, validator, query
+    ):
+        result = validator().validate(query)
+        assert result.is_valid
+        assert result.sanitized_query == f"{query}\nLIMIT 1000"
+
 
 class TestLeadingByteOrderMark:
     """A byte order mark (U+FEFF) an editor put before the query is not a first word."""
@@ -790,6 +1256,40 @@ class TestLeadingByteOrderMark:
         assert not MySQLValidator().validate("﻿/*!SET*/ sql_mode = (SELECT 1)").is_valid
 
 
+SHARE_LOCK_SHAPES = [
+    "SELECT * FROM t FOR SHARE",
+    "select * from t for share nowait",
+    "SELECT * FROM t FOR KEY SHARE",
+    "SELECT * FROM t FOR KEY SHARE SKIP LOCKED",
+    "SELECT * FROM t FOR/**/SHARE",
+    "SELECT * FROM t FOR -- c\nSHARE",
+    "SELECT * FROM t FOR /* a */ KEY /* b */ SHARE",
+    "SELECT * FROM t FOR\n\tSHARE OF t",
+]
+MYSQL_COMMENT_LOCK_SHAPES = [
+    "SELECT * FROM t LOCK IN SHARE MODE",
+    "select * from t lock in share mode",
+    "SELECT * FROM t LOCK/**/IN/**/SHARE/**/MODE",
+    "SELECT * FROM t LOCK #x\nIN SHARE MODE",
+    "SELECT * FROM t /*! LOCK IN SHARE MODE */",
+    "SELECT * FROM t /*!50000 FOR SHARE */",
+    "SELECT * FROM t /*!FOR*/ SHARE",
+    "SELECT * FROM t FOR #c\nSHARE",
+    "SELECT * FROM t FOR/*!*/SHARE",
+]
+# A long run of share-lock words and comments, as (piece, repetitions). Each count keeps the
+# query under sqlparse's 10 000-token cap (``FOR /*`` lexes to 4 tokens, ``LOCK IN /*`` to
+# 6): over it, validate() refuses the query at its first step, before any of the scans these
+# runs are meant to time.
+LONG_LOCK_WORD_RUNS = [
+    ("FOR /*", 2000),
+    ("FOR ", 3000),
+    ("LOCK IN /*", 1400),
+    ("FOR -- \n", 3000),
+    ("FOR #", 3000),
+]
+
+
 class TestLockingReads:
     """A locking read takes row locks other sessions wait on; FOR UPDATE is refused by the
     UPDATE keyword, and the share forms are refused alike, with a comment between the words
@@ -797,19 +1297,7 @@ class TestLockingReads:
 
     LOCK_ERROR = "Query takes row locks (FOR SHARE, LOCK IN SHARE MODE), which is not allowed"
 
-    @pytest.mark.parametrize(
-        "query",
-        [
-            "SELECT * FROM t FOR SHARE",
-            "select * from t for share nowait",
-            "SELECT * FROM t FOR KEY SHARE",
-            "SELECT * FROM t FOR KEY SHARE SKIP LOCKED",
-            "SELECT * FROM t FOR/**/SHARE",
-            "SELECT * FROM t FOR -- c\nSHARE",
-            "SELECT * FROM t FOR /* a */ KEY /* b */ SHARE",
-            "SELECT * FROM t FOR\n\tSHARE OF t",
-        ],
-    )
+    @pytest.mark.parametrize("query", SHARE_LOCK_SHAPES)
     @pytest.mark.parametrize("validator", [PostgreSQLValidator, MySQLValidator])
     def test_share_locks_are_refused(self, validator, query):
         result = validator().validate(query)
@@ -828,20 +1316,7 @@ class TestLockingReads:
     def test_update_locks_stay_refused(self, validator, query):
         assert not validator().validate(query).is_valid
 
-    @pytest.mark.parametrize(
-        "query",
-        [
-            "SELECT * FROM t LOCK IN SHARE MODE",
-            "select * from t lock in share mode",
-            "SELECT * FROM t LOCK/**/IN/**/SHARE/**/MODE",
-            "SELECT * FROM t LOCK #x\nIN SHARE MODE",
-            "SELECT * FROM t /*! LOCK IN SHARE MODE */",
-            "SELECT * FROM t /*!50000 FOR SHARE */",
-            "SELECT * FROM t /*!FOR*/ SHARE",
-            "SELECT * FROM t FOR #c\nSHARE",
-            "SELECT * FROM t FOR/*!*/SHARE",
-        ],
-    )
+    @pytest.mark.parametrize("query", MYSQL_COMMENT_LOCK_SHAPES)
     def test_mysql_share_locks_in_every_comment_form_are_refused(self, query):
         result = MySQLValidator().validate(query)
         assert not result.is_valid
@@ -869,14 +1344,16 @@ class TestLockingReads:
     def test_columns_and_strings_named_share_or_lock_pass(self, validator, query):
         assert validator().validate(query).is_valid
 
-    @pytest.mark.parametrize("piece", ["FOR /*", "FOR ", "LOCK IN /*", "FOR -- \n", "FOR #"])
+    @pytest.mark.parametrize(("piece", "count"), LONG_LOCK_WORD_RUNS)
     @pytest.mark.parametrize("validator", [PostgreSQLValidator, MySQLValidator])
-    def test_a_long_run_of_words_and_comments_validates_quickly(self, validator, piece):
-        import time
-
-        start = time.monotonic()
-        validator().validate("SELECT 1 FROM t WHERE a = 1 " + piece * 3000)
-        assert time.monotonic() - start < 2.0
+    def test_a_long_run_of_words_and_comments_validates_quickly(
+        self, validator, piece, count, validate_seconds_without_sqlparse
+    ):
+        seconds = validate_seconds_without_sqlparse(
+            validator(),
+            "SELECT 1 FROM t WHERE a = 1 " + piece * count,  # noqa: S608
+        )
+        assert seconds < 2.0
 
     @pytest.mark.parametrize(
         "query",
@@ -966,6 +1443,19 @@ class TestWithoutTrailingGaps:
         assert MySQLValidator().without_trailing_gaps("SELECT 1 #c") == "SELECT 1"
         assert PostgreSQLValidator().without_trailing_gaps("SELECT 1 #c") == "SELECT 1 #c"
 
+    @pytest.mark.parametrize(
+        ("validator", "query", "expected"),
+        [
+            (PostgreSQLValidator, "SELECT a # 1 FROM big;", "SELECT a # 1 FROM big"),
+            (MySQLValidator, "SELECT a--1 FROM t;", "SELECT a--1 FROM t"),
+            (MySQLValidator, "SELECT 5--1 /*! + 1 */;", "SELECT 5--1 /*! + 1 */"),
+        ],
+    )
+    def test_a_semicolon_inside_a_token_sqlparse_reads_as_a_comment_goes(
+        self, validator, query, expected
+    ):
+        assert validator().without_trailing_gaps(query) == expected
+
     def test_an_empty_or_unparseable_query_is_none(self):
         from sqlparse.exceptions import SQLParseError
 
@@ -975,3 +1465,39 @@ class TestWithoutTrailingGaps:
             side_effect=SQLParseError("too deep"),
         ):
             assert PostgreSQLValidator().without_trailing_gaps("SELECT 1") is None
+
+
+class TestCodeEnd:
+    """``code_end``: the length of one token without the whitespace and semicolons at its end."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("", ""),
+            (";", ""),
+            (";;", ""),
+            (" ; ;\n", ""),
+            ("x", "x"),
+            ("x ;", "x"),
+            ("x ; ;", "x"),
+            ("x ;\n", "x"),
+            ("a ; b", "a ; b"),
+            # Nothing else is read: a comment, a quote or a closer after the code stays (a ;
+            # that ends a trailing comment goes with it, which changes nothing).
+            ("x /* c */", "x /* c */"),
+            ("x -- c;", "x -- c"),
+            ("# 1 FROM big; -- done", "# 1 FROM big; -- done"),
+            ("a 'b ; c'", "a 'b ; c'"),
+            ("--1 /*! + 1 */ ;", "--1 /*! + 1 */"),
+        ],
+    )
+    def test_only_whitespace_and_semicolons_at_the_end_go(self, text, expected):
+        assert text[: code_end(text)] == expected
+
+
+def test_a_semicolon_inside_a_literal_gets_the_explained_message():
+    result = PostgreSQLValidator().validate("SELECT 'a; b' AS x")
+
+    assert not result.is_valid
+    assert result.error_message == MULTIPLE_STATEMENTS_ERROR
+    assert "even inside a string literal" in result.error_message

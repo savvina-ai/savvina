@@ -163,14 +163,12 @@ Every successful assistant response shows two feedback buttons next to the expla
 
 > **Note:** Thumbs down clears the cache but does not prevent the LLM from generating the same query again. If the query is structurally wrong, use the **Edit SQL** button to correct it, or refine your question.
 
-### Undoing feedback
+### Changing a rating
 
-Click the active (highlighted) button again to retract your rating:
+A rating cannot be changed from the chat: once a message is rated, both buttons are disabled.
 
-- Retracting a 👍 removes the entry from the Example Library so it will no longer influence prompts.
-- Retracting a 👎 clears the rating field. Cache entries that were already evicted are not restored, but the feedback slot is freed so you can re-rate the message.
-
-While one rating is active, the opposite button is disabled — retract the current rating first if you want to switch.
+- To stop a 👍 example from influencing prompts, delete it in **Settings → Examples Library**.
+- A 👎 has nothing to undo: it only evicted cache entries, and the next similar question fills them again.
 
 ---
 

@@ -227,3 +227,34 @@ describe('ProviderCard editor', () => {
     expect(screen.getByPlaceholderText(/API key \(leave blank/)).toHaveValue('');
   });
 });
+
+describe('ProviderCard status dot', () => {
+  it('is neutral until the provider is tested, whatever the listing says', async () => {
+    renderPage();
+    expect(await screen.findByTestId('provider-status-dot')).toHaveClass('bg-muted-foreground');
+  });
+
+  it('turns green after a passing Test', async () => {
+    server.use(
+      http.post(`${API}/api/v1/providers/provider-1/test`, () =>
+        HttpResponse.json({ success: true, message: 'claude is healthy' }),
+      ),
+    );
+    renderPage();
+    await userEvent.click(await screen.findByRole('button', { name: 'Test' }));
+    await screen.findByText('✓ claude is healthy');
+    expect(screen.getByTestId('provider-status-dot')).toHaveClass('bg-success');
+  });
+
+  it('turns red after a failing Test', async () => {
+    server.use(
+      http.post(`${API}/api/v1/providers/provider-1/test`, () =>
+        HttpResponse.json({ success: false, message: 'bad key' }),
+      ),
+    );
+    renderPage();
+    await userEvent.click(await screen.findByRole('button', { name: 'Test' }));
+    await screen.findByText('✗ bad key');
+    expect(screen.getByTestId('provider-status-dot')).toHaveClass('bg-destructive');
+  });
+});

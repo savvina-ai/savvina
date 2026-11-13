@@ -11,8 +11,11 @@ import pytest
 
 from app.providers.base import (
     LLMResponse,
+    _extract_json_from_text,
     _extract_sql,
+    _strip_reasoning_blocks,
     is_degenerate_output,
+    is_reasoning_only,
     parse_llm_response,
 )
 from app.providers.cerebras_provider import CerebrasProvider
@@ -1002,3 +1005,122 @@ class TestMistralProvider:
         ok, detail = await self.provider.health_check()
         assert ok is False
         assert "auth" in detail
+
+
+# ── Reasoning scratchpads must never reach the user ───────────────────────────
+
+
+class TestReasoningScratchpads:
+    def test_paired_think_block_is_removed(self):
+        assert _strip_reasoning_blocks("<think>draft</think>QUERY:\nSELECT 1") == "QUERY:\nSELECT 1"
+
+    def test_thinking_alias_is_removed(self):
+        assert _strip_reasoning_blocks("<thinking>draft</thinking>answer") == "answer"
+
+    def test_thought_tag_is_removed(self):
+        assert _strip_reasoning_blocks("<thought>draft</thought>answer") == "answer"
+
+    def test_orphan_closer_drops_everything_before_it(self):
+        assert _strip_reasoning_blocks("draft SELECT 9</think>answer") == "answer"
+
+    def test_orphan_opener_drops_everything_after_it(self):
+        assert _strip_reasoning_blocks("answer<thought>never closed") == "answer"
+
+    def test_text_without_a_tag_is_unchanged(self):
+        text = "QUERY:\n```sql\nSELECT thought FROM notes\n```"
+        assert _strip_reasoning_blocks(text) == text
+
+    def test_the_leaked_refusal_shape_never_becomes_the_explanation(self):
+        raw = (
+            '<thought>The user wants to "Delete all orders".\nRule 1: never DELETE.\nI must refuse'
+        )
+        parsed = parse_llm_response(raw, "gemma-4-31b-it")
+        assert parsed.query == ""
+        assert parsed.explanation == ""
+        assert parsed.raw_response == raw
+
+    def test_a_refusal_after_the_scratchpad_is_kept(self):
+        parsed = parse_llm_response("<thought>draft</thought>I cannot delete data.", "m")
+        assert parsed.query == ""
+        assert parsed.explanation == "I cannot delete data."
+
+    def test_a_json_draft_inside_the_scratchpad_is_not_extracted(self):
+        assert _extract_json_from_text('<thought>{"a": 1}</thought>{"b": 2}') == '{"b": 2}'
+
+    def test_only_a_reply_that_is_all_scratchpad_is_reasoning_only(self):
+        assert is_reasoning_only("<thought>never closed")
+        assert is_reasoning_only("<think>draft</think>")
+        assert not is_reasoning_only("<think>draft</think>answer")
+        # Empty after parsing, but not a scratchpad: must not be reported as one.
+        assert not is_reasoning_only("EXPLANATION:")
+        assert not is_reasoning_only("   ")
+
+    def test_decoy_query_inside_a_paired_scratchpad_is_not_used(self):
+        raw = (
+            "<think>QUERY:\n```sql\nDELETE FROM t\n```\nEXPLANATION: draft</think>"
+            "QUERY:\n```sql\nSELECT 1\n```\nEXPLANATION:\nreal"
+        )
+        parsed = parse_llm_response(raw, "m")
+        assert parsed.query == "SELECT 1"
+        assert parsed.explanation == "real"
+
+    def test_decoy_query_before_an_orphan_closer_is_not_used(self):
+        raw = (
+            "QUERY:\n```sql\nDELETE FROM t\n```\nEXPLANATION: draft</think>"
+            "QUERY:\n```sql\nSELECT 1\n```\nEXPLANATION:\nreal"
+        )
+        parsed = parse_llm_response(raw, "m")
+        assert parsed.query == "SELECT 1"
+        assert parsed.explanation == "real"
+
+    def test_tag_case_and_whitespace_are_tolerated(self):
+        assert _strip_reasoning_blocks("< THINK >x</ Thought >answer") == "answer"
+
+    def test_two_blocks_in_one_reply_are_both_removed(self):
+        assert _strip_reasoning_blocks("<think>a</think>one<thought>b</thought>two") == "onetwo"
+
+    def test_block_then_trailing_orphan_opener(self):
+        assert _strip_reasoning_blocks("<think>a</think>keep<think>never closed") == "keep"
+
+    def test_many_unclosed_openers_do_not_blow_up(self):
+        parsed = parse_llm_response("<think>" * 20000, "m")
+        assert parsed.query == ""
+        assert parsed.explanation == ""
+
+
+class TestPlaceholderQuery:
+    """A model that refuses writes the refusal in EXPLANATION and a placeholder in QUERY."""
+
+    @staticmethod
+    def _raw(query: str) -> str:
+        return f"QUERY:\n{query}\n\nEXPLANATION:\nRule 1 forbids data changes."
+
+    @pytest.mark.parametrize(
+        "placeholder",
+        [
+            "(Cannot generate query due to safety rules)",
+            "(None)",
+            "(n/a)",
+            "( no query )",
+            "(Cannot generate query.)",
+            "(Updates are not allowed)",
+        ],
+    )
+    def test_a_parenthesised_non_sql_placeholder_is_no_query(self, placeholder):
+        parsed = parse_llm_response(self._raw(placeholder), "m")
+        assert parsed.query == ""
+        assert parsed.explanation == "Rule 1 forbids data changes."
+
+    @pytest.mark.parametrize(
+        "real",
+        [
+            "(SELECT 1)",
+            "(SELECT a FROM (SELECT 1 AS a) t)",
+            "(WITH c AS (SELECT 1) SELECT * FROM c)",
+            "DELETE FROM orders",
+            "(DELETE FROM orders)",
+        ],
+    )
+    def test_real_sql_still_reaches_the_validator(self, real):
+        parsed = parse_llm_response(self._raw(real), "m")
+        assert parsed.query == real

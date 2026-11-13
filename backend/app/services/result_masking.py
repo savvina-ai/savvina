@@ -50,6 +50,7 @@ from sqlparse.utils import remove_quotes
 
 from ..core.identifiers import ident_leaf, strip_ident_quotes, unquote_ident
 from ..datasources.models import PrivacySettings
+from ..datasources.validators.base_sql_validator import EXECUTABLE_OPENER
 from ..schemas.chat import QueryResultsResponse
 
 logger = logging.getLogger(__name__)
@@ -1107,14 +1108,6 @@ def _engine_lexing() -> tuple[object, object, frozenset[object], Any]:
     return MySQL(), Postgres(), strings, TokenType
 
 
-# The opener of a MySQL or MariaDB executable comment, with its optional version number: the
-# server runs the content, so for every check it is code, not a comment. Shared with
-# ``sensitive_guard``, which refuses it in strict mode. The MySQL validator keeps its own copy
-# (``mysql_validator._EXECUTABLE_OPENER``, which also eats the version digits): datasources
-# do not import from services, so keep the two in step.
-EXECUTABLE_COMMENT = re.compile(r"/\*M?!")
-
-
 def has_escape_string_continuation(sql: str) -> bool:
     """Whether *sql*, lexed as PostgreSQL, has an ``E'…'`` continued by a ``'…'`` on a later
     line, which the tokenizer reads otherwise than PostgreSQL (``_lex_like_the_engine``).
@@ -1356,7 +1349,7 @@ def _lex_like_the_engine(sql: str, dq: bool, *, refuse_executable_comments: bool
         if text.isspace():
             out.append(text)
             return
-        if refuse_executable_comments and EXECUTABLE_COMMENT.search(text):
+        if refuse_executable_comments and EXECUTABLE_OPENER.search(text):
             raise _ExecutableCommentError("MySQL executable comment")
         out.append(_NON_SPACE.sub(" ", text))
 
