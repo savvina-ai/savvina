@@ -53,6 +53,11 @@ router = APIRouter()
 
 _MIN_PASSWORD_LEN = 12
 _REFRESH_COOKIE_NAME = "savvina_rt"
+# JS-readable hint that a session may exist. It carries no token: the HttpOnly refresh cookie is
+# invisible to the SPA, so this is the only way a page load can tell a returning user from an
+# anonymous visitor and skip the /auth/refresh call (a 401 in the console and one rate-limited
+# request per visit) for the latter. Set and cleared with the refresh cookie, same lifetime.
+_SESSION_HINT_COOKIE_NAME = "savvina_session"
 
 
 def _set_refresh_cookie(response: Response, raw_token: str, settings, request: Request) -> None:
@@ -73,6 +78,7 @@ def _set_refresh_cookie(response: Response, raw_token: str, settings, request: R
     (app.auth.limiter._real_ip) and removes its throttling entirely.
     """
     scheme = get_effective_scheme(request.scope, settings.behind_tls_proxy)
+    max_age = settings.refresh_token_expire_days * 86_400
 
     response.set_cookie(
         key=_REFRESH_COOKIE_NAME,
@@ -80,13 +86,23 @@ def _set_refresh_cookie(response: Response, raw_token: str, settings, request: R
         httponly=True,
         secure=scheme == "https",
         samesite="strict",
-        max_age=settings.refresh_token_expire_days * 86_400,
+        max_age=max_age,
+        path="/",
+    )
+    response.set_cookie(
+        key=_SESSION_HINT_COOKIE_NAME,
+        value="1",
+        httponly=False,
+        secure=scheme == "https",
+        samesite="strict",
+        max_age=max_age,
         path="/",
     )
 
 
 def _clear_refresh_cookie(response: Response) -> None:
     response.delete_cookie(key=_REFRESH_COOKIE_NAME, path="/")
+    response.delete_cookie(key=_SESSION_HINT_COOKIE_NAME, path="/")
 
 
 _SPECIAL_CHARS_RE = re.compile(r"[!@#$%^&*(),.?\":{}|<>\-_+=\[\]\\;'~/`]")
@@ -270,7 +286,7 @@ async def login(
 
 
 @router.post("/refresh", response_model=TokenPairResponse)
-@limiter.limit(get_settings().auth_rate_limit)
+@limiter.limit(get_settings().refresh_rate_limit)
 async def refresh_token(
     request: Request,
     response: Response,

@@ -9,33 +9,38 @@ import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest'
 // here so that authStore's module-level `new BroadcastChannel(...)` call sees
 // the mock instead of jsdom's undefined.
 // ---------------------------------------------------------------------------
-const { mockRefresh, mockLogin, bcPostMessage, getOnMessage } = vi.hoisted(() => {
-  const mockRefresh = vi.fn()
-  const mockLogin = vi.fn()
-  const bcPostMessage = vi.fn()
-  let _onMessage: ((ev: MessageEvent) => void) | null = null
+const { mockRefresh, mockLogin, mockGetMe, mockGetSetupStatus, bcPostMessage, getOnMessage } =
+  vi.hoisted(() => {
+    const mockRefresh = vi.fn()
+    const mockLogin = vi.fn()
+    const mockGetMe = vi.fn()
+    const mockGetSetupStatus = vi.fn()
+    const bcPostMessage = vi.fn()
+    let _onMessage: ((ev: MessageEvent) => void) | null = null
 
-  function MockBC() {
-    return {
-      postMessage: bcPostMessage,
-      set onmessage(h: ((ev: MessageEvent) => void) | null) {
-        _onMessage = h
-      },
-      get onmessage() {
-        return _onMessage
-      },
+    function MockBC() {
+      return {
+        postMessage: bcPostMessage,
+        set onmessage(h: ((ev: MessageEvent) => void) | null) {
+          _onMessage = h
+        },
+        get onmessage() {
+          return _onMessage
+        },
+      }
     }
-  }
 
-  globalThis.BroadcastChannel = MockBC as unknown as typeof BroadcastChannel
+    globalThis.BroadcastChannel = MockBC as unknown as typeof BroadcastChannel
 
-  return {
-    mockRefresh,
-    mockLogin,
-    bcPostMessage,
-    getOnMessage: () => _onMessage,
-  }
-})
+    return {
+      mockRefresh,
+      mockLogin,
+      mockGetMe,
+      mockGetSetupStatus,
+      bcPostMessage,
+      getOnMessage: () => _onMessage,
+    }
+  })
 
 vi.mock('../api/client', () => ({ _registerAuthCallbacks: vi.fn() }))
 
@@ -44,8 +49,8 @@ vi.mock('../api/auth', () => ({
     refresh: mockRefresh,
     login: mockLogin,
     logout: vi.fn(),
-    getMe: vi.fn(),
-    getSetupStatus: vi.fn(),
+    getMe: mockGetMe,
+    getSetupStatus: mockGetSetupStatus,
     register: vi.fn(),
   },
 }))
@@ -198,5 +203,97 @@ describe('authStore — BroadcastChannel coordination', () => {
 
     // Our timer was cancelled — no refresh should have been issued
     expect(mockRefresh).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Session restore on page load — gated on the session-hint cookie
+// ---------------------------------------------------------------------------
+const SESSION_HINT = 'savvina_session'
+
+function setHint() {
+  document.cookie = `${SESSION_HINT}=1; path=/`
+}
+
+function clearHint() {
+  document.cookie = `${SESSION_HINT}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT`
+}
+
+describe('authStore — initialize() and the session-hint cookie', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    clearHint()
+    mockRefresh.mockReset()
+    mockGetMe.mockReset()
+    mockGetSetupStatus.mockReset()
+    mockGetSetupStatus.mockResolvedValue({ needs_setup: false })
+    resetStore()
+  })
+
+  afterEach(() => {
+    clearHint()
+    useAuthStore.setState({ accessToken: null, user: null })
+  })
+
+  it('does not call /auth/refresh for a visitor with no hint cookie', async () => {
+    await useAuthStore.getState().initialize()
+
+    expect(mockRefresh).not.toHaveBeenCalled()
+    expect(mockGetMe).not.toHaveBeenCalled()
+    const state = useAuthStore.getState()
+    expect(state.accessToken).toBeNull()
+    expect(state.user).toBeNull()
+    expect(state.isLoading).toBe(false)
+  })
+
+  it('still reads the setup status for a visitor with no hint cookie', async () => {
+    mockGetSetupStatus.mockResolvedValueOnce({ needs_setup: true })
+
+    await useAuthStore.getState().initialize()
+
+    expect(mockGetSetupStatus).toHaveBeenCalledTimes(1)
+    expect(useAuthStore.getState().needsSetup).toBe(true)
+  })
+
+  it('restores the session through /auth/refresh when the hint cookie is present', async () => {
+    vi.useFakeTimers()
+    try {
+      setHint()
+      mockRefresh.mockResolvedValueOnce({ access_token: 'restored', expires_in: 900 })
+      mockGetMe.mockResolvedValueOnce(mockUser)
+
+      await useAuthStore.getState().initialize()
+
+      expect(mockRefresh).toHaveBeenCalledTimes(1)
+      const state = useAuthStore.getState()
+      expect(state.accessToken).toBe('restored')
+      expect(state.user).toEqual(mockUser)
+      expect(state.isLoading).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('ends up signed out when the hint cookie is stale and /auth/refresh is refused', async () => {
+    setHint()
+    mockRefresh.mockRejectedValueOnce(new Error('401'))
+
+    await useAuthStore.getState().initialize()
+
+    const state = useAuthStore.getState()
+    expect(mockRefresh).toHaveBeenCalledTimes(1)
+    expect(state.accessToken).toBeNull()
+    expect(state.user).toBeNull()
+    expect(state.isLoading).toBe(false)
+  })
+
+  it('does not read a cookie whose name only ends with the hint name', async () => {
+    document.cookie = `x${SESSION_HINT}=1; path=/`
+    try {
+      await useAuthStore.getState().initialize()
+      expect(mockRefresh).not.toHaveBeenCalled()
+    } finally {
+      document.cookie = `x${SESSION_HINT}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT`
+    }
   })
 })

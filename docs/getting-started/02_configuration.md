@@ -63,7 +63,7 @@ The only provider-related environment variables are:
 | `OLLAMA_BASE_URL` | Ollama (local) base URL | Default: `http://ollama:11434`. Ollama needs no API key. **Merely setting this variable — even to the same value as the default — is what makes Ollama appear as a configured provider in the UI.** Leaving it unset is what keeps Ollama hidden on installations that never use it. |
 | `VERIFY_SSL` | TLS verification for all provider calls | Default `true`; see [SSL / TLS Settings](#ssl--tls-settings). |
 
-A provider with no saved config shows a grey "not configured" dot on the Settings page and cannot be selected for chat until a config with a key is added.
+A provider with no saved config cannot be tested or selected for chat until a config with a key is added.
 
 **Model resolution:** `GET /api/v1/providers` always returns `current_model` as the model that will actually be used — the saved model if one is set, or the provider's default model otherwise. An empty `current_model` should never appear in a correctly configured provider.
 
@@ -133,7 +133,8 @@ The query cache stores question → SQL pairs and uses fastembed ONNX embeddings
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `AUTH_RATE_LIMIT` | string | `10/minute` | Rate limit applied to authentication endpoints (login, register, refresh, password reset, profile update). Uses `slowapi` syntax, e.g. `20/minute`, `100/hour`. |
+| `AUTH_RATE_LIMIT` | string | `10/minute` | Rate limit applied to authentication endpoints (login, register, logout, password reset, profile update, setup status). Uses `slowapi` syntax, e.g. `20/minute`, `100/hour`. |
+| `REFRESH_RATE_LIMIT` | string | `60/minute` | Rate limit applied to `POST /api/v1/auth/refresh` alone. The web app calls it once per page load of a signed-in browser (one with the `savvina_session` hint cookie), so it gets a larger budget than the other authentication endpoints. Same `slowapi` syntax. |
 | `TRUSTED_PROXIES` | JSON array | `["127.0.0.1","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","::1","fc00::/7"]` | CIDR ranges (IPv4 and IPv6) whose direct connection is trusted to set `X-Real-IP` (client IP). |
 
 **`TRUSTED_PROXIES` decides one thing: which IP a request is attributed to.** If the request's *direct* TCP peer is inside one of these ranges, the client IP is taken from the `X-Real-IP` header; otherwise the direct peer address is used and the header is ignored. Note it is `X-Real-IP` specifically — `X-Forwarded-For` is not consulted, so a proxy that only sets the latter will leave every request attributed to the proxy itself. That resolved IP is the rate-limit key and is what login attempts are logged against. It has no bearing on HTTPS, the session cookie's `Secure` flag, or HSTS — those are governed by `BEHIND_TLS_PROXY` (next section), not by any header.

@@ -68,7 +68,9 @@ Authenticate with email + password. **Rate limited:** 10 req/min.
 
 ### `POST /api/v1/auth/refresh`
 
-Rotate refresh token — issues a new pair, revokes the old one. Uses `SELECT FOR UPDATE` to prevent concurrent refresh races. **Rate limited:** 10 req/min.
+Rotate refresh token — issues a new pair, revokes the old one. Uses `SELECT FOR UPDATE` to prevent concurrent refresh races. **Rate limited:** 60 req/min per IP (`REFRESH_RATE_LIMIT`).
+
+The refresh token travels in the HttpOnly `savvina_rt` cookie. Login, register and refresh also set `savvina_session=1`, a script-readable cookie with the same lifetime and no token in it, which logout clears with the refresh cookie. The web app calls this endpoint on page load only when that hint is present, so an anonymous visitor to the login page makes no refresh request.
 
 **Request body:** `{"refresh_token": "<token>"}`
 
@@ -747,6 +749,8 @@ Execute a user-edited version of a pending query. The edited query goes through 
 
 **Response `200`:** Updated `ChatResponse` with edited query and results
 
+The stored message always describes the query that was last submitted. When the edit is refused by the validator or fails to run, the message keeps the edited query and its error (`status: "error"`) and loses its previous rows and timing; a later successful edit sets `status: "executed"` and clears the error.
+
 ---
 
 ### `POST /api/v1/chat/feedback/{message_id}`
@@ -771,7 +775,7 @@ Submit feedback on a generated query.
 
 Retract previously submitted feedback on a message.
 
-- Retracting `thumbs_up` also removes the verified example that was added to the example library.
+- Retracting `thumbs_up` also removes the verified example that was added to the example library. The example is matched by the message's current query: if the query was edited after the rating, the example stays in the library and is removed in Settings → Examples Library.
 - Retracting `thumbs_down` clears the feedback field only — already-evicted cache entries are not restored.
 
 **Response `204`:** No content
@@ -877,6 +881,7 @@ Manually add a verified question → query pair to the example library.
 ```
 
 **Response `201`:** `ExampleResponse`
+**Response `422`:** The connection's SQL validator refused the query; `detail` reads `Example query rejected: <reason>` and nothing is stored. An example reaches the model as a few-shot hint, so it must be a read the connection allows.
 
 ---
 
@@ -894,6 +899,7 @@ Update the question and/or query of an existing verified example. The example's 
 
 **Response `200`:** `ExampleResponse`, its `query` served as the list serves it (a query stored by an older version under the whole-query row-filter wrap is returned unwrapped)
 **Response `404`:** Example not found
+**Response `422`:** The query was changed and the connection's SQL validator refused the new one (`Example query rejected: <reason>`); nothing is written. A request that leaves the query as it is, or changes only the question, is not validated again.
 
 ---
 
